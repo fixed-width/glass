@@ -198,6 +198,16 @@ pub struct A11ySnapshotArgs {
     pub max_nodes: Option<u32>,
 }
 
+/// Arguments for the experimental lossless compact-outline revision tool.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct A11ySnapshotDiffArgs {
+    /// Node cap; omit for default, 0 removes only the node cap.
+    pub max_nodes: Option<u32>,
+    /// Caller-held revision; omit/null for full recovery. Nonempty ASCII, at most 128 bytes.
+    #[schemars(length(min = 1, max = 128))]
+    pub base_revision: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ClickArgs {
     /// Click x in window-relative pixels.

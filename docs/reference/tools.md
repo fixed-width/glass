@@ -834,6 +834,55 @@ re-snapshot will not change that, so it steers straight to the pixel path. See
 Roles are normalized across platforms; see [Accessibility roles by platform](a11y-roles.md) for
 what each backend can produce.
 
+### `glass_a11y_snapshot_diff`
+
+**Experimental; full profile only.** Takes one fresh accessibility read on every call and returns
+a lossless representation of the existing `compact-v1` outline. This tool is for clients that
+reconstruct text and verify the protocol. `glass_a11y_snapshot` keeps its existing contract.
+
+- `max_nodes` (integer, optional) — the snapshot node cap; omission uses defaults and `0` removes
+  only the node cap. Depth and sibling limits still apply.
+- `base_revision` (string or null, optional) — the caller's last verified revision. Omission/null
+  requests a full read. Supplied values must be nonempty ASCII of at most 128 bytes.
+
+The trusted `result` contains `version: 1`, `kind: "full" | "diff" | "unchanged"`, fresh opaque
+`revision`, opaque `context_id`, `outline_format: "compact-v1"`, `body_sha256`, UTF-8 `body_bytes`,
+LF `line_count`, `cacheable`, and `completeness`. Completeness repeats current `count`, nullable
+`truncated: {limit: "nodes" | "depth" | "siblings", limit_value, nodes_walked}`, `unreadable`,
+`unexposed`, and `subject_mismatch`. Current recovery guidance accompanies every packet.
+
+One untrusted JSON observation block carries the application text. A full packet contains
+`{"outline":"…"}`. A diff contains `{"edits":[{"start":3,"delete":1,"insert":["new line\n"]}]}`;
+unchanged contains `{"edits":[]}`. Optional `subject: {asked, actual}` stays inside this untrusted
+payload. Diff and unchanged results include `base_revision`; full results include `full_reason`.
+
+Lines retain their LF terminator, including CR before LF; a final unterminated line retains its
+bytes. Empty text has zero lines. Edit offsets refer to the baseline, increase without overlap,
+and must be applied in reverse order. Validate packet version, RPC order, expected baseline and
+context, edit types/order/ranges, reconstructed byte/line counts and SHA-256 before replacing
+local state. Fetch and verify every externalized resource first. Invalid, duplicate, late or
+corrupt responses leave the client baseline unchanged; recover by omitting `base_revision`.
+Finish decoding a response before issuing its dependent request. Reconstructed text stays untrusted.
+
+The server retains one volatile baseline, bounded to 1 MiB of outline and owned metadata and
+16,384 lines. Unknown or superseded revisions recover with a fresh full read. Session/window,
+provider, process, limits, coordinate interpretation or disclosure changes require full output.
+Selecting even the same window breaks continuity. Unknown or ambiguous scope returns
+`cacheable: false`. macOS currently attests selected-window scope plus root-selection uniqueness
+and scale during the fresh AX read. Other backends return `context_unproven` without retention.
+Scope is an observed episode, with the ordinary snapshot's root guarantees; tokens do not identify
+a native object's lifetime. IDs remain immediate references from the latest read.
+
+Full reasons, in precedence order: `context_unproven`, `size_limit`, `requested`,
+`baseline_unavailable`, `context_changed`, `metadata_changed`, `not_smaller`. Oversized observations
+remain complete through normal output/resource handling but are not retained. Diff/unchanged is
+chosen only when its complete logical response is smaller than full; transport externalization
+can change wire savings. A partial observation retains its disclosures and cannot prove absence.
+Unchanged describes outline bytes, not hidden state or verified action effects. Reads and failed
+output/cancellation never authorize replaying an action. No native traversal is skipped.
+
+The external interaction client includes a strict receiver in `tools/interaction-bench/snapshot_revisions.py`.
+
 ### `glass_a11y_marks`
 
 Screenshot of the active window with a numbered Set-of-Mark box on each interactable element, plus a

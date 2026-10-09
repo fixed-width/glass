@@ -416,10 +416,6 @@ fn artifact_error_category(error: ArtifactError) -> &'static str {
 }
 
 impl AppliedOutcome {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Used by output policy contract tests.")
-    )]
     pub(crate) fn output_metadata(&self) -> Option<&OutputMetadata> {
         self.metadata.as_ref()
     }

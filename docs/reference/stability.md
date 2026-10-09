@@ -67,5 +67,5 @@ is **not** covered by the guarantee above: its name, parameters, and result shap
 tool may be removed, in any release — until it is promoted to stable in a later version. This lets a
 new tool's shape settle against real use before it is locked.
 
-All tools in the current release are **stable**; none is experimental.
+`glass_a11y_snapshot_diff` is **experimental**. Other tools are stable.
 

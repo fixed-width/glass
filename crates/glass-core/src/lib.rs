@@ -93,12 +93,12 @@ pub use deadline::{Deadline, Whose};
 pub mod accessibility;
 pub use accessibility::{
     Accessibility, ActionabilityCheck, ActionabilityCheckName, ActionabilityReport,
-    ActionabilitySource, ActionabilityVerdict, AxContext, AxNode, AxNodeId, AxRect, AxRole,
-    AxStateCoverage, AxStates, AxTarget, AxTree, ChangeSignal, ChangeWait, ClickMethod,
-    ElementCondition, ElementInfo, ElementMatch, MAX_DEPTH, MAX_NODES, MAX_SIBLINGS, MatchField,
-    MatchTier, PointerHit, ScopeResolution, SemanticMatch, SemanticQuery, SemanticQueryError,
-    SemanticQueryResult, SemanticSelector, SemanticState, Subject, Truncation, TruncationLimit,
-    WalkBudget, WalkLimits, element_match, normalize_description, normalize_name,
+    ActionabilitySource, ActionabilityVerdict, AxContext, AxNode, AxNodeId, AxObservationScope,
+    AxRect, AxRole, AxStateCoverage, AxStates, AxTarget, AxTree, ChangeSignal, ChangeWait,
+    ClickMethod, ElementCondition, ElementInfo, ElementMatch, MAX_DEPTH, MAX_NODES, MAX_SIBLINGS,
+    MatchField, MatchTier, PointerHit, ScopeResolution, SemanticMatch, SemanticQuery,
+    SemanticQueryError, SemanticQueryResult, SemanticSelector, SemanticState, Subject, Truncation,
+    TruncationLimit, WalkBudget, WalkLimits, element_match, normalize_description, normalize_name,
 };
 
 pub mod marks;
@@ -122,10 +122,11 @@ pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef
 
 pub mod session;
 pub use session::{
-    ActionDeadline, ActionMethod, ActionMode, ActionTarget, Backend, ClickTargetParams,
-    ConfirmationStatus, DispatchStatus, FindElementsOutcome, FindElementsParams, Glass,
-    MutationReport, PlatformFactory, ResolutionReport, RetryGuidance, SCROLL_TO_DEFAULT_STEP,
-    SCROLL_TO_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS,
+    ActionDeadline, ActionMethod, ActionMode, ActionTarget, AxObservation, Backend,
+    ClickTargetParams, ConfirmationStatus, DispatchStatus, FindElementsOutcome, FindElementsParams,
+    Glass, MutationReport, ObservationContext, ObservationEpoch, ObservationGeneration,
+    ObservationInvalidation, PlatformFactory, ResolutionReport, RetryGuidance,
+    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS,
     SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome, ScrollToElementParams,
     SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticTarget,
     SetValueTargetParams, TypeTargetParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome,

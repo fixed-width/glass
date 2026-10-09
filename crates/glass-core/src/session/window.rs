@@ -20,6 +20,9 @@ impl Glass {
     }
 
     fn window_inner_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        if !matches!(op, WindowOp::Geometry) {
+            self.observation_epoch.invalidate();
+        }
         let s = self.active_mut()?;
         let geometry = s.platform.window_by(op, deadline)?;
         s.geometry = geometry.clone();
@@ -43,6 +46,7 @@ impl Glass {
     }
 
     pub fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        self.observation_epoch.invalidate();
         let s = self.active_mut()?;
         let geometry = s.platform.select_window_by(id, deadline)?;
         s.geometry = geometry.clone();

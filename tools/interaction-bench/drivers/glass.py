@@ -4,6 +4,7 @@ import re
 import time
 
 from evidence import EvidenceError
+from snapshot_revisions import SnapshotReceiver
 
 
 def normalize(request, decoded):
@@ -73,6 +74,7 @@ class Driver:
         )
         self.deadline = deadline
         self.events = []
+        self.snapshot_receiver = SnapshotReceiver()
 
     def call(self, step, name, arguments, allow_error=False):
         self.client.step = step
@@ -85,13 +87,34 @@ class Driver:
         if timeout <= 0:
             raise TimeoutError("attempt action deadline exhausted")
         request = {"name": name, "arguments": arguments}
-        reply = self.client.rpc("tools/call", request, timeout=timeout)
+        revision_sequence = self.client.sequence + 1 if name == "glass_a11y_snapshot_diff" else None
+        if revision_sequence is not None:
+            self.snapshot_receiver.begin(revision_sequence, arguments.get("base_revision"))
+        try:
+            reply = self.client.rpc("tools/call", request, timeout=timeout)
+        except BaseException:
+            if revision_sequence is not None:
+                self.snapshot_receiver.abort(revision_sequence)
+            raise
         origin = self.client.calls[-1]["sequence"]
         if self.client.calls[-1]["response_text_bytes"] > 8192:
             raise EvidenceError("Glass tool reply exceeded its inline text budget")
         self.evidence.timeout = max(0.01, self.deadline - time.monotonic())
-        decoded = self.evidence.decode(name, reply)
+        try:
+            decoded = self.evidence.decode(name, reply)
+            revision = None
+            if revision_sequence is not None:
+                if decoded["is_error"] and allow_error:
+                    self.snapshot_receiver.abort(revision_sequence)
+                else:
+                    revision = self.snapshot_receiver.accept(revision_sequence, decoded)
+        except BaseException:
+            if revision_sequence is not None:
+                self.snapshot_receiver.abort(revision_sequence)
+            raise
         facts = normalize(request, decoded)
+        if revision is not None:
+            facts["snapshot_revision"] = revision
         self.events.append({"step": step, "call": origin, "facts": facts})
         if facts["error"] and not allow_error:
             raise EvidenceError(

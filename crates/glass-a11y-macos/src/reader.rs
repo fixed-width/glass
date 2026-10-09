@@ -95,6 +95,7 @@ impl SnapshotBoundary for NativeSnapshotAxBoundary {
 #[derive(Debug)]
 pub struct MacosA11y {
     snapshot_boundary: Box<dyn SnapshotBoundary>,
+    observation_scope: Option<glass_core::AxObservationScope>,
 }
 
 impl Default for MacosA11y {
@@ -107,21 +108,26 @@ impl MacosA11y {
     pub fn new() -> Self {
         Self {
             snapshot_boundary: Box::new(NativeSnapshotAxBoundary),
+            observation_scope: None,
         }
     }
 
     #[cfg(test)]
     fn with_snapshot_boundary(snapshot_boundary: Box<dyn SnapshotBoundary>) -> Self {
-        Self { snapshot_boundary }
+        Self {
+            snapshot_boundary,
+            observation_scope: None,
+        }
     }
 }
 
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.observation_scope = None;
         let snapshot_boundary = self.snapshot_boundary.as_ref();
-        run_snapshot(ctx.deadline, snapshot_boundary, |trusted, deadline| {
+        let (tree, scope) = run_snapshot(ctx.deadline, snapshot_boundary, |trusted, deadline| {
             require_accessibility_grant(trusted)?;
-            let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
+            let (window_el, scale, unambiguous) = resolve_window_scoped_after_grant(ctx, deadline)?;
 
             let mut budget = WalkBudget::with_limits(ctx.limits);
             let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
@@ -130,9 +136,21 @@ impl Accessibility for MacosA11y {
                 tree.truncated = budget.truncation();
                 tree.unreadable = budget.unreadable();
                 // `glass-core` assigns ids after this walk, keeping numbering backend-independent.
-                Ok(tree)
+                Ok((
+                    tree,
+                    unambiguous.then_some(glass_core::AxObservationScope {
+                        provider: "macos-ax-v1",
+                        coordinate_basis: scale.to_bits(),
+                    }),
+                ))
             })
-        })
+        })?;
+        self.observation_scope = scope;
+        Ok(tree)
+    }
+
+    fn observation_scope(&self) -> Option<glass_core::AxObservationScope> {
+        self.observation_scope
     }
 
     fn state_coverage(&self) -> glass_core::AxStateCoverage {
@@ -555,6 +573,13 @@ fn resolve_window_after_grant(
     ctx: &AxContext,
     deadline: SemanticDeadline,
 ) -> Result<(CFRetained<AXUIElement>, f64)> {
+    resolve_window_scoped_after_grant(ctx, deadline).map(|(window, scale, _)| (window, scale))
+}
+
+fn resolve_window_scoped_after_grant(
+    ctx: &AxContext,
+    deadline: SemanticDeadline,
+) -> Result<(CFRetained<AXUIElement>, f64, bool)> {
     deadline.require()?;
     let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
     let app = deadline.observe(|| ffi::app_element(pid as i32))?;
@@ -605,8 +630,9 @@ fn select_window(
     win: &WindowGeometry,
     deadline: SemanticDeadline,
     resolution: EffectiveDeadline,
-) -> Result<Option<(CFRetained<AXUIElement>, f64)>> {
+) -> Result<Option<(CFRetained<AXUIElement>, f64, bool)>> {
     let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
+    let mut matching_windows = 0usize;
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
         if resolution.callee_expired(deadline)? {
@@ -690,6 +716,7 @@ fn select_window(
             continue;
         }
         let dist = dx + dy;
+        matching_windows += 1;
         if best
             .as_ref()
             .is_none_or(|(best_dist, _, _)| dist < *best_dist)
@@ -712,7 +739,7 @@ fn select_window(
     if resolution.callee_expired(deadline)? {
         return Ok(None);
     }
-    Ok(best.map(|(_, w, scale)| (w, scale)))
+    Ok(best.map(|(_, w, scale)| (w, scale, matching_windows == 1)))
 }
 
 /// One of the label attributes a node's `name`/`description` come from (`AXTitle`,

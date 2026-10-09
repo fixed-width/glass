@@ -1205,10 +1205,14 @@ pub enum ChangeWait {
     Unusable,
 }
 
-/// The OS accessibility seam — one impl per OS. Object-safe; the session stores
-/// it boxed as `Send` (the `Send` bound lives at the storage site, not on the
-/// trait). Distinct from `Platform`: accessibility varies per-OS, not per-
-/// display-server.
+/// Facts from the most recent snapshot's actual root selection, without native references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AxObservationScope {
+    pub provider: &'static str,
+    pub coordinate_basis: u64,
+}
+
+/// The OS accessibility seam, stored as a Send trait object by the session.
 pub trait Accessibility {
     /// Snapshot the active window's accessibility subtree in window-relative coordinates; the
     /// caller assigns node ids with [`AxTree::assign_ids`].
@@ -1220,6 +1224,11 @@ pub trait Accessibility {
     /// Use [`crate::GlassError::AccessibilityNotReady`] only when the app has not published a usable
     /// tree before the deadline.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
+
+    /// Return scope only for an unambiguous successful snapshot; clear it on failed reads.
+    fn observation_scope(&self) -> Option<AxObservationScope> {
+        None
+    }
 
     /// Subscribe before the first snapshot so changes between subscription and read remain
     /// observable; `None` means this reader has no event stream.

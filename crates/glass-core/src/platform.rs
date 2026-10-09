@@ -509,6 +509,12 @@ pub trait Platform {
         None
     }
 
+    /// Selected window used by fresh geometry/accessibility reads, when the backend can attest it.
+    /// This is an observation episode, not proof of a native object's lifetime.
+    fn observation_window_id(&self) -> Option<WindowId> {
+        None
+    }
+
     /// Whether another native window intercepts this active-window-relative point.
     /// This is a read-only check: do not move the pointer, focus, or raise a window.
     /// `false` supplies no additional occlusion evidence; it does not prove a control clear.
