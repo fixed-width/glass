@@ -43,6 +43,7 @@
 //! `GLASS_A11Y_FIXTURE_BIN` when set (the granted run pre-builds it); otherwise this builds
 //! `fixture/a11y_fixture.swift` with `swiftc`, or skips if neither is available.
 
+mod a11y_identity;
 mod common;
 
 #[cfg(not(target_os = "macos"))]
@@ -208,7 +209,7 @@ mod macos_main {
         }
     }
 
-    fn glass_with_a11y() -> Glass {
+    fn glass_with_a11y() -> (Glass, tempfile::TempDir) {
         let factory: PlatformFactory = Box::new(|_backend| {
             Ok(Backend {
                 platform: Box::new(MacosPlatform::new()?),
@@ -217,8 +218,10 @@ mod macos_main {
         });
         let dir = tempfile::tempdir().expect("semantic baseline tempdir");
         let root = dir.path().join("baselines");
-        std::mem::forget(dir);
-        Glass::new(factory, "macos".into(), BaselineStore::new(root), 100)
+        (
+            Glass::new(factory, "macos".into(), BaselineStore::new(root), 100),
+            dir,
+        )
     }
 
     /// Launch the fixture, snapshot its accessibility tree, and assert the outline contains
@@ -473,7 +476,7 @@ mod macos_main {
             ConfirmationStatus, DispatchStatus, SemanticActionFailureKind, SemanticState,
         };
 
-        let mut glass = glass_with_a11y();
+        let (mut glass, _baselines) = glass_with_a11y();
         glass
             .start(&AppSpec {
                 build: None,
@@ -766,8 +769,8 @@ mod macos_main {
             SemanticActionFailureKind,
         };
 
-        let mut target = glass_with_a11y();
-        let mut cover = glass_with_a11y();
+        let (mut target, _target_baselines) = glass_with_a11y();
+        let (mut cover, _cover_baselines) = glass_with_a11y();
         let click = |name: &str| glass_core::ClickTargetParams {
             target: ActionTarget::Semantic(semantic_target(AxRole::Button, name, vec![])),
             mode: ActionMode::Pointer,
@@ -950,6 +953,10 @@ mod macos_main {
                 if let Err(error) = stop_result {
                     cleanup_dir(&fixture_dir);
                     fail(format!("stop_app: {error}"));
+                }
+                if let Err(error) = crate::a11y_identity::run(&mut platform, &fixture_bin) {
+                    cleanup_dir(&fixture_dir);
+                    fail(error);
                 }
                 if let Err(error) = run_semantic_checks(&fixture_bin) {
                     cleanup_dir(&fixture_dir);

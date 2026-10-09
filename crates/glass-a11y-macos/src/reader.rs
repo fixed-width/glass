@@ -31,6 +31,7 @@ use crate::select_diagnostic::{CandidateOutcome, candidate_line};
 use crate::semantic_deadline::{
     EffectiveDeadline, SemanticDeadline, SnapshotBoundary, run_snapshot,
 };
+use crate::target_search::{self, TargetTree};
 
 /// Per-axis pixel tolerance when matching an `AXWindow`'s origin against the backend's
 /// reported window origin. Same basis as `axwindow.rs`'s geometry-match fallback. Sized for
@@ -141,10 +142,7 @@ impl Accessibility for MacosA11y {
     fn focus(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
         let deadline = SemanticDeadline::focus(ctx.deadline, target.id.0);
         let (window_el, scale) = resolve_window(ctx, deadline)?;
-        let mut budget = WalkBudget::with_limits(ctx.limits);
-        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
-        let el = found.ok_or(GlassError::AxElementChanged(target.id.0))?;
-        verify_target_fingerprint(&el, ctx, target, scale, deadline)?;
+        let (el, _) = resolve_target(window_el, ctx, target, scale, deadline)?;
         if !deadline.observe(|| ffi::is_settable_checked(&el, attr::FOCUSED))?? {
             return Err(GlassError::AxActionUnavailable(target.id.0));
         }
@@ -160,10 +158,7 @@ impl Accessibility for MacosA11y {
     ) -> Result<PointerHit> {
         let deadline = SemanticDeadline::snapshot(ctx.deadline);
         let (window_el, scale) = resolve_window(ctx, deadline)?;
-        let mut budget = WalkBudget::with_limits(ctx.limits);
-        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
-        let target_el = found.ok_or(GlassError::AxElementChanged(target.id.0))?;
-        let target_role = verify_target_fingerprint(&target_el, ctx, target, scale, deadline)?;
+        let (target_el, target_role) = resolve_target(window_el, ctx, target, scale, deadline)?;
 
         let global_x = (f64::from(ctx.window.x) + f64::from(point.0)) / scale;
         let global_y = (f64::from(ctx.window.y) + f64::from(point.1)) / scale;
@@ -192,28 +187,7 @@ impl Accessibility for MacosA11y {
         deadline.require()?;
         let (window_el, scale) = resolve_window(ctx, deadline)?;
 
-        // Start at 0 to match snapshot ids; role, name, and bounds reject drift.
-        let mut budget = WalkBudget::with_limits(ctx.limits);
-        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
-        deadline.require()?;
-        let el = found.ok_or(GlassError::AxElementNotFound(target.id.0))?;
-
-        // Reject a stale pre-order id unless role, name, and bounds still match.
-        let ax_role = deadline
-            .observe(|| ffi::attribute_string(&el, attr::ROLE))?
-            .unwrap_or_default();
-        let subrole = read_subrole(&el, &ax_role, deadline)?;
-        let role = mapping::map_role(&ax_role, subrole.as_deref());
-        // Same rule `walk` derived this element's `name` from, so a fingerprint can never be
-        // computed from a differently-read name and reject an element that never moved.
-        let name = read_name(&el, deadline)?;
-        let bounds = window_relative_rect(&el, scale, &ctx.window, deadline)?;
-        deadline.require()?;
-        if !target.matches(role, name.as_deref())
-            || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
-        {
-            return Err(GlassError::AxElementChanged(target.id.0));
-        }
+        let (el, _) = resolve_target(window_el, ctx, target, scale, deadline)?;
 
         if !deadline.observe(|| ffi::is_settable_checked(&el, attr::VALUE))?? {
             return Err(GlassError::AxElementNotEditable(target.id.0));
@@ -260,28 +234,7 @@ impl Accessibility for MacosA11y {
         deadline.require()?;
         let (window_el, scale) = resolve_window(ctx, deadline)?;
 
-        // Rewalk from the root to preserve snapshot ids; a miss or fingerprint mismatch means the
-        // captured element changed.
-        let mut budget = WalkBudget::with_limits(ctx.limits);
-        let found = find_nth(window_el, 0, &mut budget, target.id.0, deadline)?;
-        deadline.require()?;
-        let el = found.ok_or(GlassError::AxElementChanged(target.id.0))?;
-
-        // Same fingerprint gate as set_value: role + name + bounds.
-        let ax_role = deadline
-            .observe(|| ffi::attribute_string(&el, attr::ROLE))?
-            .unwrap_or_default();
-        let subrole = read_subrole(&el, &ax_role, deadline)?;
-        let role = mapping::map_role(&ax_role, subrole.as_deref());
-        // `name` derived exactly as in `walk` and `set_value` — see there.
-        let name = read_name(&el, deadline)?;
-        let bounds = window_relative_rect(&el, scale, &ctx.window, deadline)?;
-        deadline.require()?;
-        if !target.matches(role, name.as_deref())
-            || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
-        {
-            return Err(GlassError::AxElementChanged(target.id.0));
-        }
+        let (el, _) = resolve_target(window_el, ctx, target, scale, deadline)?;
 
         if !deadline
             .observe(|| ffi::action_names(&el))?
@@ -303,6 +256,69 @@ impl Accessibility for MacosA11y {
     }
 }
 
+fn resolve_target(
+    window: CFRetained<AXUIElement>,
+    ctx: &AxContext,
+    target: &AxTarget,
+    scale: f64,
+    deadline: SemanticDeadline,
+) -> Result<(CFRetained<AXUIElement>, AxRole)> {
+    let mut budget = WalkBudget::with_limits(ctx.limits);
+    if let Some(element) = find_nth(window.clone(), 0, &mut budget, target.id.0, deadline)? {
+        match verify_target_fingerprint(&element, ctx, target, scale, deadline) {
+            Ok(role) => return Ok((element, role)),
+            Err(GlassError::AxElementChanged(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    // A shifted ordinal can be recovered only by a unique identity with known, consistent bounds.
+    if target.bounds.is_none() {
+        return Err(GlassError::AxElementChanged(target.id.0));
+    }
+    let mut tree = NativeTargetTree { target, deadline };
+    let element = target_search::find_unique(&mut tree, window, ctx.limits)?
+        .ok_or(GlassError::AxElementChanged(target.id.0))?;
+    let role = verify_target_fingerprint(&element, ctx, target, scale, deadline)?;
+    Ok((element, role))
+}
+
+struct NativeTargetTree<'a> {
+    target: &'a AxTarget,
+    deadline: SemanticDeadline,
+}
+
+impl TargetTree for NativeTargetTree<'_> {
+    type Element = CFRetained<AXUIElement>;
+
+    fn require(&mut self) -> Result<()> {
+        self.deadline.require()
+    }
+
+    fn matches(&mut self, element: &Self::Element) -> Result<bool> {
+        let role = checked_role(element, self.deadline)?;
+        if role != self.target.role {
+            return Ok(false);
+        }
+        let title = self
+            .deadline
+            .observe(|| ffi::attribute_string_checked(element, attr::TITLE))??;
+        let name = mapping::node_name(title, || {
+            self.deadline
+                .observe(|| ffi::attribute_string_checked(element, attr::DESCRIPTION))?
+        })?;
+        Ok(self.target.matches(role, name.as_deref()))
+    }
+
+    fn children(&mut self, element: &Self::Element) -> Result<Vec<Self::Element>> {
+        self.deadline.observe(|| ffi::children(element))?
+    }
+
+    fn should_skip(&mut self, element: &Self::Element) -> Result<bool> {
+        should_skip(element, self.deadline)
+    }
+}
+
 fn verify_target_fingerprint(
     el: &AXUIElement,
     ctx: &AxContext,
@@ -317,12 +333,12 @@ fn verify_target_fingerprint(
     let role = mapping::map_role(&ax_role, subrole.as_deref());
     let name = read_name(el, deadline)?;
     let bounds = window_relative_rect(el, scale, &ctx.window, deadline)?;
+    deadline.require()?;
     if !target.matches(role, name.as_deref())
         || !target.bounds_consistent(bounds, SET_VALUE_BOUNDS_TOL)
     {
         return Err(GlassError::AxElementChanged(target.id.0));
     }
-    deadline.require()?;
     Ok(role)
 }
 
@@ -904,10 +920,9 @@ fn should_skip(el: &AXUIElement, deadline: SemanticDeadline) -> Result<bool> {
 
 /// Pre-order walk mirroring [`walk`]'s traversal — same `should_skip` predicate, same
 /// `AXChildren` order, same bounds via [`WalkBudget::may_explore_children`] — to locate the
-/// element at
-/// pre-order index `target`. That is the same numbering `glass_core::AxTree::assign_ids`
-/// gives the tree `snapshot` returns (root = 0), so a `target.id` captured from a snapshot
-/// lands on the same element here. `budget` doubles as the running id (a node's id is
+/// element at pre-order index `target`. This matches `glass_core::AxTree::assign_ids`
+/// (root = 0) while the tree is unchanged; [`resolve_target`] verifies the fingerprint and
+/// handles shifted indices before dispatch. `budget` doubles as the running id (a node's id is
 /// `budget.nodes_walked()`'s value on arrival, before [`WalkBudget::visit`]) and the node
 /// bound, identically to `walk`. Takes (and, on a mismatch, drops) ownership of each
 /// candidate rather than borrowing, since a matched child must outlive the `Vec` of siblings

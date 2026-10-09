@@ -12,6 +12,9 @@ pub mod select_diagnostic; // pure select_window candidate-line rendering — cr
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod semantic_deadline;
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod target_search;
 
 // The cfg(macos) AXUIElement reader: `ffi` holds every `unsafe` AX read primitive, `reader`
 // the `unsafe`-free root selection + pre-order walk behind glass-core's `Accessibility`
