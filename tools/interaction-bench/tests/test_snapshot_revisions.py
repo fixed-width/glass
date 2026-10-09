@@ -141,6 +141,17 @@ class SnapshotRevisionTests(unittest.TestCase):
         malformed = packet("fresh", "r2")
         malformed["envelope"]["result"]["output"] = 1
         corrupt.append(malformed)
+        for reason in ("context_unproven", "size_limit"):
+            malformed = packet("fresh", "r2")
+            malformed["envelope"]["result"]["full_reason"] = reason
+            corrupt.append(malformed)
+        malformed = packet("fresh", "r2")
+        malformed["envelope"]["result"]["cacheable"] = False
+        corrupt.append(malformed)
+        malformed = packet("fresh", "r2")
+        malformed["envelope"]["result"]["completeness"]["subject_mismatch"] = True
+        malformed["observations"][0]["subject"] = {"asked": "A", "actual": "B"}
+        corrupt.append(malformed)
         for malformed in corrupt:
             receiver = self.establish()
             baseline = receiver.baseline

@@ -1,6 +1,6 @@
 //! Lossless, bounded compact-outline revisions; native reads remain fresh.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use glass_core::{AxObservation, ObservationContext, ObservationEpoch, ObservationInvalidation};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -26,6 +26,16 @@ struct Baseline {
 struct State {
     sequence: u64,
     baseline: Option<Arc<Baseline>>,
+    published: bool,
+    continuity: Arc<()>,
+}
+
+impl State {
+    fn invalidate(&mut self) {
+        self.baseline = None;
+        self.published = false;
+        self.continuity = Arc::new(());
+    }
 }
 
 pub(crate) struct SnapshotRevisionStore {
@@ -39,7 +49,7 @@ impl ObservationInvalidation for SnapshotRevisionStore {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .baseline = None;
+            .invalidate();
     }
 }
 
@@ -51,6 +61,8 @@ impl SnapshotRevisionStore {
             state: Mutex::new(State {
                 sequence: 0,
                 baseline: None,
+                published: false,
+                continuity: Arc::new(()),
             }),
         });
         let listener: Arc<dyn ObservationInvalidation> = store.clone();
@@ -77,7 +89,11 @@ impl SnapshotRevisionStore {
                 sequence: state.sequence,
                 revision: format!("{}-{:016x}", self.server_epoch, state.sequence),
                 requested_base: args.base_revision.clone(),
-                baseline: state.baseline.clone(),
+                baseline: state
+                    .published
+                    .then(|| state.baseline.as_ref().map(Arc::downgrade))
+                    .flatten(),
+                continuity: state.continuity.clone(),
                 candidate: Mutex::new(None),
             }),
             completed: false,
@@ -87,7 +103,7 @@ impl SnapshotRevisionStore {
     fn fail(&self, sequence: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.sequence == sequence {
-            state.baseline = None;
+            state.invalidate();
         }
     }
 }
@@ -116,7 +132,7 @@ impl PendingRevision {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(candidate) = candidate {
-                let generation = candidate.context.generation.clone();
+                let generation = candidate.generation;
                 let published = self.request.store.epoch.if_current(&generation, || {
                     let mut state = self
                         .request
@@ -124,8 +140,14 @@ impl PendingRevision {
                         .state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    if state.sequence == self.request.sequence {
-                        state.baseline = Some(candidate);
+                    if state.sequence == self.request.sequence
+                        && Arc::ptr_eq(&state.continuity, &candidate.continuity)
+                        && state
+                            .baseline
+                            .as_ref()
+                            .is_some_and(|base| base.revision.as_ref() == self.request.revision)
+                    {
+                        state.published = true;
                         true
                     } else {
                         false
@@ -150,8 +172,14 @@ pub(crate) struct Reservation {
     sequence: u64,
     revision: String,
     requested_base: Option<String>,
-    baseline: Option<Arc<Baseline>>,
-    candidate: Mutex<Option<Arc<Baseline>>>,
+    baseline: Option<Weak<Baseline>>,
+    continuity: Arc<()>,
+    candidate: Mutex<Option<DeliveryCandidate>>,
+}
+
+struct DeliveryCandidate {
+    generation: glass_core::ObservationGeneration,
+    continuity: Arc<()>,
 }
 
 impl Reservation {
@@ -213,7 +241,19 @@ impl Reservation {
         let retained_bytes = retained_size(&outline, &fingerprint, context.as_ref());
         let cacheable =
             context.is_some() && retained_bytes <= MAX_BASELINE_BYTES && line_count <= MAX_LINES;
-        let baseline = self.baseline.as_deref();
+        let baseline_owner = {
+            let state = self
+                .store
+                .state
+                .lock()
+                .map_err(|_| "snapshot revision state unavailable")?;
+            if state.published && Arc::ptr_eq(&state.continuity, &self.continuity) {
+                self.baseline.as_ref().and_then(Weak::upgrade)
+            } else {
+                None
+            }
+        };
+        let baseline = baseline_owner.as_deref();
         let same_context = context
             .as_ref()
             .is_some_and(|ctx| baseline.is_some_and(|base| &base.context == ctx));
@@ -226,8 +266,8 @@ impl Reservation {
             crate::artifacts::new_server_id()
         };
         // An incompatible observation releases retained state before output processing.
-        if !same_context || !cacheable {
-            self.store.fail(self.sequence);
+        if !cacheable || (baseline.is_some() && !same_context) {
+            self.store.invalidate();
         }
         let reason = if context.is_none() {
             "context_unproven"
@@ -284,18 +324,33 @@ impl Reservation {
         }
         let mut content = vec![OutContent::untrusted_observation(&payload.to_string())];
         content.extend(guidance.into_iter().map(OutContent::trusted_guidance));
+        drop(baseline_owner);
         if cacheable {
-            let baseline = Arc::new(Baseline {
-                outline: outline.into_boxed_str(),
-                fingerprint: fingerprint.into_boxed_str(),
-                context: context.expect("cacheable context is proven"),
-                context_id: context_id.into_boxed_str(),
-                revision: self.revision.clone().into_boxed_str(),
-            });
-            *self
-                .candidate
+            let mut state = self
+                .store
+                .state
                 .lock()
-                .map_err(|_| "snapshot revision candidate unavailable")? = Some(baseline);
+                .map_err(|_| "snapshot revision state unavailable")?;
+            if state.sequence == self.sequence {
+                state.baseline = None;
+                state.published = false;
+                let context = context.expect("cacheable context is proven");
+                *self
+                    .candidate
+                    .lock()
+                    .map_err(|_| "snapshot revision candidate unavailable")? =
+                    Some(DeliveryCandidate {
+                        generation: context.generation.clone(),
+                        continuity: state.continuity.clone(),
+                    });
+                state.baseline = Some(Arc::new(Baseline {
+                    outline: outline.into_boxed_str(),
+                    fingerprint: fingerprint.into_boxed_str(),
+                    context,
+                    context_id: context_id.into_boxed_str(),
+                    revision: self.revision.clone().into_boxed_str(),
+                }));
+            }
         }
         Ok(ToolOutput::result_with(TOOL, result, content))
     }

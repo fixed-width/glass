@@ -101,6 +101,7 @@ class SnapshotReceiver:
             raise EvidenceError("invalid truncation disclosure")
         if "subject" in payload and (
             not isinstance(payload["subject"], dict)
+            or set(payload["subject"]) != {"asked", "actual"}
             or any(not isinstance(payload["subject"].get(name), str) for name in ("asked", "actual"))
         ):
             raise EvidenceError("invalid untrusted subject")
@@ -111,6 +112,11 @@ class SnapshotReceiver:
                 "metadata_changed", "size_limit", "not_smaller",
             ):
                 raise EvidenceError("invalid full snapshot")
+            if (
+                result["cacheable"] != (result["full_reason"] not in ("context_unproven", "size_limit"))
+                or (metadata["subject_mismatch"] and result["full_reason"] != "context_unproven")
+            ):
+                raise EvidenceError("ineligible full snapshot cannot become a baseline")
             outline = payload["outline"]
             if not isinstance(outline, str):
                 raise EvidenceError("full outline must be text")

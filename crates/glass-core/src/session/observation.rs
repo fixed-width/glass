@@ -130,6 +130,9 @@ impl Glass {
         if tree.subject.is_some() {
             context = None;
         }
+        if context.is_none() {
+            self.observation_epoch.invalidate();
+        }
         Ok(AxObservation { tree, context })
     }
 }
@@ -226,6 +229,24 @@ mod tests {
         assert_eq!(
             glass.active.as_ref().unwrap().last_ax.as_ref(),
             Some(&observation.tree)
+        );
+    }
+
+    #[test]
+    fn direct_unproven_read_invalidates_the_previous_observation_episode() {
+        let mut glass = glass_with_a11y(platform().with_geometry_error_at(4), fake_tree());
+        glass.start(&spec()).unwrap();
+        let first = glass.a11y_observation(None).unwrap();
+        let generation = first.context.unwrap().generation;
+        let second = glass.a11y_observation(None).unwrap();
+        assert!(second.context.is_none());
+        assert_eq!(
+            glass.observation_epoch().if_current(&generation, || true),
+            None
+        );
+        assert_eq!(
+            glass.active.as_ref().unwrap().last_ax.as_ref(),
+            Some(&second.tree)
         );
     }
 

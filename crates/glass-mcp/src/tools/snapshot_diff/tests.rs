@@ -10,8 +10,10 @@ fn args(base: Option<&str>) -> A11ySnapshotDiffArgs {
 }
 
 fn observation(epoch: &ObservationEpoch) -> AxObservation {
+    let mut tree = crate::tools::testutil::fake_tree();
+    tree.assign_ids();
     AxObservation {
-        tree: crate::tools::testutil::fake_tree(),
+        tree,
         context: Some(ObservationContext {
             generation: epoch.generation(),
             backend: "fake".into(),
@@ -65,6 +67,87 @@ fn establish(store: &Arc<SnapshotRevisionStore>, outline: &str) -> String {
     let revision = result["revision"].as_str().unwrap().to_owned();
     publish(pending);
     revision
+}
+
+#[test]
+fn version_one_full_packet_matches_the_complete_wire_contract() {
+    let store = SnapshotRevisionStore::new(ObservationEpoch::default());
+    let pending = store.reserve(&args(None)).unwrap();
+    let output = pending
+        .request
+        .encode_outline(observation(&store.epoch), "é\r\nlast".into())
+        .unwrap();
+    let (mut result, payload) = packet(&output);
+    assert_eq!(result["revision"].as_str().unwrap().len(), 49);
+    assert_eq!(result["context_id"].as_str().unwrap().len(), 32);
+    result["revision"] = json!("opaque-revision");
+    result["context_id"] = json!("opaque-context");
+    assert_eq!(
+        result,
+        json!({
+            "version":1, "kind":"full", "revision":"opaque-revision", "context_id":"opaque-context",
+            "outline_format":"compact-v1", "body_sha256":"d01a54c051a66b013f7cb095d570bfd430efe1c3e30628f59d3630d0efa69eed",
+            "body_bytes":8, "line_count":2, "cacheable":true, "full_reason":"requested",
+            "completeness":{"count":2,"truncated":null,"unreadable":0,"unexposed":0,"subject_mismatch":false}
+        })
+    );
+    assert_eq!(payload, json!({"outline":"é\r\nlast"}));
+}
+
+#[test]
+fn oversized_delta_externalizes_its_exact_fresh_payload_before_publication() {
+    use crate::output::{TargetAccess, ToolEffect};
+    use crate::output_policy::{OutputPolicy, ToolCallOutcome};
+    let store = SnapshotRevisionStore::new(ObservationEpoch::default());
+    let original = format!(
+        "{}old\n{}",
+        "stable\n".repeat(2000),
+        "suffix\n".repeat(2000)
+    );
+    let revision = establish(&store, &original);
+    let current = original.replace("old\n", &format!("{}\n", "雪\\\"".repeat(2000)));
+    let pending = store.reserve(&args(Some(&revision))).unwrap();
+    let output = pending
+        .request
+        .encode_outline(observation(&store.epoch), current.clone())
+        .unwrap();
+    let (result, _) = packet(&output);
+    assert_eq!(result["kind"], "diff");
+    let expected = output.render_text_blocks()[1].clone();
+    assert!(expected.len() > crate::output_policy::MAX_TEXT_BYTES);
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = crate::artifacts::ArtifactStore::for_test(root.path(), 4 << 20).unwrap();
+    let policy = OutputPolicy::new(artifacts.clone());
+    let applied = policy.apply(ToolCallOutcome {
+        tool: TOOL,
+        effect: ToolEffect::ReadOnly,
+        is_error: false,
+        target_access: TargetAccess::NoActiveTarget,
+        output,
+    });
+    let metadata = applied.output_metadata().unwrap();
+    assert!(metadata.complete);
+    assert!(applied.output.text_bytes() <= crate::output_policy::MAX_TEXT_BYTES);
+    let descriptor = metadata
+        .externalized
+        .iter()
+        .find(|item| item.mime_type().starts_with("text/plain"))
+        .unwrap();
+    let resource = artifacts.read(descriptor.uri()).unwrap();
+    assert_eq!(resource.text, expected);
+    assert_eq!(resource.sha256, descriptor.sha256());
+    assert!(resource.untrusted);
+    pending.complete(metadata.complete && !applied.is_error);
+    let next = store
+        .reserve(&args(Some(result["revision"].as_str().unwrap())))
+        .unwrap();
+    let (result, _) = packet(
+        &next
+            .request
+            .encode_outline(observation(&store.epoch), current)
+            .unwrap(),
+    );
+    assert_eq!(result["kind"], "unchanged");
 }
 
 #[test]
@@ -277,6 +360,89 @@ fn cancelled_and_failed_older_reservations_cannot_erase_newer_publication() {
             .unwrap()
             .revision,
         newest.into_boxed_str()
+    );
+}
+
+#[test]
+fn ineligible_observations_invalidate_baselines_of_already_reserved_calls() {
+    for oversized in [false, true] {
+        let store = SnapshotRevisionStore::new(ObservationEpoch::default());
+        let outline = "same\n".repeat(100);
+        let revision = establish(&store, &outline);
+        let older = store.reserve(&args(Some(&revision))).unwrap();
+        let newer = store.reserve(&args(Some(&revision))).unwrap();
+        let mut current = observation(&store.epoch);
+        if !oversized {
+            current.context = None;
+        }
+        let body = if oversized {
+            "x".repeat(MAX_BASELINE_BYTES)
+        } else {
+            outline.clone()
+        };
+        let (result, _) = packet(&older.request.encode_outline(current, body).unwrap());
+        assert_eq!(result["cacheable"], false);
+        assert!(store.state.lock().unwrap().baseline.is_none());
+        let (result, _) = packet(
+            &newer
+                .request
+                .encode_outline(observation(&store.epoch), outline.clone())
+                .unwrap(),
+        );
+        assert_eq!(result["kind"], "full");
+        assert_eq!(result["full_reason"], "baseline_unavailable");
+        let recovered = result["revision"].as_str().unwrap().to_owned();
+        publish(newer);
+        publish(older);
+        let next = store.reserve(&args(Some(&recovered))).unwrap();
+        let (result, _) = packet(
+            &next
+                .request
+                .encode_outline(observation(&store.epoch), outline)
+                .unwrap(),
+        );
+        assert_eq!(result["kind"], "unchanged");
+    }
+}
+
+#[test]
+fn suspended_reservations_retain_no_superseded_baseline_or_candidate_bytes() {
+    let store = SnapshotRevisionStore::new(ObservationEpoch::default());
+    let revision = establish(&store, &"x".repeat(900_000));
+    let previous = Arc::downgrade(store.state.lock().unwrap().baseline.as_ref().unwrap());
+    let mut suspended = Vec::new();
+    for _ in 0..32 {
+        suspended.push(store.reserve(&args(Some(&revision))).unwrap());
+    }
+    assert_eq!(
+        Arc::strong_count(store.state.lock().unwrap().baseline.as_ref().unwrap()),
+        1
+    );
+    let newest = suspended.last().unwrap();
+    newest
+        .request
+        .encode_outline(observation(&store.epoch), "y".repeat(900_000))
+        .unwrap();
+    assert!(
+        previous.upgrade().is_none(),
+        "reservations cannot retain old outlines"
+    );
+    for _ in 0..16 {
+        let candidate = Arc::downgrade(store.state.lock().unwrap().baseline.as_ref().unwrap());
+        let pending = store.reserve(&args(None)).unwrap();
+        pending
+            .request
+            .encode_outline(observation(&store.epoch), "z".repeat(900_000))
+            .unwrap();
+        assert!(
+            candidate.upgrade().is_none(),
+            "suspended delivery cannot retain a candidate"
+        );
+        suspended.push(pending);
+    }
+    assert_eq!(
+        Arc::strong_count(store.state.lock().unwrap().baseline.as_ref().unwrap()),
+        1
     );
 }
 

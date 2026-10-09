@@ -632,7 +632,7 @@ fn select_window(
     resolution: EffectiveDeadline,
 ) -> Result<Option<(CFRetained<AXUIElement>, f64, bool)>> {
     let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
-    let mut matching_windows = 0usize;
+    let mut root_scope = RootScopeProof::default();
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
         if resolution.callee_expired(deadline)? {
@@ -651,6 +651,7 @@ fn select_window(
         let (ax_w, ax_h) = match size {
             Ok(size) => size,
             Err(e) => {
+                root_scope.unresolved = true;
                 diagnostics.push(candidate_line(
                     role,
                     &CandidateOutcome::SizeUnreadable(e.to_string()),
@@ -658,7 +659,8 @@ fn select_window(
                 continue;
             }
         };
-        if ax_w <= 0.0 || ax_h <= 0.0 {
+        if !ax_w.is_finite() || !ax_h.is_finite() || ax_w <= 0.0 || ax_h <= 0.0 {
+            root_scope.unresolved = true;
             diagnostics.push(candidate_line(
                 role,
                 &CandidateOutcome::NonPositiveSize { ax_w, ax_h },
@@ -667,8 +669,10 @@ fn select_window(
         }
         // macOS backing scale is always an integer; snap out the border/content-vs-frame
         // inset noise in the raw width ratio (see doc comment above).
-        let scale = (win.width as f64 / ax_w).round().max(1.0);
-        if !scale.is_finite() || scale <= 0.0 {
+        let raw_scale = win.width as f64 / ax_w;
+        let scale = raw_scale.round().max(1.0);
+        if !raw_scale.is_finite() || raw_scale <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+            root_scope.unresolved = true;
             diagnostics.push(candidate_line(
                 role,
                 &CandidateOutcome::InvalidScale { ax_w, ax_h, scale },
@@ -681,6 +685,7 @@ fn select_window(
         let (ax_x, ax_y) = match position {
             Ok(pos) => pos,
             Err(e) => {
+                root_scope.unresolved = true;
                 diagnostics.push(candidate_line(
                     role,
                     &CandidateOutcome::PositionUnreadable {
@@ -693,10 +698,17 @@ fn select_window(
                 continue;
             }
         };
-        // Cast to `i64` before subtracting so `.abs()` can never wrap (`i32::MIN.abs()`
-        // panics) — the same no-overflow discipline `axwindow::within_tolerance` follows.
-        let dx = ((ax_x * scale).round() as i64 - i64::from(win.x)).abs();
-        let dy = ((ax_y * scale).round() as i64 - i64::from(win.y)).abs();
+        if !finite_scope_geometry(ax_x, ax_y, ax_w, ax_h, scale) {
+            root_scope.unresolved = true;
+            continue;
+        }
+        // Saturate native-coordinate subtraction so malformed values cannot overflow.
+        let dx = ((ax_x * scale).round() as i64)
+            .saturating_sub(i64::from(win.x))
+            .saturating_abs();
+        let dy = ((ax_y * scale).round() as i64)
+            .saturating_sub(i64::from(win.y))
+            .saturating_abs();
         diagnostics.push(candidate_line(
             role,
             &CandidateOutcome::Measured {
@@ -716,7 +728,7 @@ fn select_window(
             continue;
         }
         let dist = dx + dy;
-        matching_windows += 1;
+        root_scope.matching += 1;
         if best
             .as_ref()
             .is_none_or(|(best_dist, _, _)| dist < *best_dist)
@@ -739,7 +751,34 @@ fn select_window(
     if resolution.callee_expired(deadline)? {
         return Ok(None);
     }
-    Ok(best.map(|(_, w, scale)| (w, scale, matching_windows == 1)))
+    Ok(best.map(|(_, w, scale)| (w, scale, root_scope.proven())))
+}
+
+#[derive(Default)]
+struct RootScopeProof {
+    matching: usize,
+    unresolved: bool,
+}
+
+impl RootScopeProof {
+    fn proven(&self) -> bool {
+        self.matching == 1 && !self.unresolved
+    }
+}
+
+fn finite_scope_geometry(x: f64, y: f64, width: f64, height: f64, scale: f64) -> bool {
+    [
+        x,
+        y,
+        width,
+        height,
+        scale,
+        x * scale,
+        y * scale,
+        height * scale,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
 }
 
 /// One of the label attributes a node's `name`/`description` come from (`AXTitle`,
@@ -1089,6 +1128,38 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn root_scope_requires_one_match_and_every_other_candidate_resolved() {
+        let mut proof = RootScopeProof {
+            matching: 1,
+            unresolved: false,
+        };
+        assert!(proof.proven());
+        proof.unresolved = true;
+        assert!(
+            !proof.proven(),
+            "an unreadable second window may overlap the match"
+        );
+        proof.unresolved = false;
+        proof.matching = 2;
+        assert!(
+            !proof.proven(),
+            "two matching windows do not attest a unique root"
+        );
+    }
+
+    #[test]
+    fn nonfinite_native_geometry_cannot_attest_root_scope() {
+        assert!(finite_scope_geometry(10.0, 20.0, 300.0, 400.0, 2.0));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!finite_scope_geometry(invalid, 20.0, 300.0, 400.0, 2.0));
+            assert!(!finite_scope_geometry(10.0, invalid, 300.0, 400.0, 2.0));
+            assert!(!finite_scope_geometry(10.0, 20.0, invalid, 400.0, 2.0));
+            assert!(!finite_scope_geometry(10.0, 20.0, 300.0, invalid, 2.0));
+        }
+        assert!(!finite_scope_geometry(f64::MAX, 20.0, 300.0, 400.0, 2.0));
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotBoundaryEvent {
