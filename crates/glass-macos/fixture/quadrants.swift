@@ -202,6 +202,12 @@ final class QuadrantView: NSView {
         let x = Int(locationInView.x.rounded())
         let y = Int((bounds.height - locationInView.y).rounded())
         print("click: \(x),\(y)")
+        print("click-count: \(event.clickCount)")
+        fflush(stdout)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        print("click-up-count: \(event.clickCount)")
         fflush(stdout)
     }
 

@@ -625,6 +625,7 @@ mod macos_main {
             let before_value = find_by_name(&before_type.root, "Note")
                 .and_then(|node| node.value.clone())
                 .ok_or_else(|| "before targeted type snapshot has no Note value".to_string())?;
+            let committed_text = "Zé漢🧪e\u{301}👩\u{200d}💻";
             let typed = glass
                 .type_target(
                     &glass_core::TypeTargetParams {
@@ -637,7 +638,7 @@ mod macos_main {
                         timeout_ms: 5_000,
                         max_nodes: None,
                     },
-                    "Z",
+                    committed_text,
                 )
                 .map_err(|error| format!("native targeted type: {error}"))?;
             let Some(ref focus) = typed.focus else {
@@ -658,12 +659,12 @@ mod macos_main {
                 .value
                 .as_deref()
                 .ok_or_else(|| "typed Note has no value".to_string())?;
-            let inserted_once = after_value.len() == before_value.len() + 1
-                && after_value.matches('Z').count() == before_value.matches('Z').count() + 1
-                && after_value.replacen('Z', "", 1) == before_value;
+            let inserted_once = after_value.len() == before_value.len() + committed_text.len()
+                && after_value.matches(committed_text).count() == 1
+                && after_value.replacen(committed_text, "", 1) == before_value;
             if !typed_note.states.focused || !inserted_once {
                 return Err(format!(
-                    "targeted type did not insert exactly one Z: before={before_value:?}, after={after_value:?}, node={typed_note:?}"
+                    "targeted type did not insert the exact committed text once: before={before_value:?}, after={after_value:?}, node={typed_note:?}"
                 ));
             }
             let typed_value = after_value.to_string();

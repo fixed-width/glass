@@ -10,9 +10,8 @@
 //! `clickGlobal`/`postKey`/`typeString` onto `objc2-core-graphics`'s generated bindings, which
 //! expose `CGEvent`'s constructors/accessors as **associated** functions taking
 //! `Option<&CGEvent>` (e.g. `CGEvent::post(tap, event)`), not Swift's `self`-methods.
-//! header-translator marks all of them (and `NSRunningApplication::activateWithOptions`) plain
-//! safe: their only precondition, a live `CGEvent`/`CGEventSource`/`NSRunningApplication`
-//! reference, is already enforced by the type system, so this file needs no `unsafe` block.
+//! Event construction and posting are safe bindings; Unicode payload buffers are handled by
+//! the safe wrapper in `ffi.rs`, keeping this module free of `unsafe` blocks.
 //!
 //! Drag/scroll/text/chord reuse glass_core's deadline-aware shared drivers. macOS represents
 //! held modifiers as `CGEventFlags` stamped on payload events, so its drag, scroll, and chord
@@ -41,7 +40,9 @@ use glass_core::{
 };
 
 use crate::coords::pixel_to_global_point;
-use crate::input_deadline::{after_focus, require_payload_time, run_scroll_wheel_by};
+use crate::input_deadline::{
+    after_focus, require_payload_time, run_click_pairs_by, run_scroll_wheel_by,
+};
 use crate::keymap;
 
 /// Map a window-relative pixel coordinate to a global Quartz point, accounting for the
@@ -114,25 +115,24 @@ pub(crate) fn send_pointer_by(
             let flags = to_flags(modifiers);
             let cg_button = to_cg_button(button);
             let (down_ty, up_ty) = click_types(button);
-            // One down/up pair stamped with `clicks` in `kCGMouseEventClickState`, rather
-            // than `clicks` separate down/up pairs — the documented CGEvent technique for
-            // synthesizing a double/triple click.
-            let clicks = i64::from(count);
-            let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
-            CGEvent::set_integer_value_field(
-                Some(&down),
-                CGEventField::MouseEventClickState,
-                clicks,
-            );
-            let up = mouse_event(source.as_deref(), up_ty, point, cg_button, flags)?;
-            CGEvent::set_integer_value_field(Some(&up), CGEventField::MouseEventClickState, clicks);
-
-            require_payload_time(deadline)?;
-            post(&down);
-            let down_deadline = require_payload_time(deadline);
-            post(&up);
-            down_deadline?;
-            require_payload_time(deadline)?;
+            run_click_pairs_by(
+                deadline,
+                count,
+                |ordinal| {
+                    let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
+                    let up = mouse_event(source.as_deref(), up_ty, point, cg_button, flags)?;
+                    for event in [&down, &up] {
+                        CGEvent::set_integer_value_field(
+                            Some(event),
+                            CGEventField::MouseEventClickState,
+                            i64::from(ordinal),
+                        );
+                    }
+                    Ok((down, up))
+                },
+                |event| post(&event),
+                thread::sleep,
+            )?;
         }
         PointerEvent::Drag {
             from_x,
@@ -231,32 +231,42 @@ fn keyboard_event(
     Ok(ev)
 }
 
-/// Post one committed typed keystroke: a keyDown immediately followed by a keyUp, both carrying
-/// `flags` such as Shift for an uppercase character.
-fn tap_key(source: Option<&CGEventSource>, keycode: u16, flags: CGEventFlags) -> Result<()> {
+fn typed_key_events(
+    source: Option<&CGEventSource>,
+    character: char,
+) -> Result<(CFRetained<CGEvent>, CFRetained<CGEvent>)> {
+    let (keycode, shift) = match keymap::key_for(character) {
+        Some(mapped) => mapped,
+        None if character.is_ascii() => {
+            return Err(GlassError::InvalidKey(character.to_string()));
+        }
+        None => (0, false),
+    };
+    let flags = if shift {
+        CGEventFlags::MaskShift
+    } else {
+        CGEventFlags::empty()
+    };
     let down = keyboard_event(source, keycode, true, flags)?;
-    post(&down);
     let up = keyboard_event(source, keycode, false, flags)?;
-    post(&up);
-    Ok(())
+    if !character.is_ascii() {
+        crate::ffi::set_keyboard_unicode(&down, character);
+        crate::ffi::set_keyboard_unicode(&up, character);
+    }
+    Ok((down, up))
 }
 
-/// macOS typing emits one committed key pair per character; unmappable US-layout characters fail
-/// instead of being skipped.
+/// Emit physical ASCII keys and explicit Unicode payloads for other committed characters.
 struct MacTypeSink<'a> {
     source: Option<&'a CGEventSource>,
 }
 
 impl TypeSink for MacTypeSink<'_> {
     fn character(&mut self, c: char) -> Result<()> {
-        let (keycode, shift) =
-            keymap::key_for(c).ok_or_else(|| GlassError::InvalidKey(c.to_string()))?;
-        let flags = if shift {
-            CGEventFlags::MaskShift
-        } else {
-            CGEventFlags::empty()
-        };
-        tap_key(self.source, keycode, flags)
+        let (down, up) = typed_key_events(self.source, c)?;
+        post(&down);
+        post(&up);
+        Ok(())
     }
 }
 
@@ -784,18 +794,46 @@ mod tests {
     }
 
     #[test]
-    fn mac_type_sink_rejects_unmappable_char() {
-        // Errors before posting anything, so a `None` source is safe here too.
-        let mut sink = MacTypeSink { source: None };
+    fn typed_unicode_events_carry_exact_utf16_on_down_and_up() {
+        for character in ['é', '漢', '🧪', '\u{301}', '\u{200d}'] {
+            let (down, up) = typed_key_events(None, character).unwrap();
+            let expected: Vec<u16> = character.to_string().encode_utf16().collect();
+            for event in [down, up] {
+                assert_eq!(crate::ffi::keyboard_unicode(&event), expected);
+                assert_eq!(CGEvent::flags(Some(&event)), CGEventFlags::empty());
+            }
+        }
+    }
+
+    #[test]
+    fn typed_ascii_keeps_physical_key_and_shift() {
+        for character in ['a', 'A', '!', ' ', '0'] {
+            let (keycode, shift) = keymap::key_for(character).unwrap();
+            let (down, up) = typed_key_events(None, character).unwrap();
+            for event in [down, up] {
+                assert_eq!(
+                    CGEvent::integer_value_field(Some(&event), CGEventField::KeyboardEventKeycode),
+                    i64::from(keycode)
+                );
+                assert_eq!(
+                    CGEvent::flags(Some(&event)).contains(CGEventFlags::MaskShift),
+                    shift
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_ascii_rejects_unsupported_control_before_dispatch() {
         assert!(matches!(
-            sink.character('€'),
+            typed_key_events(None, '\0'),
             Err(GlassError::InvalidKey(_))
         ));
     }
 
     #[test]
     fn send_chord_rejects_empty_unknown_modifier_and_unknown_key() {
-        // None of these reach `tap_key` (they error before posting anything), so a `None`
+        // All error before posting anything, so a `None`
         // event source is safe to pass here. Each also asserts the message names the
         // specific bad token — mirroring `glass_core::keys::parse_chord`'s specificity —
         // so a regression that flattens these back to a bare `chord.to_string()` is caught.

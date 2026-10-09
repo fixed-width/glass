@@ -1,5 +1,7 @@
 //! Pure deadline sequencing shared by the macOS input backend and host-runnable tests.
 
+use std::time::Duration;
+
 use glass_core::{BoundDispatch, Deadline, GlassError, Result, Whose};
 
 pub(crate) fn require_payload_time(deadline: Deadline) -> Result<()> {
@@ -36,15 +38,105 @@ pub(crate) fn run_scroll_wheel_by<T>(
     require_payload_time(deadline)
 }
 
+pub(crate) fn run_click_pairs_by<T>(
+    deadline: Deadline,
+    count: u32,
+    mut build_pair: impl FnMut(u32) -> Result<(T, T)>,
+    mut post: impl FnMut(T),
+    mut pause: impl FnMut(Duration),
+) -> Result<()> {
+    for ordinal in 1..=count {
+        require_payload_time(deadline)?;
+        let (down, up) = build_pair(ordinal)?;
+        require_payload_time(deadline)?;
+        post(down);
+        let down_result = require_payload_time(deadline);
+        post(up);
+        down_result?;
+        require_payload_time(deadline)?;
+        if ordinal < count {
+            let dwell = Duration::from_millis(50);
+            pause(deadline.remaining().unwrap_or(dwell).min(dwell));
+        }
+    }
+    require_payload_time(deadline)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{after_focus, run_scroll_wheel_by};
+    use super::{after_focus, run_click_pairs_by, run_scroll_wheel_by};
     use glass_core::{
         BoundDispatch, BoundKind, ChordSink, Deadline, DragGesture, DragSink, Result, ScrollSink,
         TypeSink, Whose, run_chord_by, run_drag_by, run_scroll_by, run_type_by,
     };
     use std::cell::Cell;
     use std::time::Duration;
+
+    #[test]
+    fn multi_click_posts_each_pair_and_pauses_only_between_pairs() {
+        let mut events = Vec::new();
+        let mut pauses = Vec::new();
+        run_click_pairs_by(
+            Deadline::UNBOUNDED,
+            3,
+            |ordinal| Ok(((ordinal, true), (ordinal, false))),
+            |event| events.push(event),
+            |duration| pauses.push(duration),
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            [
+                (1, true),
+                (1, false),
+                (2, true),
+                (2, false),
+                (3, true),
+                (3, false)
+            ]
+        );
+        assert_eq!(pauses, [Duration::from_millis(50); 2]);
+    }
+
+    #[test]
+    fn multi_click_expiry_after_down_releases_without_another_click() {
+        let mut events = Vec::new();
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_millis(100));
+        let error = run_click_pairs_by(
+            deadline,
+            3,
+            |ordinal| Ok(((ordinal, true), (ordinal, false))),
+            |event| {
+                events.push(event);
+                if event.1 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            },
+            |_| panic!("must stop before the inter-click pause"),
+        )
+        .unwrap_err();
+        assert_eq!(events, [(1, true), (1, false)]);
+        assert_post_focus_timeout(error);
+    }
+
+    #[test]
+    fn multi_click_pair_construction_expiry_posts_nothing() {
+        let mut events = Vec::new();
+        let deadline = Deadline::at(std::time::Instant::now() + Duration::from_millis(100));
+        let error = run_click_pairs_by(
+            deadline,
+            2,
+            |ordinal| {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(((ordinal, true), (ordinal, false)))
+            },
+            |event| events.push(event),
+            |_| panic!("must stop before the inter-click pause"),
+        )
+        .unwrap_err();
+        assert!(events.is_empty());
+        assert_post_focus_timeout(error);
+    }
 
     #[derive(Default)]
     struct RecordingSink {
