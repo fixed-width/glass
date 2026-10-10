@@ -8,6 +8,100 @@
 
 use serde::Serialize;
 
+/// Backend-owned input routing. This is not a caller-selected session option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputRoute {
+    SharedDesktop,
+    Isolated,
+    WindowTargeted,
+}
+
+/// Whether admitted input can affect the host user's pointer or foreground application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopInterference {
+    None,
+    Possible,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InputOperationCapability {
+    #[serde(flatten)]
+    pub support: CapabilityStatus,
+    pub desktop_interference: DesktopInterference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restriction: Option<&'static str>,
+}
+
+impl InputOperationCapability {
+    pub fn new(support: CapabilityStatus, desktop_interference: DesktopInterference) -> Self {
+        Self {
+            support,
+            desktop_interference,
+            restriction: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InputCapabilities {
+    pub click: InputOperationCapability,
+    pub scroll: InputOperationCapability,
+    pub text: InputOperationCapability,
+}
+
+impl InputCapabilities {
+    /// An unclassified backend cannot attest input support or desktop isolation.
+    pub fn unknown() -> Self {
+        Self::uniform(
+            CapabilityStatus::unsupported(Some("backend does not report session input support")),
+            DesktopInterference::Unknown,
+        )
+    }
+
+    pub fn uniform(support: CapabilityStatus, desktop_interference: DesktopInterference) -> Self {
+        let operation = InputOperationCapability::new(support, desktop_interference);
+        Self {
+            click: operation.clone(),
+            scroll: operation.clone(),
+            text: operation,
+        }
+    }
+
+    /// Apply the core's current window-directed subset to a backend's operation report.
+    pub(crate) fn restrict_window_targeted(&mut self) {
+        for operation in [&mut self.click, &mut self.scroll] {
+            if operation.support.status == Support::Degraded
+                || (operation.support.status == Support::Supported
+                    && operation.desktop_interference != DesktopInterference::None)
+            {
+                operation.support = CapabilityStatus::unsupported(Some(
+                    "no qualified input without desktop interference",
+                ));
+            }
+        }
+        self.click.restriction = Some(
+            "coordinate left click only: count 1, no modifiers; semantic and ID clicks are unsupported",
+        );
+        self.scroll.restriction = Some(
+            "coordinate vertical wheel scroll only: dx 0, no modifiers; scroll_to_element is unsupported",
+        );
+        self.text = InputOperationCapability::new(
+            CapabilityStatus::unsupported(Some(
+                "this route has no qualified keyboard or text input",
+            )),
+            DesktopInterference::Unknown,
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCapabilities {
+    pub backend: String,
+    pub input: InputCapabilities,
+}
+
 /// Whether an operation can be performed right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,7 +112,7 @@ pub enum Support {
     Degraded,
     /// Supported by this backend in principle, but a setup step is missing right now.
     RequiresSetup,
-    /// This backend can never do it (a code-constant fact).
+    /// Unavailable for this backend or the selected session route.
     Unsupported,
 }
 

@@ -2389,6 +2389,17 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
 }
 
 impl Platform for WaylandPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        glass_core::InputRoute::Isolated
+    }
+
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        glass_core::InputCapabilities::uniform(
+            glass_core::CapabilityStatus::supported(),
+            glass_core::DesktopInterference::None,
+        )
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],

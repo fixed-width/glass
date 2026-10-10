@@ -390,6 +390,9 @@ pub(crate) fn success_output(
 }
 
 fn semantic_category(error: &SemanticActionError) -> SafeErrorCategory {
+    if error.kind == SemanticActionFailureKind::UnsupportedOperation {
+        return SafeErrorCategory::UnsupportedOperation;
+    }
     let sequence_deadline = error
         .resolution
         .as_ref()
@@ -410,6 +413,7 @@ fn semantic_category(error: &SemanticActionError) -> SafeErrorCategory {
         SemanticActionFailureKind::UnstableTarget => SafeErrorCategory::UnstableTarget,
         SemanticActionFailureKind::FocusUnconfirmed => SafeErrorCategory::FocusUnconfirmed,
         SemanticActionFailureKind::UnsupportedMode => SafeErrorCategory::UnsupportedMode,
+        SemanticActionFailureKind::UnsupportedOperation => SafeErrorCategory::UnsupportedOperation,
         SemanticActionFailureKind::ActionDeadlineExceeded => {
             SafeErrorCategory::ActionDeadlineExceeded
         }
@@ -431,6 +435,16 @@ fn failure_result(error: &SemanticActionError) -> Value {
         "actionability": actionability_json(&error.actionability),
         "candidate_count": error.candidates.len(),
     });
+    if let Some(admission_failure) = error
+        .source
+        .as_ref()
+        .and_then(super::unsupported_operation_failure)
+        && let Some(fields) = admission_failure.as_object()
+    {
+        for (key, value) in fields {
+            result[key] = value.clone();
+        }
+    }
     if let Some(resolution) = &error.resolution {
         result["resolution"] = resolution_json(resolution);
     }

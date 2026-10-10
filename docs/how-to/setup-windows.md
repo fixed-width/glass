@@ -79,6 +79,13 @@ Use a classic single-process app like `charmap` or `mspaint` for a first test â€
 apps (including the Windows 11 `notepad`) launch out-of-process and hand off, which glass sees as the
 launched process exiting.
 
+## Desktop interaction
+
+Native input uses the interactive desktop and can move your pointer or change focus. Read the active
+session's `glass_capabilities` report with `scope: "session"` for input support and desktop
+interference. A virtual display driver provides a monitor, not an isolated pointer or keyboard.
+The existing launch-context requirements continue to apply; there is no new input-mode setting.
+
 ## Headless capture â€” a virtual display driver
 
 glass captures the interactive console session the GPU composes. A box with a physical monitor (or a

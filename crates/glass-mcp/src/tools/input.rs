@@ -8,8 +8,10 @@ use crate::tools::{
     ToolOutput, ToolResult, erase_semantic_context, parse_button, semantic_return_error,
 };
 
-fn standalone(result: ContextualToolResult) -> ToolResult {
-    result.map(|o| o.output).map_err(|e| e.message)
+fn standalone(tool: &'static str, result: ContextualToolResult) -> ToolResult {
+    result
+        .map(|o| o.output)
+        .map_err(|error| error.standalone_message(tool))
 }
 
 pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, String> {
@@ -71,7 +73,7 @@ pub(crate) fn validate_key_args(a: &KeyArgs) -> Result<(), ContextualError> {
 }
 
 pub fn click(glass: &mut Glass, a: &ClickArgs) -> ToolResult {
-    standalone(click_with(glass, a, ToolContext::UNBOUNDED))
+    standalone("glass_click", click_with(glass, a, ToolContext::UNBOUNDED))
 }
 
 pub(crate) fn click_with(
@@ -99,7 +101,10 @@ pub(crate) fn click_with(
 }
 
 pub fn mouse_move(glass: &mut Glass, a: &MoveArgs) -> ToolResult {
-    standalone(mouse_move_with(glass, a, ToolContext::UNBOUNDED))
+    standalone(
+        "glass_move",
+        mouse_move_with(glass, a, ToolContext::UNBOUNDED),
+    )
 }
 
 pub(crate) fn mouse_move_with(
@@ -117,7 +122,7 @@ pub(crate) fn mouse_move_with(
 }
 
 pub fn drag(glass: &mut Glass, a: &DragArgs) -> ToolResult {
-    standalone(drag_with(glass, a, ToolContext::UNBOUNDED))
+    standalone("glass_drag", drag_with(glass, a, ToolContext::UNBOUNDED))
 }
 
 pub(crate) fn drag_with(
@@ -172,12 +177,15 @@ pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
             pointers,
             duration_ms: a.duration_ms.unwrap_or(250).min(10_000),
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| super::core_error_message("glass_gesture", error))?;
     Ok(ToolOutput::result("glass_gesture", serde_json::json!({})))
 }
 
 pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {
-    standalone(scroll_with(glass, a, ToolContext::UNBOUNDED))
+    standalone(
+        "glass_scroll",
+        scroll_with(glass, a, ToolContext::UNBOUNDED),
+    )
 }
 
 pub(crate) fn scroll_with(
@@ -276,7 +284,7 @@ pub(crate) fn type_text_with(
 }
 
 pub fn key(glass: &mut Glass, a: &KeyArgs) -> ToolResult {
-    standalone(key_with(glass, a, ToolContext::UNBOUNDED))
+    standalone("glass_key", key_with(glass, a, ToolContext::UNBOUNDED))
 }
 
 pub(crate) fn key_with(
@@ -308,6 +316,7 @@ mod tests {
     fn started_with(platform: FakePlatform) -> Glass {
         let mut g = glass_with(platform);
         let a = StartArgs {
+            _rejected_input_mode: None,
             build: None,
             run: vec!["app".into()],
             backend: None,

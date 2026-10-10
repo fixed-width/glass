@@ -1172,14 +1172,40 @@ See [session trace](session-trace.md) for scope and tool-result `_meta.glass.tra
 ### `glass_capabilities`
 
 Report which operations can be performed **right now** on a backend — so you can check before you
-act, instead of discovering an `Unsupported` error by trying. Static: no session required, works
-before `glass_start`.
+act, instead of discovering an `Unsupported` error by trying. The default backend report requires no session and works
+before `glass_start`; session scope describes the actual active input environment.
 
 - `backend` (string, optional) — which backend to report: `x11`, `wayland`, `windows`, `macos`,
   `android`, `ios`. Omit for the active/default backend.
+- `scope` (`"backend"` or `"session"`, default `"backend"`) — retain the backend report or read
+  support for the active session. Session scope requires an active session; an explicit backend
+  must match it. The query does not focus a window, prepare input or request permissions.
+
+Session scope returns `{scope: "session", backend, input, tool_profile}`. `input` contains `click`,
+`scroll` and `text`, each with `status`, optional `note`/`restriction`, relevant `tools` and
+`desktop_interference`. Support uses the same `supported`, `degraded`, `requires_setup`, `unsupported`
+values as the backend report. `text` also describes ordinary keyboard dispatch through `glass_key`.
+Tool lists are filtered for the full/lean profile; `glass_do` supports the stated operation subset.
+Semantic accessibility support remains a separate capability, rather than being implied by a
+coordinate-click entry.
+
+`desktop_interference` is `none`, `possible` or `unknown`, independently of operation support:
+
+- **none**: admitted input stays within a private display/device or an attested non-interfering route.
+- **possible**: input shares the user's display and may move their pointer or change foreground focus.
+- **unknown**: the backend has no attestation; callers must not assume isolation.
+
+Owned Xvfb, headless Wayland, Android emulator and iOS Simulator sessions already provide isolated
+input with the normal tools. Explicitly attached X11 displays and current native macOS/Windows input
+report possible desktop interference. A virtual monitor does not change this. Session support uses
+the connected mobile input driver, so unavailable companions and typing limitations remain visible.
+No input mode or extra desktop-control permission is required; existing OS grants still apply.
+These facts describe input dispatch, not startup activation, clipboard/file/network isolation or
+confirmation that a dispatched action had the desired effect. Every action still validates its target
+and current dispatch conditions; the capability query sends no probe input.
 
 Returns JSON as `result` (no untrusted siblings — capability data is glass-computed, not read from
-the app). For a backend compiled into this binary:
+the app). For backend scope with a backend compiled into this binary:
 
 `{ "backend", "available": true, "tool_profile": "full" | "lean", "capabilities": { <operation>: { "status", "note"?, "tools" } } }`
 

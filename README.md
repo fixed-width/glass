@@ -19,6 +19,10 @@ or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** 
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
 including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
+The same input tools work across backends. Default Linux displays and mobile emulators keep input
+separate from your desktop; native Windows and macOS currently share it. `glass_capabilities` with
+`scope: "session"` reports click, scroll and text support and whether each can affect your desktop.
+
 ## See it
 
 ![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)
@@ -124,7 +128,8 @@ thing you can add** when pointing an agent at glass.
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ the Simulator | ✓ Seatbelt |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
+| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | – shared desktop |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | – shared desktop |
 
 Full matrix, per-capability detail, and system requirements:
 [docs/reference/platforms.md](docs/reference/platforms.md). Transport is MCP over stdio (default) or

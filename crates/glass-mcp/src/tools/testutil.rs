@@ -14,6 +14,7 @@ use super::{OutContent, ToolOutput};
 
 #[derive(Default)]
 pub struct FakePlatform {
+    pub input_route: Option<glass_core::InputRoute>,
     pub geometry: WindowGeometry,
     pub frames: VecDeque<Frame>,
     pub pending_logs: Vec<(Stream, String)>,
@@ -35,6 +36,11 @@ pub struct FakePlatform {
 }
 
 impl FakePlatform {
+    pub fn with_input_route(mut self, route: glass_core::InputRoute) -> Self {
+        self.input_route = Some(route);
+        self
+    }
+
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             geometry: WindowGeometry {
@@ -94,6 +100,23 @@ pub fn frame_4x4_corner(corner: [u8; 4]) -> Frame {
 }
 
 impl Platform for FakePlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        self.input_route
+            .unwrap_or(glass_core::InputRoute::SharedDesktop)
+    }
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        let interference = match self.input_route() {
+            glass_core::InputRoute::Isolated | glass_core::InputRoute::WindowTargeted => {
+                glass_core::DesktopInterference::None
+            }
+            glass_core::InputRoute::SharedDesktop => glass_core::DesktopInterference::Possible,
+        };
+        glass_core::InputCapabilities::uniform(
+            glass_core::CapabilityStatus::supported(),
+            interference,
+        )
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[glass_core::ProtectedHostPath],

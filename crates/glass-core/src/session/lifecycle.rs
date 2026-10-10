@@ -14,7 +14,7 @@ impl Glass {
         let result = self.start_on_inner(backend, spec);
         self.emit_audit(
             &crate::audit::Actuation::Launch { spec, backend },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_core_result(&result),
             t.elapsed(),
         );
         result
@@ -46,6 +46,7 @@ impl Glass {
             ) => HostPathAccess::DeniedBySandbox,
         };
         let mut session = ActiveSession {
+            input_route: platform.input_route(),
             backend: backend.to_owned(),
             platform,
             accessibility,
@@ -81,7 +82,7 @@ impl Glass {
             sink.record(
                 &crate::audit::Actuation::Stop,
                 &crate::audit::ActuationContext { window },
-                &crate::audit::AuditOutcome::from_result(&result),
+                &crate::audit::AuditOutcome::from_core_result(&result),
                 t.elapsed(),
             );
         }

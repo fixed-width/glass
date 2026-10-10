@@ -1488,6 +1488,26 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
 }
 
 impl Platform for X11Platform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        if self.xvfb.is_some() {
+            glass_core::InputRoute::Isolated
+        } else {
+            glass_core::InputRoute::SharedDesktop
+        }
+    }
+
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        let interference = if self.xvfb.is_some() {
+            glass_core::DesktopInterference::None
+        } else {
+            glass_core::DesktopInterference::Possible
+        };
+        glass_core::InputCapabilities::uniform(
+            glass_core::CapabilityStatus::supported(),
+            interference,
+        )
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],
@@ -2709,6 +2729,35 @@ mod tests {
 mod display_tests {
     use super::*;
     use crate::testx::TestX;
+
+    #[test]
+    #[ignore = "starts an owned private X server; needs Xvfb"]
+    fn session_input_attests_isolation_only_when_the_platform_owns_the_display() {
+        let xvfb = crate::xvfb::Xvfb::start("1280x800x24").unwrap();
+        let mut platform = X11Platform::connect(Some(&xvfb.display)).unwrap();
+        assert_eq!(
+            platform.input_route(),
+            glass_core::InputRoute::SharedDesktop
+        );
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::Supported);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::Possible
+            );
+        }
+        platform.xvfb = Some(xvfb);
+        assert_eq!(platform.input_route(), glass_core::InputRoute::Isolated);
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::Supported);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::None
+            );
+        }
+    }
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]

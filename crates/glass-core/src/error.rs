@@ -50,6 +50,11 @@ fn render_observed(observed: &Option<String>) -> String {
 /// agent. Backend crates fold their OS-specific failures into `Backend`.
 #[derive(Debug, Error)]
 pub enum GlassError {
+    #[error("{operation} is unsupported by this session: {reason}")]
+    UnsupportedOperation {
+        operation: &'static str,
+        reason: &'static str,
+    },
     #[error("no active session — call glass_start to launch an app first")]
     NoActiveSession,
 

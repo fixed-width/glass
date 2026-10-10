@@ -83,6 +83,7 @@ pub(crate) enum SafeErrorCategory {
     UnstableTarget,
     FocusUnconfirmed,
     UnsupportedMode,
+    UnsupportedOperation,
     NoActiveSession,
     StaleElement,
     NotEditable,
@@ -103,6 +104,7 @@ impl SafeErrorCategory {
         }
 
         match error.cause() {
+            glass_core::GlassError::UnsupportedOperation { .. } => Self::UnsupportedOperation,
             glass_core::GlassError::NoActiveSession => Self::NoActiveSession,
             glass_core::GlassError::NoAxSnapshot
             | glass_core::GlassError::AxElementNotFound(_)
@@ -135,6 +137,9 @@ impl SafeErrorCategory {
             Self::UnstableTarget => "semantic target is unstable",
             Self::FocusUnconfirmed => "target focus was not confirmed",
             Self::UnsupportedMode => "semantic action mode is unsupported",
+            Self::UnsupportedOperation => {
+                "operation is unsupported by this session; inspect session capabilities"
+            }
             Self::NoActiveSession => "no active session",
             Self::StaleElement => "element is stale or missing",
             Self::NotEditable => {
@@ -162,6 +167,7 @@ impl SafeErrorCategory {
             Self::UnstableTarget => "unstable_target",
             Self::FocusUnconfirmed => "focus_unconfirmed",
             Self::UnsupportedMode => "unsupported_mode",
+            Self::UnsupportedOperation => "unsupported_operation",
             Self::NoActiveSession => "no_active_session",
             Self::StaleElement => "stale_element",
             Self::NotEditable => "not_editable",
@@ -250,15 +256,28 @@ impl ContextualError {
             },
             sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
             bound_dispatch,
-            result: None,
+            result: unsupported_operation_failure(&error),
             siblings: Vec::new(),
             post_write,
         }
     }
 
+    fn standalone_message(self, tool: &'static str) -> String {
+        if self.category == SafeErrorCategory::UnsupportedOperation {
+            json!({
+                "ok": false,
+                "tool": tool,
+                "error": {"code": self.code, "category": self.category, "summary": self.safe_summary},
+                "result": self.result,
+            }).to_string()
+        } else {
+            self.message
+        }
+    }
+
     pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
         let out = Self::from_error(error);
-        if context.owner == Some(glass_core::Whose::Caller) && context.deadline.has_passed() {
+        if out.sequence_deadline_overrides(context) {
             out.after_sequence_deadline()
         } else {
             out
@@ -276,7 +295,7 @@ impl ContextualError {
     ) -> Self {
         let bounded = error.bound().is_some();
         let mut out = Self::from_error(error);
-        if context.owner == Some(glass_core::Whose::Caller) && context.deadline.has_passed() {
+        if out.sequence_deadline_overrides(context) {
             return out.after_sequence_deadline();
         }
         if whose == glass_core::Whose::Callee && bounded {
@@ -290,6 +309,12 @@ impl ContextualError {
             out.sequence_deadline_exceeded = false;
         }
         out
+    }
+
+    fn sequence_deadline_overrides(&self, context: ToolContext) -> bool {
+        self.category != SafeErrorCategory::UnsupportedOperation
+            && context.owner == Some(glass_core::Whose::Caller)
+            && context.deadline.has_passed()
     }
 
     pub fn after_dispatch(mut self) -> Self {
@@ -486,6 +511,27 @@ fn floor_from_var(v: Result<String, std::env::VarError>) -> Result<Option<String
     }
 }
 
+pub(crate) fn unsupported_operation_failure(
+    error: &glass_core::GlassError,
+) -> Option<serde_json::Value> {
+    if let glass_core::GlassError::UnsupportedOperation { operation, reason } = error.cause() {
+        let not_dispatched = error.bound_dispatch() == Some(BoundDispatch::NotDispatched);
+        Some(json!({
+            "reason": reason,
+            "operation": operation,
+            "dispatch": if not_dispatched { "not_dispatched" } else { "may_have_dispatched" },
+            "side_effects_may_have_occurred": !not_dispatched,
+            "retry": if not_dispatched { "correct_request" } else { "inspect_before_retry" },
+        }))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn core_error_message(tool: &'static str, error: glass_core::GlassError) -> String {
+    ContextualError::from_error(error).standalone_message(tool)
+}
+
 pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
     if a.run.is_empty() {
         return Err("`run` must contain at least the program to launch".into());
@@ -530,7 +576,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         Some(b) => glass.start_on(b, &spec),
         None => glass.start(&spec),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| core_error_message("glass_start", error))?;
     Ok(ToolOutput::result("glass_start", geometry_value(&geo)))
 }
 
@@ -557,7 +603,9 @@ pub fn window(glass: &mut Glass, a: &WindowArgs) -> ToolResult {
         },
         other => return Err(format!("unknown window op '{other}'")),
     };
-    let geo = glass.window(&op).map_err(|e| e.to_string())?;
+    let geo = glass
+        .window(&op)
+        .map_err(|error| core_error_message("glass_window", error))?;
     Ok(ToolOutput::result("glass_window", geometry_value(&geo)))
 }
 
@@ -589,7 +637,7 @@ pub fn list_windows(glass: &mut Glass) -> ToolResult {
 pub fn select_window(glass: &mut Glass, a: &SelectWindowArgs) -> ToolResult {
     let geo = glass
         .select_window(WindowId(a.id))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| core_error_message("glass_select_window", error))?;
     Ok(ToolOutput::result(
         "glass_select_window",
         geometry_value(&geo),
@@ -1019,5 +1067,7 @@ mod wait;
 #[cfg(test)]
 pub(crate) mod testutil;
 
+#[cfg(test)]
+mod session_input_tests;
 #[cfg(test)]
 mod tests;

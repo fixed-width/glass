@@ -337,6 +337,15 @@ pub struct AppSpec {
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
 /// glass-core code depends on a concrete backend. Must stay object-safe.
 pub trait Platform {
+    /// Backend-selected routing; callers do not configure it.
+    fn input_route(&self) -> crate::InputRoute {
+        crate::InputRoute::SharedDesktop
+    }
+
+    /// Read current session input support without capture, focus, prompts or dispatch.
+    fn input_capabilities(&self) -> crate::InputCapabilities {
+        crate::InputCapabilities::unknown()
+    }
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],

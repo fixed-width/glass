@@ -335,6 +335,21 @@ fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
 }
 
 impl Platform for AndroidPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        glass_core::InputRoute::Isolated
+    }
+
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        let support = if self.agent.is_some() {
+            glass_core::CapabilityStatus::supported()
+        } else {
+            glass_core::CapabilityStatus::degraded(
+                "adb input only; no connected high-fidelity agent",
+            )
+        };
+        glass_core::InputCapabilities::uniform(support, glass_core::DesktopInterference::None)
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         _paths: &[ProtectedHostPath],
@@ -810,6 +825,36 @@ mod platform_tests {
             app: None,
             window_list_parse_delay: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn session_input_reports_actual_agent_state_without_device_or_input_calls() {
+        let fake = FakeAdb::new(&[]);
+        let mut platform = platform_over(&fake);
+        assert_eq!(platform.input_route(), glass_core::InputRoute::Isolated);
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::Degraded);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::None
+            );
+            assert!(operation.support.note.unwrap().contains("adb"));
+        }
+        let (port, requests) =
+            crate::agent::fake_agent(r#"{"hello":{"proto":1}}"#, vec![r#"{"ok":true}"#]);
+        platform.agent = Some(Arc::new(AgentClient::connect(port).unwrap()));
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::Supported);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::None
+            );
+        }
+        assert!(fake.calls().is_empty());
+        assert!(requests.lock().unwrap().is_empty());
     }
 
     /// A device that answers everything a healthy launch asks of it.

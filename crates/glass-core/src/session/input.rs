@@ -62,7 +62,7 @@ impl Glass {
         let result = self.pointer_inner_by(event, deadline);
         self.emit_audit(
             &crate::audit::Actuation::Pointer { event },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_core_result(&result),
             t.elapsed(),
         );
         result
@@ -73,6 +73,7 @@ impl Glass {
         event: &PointerEvent,
         deadline: Deadline,
     ) -> Result<()> {
+        self.check_mutation(super::admission::Mutation::Pointer(event))?;
         crate::validate_pointer_input(event)?;
         self.check_bounds(event)?;
         if deadline.has_passed() {
@@ -100,13 +101,14 @@ impl Glass {
         let result = self.key_inner_by(event, deadline);
         self.emit_audit(
             &crate::audit::Actuation::Key { event },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_core_result(&result),
             t.elapsed(),
         );
         result
     }
 
     pub(super) fn key_inner_by(&mut self, event: &KeyEvent, deadline: Deadline) -> Result<()> {
+        self.check_mutation(super::admission::Mutation::Key)?;
         let s = self.active_mut()?;
         s.platform.send_key_by(event, deadline)?;
         s.pump();

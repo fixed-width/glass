@@ -647,7 +647,30 @@ fn resize_was_refused(
     requested_a_change && nothing_moved
 }
 
+fn session_input_support(
+    screen_recording: bool,
+    accessibility: bool,
+) -> glass_core::CapabilityStatus {
+    if !screen_recording {
+        glass_core::CapabilityStatus::requires_setup(crate::permissions::screen_recording_remedy())
+    } else if !accessibility {
+        glass_core::CapabilityStatus::requires_setup(crate::permissions::accessibility_remedy())
+    } else {
+        glass_core::CapabilityStatus::supported()
+    }
+}
+
 impl Platform for MacosPlatform {
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        glass_core::InputCapabilities::uniform(
+            session_input_support(
+                crate::permissions::screen_recording_granted(),
+                crate::permissions::accessibility_granted(),
+            ),
+            glass_core::DesktopInterference::Possible,
+        )
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],
@@ -1081,6 +1104,27 @@ impl Drop for MacosPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_input_uses_the_existing_permission_requirements_and_remedies() {
+        for accessibility in [false, true] {
+            let support = session_input_support(false, accessibility);
+            assert_eq!(support.status, glass_core::Support::RequiresSetup);
+            assert_eq!(
+                support.note,
+                Some(crate::permissions::screen_recording_remedy())
+            );
+        }
+        let support = session_input_support(true, false);
+        assert_eq!(support.status, glass_core::Support::RequiresSetup);
+        assert_eq!(
+            support.note,
+            Some(crate::permissions::accessibility_remedy())
+        );
+        let support = session_input_support(true, true);
+        assert_eq!(support.status, glass_core::Support::Supported);
+        assert!(support.note.is_none());
+    }
 
     fn test_platform() -> MacosPlatform {
         MacosPlatform {

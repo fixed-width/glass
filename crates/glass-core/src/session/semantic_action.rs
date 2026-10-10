@@ -181,6 +181,7 @@ pub enum SemanticActionFailureKind {
     UnstableTarget,
     FocusUnconfirmed,
     UnsupportedMode,
+    UnsupportedOperation,
     ActionDeadlineExceeded,
     SequenceDeadlineExceeded,
     ActionFailed,
@@ -198,6 +199,7 @@ impl SemanticActionFailureKind {
             Self::UnstableTarget => "unstable_target",
             Self::FocusUnconfirmed => "focus_unconfirmed",
             Self::UnsupportedMode => "unsupported_mode",
+            Self::UnsupportedOperation => "unsupported_operation",
             Self::ActionDeadlineExceeded => "action_deadline_exceeded",
             Self::SequenceDeadlineExceeded => "sequence_deadline_exceeded",
             Self::ActionFailed => "action_failed",
@@ -437,6 +439,31 @@ fn request_error(summary: &'static str, sequence_deadline: Deadline) -> Box<Sema
         },
         RetryGuidance::CorrectRequest,
         None,
+    )
+}
+
+fn input_admission_error(source: GlassError, deadline: Deadline) -> Box<SemanticActionError> {
+    let (kind, summary) = if matches!(source.cause(), GlassError::UnsupportedOperation { .. }) {
+        (
+            SemanticActionFailureKind::UnsupportedOperation,
+            "operation is unsupported by this session; inspect session capabilities",
+        )
+    } else {
+        (
+            SemanticActionFailureKind::ActionFailed,
+            "action admission failed",
+        )
+    };
+    empty_error(
+        kind,
+        summary,
+        ActionDeadline {
+            deadline,
+            owner: deadline.instant().map(|_| Whose::Caller),
+            allow_wait: false,
+        },
+        RetryGuidance::CorrectRequest,
+        Some(source),
     )
 }
 
@@ -1693,7 +1720,7 @@ impl Glass {
                 dispatch,
                 confirmation,
             },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_semantic_result(&result),
             started.elapsed(),
         );
         result
@@ -1704,6 +1731,8 @@ impl Glass {
         params: ClickTargetParams,
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
+        self.check_mutation(super::admission::Mutation::SemanticClick)
+            .map_err(|source| input_admission_error(source, sequence_deadline))?;
         let bound = target_deadline(
             &params.target,
             params.timeout_ms,
@@ -1895,15 +1924,18 @@ impl Glass {
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
         let started = std::time::Instant::now();
-        let result = match target_deadline(
-            &params.target,
-            params.timeout_ms,
-            params.max_nodes,
-            sequence_deadline,
-        ) {
-            Ok(bound) => self.set_value_once(params, text, sequence_deadline, bound),
-            Err(error) => Err(error),
-        };
+        let result = self
+            .check_mutation(super::admission::Mutation::SetValue)
+            .map_err(|source| input_admission_error(source, sequence_deadline))
+            .and_then(|()| {
+                target_deadline(
+                    &params.target,
+                    params.timeout_ms,
+                    params.max_nodes,
+                    sequence_deadline,
+                )
+            })
+            .and_then(|bound| self.set_value_once(params, text, sequence_deadline, bound));
         let element = self.semantic_action_audit_element(&result, &params.target);
         let (dispatch, confirmation) = match &result {
             Ok(outcome) => (
@@ -1922,7 +1954,7 @@ impl Glass {
                 dispatch,
                 confirmation,
             },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_semantic_result(&result),
             started.elapsed(),
         );
         result
@@ -2222,6 +2254,8 @@ impl Glass {
         text: &str,
         sequence_deadline: Deadline,
     ) -> SemanticActionResult<SemanticActionOutcome> {
+        self.check_mutation(super::admission::Mutation::Type)
+            .map_err(|source| input_admission_error(source, sequence_deadline))?;
         let bound = target_deadline(
             &ActionTarget::Semantic(params.target.clone()),
             Some(params.timeout_ms),
@@ -2309,7 +2343,7 @@ impl Glass {
                 focus_confirmation: focus_confirmation.as_str(),
                 type_dispatch: type_dispatch.as_str(),
             },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_semantic_result(&result),
             started.elapsed(),
         );
         result

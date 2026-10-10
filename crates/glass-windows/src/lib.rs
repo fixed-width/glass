@@ -321,6 +321,13 @@ mod backend {
     }
 
     impl Platform for WindowsPlatform {
+        fn input_capabilities(&self) -> glass_core::InputCapabilities {
+            glass_core::InputCapabilities::uniform(
+                glass_core::CapabilityStatus::supported(),
+                glass_core::DesktopInterference::Possible,
+            )
+        }
+
         fn configure_protected_host_paths(
             &mut self,
             paths: &[ProtectedHostPath],

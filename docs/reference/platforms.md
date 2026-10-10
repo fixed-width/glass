@@ -12,7 +12,20 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
 | Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ virtual display · VM tier | ✓ headless emulator | ✓ headless simctl boot | 🚧 |
+| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | – shared desktop |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | – shared desktop |
+
+Input without desktop interference means the agent's pointer and keyboard stay separate from yours.
+It is already provided by owned Linux displays, the Android emulator and the iOS Simulator, using
+the normal tools without extra input configuration. An explicitly attached X11 display has no
+Glass-owned isolation guarantee. Native Windows/macOS input can change focus or move your pointer;
+a virtual monitor alone does not isolate input. Running Glass and its target inside a VM provides a
+separate desktop, but the native backend cannot attest isolation from the VM host.
+
+For the actual active session, use `glass_capabilities` with `scope: "session"`: each input operation
+reports its support and `desktop_interference: "none" | "possible" | "unknown"`. `none` describes
+admitted input dispatch, not app startup, clipboard or filesystem isolation. Setup requirements and
+operation limitations still apply, such as the iOS input companion and US-ASCII typing.
 
 Occlusion checks use the platform's accessibility hit test. A covering element omitted from that
 tree can still intercept physical input even when the hit test reports the target. Linux retries

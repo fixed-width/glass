@@ -583,6 +583,7 @@ impl Glass {
         params: &ScrollToElementParams,
         sequence_deadline: Deadline,
     ) -> Result<ScrollToElementOutcome> {
+        self.check_mutation(super::admission::Mutation::ScrollToElement)?;
         if sequence_deadline.has_passed() {
             return Err(GlassError::deadline_not_started("scroll to element"));
         }

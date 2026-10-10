@@ -23,6 +23,7 @@ use crate::stability::StabilityTracker;
 
 mod a11y;
 mod a11y_poll;
+mod admission;
 mod baseline;
 mod capture;
 mod clipboard;
@@ -53,6 +54,7 @@ pub use wait::{
 };
 
 struct ActiveSession {
+    input_route: crate::InputRoute,
     backend: String,
     platform: Box<dyn Platform + Send>,
     // Held here so the session owns the backend's accessibility reader and the

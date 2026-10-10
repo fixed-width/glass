@@ -21,7 +21,9 @@ fn standalone(result: ContextualToolResult) -> ToolResult {
 
 fn standalone_scroll_to_element(result: ContextualToolResult) -> ToolResult {
     result.map(|o| o.output).map_err(|e| {
-        if e.bound_dispatch == Some(glass_core::BoundDispatch::MayHaveDispatched) {
+        if e.category == super::SafeErrorCategory::UnsupportedOperation {
+            e.standalone_message("glass_scroll_to_element")
+        } else if e.bound_dispatch == Some(glass_core::BoundDispatch::MayHaveDispatched) {
             format!(
                 "{}\nRetry safety: one or more earlier steps may already have changed the app. The caller should re-observe before retrying.",
                 e.message

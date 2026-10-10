@@ -21,6 +21,11 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
+  including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
+  isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
+  driver limitations, using the same input tools and existing permissions.
+
 - Experimental `glass_a11y_snapshot_diff` in the full tool profile returns fresh, lossless
   compact-outline revisions with full-read recovery, bounded retention and completeness disclosures.
   macOS attests unambiguous read scope; unqualified backends return full observations without retention.

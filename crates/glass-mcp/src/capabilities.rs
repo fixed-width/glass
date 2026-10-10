@@ -7,11 +7,51 @@
 
 use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
+pub(crate) fn render_session_value(
+    glass: &mut glass_core::Glass,
+    requested_backend: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let backend = glass
+        .active_backend()
+        .ok_or_else(|| glass_core::GlassError::NoActiveSession.to_string())?;
+    if requested_backend.is_some_and(|requested| requested != backend) {
+        return Err(format!(
+            "session backend is {backend}; requested backend does not match"
+        ));
+    }
+    let report = glass
+        .session_capabilities()
+        .map_err(|error| error.to_string())?;
+    let mut value = serde_json::json!(report);
+    value["scope"] = serde_json::json!("session");
+    for (operation, tools) in [
+        ("click", vec!["glass_click", "glass_do"]),
+        ("scroll", vec!["glass_scroll", "glass_do"]),
+        ("text", vec!["glass_type", "glass_key", "glass_do"]),
+    ] {
+        value["input"][operation]["tools"] = serde_json::json!(tools);
+    }
+    Ok(value)
+}
+
 pub(crate) fn apply_tool_profile(
     value: &mut serde_json::Value,
     profile: crate::tool_profile::ToolProfile,
 ) {
     value["tool_profile"] = serde_json::json!(profile);
+    if let Some(input) = value
+        .get_mut("input")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for entry in input.values_mut() {
+            if let Some(tools) = entry
+                .get_mut("tools")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                tools.retain(|tool| tool.as_str().is_some_and(|name| profile.includes(name)));
+            }
+        }
+    }
     if let Some(capabilities) = value
         .get_mut("capabilities")
         .and_then(serde_json::Value::as_object_mut)

@@ -15,7 +15,9 @@ pub fn clipboard_get(glass: &mut Glass) -> ToolResult {
 }
 
 pub fn clipboard_set(glass: &mut Glass, a: &ClipboardSetArgs) -> ToolResult {
-    glass.set_clipboard(&a.text).map_err(|e| e.to_string())?;
+    glass
+        .set_clipboard(&a.text)
+        .map_err(|error| super::core_error_message("glass_clipboard_set", error))?;
     Ok(ToolOutput::result(
         "glass_clipboard_set",
         serde_json::json!({}),
@@ -32,6 +34,7 @@ mod tests {
     fn started() -> Glass {
         let mut g = glass_with(FakePlatform::new(100, 100));
         let a = StartArgs {
+            _rejected_input_mode: None,
             build: None,
             run: vec!["app".into()],
             backend: None,

@@ -71,6 +71,9 @@ do, most of which run from any host.
 - **Keep `glass-core` platform-agnostic** — no OS types in core; every OS detail lives behind `Platform`.
 - **No silent fallbacks** — a failed capture/input returns a structured error, never a blank/stale frame.
 - **Coordinates are window-relative** at the tool boundary; only the backend maps to global coords.
+- **Report input support and desktop effects separately.** Session capability reporting is read-only.
+  Owned displays/devices already isolate ordinary input; shared desktop input may affect the user.
+  Backend routing stays internal, and restricted-route refusals never fall back to desktop control.
 - **Permissively-licensed deps only** (MIT/Apache; no copyleft).
 - **Avoid `unsafe`** — prefer safe abstractions; isolate + document any required `unsafe` with `// SAFETY:`.
 

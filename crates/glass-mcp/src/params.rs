@@ -7,6 +7,37 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::num::NonZeroU32;
 
 pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
+
+#[cfg(test)]
+mod session_capability_tests {
+    use super::*;
+
+    #[test]
+    fn start_rejects_removed_mode_without_changing_unknown_field_compatibility() {
+        for mode in [
+            serde_json::json!("background"),
+            serde_json::json!("foreground"),
+            serde_json::Value::Null,
+        ] {
+            let value = serde_json::json!({"run": ["app"], "input_mode": mode});
+            assert!(serde_json::from_value::<StartArgs>(value).is_err());
+        }
+        let args: StartArgs = serde_json::from_value(
+            serde_json::json!({"run": ["app"], "unrelated_extension": true}),
+        )
+        .unwrap();
+        let value = serde_json::to_value(args).unwrap();
+        assert!(value.get("input_mode").is_none());
+    }
+
+    #[test]
+    fn capabilities_reject_unknown_scope() {
+        assert!(
+            serde_json::from_value::<CapabilitiesArgs>(serde_json::json!({"scope": "unknown"}))
+                .is_err()
+        );
+    }
+}
 pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -60,8 +91,24 @@ pub struct WindowHintArgs {
     pub class: Option<String>,
 }
 
+fn reject_input_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<()>, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(
+        "input_mode is not supported; use the normal input tools and inspect session capabilities",
+    ))
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StartArgs {
+    // Reject cached requests for the unmerged mode without tightening the existing start schema.
+    #[serde(
+        default,
+        rename = "input_mode",
+        deserialize_with = "reject_input_mode",
+        skip_serializing
+    )]
+    #[schemars(skip)]
+    pub(crate) _rejected_input_mode: Option<()>,
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
     /// Desktop: [executable, args...]. iOS: [.app-or-bundle-id, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].
@@ -447,8 +494,19 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CapabilitiesArgs {
-    /// x11, wayland, windows, macos, android or ios. Default active/default backend. Valid but unbuilt backends report available:false.
+    /// backend (default) or active session.
+    pub scope: Option<CapabilitiesScope>,
+    /// Backend name, defaulting to active/default; session scope requires a match.
     pub backend: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum CapabilitiesScope {
+    #[default]
+    Backend,
+    Session,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

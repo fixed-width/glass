@@ -372,6 +372,7 @@ impl Glass {
         plan: Option<&super::semantic_action::PlannedPointerInput>,
         deadline: Deadline,
     ) -> Result<()> {
+        self.check_mutation(super::admission::Mutation::SemanticClick)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("click element"));
         }
@@ -533,6 +534,7 @@ impl Glass {
         id: AxNodeId,
         deadline: Deadline,
     ) -> Result<Option<AxNodeId>> {
+        self.check_mutation(super::admission::Mutation::SemanticClick)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
                 "native accessibility action",
@@ -599,6 +601,7 @@ impl Glass {
         id: AxNodeId,
         deadline: Deadline,
     ) -> Result<Option<AxNodeId>> {
+        self.check_mutation(super::admission::Mutation::Type)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started(
                 "native accessibility focus",
@@ -677,6 +680,7 @@ impl Glass {
         text: &str,
         deadline: Deadline,
     ) -> Result<SetValueExecution> {
+        self.check_mutation(super::admission::Mutation::SetValue)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("set value"));
         }

@@ -64,7 +64,10 @@ pub mod doctor;
 pub use doctor::{Check, CheckStatus, Diagnosis, Palette, ProbeFailure, Section};
 
 pub mod capability;
-pub use capability::{CapabilityMap, CapabilityStatus, Support};
+pub use capability::{
+    CapabilityMap, CapabilityStatus, DesktopInterference, InputCapabilities,
+    InputOperationCapability, InputRoute, SessionCapabilities, Support,
+};
 
 pub mod stability;
 pub use stability::StabilityTracker;
