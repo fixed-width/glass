@@ -571,6 +571,24 @@ mod tests {
         A11yThread::new("a11y bus", IMPATIENT)
     }
 
+    fn value_timeout_after_dispatch(ended_by: Whose) -> GlassError {
+        let started = Instant::now();
+        let ends = started + CEILING;
+        let dispatch = A11yMutationDispatch::new("set_value", ends);
+        dispatch.begin_at(started).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(())).unwrap();
+        let mut clock = [started, ends].into_iter();
+        receive_by_with_clock(
+            rx,
+            ends,
+            || clock.next().unwrap(),
+            || reader().set_value_no_answer(7, ended_by, &dispatch),
+            || panic!("the queued response keeps the channel connected"),
+        )
+        .expect_err("the value mutation's response arrives at the absolute bound")
+    }
+
     /// A job that never answers inside an [`IMPATIENT`] ceiling. Half a second, not thirty: each
     /// call leaves this thread sleeping after the test has moved on.
     fn hangs() -> impl FnOnce() -> Result<()> + Send + 'static {
@@ -1136,14 +1154,15 @@ mod tests {
 
     #[test]
     fn a_timeout_after_native_value_dispatch_is_an_unconfirmed_write() {
-        let error = reader()
-            .set_value(7, Deadline::from_millis(20), |dispatch| {
-                dispatch.dispatch(hangs())
-            })
-            .expect_err("the native setter outlives the caller");
+        let error = value_timeout_after_dispatch(Whose::Caller);
 
         assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
         assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
         assert!(
             matches!(error.cause(), GlassError::Bounded { .. }),
             "{error}"
@@ -1153,14 +1172,7 @@ mod tests {
 
     #[test]
     fn a_backend_ceiling_after_native_value_dispatch_preserves_its_bound() {
-        let error = A11yThread::new("a11y bus", Duration::from_millis(20))
-            .set_value(7, Deadline::UNBOUNDED, |dispatch| {
-                dispatch.dispatch(|| {
-                    std::thread::sleep(Duration::from_millis(100));
-                    Ok(())
-                })
-            })
-            .expect_err("the native setter outlives the backend ceiling");
+        let error = value_timeout_after_dispatch(Whose::Callee);
 
         assert_eq!(error.bound_owner(), Some(Whose::Callee), "{error}");
         assert_eq!(error.bound(), Some(crate::BoundKind::TimedOut), "{error}");

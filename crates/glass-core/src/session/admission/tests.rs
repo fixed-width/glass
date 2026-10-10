@@ -373,6 +373,7 @@ fn background_selection_only_refreshes_the_same_reliably_identified_window() {
 #[test]
 fn session_capabilities_are_read_only_and_never_authorize_background_text() {
     let (mut glass, _dir, calls, reads) = background(Some(WindowId(1)));
+    assert_eq!(glass.active_input_mode(), Some(InputMode::Background));
     let epoch = glass.observation_epoch();
     let generation = epoch.generation();
     let report = glass.session_capabilities().unwrap();
@@ -389,10 +390,24 @@ fn session_capabilities_are_read_only_and_never_authorize_background_text() {
     assert_eq!(epoch.generation(), generation);
     assert!(reads.lock().unwrap().is_none());
     glass.stop().unwrap();
+    assert_eq!(glass.active_input_mode(), None);
     assert!(matches!(
         glass.session_capabilities(),
         Err(GlassError::NoActiveSession)
     ));
+}
+
+#[test]
+fn a_platform_without_a_background_route_reports_unsupported_without_actuation() {
+    let calls: Calls = Arc::default();
+    let mut platform = FakePlatform::new(100, 100).with_event_log(calls.clone());
+    let report = platform.background_input_capabilities().unwrap();
+    assert!(report.profile.is_none());
+    for operation in [report.click, report.scroll, report.text] {
+        assert_eq!(operation.status, BackgroundSupport::Unsupported);
+        assert!(!operation.reasons.is_empty());
+    }
+    assert!(calls.lock().unwrap().is_empty());
 }
 
 #[test]

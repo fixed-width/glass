@@ -42,3 +42,20 @@ impl std::fmt::Display for InputMode {
         f.write_str(self.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_mode_names_match_the_wire_format() {
+        for (mode, name) in [
+            (InputMode::Foreground, "foreground"),
+            (InputMode::Background, "background"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), name);
+            assert_eq!(mode.as_str(), name);
+            assert_eq!(mode.to_string(), name);
+        }
+    }
+}

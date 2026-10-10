@@ -1,0 +1,4 @@
+# This replacement is identical to the trait's current default capability report.
+exclude_re = [
+    '^crates/glass-core/src/platform\.rs:\d+:\d+: replace Platform::background_input_capabilities -> Result<crate::BackgroundInputCapabilities> with Ok\(Default::default\(\)\)$',
+]
