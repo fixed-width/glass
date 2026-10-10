@@ -277,10 +277,7 @@ impl ContextualError {
 
     pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
         let out = Self::from_error(error);
-        if out.category != SafeErrorCategory::UnsupportedOperation
-            && context.owner == Some(glass_core::Whose::Caller)
-            && context.deadline.has_passed()
-        {
+        if out.sequence_deadline_overrides(context) {
             out.after_sequence_deadline()
         } else {
             out
@@ -298,10 +295,7 @@ impl ContextualError {
     ) -> Self {
         let bounded = error.bound().is_some();
         let mut out = Self::from_error(error);
-        if out.category != SafeErrorCategory::UnsupportedOperation
-            && context.owner == Some(glass_core::Whose::Caller)
-            && context.deadline.has_passed()
-        {
+        if out.sequence_deadline_overrides(context) {
             return out.after_sequence_deadline();
         }
         if whose == glass_core::Whose::Callee && bounded {
@@ -315,6 +309,12 @@ impl ContextualError {
             out.sequence_deadline_exceeded = false;
         }
         out
+    }
+
+    fn sequence_deadline_overrides(&self, context: ToolContext) -> bool {
+        self.category != SafeErrorCategory::UnsupportedOperation
+            && context.owner == Some(glass_core::Whose::Caller)
+            && context.deadline.has_passed()
     }
 
     pub fn after_dispatch(mut self) -> Self {

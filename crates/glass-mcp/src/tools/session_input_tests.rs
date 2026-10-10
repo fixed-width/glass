@@ -54,6 +54,38 @@ fn admission_projection_preserves_stronger_dispatch_evidence() {
 }
 
 #[test]
+fn operation_refusals_keep_their_reason_after_the_sequence_deadline() {
+    let context = ToolContext {
+        deadline: glass_core::Deadline::at(std::time::Instant::now()),
+        owner: Some(glass_core::Whose::Caller),
+        allow_wait: false,
+    };
+    let refused = || {
+        glass_core::GlassError::UnsupportedOperation {
+            operation: "keyboard or text input",
+            reason: "no qualified text route",
+        }
+        .before_dispatch()
+    };
+    for error in [
+        ContextualError::from_core(refused(), context),
+        ContextualError::from_resolved_bound(refused(), context, glass_core::Whose::Caller),
+        ContextualError::from_resolved_bound(refused(), context, glass_core::Whose::Callee),
+    ] {
+        assert_eq!(error.category, SafeErrorCategory::UnsupportedOperation);
+        assert!(!error.sequence_deadline_exceeded);
+        let result = error.result.unwrap();
+        assert_eq!(result["reason"], "no qualified text route");
+        assert_eq!(result["dispatch"], "not_dispatched");
+    }
+    let error = ContextualError::from_core(
+        glass_core::GlassError::Backend("transport failed".into()),
+        context,
+    );
+    assert_eq!(error.category, SafeErrorCategory::SequenceDeadlineExceeded);
+}
+
+#[test]
 fn unchanged_start_result_and_normal_input_need_no_mode_configuration() {
     for route in [InputRoute::Isolated, InputRoute::SharedDesktop] {
         let specs: Arc<Mutex<Vec<AppSpec>>> = Arc::default();
@@ -71,7 +103,7 @@ fn unchanged_start_result_and_normal_input_need_no_mode_configuration() {
 }
 
 #[test]
-fn standalone_mutations_preserve_typed_mode_refusal_and_do_not_expose_text() {
+fn standalone_mutations_preserve_typed_operation_refusal_and_do_not_expose_text() {
     let (mut glass, _dir, events) = targeted();
     for error in [
         mouse_move(&mut glass, &args(json!({"x": 1, "y": 1}))).unwrap_err(),
@@ -83,7 +115,7 @@ fn standalone_mutations_preserve_typed_mode_refusal_and_do_not_expose_text() {
     ] {
         assert_operation_refusal(
             &serde_json::from_str(&error)
-                .unwrap_or_else(|_| panic!("expected structured mode refusal: {error}")),
+                .unwrap_or_else(|_| panic!("expected structured operation refusal: {error}")),
         );
         assert!(!error.contains("sensitive payload"));
     }
