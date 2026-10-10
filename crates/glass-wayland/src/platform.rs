@@ -2389,6 +2389,17 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
 }
 
 impl Platform for WaylandPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        glass_core::InputRoute::Isolated
+    }
+
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        glass_core::InputCapabilities::uniform(
+            glass_core::CapabilityStatus::supported(),
+            glass_core::DesktopInterference::None,
+        )
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],
@@ -2399,7 +2410,6 @@ impl Platform for WaylandPlatform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        spec.input_mode.require_foreground("app start")?;
         glass_sandbox_linux::validate_protected_paths(&self.protected_host_paths)?;
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
 
@@ -7005,7 +7015,6 @@ mod tests {
             .expect("private runtime directory");
         let config = runtime_dir.path().join("sway.cfg");
         let spec = AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["sh".into(), "-c".into(), "sleep 30".into()],
             cwd: None,

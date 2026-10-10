@@ -193,7 +193,6 @@ fn browser_spec(browser: &str, profile: &Path, lever: Lever) -> AppSpec {
     let mut env = vec![("LIBGL_ALWAYS_SOFTWARE".to_string(), "1".to_string())];
     env.extend(lever.vars());
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run,
         cwd: None,

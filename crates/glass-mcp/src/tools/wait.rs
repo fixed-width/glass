@@ -21,7 +21,7 @@ fn standalone(result: ContextualToolResult) -> ToolResult {
 
 fn standalone_scroll_to_element(result: ContextualToolResult) -> ToolResult {
     result.map(|o| o.output).map_err(|e| {
-        if e.category == super::SafeErrorCategory::UnsupportedInputMode {
+        if e.category == super::SafeErrorCategory::UnsupportedOperation {
             e.standalone_message("glass_scroll_to_element")
         } else if e.bound_dispatch == Some(glass_core::BoundDispatch::MayHaveDispatched) {
             format!(
@@ -392,7 +392,6 @@ mod tests {
         let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
         glass
             .start(&AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["x".into()],
                 cwd: None,
@@ -685,7 +684,6 @@ mod tests {
     fn started_a11y_with(tree: AxTree) -> Glass {
         let mut g = glass_with_a11y(FakePlatform::new(100, 100), tree);
         g.start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["x".into()],
             cwd: None,
@@ -854,7 +852,6 @@ mod tests {
     fn started_frames(frames: Vec<Frame>) -> Glass {
         let mut g = glass_with(FakePlatform::new(2, 2).with_frames(frames));
         g.start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["x".into()],
             cwd: None,
@@ -908,7 +905,6 @@ mod tests {
         let white = Frame::solid(4, 4, [255, 255, 255, 255]);
         let mut g = glass_with(FakePlatform::new(4, 4).with_frames(vec![black, white]));
         g.start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["x".into()],
             cwd: None,
@@ -1008,7 +1004,6 @@ mod tests {
                 .with_capture_log(log.clone()),
         );
         g.start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["x".into()],
             cwd: None,
@@ -1072,7 +1067,6 @@ mod tests {
     fn started_logs(logs: Vec<(glass_core::Stream, &str)>) -> Glass {
         let mut g = glass_with(FakePlatform::new(10, 10).with_logs(logs));
         g.start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["x".into()],
             cwd: None,

@@ -16,32 +16,22 @@ pub(super) enum Mutation<'a> {
 mod tests;
 
 impl Glass {
-    /// Read-only session support, excluding background actions in Foreground and all background text.
-    pub fn session_capabilities(&mut self) -> Result<crate::SessionCapabilities> {
-        let session = self.active_mut()?;
-        let mut background_input = if session.input_mode == crate::InputMode::Background {
-            session.platform.background_input_capabilities()?
-        } else {
-            crate::BackgroundInputCapabilities::default()
-        };
-        if background_input.profile.is_none() {
-            background_input.click =
-                crate::BackgroundOperation::unsupported("no qualified background click profile");
-            background_input.scroll =
-                crate::BackgroundOperation::unsupported("no qualified background scroll profile");
+    /// Read-only input support and desktop effects for the active session.
+    pub fn session_capabilities(&self) -> Result<crate::SessionCapabilities> {
+        let session = self.require_active()?;
+        let mut input = session.platform.input_capabilities();
+        if session.input_route == crate::InputRoute::WindowTargeted {
+            input.restrict_window_targeted();
         }
-        background_input.text =
-            crate::BackgroundOperation::unsupported("background text input is unsupported");
         Ok(crate::SessionCapabilities {
             backend: session.backend.clone(),
-            input_mode: session.input_mode,
-            background_input,
+            input,
         })
     }
 
     pub(super) fn check_mutation(&self, mutation: Mutation<'_>) -> Result<()> {
-        let mode = self.require_active()?.input_mode;
-        if mode == crate::InputMode::Foreground {
+        let route = self.require_active()?.input_route;
+        if route != crate::InputRoute::WindowTargeted {
             return Ok(());
         }
         let operation = match mutation {
@@ -50,10 +40,20 @@ impl Glass {
                 count: 1,
                 modifiers,
                 ..
-            }) if modifiers.is_empty() => return Ok(()),
+            }) if modifiers.is_empty() => {
+                return require_targeted_support(
+                    self.require_active()?.platform.input_capabilities().click,
+                    "click",
+                );
+            }
             Mutation::Pointer(PointerEvent::Scroll {
                 dx: 0, modifiers, ..
-            }) if modifiers.is_empty() => return Ok(()),
+            }) if modifiers.is_empty() => {
+                return require_targeted_support(
+                    self.require_active()?.platform.input_capabilities().scroll,
+                    "scroll",
+                );
+            }
             Mutation::Window(WindowOp::Geometry) => return Ok(()),
             Mutation::Pointer(_) => "pointer operation",
             Mutation::Key | Mutation::Type => "keyboard or text input",
@@ -64,6 +64,29 @@ impl Glass {
             Mutation::Window(_) => "window mutation",
             Mutation::SelectWindow => "window selection",
         };
-        Err(mode.unsupported(operation))
+        Err(GlassError::UnsupportedOperation {
+            operation,
+            reason: "this session only admits qualified coordinate left clicks and vertical scrolls",
+        }
+        .before_dispatch())
     }
+}
+
+fn require_targeted_support(
+    capability: crate::InputOperationCapability,
+    operation: &'static str,
+) -> Result<()> {
+    if capability.support.status == crate::Support::Supported
+        && capability.desktop_interference == crate::DesktopInterference::None
+    {
+        return Ok(());
+    }
+    Err(GlassError::UnsupportedOperation {
+        operation,
+        reason: capability
+            .support
+            .note
+            .unwrap_or("no qualified input without desktop interference"),
+    }
+    .before_dispatch())
 }

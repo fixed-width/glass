@@ -39,7 +39,6 @@ fn require_gtk4() {
 
 fn demo_spec(env: Vec<(String, String)>) -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["python3".into(), TASKS_DEMO.into()],
         cwd: None,

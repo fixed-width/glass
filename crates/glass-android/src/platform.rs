@@ -335,6 +335,21 @@ fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
 }
 
 impl Platform for AndroidPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        glass_core::InputRoute::Isolated
+    }
+
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        let support = if self.agent.is_some() {
+            glass_core::CapabilityStatus::supported()
+        } else {
+            glass_core::CapabilityStatus::degraded(
+                "adb input only; no connected high-fidelity agent",
+            )
+        };
+        glass_core::InputCapabilities::uniform(support, glass_core::DesktopInterference::None)
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         _paths: &[ProtectedHostPath],
@@ -343,7 +358,6 @@ impl Platform for AndroidPlatform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        spec.input_mode.require_foreground("app start")?;
         run_build(spec, &self.logs)?;
         let target = parse_launch(&spec.run)?;
         let adb = self.adb().clone();
@@ -727,7 +741,6 @@ mod platform_tests {
 
     fn spec() -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["com.example.app/.MainActivity".to_string()],
             cwd: None,
@@ -814,6 +827,36 @@ mod platform_tests {
         }
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn session_input_reports_actual_agent_state_without_device_or_input_calls() {
+        let fake = FakeAdb::new(&[]);
+        let mut platform = platform_over(&fake);
+        assert_eq!(platform.input_route(), glass_core::InputRoute::Isolated);
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::Degraded);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::None
+            );
+            assert!(operation.support.note.unwrap().contains("adb"));
+        }
+        let (port, requests) =
+            crate::agent::fake_agent(r#"{"hello":{"proto":1}}"#, vec![r#"{"ok":true}"#]);
+        platform.agent = Some(Arc::new(AgentClient::connect(port).unwrap()));
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::Supported);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::None
+            );
+        }
+        assert!(fake.calls().is_empty());
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
     /// A device that answers everything a healthy launch asks of it.
     fn launchable() -> FakeAdb {
         FakeAdb::new(&[
@@ -826,26 +869,6 @@ mod platform_tests {
             ("exec-out screencap", Answer::says(frame_bytes(1080, 2400))),
             ("*", Answer::Silent),
         ])
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn background_start_refuses_before_build_or_device_work() {
-        let fake = FakeAdb::new(&[]);
-        let mut platform = platform_over(&fake);
-        let mut requested = spec();
-        requested.input_mode = glass_core::InputMode::Background;
-        requested.build = Some("exit 91".into());
-        let error = platform.start_app(&requested).unwrap_err();
-        assert!(matches!(
-            error.cause(),
-            GlassError::UnsupportedInputMode { .. }
-        ));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::NotDispatched)
-        );
-        assert!(fake.calls().is_empty());
     }
 
     /// A launched app on a fake device, ready for the calls that need a session.

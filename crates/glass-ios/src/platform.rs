@@ -410,6 +410,28 @@ pub(crate) fn checked_scale(density: f64) -> Result<f64> {
 }
 
 impl Platform for IosPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        glass_core::InputRoute::Isolated
+    }
+
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        let support = if self.driver.is_some() {
+            glass_core::CapabilityStatus::supported()
+        } else {
+            glass_core::CapabilityStatus::requires_setup(
+                "needs a connected idb_companion; session is observe-only",
+            )
+        };
+        let mut report =
+            glass_core::InputCapabilities::uniform(support, glass_core::DesktopInterference::None);
+        if self.driver.is_some() {
+            report.text.support = glass_core::CapabilityStatus::degraded(
+                "US-ASCII input only; non-ASCII characters are unsupported",
+            );
+        }
+        report
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         _paths: &[ProtectedHostPath],
@@ -425,7 +447,6 @@ impl Platform for IosPlatform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        spec.input_mode.require_foreground("app start")?;
         // `self.app` is overwritten below, so an app still recorded here is one nothing would
         // reap again, `Drop` included. A no-op on the path `Glass` takes — a platform per
         // session.
@@ -1353,13 +1374,39 @@ mod teardown_tests {
         }
     }
 
+    #[test]
+    fn session_input_reports_actual_companion_and_typing_limits_without_simulator_calls() {
+        let fake = FakeSimctl::new();
+        let mut platform = platform(&fake, false);
+        assert_eq!(platform.input_route(), glass_core::InputRoute::Isolated);
+        let calls = fake.calls();
+        let report = platform.input_capabilities();
+        for operation in [report.click, report.scroll, report.text] {
+            assert_eq!(operation.support.status, glass_core::Support::RequiresSetup);
+            assert_eq!(
+                operation.desktop_interference,
+                glass_core::DesktopInterference::None
+            );
+        }
+        platform.driver = Some(IdbDriver::for_test());
+        let report = platform.input_capabilities();
+        assert_eq!(report.click.support.status, glass_core::Support::Supported);
+        assert_eq!(report.scroll.support.status, glass_core::Support::Supported);
+        assert_eq!(report.text.support.status, glass_core::Support::Degraded);
+        assert!(report.text.support.note.unwrap().contains("US-ASCII"));
+        assert_eq!(
+            report.text.desktop_interference,
+            glass_core::DesktopInterference::None
+        );
+        assert_eq!(fake.calls(), calls);
+    }
+
     fn spec() -> AppSpec {
         spec_for(BUNDLE)
     }
 
     fn spec_for(bundle: &str) -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![bundle.to_string()],
             cwd: None,
@@ -1613,27 +1660,6 @@ mod teardown_tests {
             "all calls: {:?}",
             fake.calls()
         );
-    }
-
-    #[test]
-    fn background_start_preserves_the_previous_app_before_build_or_termination() {
-        let fake = FakeSimctl::new();
-        let mut platform = platform(&fake, true);
-        let calls = fake.calls();
-        let mut requested = spec_for("tech.fixedwidth.other");
-        requested.input_mode = glass_core::InputMode::Background;
-        requested.build = Some("exit 91".into());
-        let error = platform.start_app(&requested).unwrap_err();
-        assert!(matches!(
-            error.cause(),
-            GlassError::UnsupportedInputMode { .. }
-        ));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::NotDispatched)
-        );
-        assert_eq!(fake.calls(), calls);
-        assert_eq!(platform.app.as_ref().unwrap().bundle_id, BUNDLE);
     }
 
     /// Starting a second app overwrites `self.app`, leaving the first running with nothing able

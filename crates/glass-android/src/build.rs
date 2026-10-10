@@ -69,7 +69,6 @@ mod tests {
     #[cfg(unix)]
     fn spec_that_builds_with(build: &str) -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: Some(build.to_string()),
             run: vec!["com.example.app/.MainActivity".to_string()],
             cwd: None,

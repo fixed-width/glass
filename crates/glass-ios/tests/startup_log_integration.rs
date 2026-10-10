@@ -44,7 +44,6 @@ fn launch_time_log_line_is_captured() {
         .expect("GLASS_IOS_STARTUP_MARKER must be the exact line the app emits at launch");
 
     let spec = AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec![app],
         cwd: None,

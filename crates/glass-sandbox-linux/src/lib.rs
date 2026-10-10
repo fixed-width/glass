@@ -1568,7 +1568,6 @@ mod tests {
 
     fn make_spec(build: Option<&str>, sandbox: SandboxLevel) -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: build.map(|s| s.to_string()),
             run: vec!["unused".into()],
             cwd: None,
@@ -1633,7 +1632,6 @@ mod tests {
 
     fn spec_with(sandbox: SandboxLevel, env: Vec<(String, String)>) -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,

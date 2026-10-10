@@ -105,7 +105,6 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                 json!({
                     "program": spec.run.first(),
                     "backend": backend,
-                    "input_mode": spec.input_mode,
                     "argc": spec.run.len(),
                     "has_build": spec.build.is_some()
                 }),
@@ -543,27 +542,31 @@ mod tests {
     }
 
     #[test]
-    fn refused_background_start_preserves_audit_session_and_dispatch_evidence() {
+    fn unsupported_operation_audit_preserves_dispatch_without_a_session_mode() {
         let buffer: Arc<Mutex<Vec<u8>>> = Arc::default();
         let sink = JsonlSink::with_writer(Box::new(Buf(buffer.clone())), AuditConfig::default());
-        let mut glass =
-            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        let platform = crate::tools::testutil::FakePlatform::new(100, 100)
+            .with_input_route(glass_core::InputRoute::WindowTargeted);
+        let mut glass = crate::tools::testutil::glass_with(platform);
         glass.set_audit_sink(Box::new(sink));
         let start: crate::params::StartArgs =
             serde_json::from_value(json!({"run": ["app"], "a11y": false})).unwrap();
         crate::tools::start(&mut glass, &start).unwrap();
-        let requested: crate::params::StartArgs = serde_json::from_value(
-            json!({"run": ["app"], "input_mode": "background", "a11y": false}),
-        )
-        .unwrap();
-        crate::tools::start(&mut glass, &requested).unwrap_err();
+        let error = glass
+            .key(&glass_core::KeyEvent::Chord("Return".into()))
+            .unwrap_err();
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
         let records = lines(&buffer);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["session"], records[1]["session"]);
-        assert_eq!(records[1]["args"]["input_mode"], "background");
+        assert!(records[0]["args"].get("input_mode").is_none());
         assert_eq!(records[1]["result"]["ok"], false);
         assert_eq!(records[1]["result"]["dispatch"], "not_dispatched");
     }
+
     fn win_ctx() -> ActuationContext {
         ActuationContext {
             window: Some(WindowRef {
@@ -1097,7 +1100,6 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
         let spec = glass_core::AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,
@@ -1240,7 +1242,6 @@ mod tests {
         tools::start(
             &mut g,
             &StartArgs {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 backend: None,
@@ -1359,7 +1360,6 @@ mod tests {
 
         fn args() -> StartArgs {
             StartArgs {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 backend: None,

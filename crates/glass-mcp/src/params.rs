@@ -9,16 +9,17 @@ use std::num::NonZeroU32;
 pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
 
 #[cfg(test)]
-mod input_mode_tests {
+mod session_capability_tests {
     use super::*;
 
     #[test]
-    fn start_rejects_unknown_input_mode() {
-        for mode in ["Background", "unknown", ""] {
-            let value = serde_json::json!({"run": ["app"], "input_mode": mode});
+    fn start_rejects_removed_mode_and_unknown_arguments() {
+        for field in ["input_mode", "allow_desktop_control", "unknown"] {
+            let mut value = serde_json::json!({"run": ["app"]});
+            value[field] = serde_json::json!("background");
             assert!(
                 serde_json::from_value::<StartArgs>(value).is_err(),
-                "{mode:?}"
+                "{field}"
             );
         }
     }
@@ -85,9 +86,8 @@ pub struct WindowHintArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StartArgs {
-    /// foreground (default) or background (currently unsupported).
-    pub input_mode: Option<InputModeArg>,
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
     /// Desktop: [executable, args...]. iOS: [.app-or-bundle-id, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].
@@ -477,23 +477,6 @@ pub struct CapabilitiesArgs {
     pub scope: Option<CapabilitiesScope>,
     /// Backend name, defaulting to active/default; session scope requires a match.
     pub backend: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-#[schemars(inline)]
-pub enum InputModeArg {
-    Foreground,
-    Background,
-}
-
-impl From<InputModeArg> for glass_core::InputMode {
-    fn from(mode: InputModeArg) -> Self {
-        match mode {
-            InputModeArg::Foreground => Self::Foreground,
-            InputModeArg::Background => Self::Background,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]

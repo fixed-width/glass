@@ -647,7 +647,30 @@ fn resize_was_refused(
     requested_a_change && nothing_moved
 }
 
+fn session_input_support(
+    screen_recording: bool,
+    accessibility: bool,
+) -> glass_core::CapabilityStatus {
+    if !screen_recording {
+        glass_core::CapabilityStatus::requires_setup(crate::permissions::screen_recording_remedy())
+    } else if !accessibility {
+        glass_core::CapabilityStatus::requires_setup(crate::permissions::accessibility_remedy())
+    } else {
+        glass_core::CapabilityStatus::supported()
+    }
+}
+
 impl Platform for MacosPlatform {
+    fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        glass_core::InputCapabilities::uniform(
+            session_input_support(
+                crate::permissions::screen_recording_granted(),
+                crate::permissions::accessibility_granted(),
+            ),
+            glass_core::DesktopInterference::Possible,
+        )
+    }
+
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],
@@ -669,7 +692,6 @@ impl Platform for MacosPlatform {
     /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`]; every other
     /// `run[0]` takes the plain-exec path below.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        spec.input_mode.require_foreground("app start")?;
         Self::run_build(spec)?;
         let run0 = spec
             .run
@@ -1083,6 +1105,27 @@ impl Drop for MacosPlatform {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_input_uses_the_existing_permission_requirements_and_remedies() {
+        for accessibility in [false, true] {
+            let support = session_input_support(false, accessibility);
+            assert_eq!(support.status, glass_core::Support::RequiresSetup);
+            assert_eq!(
+                support.note,
+                Some(crate::permissions::screen_recording_remedy())
+            );
+        }
+        let support = session_input_support(true, false);
+        assert_eq!(support.status, glass_core::Support::RequiresSetup);
+        assert_eq!(
+            support.note,
+            Some(crate::permissions::accessibility_remedy())
+        );
+        let support = session_input_support(true, true);
+        assert_eq!(support.status, glass_core::Support::Supported);
+        assert!(support.note.is_none());
+    }
+
     fn test_platform() -> MacosPlatform {
         MacosPlatform {
             logs: Arc::new(Mutex::new(Vec::new())),
@@ -1095,33 +1138,6 @@ mod tests {
             adopted: None,
             protected_host_paths: Vec::new(),
         }
-    }
-
-    #[test]
-    fn background_start_refuses_before_build_launch_or_permission_setup() {
-        let mut platform = test_platform();
-        let requested = AppSpec {
-            input_mode: glass_core::InputMode::Background,
-            build: Some("exit 91".into()),
-            run: vec!["/bin/false".into()],
-            cwd: None,
-            env: Vec::new(),
-            window_hint: None,
-            timeout_ms: 100,
-            sandbox: glass_core::SandboxLevel::Off,
-            a11y: false,
-        };
-        let error = platform.start_app(&requested).unwrap_err();
-        assert!(matches!(
-            error.cause(),
-            GlassError::UnsupportedInputMode { .. }
-        ));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::NotDispatched)
-        );
-        assert!(platform.child.is_none());
-        assert!(platform.app_pid.is_none());
     }
 
     #[test]
@@ -1334,7 +1350,6 @@ mod tests {
             protected_host_paths: Vec::new(),
         };
         let spec = AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![],
             cwd: None,

@@ -46,7 +46,6 @@ fn an_app_that_dies_on_a_bad_argument_is_caught_without_a_companion() {
     };
 
     let spec = AppSpec {
-        input_mode: Default::default(),
         build: None,
         // The fixture treats an unrecognized `--tab` as fatal.
         run: vec![app, "--tab=no-such-screen".to_string()],

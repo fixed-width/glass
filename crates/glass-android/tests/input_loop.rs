@@ -16,7 +16,6 @@ mod common;
 
 fn settings_spec() -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["com.android.settings/.Settings".to_string()],
         cwd: None,

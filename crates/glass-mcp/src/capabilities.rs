@@ -24,25 +24,12 @@ pub(crate) fn render_session_value(
         .map_err(|error| error.to_string())?;
     let mut value = serde_json::json!(report);
     value["scope"] = serde_json::json!("session");
-    for (operation, tools, restriction) in [
-        (
-            "click",
-            vec!["glass_click", "glass_do"],
-            "coordinate click only: left button, count 1, no modifiers; semantic and ID clicks are unsupported",
-        ),
-        (
-            "scroll",
-            vec!["glass_scroll", "glass_do"],
-            "coordinate vertical scroll only: dx 0, no modifiers; scroll_to_element is unsupported",
-        ),
-        (
-            "text",
-            vec!["glass_type", "glass_key", "glass_do"],
-            "all keyboard and text input is unsupported, including empty text",
-        ),
+    for (operation, tools) in [
+        ("click", vec!["glass_click", "glass_do"]),
+        ("scroll", vec!["glass_scroll", "glass_do"]),
+        ("text", vec!["glass_type", "glass_key", "glass_do"]),
     ] {
-        value["background_input"][operation]["tools"] = serde_json::json!(tools);
-        value["background_input"][operation]["restriction"] = serde_json::json!(restriction);
+        value["input"][operation]["tools"] = serde_json::json!(tools);
     }
     Ok(value)
 }
@@ -52,11 +39,11 @@ pub(crate) fn apply_tool_profile(
     profile: crate::tool_profile::ToolProfile,
 ) {
     value["tool_profile"] = serde_json::json!(profile);
-    if let Some(background) = value
-        .get_mut("background_input")
+    if let Some(input) = value
+        .get_mut("input")
         .and_then(serde_json::Value::as_object_mut)
     {
-        for entry in background.values_mut() {
+        for entry in input.values_mut() {
             if let Some(tools) = entry
                 .get_mut("tools")
                 .and_then(serde_json::Value::as_array_mut)

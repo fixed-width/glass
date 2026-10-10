@@ -1437,7 +1437,6 @@ pub(crate) fn tree_with(win_w: u32, win_h: u32, children: Vec<AxNode>) -> AxTree
 
 pub(crate) fn spec() -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["app".into()],
         cwd: None,

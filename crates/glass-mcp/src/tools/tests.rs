@@ -4,7 +4,6 @@ use glass_core::{AppSpec, Frame, SandboxLevel};
 
 fn start_args() -> StartArgs {
     StartArgs {
-        input_mode: Default::default(),
         build: None,
         run: vec!["app".into()],
         backend: None,
@@ -233,7 +232,6 @@ fn parse_button_maps_and_rejects() {
 fn a11y_snapshot_returns_outline_text() {
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -270,7 +268,6 @@ fn a11y_snapshot_returns_outline_text() {
 fn a11y_snapshot_appends_pixel_hint_when_treeless() {
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), empty_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -304,7 +301,6 @@ fn a11y_snapshot_truncation_steer_is_a_trusted_block_outside_the_untrusted_envel
     // one of glass's own. It gets its own trusted, unwrapped block.
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), truncated_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -361,7 +357,6 @@ fn a11y_snapshot_truncation_steer_is_a_trusted_block_outside_the_untrusted_envel
 fn a11y_snapshot_discloses_an_unpublished_document_as_a_trusted_block() {
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), unpublished_document_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -398,7 +393,6 @@ fn a11y_snapshot_discloses_withheld_content_as_a_trusted_block() {
     tree.unexposed = 1;
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), tree);
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -477,7 +471,6 @@ fn a_snapshot_of_another_app_says_so_in_its_text() {
 fn a11y_snapshot_unsupported_message() {
     let mut g = glass_with(FakePlatform::new(40, 30));
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -496,7 +489,6 @@ fn a11y_snapshot_unsupported_message() {
 fn set_value_tool_ok_and_errors() {
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -653,7 +645,6 @@ fn set_value_without_writable_accessibility_value_guides_keyboard_recovery() {
 #[test]
 fn set_value_tool_rejects_uneditable_and_stale() {
     let spec = AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -716,7 +707,6 @@ fn set_value_tool_rejects_uneditable_and_stale() {
 fn click_element_tool_ok_and_errors() {
     let mut g = glass_with_a11y(FakePlatform::new(100, 100), fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -771,7 +761,6 @@ fn a11y_marks_returns_image_and_legend() {
         FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let mut g = glass_with_a11y(platform, fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -816,7 +805,6 @@ fn a11y_marks_legend_spells_a_description_apart_from_a_name() {
         FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let mut g = glass_with_a11y(platform, tree);
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -854,7 +842,6 @@ fn a11y_marks_legend_untrusted_wrapped_and_image_note_present() {
         FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
     let mut g = glass_with_a11y(platform, fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -913,7 +900,6 @@ fn a11y_marks_legend_untrusted_wrapped_and_image_note_present() {
 pub(crate) fn started_a11y_frames(frames: Vec<glass_core::Frame>) -> Glass {
     let mut g = glass_with_a11y(FakePlatform::new(100, 100).with_frames(frames), fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -974,7 +960,6 @@ fn return_none_is_confirmation_only() {
 fn click_element_discloses_native_action_with_no_fallback() {
     let mut g = glass_with_a11y_invoke_ok(FakePlatform::new(100, 100), fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1012,7 +997,6 @@ fn click_element_names_the_element_it_actuated_instead() {
     // result cannot distinguish "clicked the label" from "clicked the row around it".
     let mut g = glass_with_a11y_invoke_on_another(FakePlatform::new(100, 100), fake_tree(), 7);
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1046,7 +1030,6 @@ fn click_element_names_the_element_it_actuated_instead() {
 fn click_element_omits_actuated_id_when_the_target_itself_was_clicked() {
     let mut g = glass_with_a11y_invoke_ok(FakePlatform::new(100, 100), fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1161,7 +1144,6 @@ fn return_snapshot_discloses_an_unpublished_document_the_same_way_a_snapshot_doe
         unpublished_document_tree(),
     );
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1224,7 +1206,6 @@ fn return_snapshot_settles_before_folding() {
         .with_capture_log(captures.clone());
     let mut g = glass_with_a11y(platform, fake_tree());
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1433,7 +1414,6 @@ fn type_unknown_return_rejected_before_any_keystroke() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut g = glass_with(FakePlatform::new(100, 100).with_event_log(log.clone()));
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1474,7 +1454,6 @@ fn type_observe_failure_says_text_was_typed() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut g = glass_with(FakePlatform::new(100, 100).with_event_log(log.clone()));
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1587,7 +1566,6 @@ fn type_untargeted_preserves_key_by_behavior_and_empty_success_shape() {
 fn list_and_select_window_tools() {
     let mut g = glass_with(FakePlatform::new(320, 240));
     g.start(&AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["x".into()],
         cwd: None,
@@ -1665,7 +1643,6 @@ fn production_application_text_conduits_have_explicit_trust_roles() {
     fn start(glass: &mut Glass) {
         glass
             .start(&AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,

@@ -43,7 +43,6 @@ mod imp {
 
     fn spec(level: SandboxLevel) -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["charmap.exe".to_string()],
             cwd: None,

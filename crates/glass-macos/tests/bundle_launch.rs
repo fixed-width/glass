@@ -182,7 +182,6 @@ mod macos_main {
     /// settings none of the three checks vary.
     fn bundle_spec(run0: impl Into<String>, sandbox: SandboxLevel) -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![run0.into()],
             cwd: None,

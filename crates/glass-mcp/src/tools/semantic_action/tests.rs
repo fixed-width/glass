@@ -358,7 +358,6 @@ fn started_instrumented_glass_with_errors(
     let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
     glass
         .start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,

@@ -21,16 +21,17 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
-- `glass_start` accepts an explicit `input_mode` and returns the chosen mode. Foreground remains
-  the default; background starts are refused before build, launch or existing-session teardown on
-  every shipped backend. `glass_capabilities` adds a read-only `scope: "session"` report for the
-  active mode and background click, scroll and text support.
+- `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
+  including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
+  isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
+  driver limitations, using the same input tools and existing permissions.
 
 - Experimental `glass_a11y_snapshot_diff` in the full tool profile returns fresh, lossless
   compact-outline revisions with full-read recovery, bounded retention and completeness disclosures.
   macOS attests unambiguous read scope; unqualified backends return full observations without retention.
 
 ### Changed
+- `glass_start` rejects unknown parameters instead of silently ignoring them.
 - macOS accessibility snapshots avoid duplicate value reads for checkboxes, radio buttons, and switches while preserving their reported values and checked states.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 

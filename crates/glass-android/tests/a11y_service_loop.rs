@@ -35,7 +35,6 @@ fn a11y_service_snapshot_and_actions() {
     let _stop_agent = common::StopAgent(&agents);
     let mut p = AndroidPlatform::from_env(&EmulatorRegistry::new(), &agents).expect("attach");
     let spec = AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["com.android.settings/.Settings".into()],
         cwd: None,
@@ -120,7 +119,6 @@ fn native_invoke_actuates_the_fixture() {
     });
 
     let spec = |activity: &str| AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec![format!("com.fixedwidth.glassfixture/.{activity}")],
         cwd: None,
@@ -328,7 +326,6 @@ fn companion_semantic_fixture_focuses_one_editable_and_exposes_duplicate_inputs(
     let adb = platform.resolved_adb();
     platform
         .start_app(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![
                 fixture,

@@ -1,7 +1,6 @@
 use crate::session::test_support::*;
 use crate::{
-    BackgroundInputCapabilities, BackgroundOperation, BackgroundProfile, BackgroundSupport,
-    InputMode, Modifier,
+    CapabilityStatus, DesktopInterference, InputCapabilities, InputRoute, Modifier, Support,
 };
 
 type Calls = Arc<Mutex<Vec<&'static str>>>;
@@ -9,7 +8,8 @@ type Calls = Arc<Mutex<Vec<&'static str>>>;
 struct ProbePlatform {
     calls: Calls,
     selected: Option<WindowId>,
-    known_profile: bool,
+    classified: bool,
+    route: InputRoute,
 }
 
 fn geometry() -> WindowGeometry {
@@ -79,21 +79,23 @@ impl Platform for ProbePlatform {
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
         Vec::new()
     }
-    fn background_input_capabilities(&mut self) -> Result<BackgroundInputCapabilities> {
+    fn input_route(&self) -> InputRoute {
+        self.route
+    }
+    fn input_capabilities(&self) -> InputCapabilities {
         self.calls.lock().unwrap().push("capabilities");
-        let supported = BackgroundOperation {
-            status: BackgroundSupport::Supported,
-            reasons: Vec::new(),
-        };
-        Ok(BackgroundInputCapabilities {
-            click: supported.clone(),
-            scroll: supported.clone(),
-            text: supported,
-            profile: self.known_profile.then(|| BackgroundProfile {
-                id: "test adapter".into(),
-                qualification_reference: "unit test only".into(),
-            }),
-        })
+        if self.classified {
+            InputCapabilities::uniform(
+                CapabilityStatus::supported(),
+                if self.route == InputRoute::SharedDesktop {
+                    DesktopInterference::Possible
+                } else {
+                    DesktopInterference::None
+                },
+            )
+        } else {
+            InputCapabilities::unknown()
+        }
     }
 }
 
@@ -102,19 +104,20 @@ fn backend(calls: Calls, selected: Option<WindowId>) -> Backend {
         platform: Box::new(ProbePlatform {
             calls,
             selected,
-            known_profile: true,
+            classified: true,
+            route: InputRoute::SharedDesktop,
         }),
         accessibility: Some(Box::new(FakeAccessibility::new(fake_tree_enabled()))),
     }
 }
 
-fn background(selected: Option<WindowId>) -> (Glass, tempfile::TempDir, Calls, CtxLog) {
-    background_with_profile(selected, true)
+fn targeted(selected: Option<WindowId>) -> (Glass, tempfile::TempDir, Calls, CtxLog) {
+    targeted_with_support(selected, true)
 }
 
-fn background_with_profile(
+fn targeted_with_support(
     selected: Option<WindowId>,
-    known_profile: bool,
+    classified: bool,
 ) -> (Glass, tempfile::TempDir, Calls, CtxLog) {
     let dir = tempfile::tempdir().unwrap();
     let calls: Calls = Arc::default();
@@ -124,26 +127,18 @@ fn background_with_profile(
         platform: Box::new(ProbePlatform {
             calls: calls.clone(),
             selected,
-            known_profile,
+            classified,
+            route: InputRoute::WindowTargeted,
         }),
         accessibility: Some(Box::new(reader)),
     });
-    let mut glass = Glass::new_with_input_modes(
-        Box::new(move |_, mode| {
-            assert_eq!(mode, InputMode::Background);
-            Ok(pending.take().unwrap())
-        }),
-        Box::new(|_, _| Ok(())),
+    let mut glass = Glass::new(
+        Box::new(move |_| Ok(pending.take().unwrap())),
         "fake".into(),
         BaselineStore::new(dir.path()),
         10,
     );
-    glass
-        .start(&AppSpec {
-            input_mode: InputMode::Background,
-            ..spec()
-        })
-        .unwrap();
+    glass.start(&spec()).unwrap();
     calls.lock().unwrap().clear();
     (glass, dir, calls, reads)
 }
@@ -151,13 +146,7 @@ fn background_with_profile(
 fn assert_refusal<T: std::fmt::Debug>(result: Result<T>) {
     let error = result.unwrap_err();
     assert!(
-        matches!(
-            error.cause(),
-            GlassError::UnsupportedInputMode {
-                input_mode: InputMode::Background,
-                ..
-            }
-        ),
+        matches!(error.cause(), GlassError::UnsupportedOperation { .. }),
         "{error:?}"
     );
     assert_eq!(
@@ -168,53 +157,44 @@ fn assert_refusal<T: std::fmt::Debug>(result: Result<T>) {
 }
 
 #[test]
-fn background_start_preserves_session_snapshot_and_epoch_before_factory_or_teardown() {
-    let dir = tempfile::tempdir().unwrap();
-    let calls: Calls = Arc::default();
-    let factory_calls = calls.clone();
-    let mut glass = Glass::new(
-        Box::new(move |_| {
-            factory_calls.lock().unwrap().push("factory");
-            Ok(backend(factory_calls.clone(), Some(WindowId(1))))
-        }),
-        "fake".into(),
-        BaselineStore::new(dir.path()),
-        10,
-    );
-    glass.start(&spec()).unwrap();
-    let tree = glass.a11y_snapshot(None).unwrap();
-    let epoch = glass.observation_epoch();
-    let generation = epoch.generation();
-    calls.lock().unwrap().clear();
-    let requested = AppSpec {
-        input_mode: InputMode::Background,
-        build: Some("must never run".into()),
-        ..spec()
-    };
-    assert_refusal(glass.start(&requested));
-    assert_refusal(glass.start_on("another", &requested));
-    assert_eq!(glass.active_backend(), Some("fake"));
-    assert_eq!(glass.active_input_mode(), Some(InputMode::Foreground));
-    assert_eq!(glass.geometry().unwrap(), geometry());
-    assert_eq!(epoch.generation(), generation);
-    assert_eq!(
-        glass.require_active().unwrap().last_ax.as_ref().unwrap(),
-        &tree
-    );
-    assert!(calls.lock().unwrap().is_empty());
-    glass.click_element(AxNodeId(1)).unwrap();
-    let after = calls.lock().unwrap();
-    assert_eq!(after.iter().filter(|&&call| call == "pointer").count(), 1);
-    assert!(
-        after
-            .iter()
-            .all(|&call| matches!(call, "geometry" | "pointer"))
-    );
+fn ordinary_sessions_keep_typing_and_pointer_operations_without_a_mode() {
+    for route in [InputRoute::Isolated, InputRoute::SharedDesktop] {
+        let dir = tempfile::tempdir().unwrap();
+        let calls: Calls = Arc::default();
+        let mut built = backend(calls.clone(), Some(WindowId(1)));
+        built.platform = Box::new(ProbePlatform {
+            calls: calls.clone(),
+            selected: Some(WindowId(1)),
+            classified: true,
+            route,
+        });
+        let mut pending = Some(built);
+        let mut glass = Glass::new(
+            Box::new(move |_| Ok(pending.take().unwrap())),
+            "fake".into(),
+            BaselineStore::new(dir.path()),
+            10,
+        );
+        glass.start(&spec()).unwrap();
+        calls.lock().unwrap().clear();
+        glass.key(&KeyEvent::Text("normal typing".into())).unwrap();
+        glass.pointer(&PointerEvent::Move { x: 1, y: 1 }).unwrap();
+        glass
+            .pointer(&PointerEvent::Click {
+                x: 1,
+                y: 1,
+                button: MouseButton::Right,
+                count: 2,
+                modifiers: vec![Modifier::Shift],
+            })
+            .unwrap();
+        assert_eq!(&*calls.lock().unwrap(), &["key", "pointer", "pointer"]);
+    }
 }
 
 #[test]
-fn background_pointer_shapes_are_checked_before_backend_input() {
-    let (mut glass, _dir, calls, _) = background(Some(WindowId(1)));
+fn window_targeted_pointer_shapes_are_checked_before_backend_input() {
+    let (mut glass, _dir, calls, _) = targeted(Some(WindowId(1)));
     let click = |button, count, modifiers| PointerEvent::Click {
         x: 20,
         y: 20,
@@ -231,7 +211,10 @@ fn background_pointer_shapes_are_checked_before_backend_input() {
     };
     glass.pointer(&click(MouseButton::Left, 1, vec![])).unwrap();
     glass.pointer(&scroll(0, vec![])).unwrap();
-    assert_eq!(&*calls.lock().unwrap(), &["pointer", "pointer"]);
+    assert_eq!(
+        &*calls.lock().unwrap(),
+        &["capabilities", "pointer", "capabilities", "pointer"]
+    );
     calls.lock().unwrap().clear();
     for event in [
         click(MouseButton::Right, 1, vec![]),
@@ -261,8 +244,8 @@ fn background_pointer_shapes_are_checked_before_backend_input() {
 }
 
 #[test]
-fn background_mutations_refuse_before_reads_focus_and_writes() {
-    let (mut glass, _dir, calls, reads) = background(Some(WindowId(1)));
+fn window_targeted_mutations_refuse_before_reads_focus_and_writes() {
+    let (mut glass, _dir, calls, reads) = targeted(Some(WindowId(1)));
     for event in [
         KeyEvent::Chord("enter".into()),
         KeyEvent::Text("".into()),
@@ -298,8 +281,8 @@ fn background_mutations_refuse_before_reads_focus_and_writes() {
 }
 
 #[test]
-fn background_semantic_modes_refuse_before_resolution_even_for_empty_text() {
-    let (mut glass, _dir, calls, reads) = background(Some(WindowId(1)));
+fn window_targeted_semantic_modes_refuse_before_resolution_even_for_empty_text() {
+    let (mut glass, _dir, calls, reads) = targeted(Some(WindowId(1)));
     let semantic = SemanticTarget {
         target: crate::SemanticSelector::new(Some("Save".into()), None, Vec::new()).unwrap(),
         within: None,
@@ -317,7 +300,7 @@ fn background_semantic_modes_refuse_before_resolution_even_for_empty_text() {
                     max_nodes: None,
                 })
                 .unwrap_err();
-            assert_eq!(error.kind, SemanticActionFailureKind::UnsupportedInputMode);
+            assert_eq!(error.kind, SemanticActionFailureKind::UnsupportedOperation);
             assert!(error.resolution.is_none());
             assert!(!error.side_effects_may_have_occurred());
             let error = glass
@@ -330,7 +313,7 @@ fn background_semantic_modes_refuse_before_resolution_even_for_empty_text() {
                     "",
                 )
                 .unwrap_err();
-            assert_eq!(error.kind, SemanticActionFailureKind::UnsupportedInputMode);
+            assert_eq!(error.kind, SemanticActionFailureKind::UnsupportedOperation);
             assert!(error.resolution.is_none());
         }
         let error = glass
@@ -344,7 +327,7 @@ fn background_semantic_modes_refuse_before_resolution_even_for_empty_text() {
                 "",
             )
             .unwrap_err();
-        assert_eq!(error.kind, SemanticActionFailureKind::UnsupportedInputMode);
+        assert_eq!(error.kind, SemanticActionFailureKind::UnsupportedOperation);
         assert!(error.resolution.is_none());
         assert!(error.focus.is_none());
     }
@@ -353,9 +336,9 @@ fn background_semantic_modes_refuse_before_resolution_even_for_empty_text() {
 }
 
 #[test]
-fn background_selection_only_refreshes_the_same_reliably_identified_window() {
+fn window_targeted_selection_only_refreshes_the_same_reliably_identified_window() {
     for selected in [Some(WindowId(1)), None] {
-        let (mut glass, _dir, calls, _) = background(selected);
+        let (mut glass, _dir, calls, _) = targeted(selected);
         let epoch = glass.observation_epoch();
         let generation = epoch.generation();
         assert_refusal(glass.select_window(WindowId(2)));
@@ -371,26 +354,22 @@ fn background_selection_only_refreshes_the_same_reliably_identified_window() {
 }
 
 #[test]
-fn session_capabilities_are_read_only_and_never_authorize_background_text() {
-    let (mut glass, _dir, calls, reads) = background(Some(WindowId(1)));
-    assert_eq!(glass.active_input_mode(), Some(InputMode::Background));
+fn session_capabilities_are_read_only_and_limit_only_window_targeted_text() {
+    let (mut glass, _dir, calls, reads) = targeted(Some(WindowId(1)));
     let epoch = glass.observation_epoch();
     let generation = epoch.generation();
     let report = glass.session_capabilities().unwrap();
-    assert_eq!(report.input_mode, InputMode::Background);
+    assert_eq!(report.input.click.support.status, Support::Supported);
     assert_eq!(
-        report.background_input.click.status,
-        BackgroundSupport::Supported
+        report.input.click.desktop_interference,
+        DesktopInterference::None
     );
-    assert_eq!(
-        report.background_input.text.status,
-        BackgroundSupport::Unsupported
-    );
+    assert_eq!(report.input.text.support.status, Support::Unsupported);
+    assert!(report.input.click.restriction.unwrap().contains("semantic"));
     assert_eq!(&*calls.lock().unwrap(), &["capabilities"]);
     assert_eq!(epoch.generation(), generation);
     assert!(reads.lock().unwrap().is_none());
     glass.stop().unwrap();
-    assert_eq!(glass.active_input_mode(), None);
     assert!(matches!(
         glass.session_capabilities(),
         Err(GlassError::NoActiveSession)
@@ -398,29 +377,92 @@ fn session_capabilities_are_read_only_and_never_authorize_background_text() {
 }
 
 #[test]
-fn a_platform_without_a_background_route_reports_unsupported_without_actuation() {
+fn an_unclassified_platform_does_not_claim_input_support_or_isolation() {
     let calls: Calls = Arc::default();
-    let mut platform = FakePlatform::new(100, 100).with_event_log(calls.clone());
-    let report = platform.background_input_capabilities().unwrap();
-    assert!(report.profile.is_none());
+    let platform = FakePlatform::new(100, 100).with_event_log(calls.clone());
+    assert_eq!(platform.input_route(), InputRoute::SharedDesktop);
+    let report = platform.input_capabilities();
     for operation in [report.click, report.scroll, report.text] {
-        assert_eq!(operation.status, BackgroundSupport::Unsupported);
-        assert!(!operation.reasons.is_empty());
+        assert_eq!(operation.support.status, Support::Unsupported);
+        assert_eq!(operation.desktop_interference, DesktopInterference::Unknown);
+        assert!(operation.support.note.is_some());
+        assert!(operation.restriction.is_none());
     }
     assert!(calls.lock().unwrap().is_empty());
 }
 
 #[test]
-fn session_capabilities_without_a_qualification_profile_cannot_claim_support() {
-    let (mut glass, _dir, _calls, _) = background_with_profile(Some(WindowId(1)), false);
+fn unqualified_window_targeted_support_remains_unavailable() {
+    let (glass, _dir, _calls, _) = targeted_with_support(Some(WindowId(1)), false);
     let report = glass.session_capabilities().unwrap();
-    assert!(report.background_input.profile.is_none());
-    assert_eq!(
-        report.background_input.click.status,
-        BackgroundSupport::Unsupported
-    );
-    assert_eq!(
-        report.background_input.scroll.status,
-        BackgroundSupport::Unsupported
-    );
+    assert_eq!(report.input.click.support.status, Support::Unsupported);
+    assert_eq!(report.input.scroll.support.status, Support::Unsupported);
+}
+
+#[test]
+fn targeted_shape_still_requires_current_non_interfering_support() {
+    let (mut glass, _dir, calls, _) = targeted_with_support(Some(WindowId(1)), false);
+    assert_refusal(glass.pointer(&PointerEvent::Click {
+        x: 1,
+        y: 1,
+        button: MouseButton::Left,
+        count: 1,
+        modifiers: vec![],
+    }));
+    assert_refusal(glass.pointer(&PointerEvent::Scroll {
+        x: 1,
+        y: 1,
+        dx: 0,
+        dy: 1,
+        modifiers: vec![],
+    }));
+    assert_eq!(&*calls.lock().unwrap(), &["capabilities", "capabilities"]);
+}
+
+#[test]
+fn targeted_input_requires_both_supported_status_and_no_desktop_interference() {
+    for interference in [DesktopInterference::Possible, DesktopInterference::Unknown] {
+        let capability =
+            crate::InputOperationCapability::new(CapabilityStatus::supported(), interference);
+        assert_refusal(super::require_targeted_support(capability, "click"));
+    }
+    for support in [
+        CapabilityStatus::degraded("partial"),
+        CapabilityStatus::requires_setup("setup"),
+        CapabilityStatus::unsupported(Some("unsupported")),
+    ] {
+        let capability = crate::InputOperationCapability::new(support, DesktopInterference::None);
+        assert_refusal(super::require_targeted_support(capability, "scroll"));
+    }
+}
+
+#[test]
+fn targeted_capability_reporting_agrees_with_admission_for_partial_or_interfering_input() {
+    for support in [
+        CapabilityStatus::supported(),
+        CapabilityStatus::degraded("partial"),
+        CapabilityStatus::requires_setup("setup"),
+        CapabilityStatus::unsupported(Some("unsupported")),
+    ] {
+        for interference in [
+            DesktopInterference::None,
+            DesktopInterference::Possible,
+            DesktopInterference::Unknown,
+        ] {
+            let mut report = InputCapabilities::uniform(support, interference);
+            report.restrict_window_targeted();
+            let admitted = super::require_targeted_support(report.click.clone(), "click").is_ok();
+            assert_eq!(
+                admitted,
+                support.status == Support::Supported && interference == DesktopInterference::None
+            );
+            if support.status == Support::RequiresSetup {
+                assert_eq!(report.click.support.status, Support::RequiresSetup);
+                assert_eq!(report.click.support.note, Some("setup"));
+            } else if !admitted {
+                assert_eq!(report.click.support.status, Support::Unsupported);
+            }
+            assert_eq!(report.text.support.status, Support::Unsupported);
+        }
+    }
 }

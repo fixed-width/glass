@@ -914,7 +914,6 @@ mod macos_main {
         }
         run.push(url.to_string());
         Ok(AppSpec {
-            input_mode: Default::default(),
             build: None,
             run,
             cwd: None,
@@ -1099,7 +1098,6 @@ mod macos_main {
     fn probe_timing(lever: Lever) -> Result<(), String> {
         println!("\n=== macos / {TIMING_APP} / lever={lever:?} (side-effect reading) ===");
         let spec = AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![TIMING_APP.to_string()],
             cwd: None,

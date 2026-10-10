@@ -83,7 +83,7 @@ pub(crate) enum SafeErrorCategory {
     UnstableTarget,
     FocusUnconfirmed,
     UnsupportedMode,
-    UnsupportedInputMode,
+    UnsupportedOperation,
     NoActiveSession,
     StaleElement,
     NotEditable,
@@ -104,7 +104,7 @@ impl SafeErrorCategory {
         }
 
         match error.cause() {
-            glass_core::GlassError::UnsupportedInputMode { .. } => Self::UnsupportedInputMode,
+            glass_core::GlassError::UnsupportedOperation { .. } => Self::UnsupportedOperation,
             glass_core::GlassError::NoActiveSession => Self::NoActiveSession,
             glass_core::GlassError::NoAxSnapshot
             | glass_core::GlassError::AxElementNotFound(_)
@@ -137,8 +137,8 @@ impl SafeErrorCategory {
             Self::UnstableTarget => "semantic target is unstable",
             Self::FocusUnconfirmed => "target focus was not confirmed",
             Self::UnsupportedMode => "semantic action mode is unsupported",
-            Self::UnsupportedInputMode => {
-                "operation is unsupported in background input mode; start a foreground session"
+            Self::UnsupportedOperation => {
+                "operation is unsupported by this session; inspect session capabilities"
             }
             Self::NoActiveSession => "no active session",
             Self::StaleElement => "element is stale or missing",
@@ -167,7 +167,7 @@ impl SafeErrorCategory {
             Self::UnstableTarget => "unstable_target",
             Self::FocusUnconfirmed => "focus_unconfirmed",
             Self::UnsupportedMode => "unsupported_mode",
-            Self::UnsupportedInputMode => "unsupported_input_mode",
+            Self::UnsupportedOperation => "unsupported_operation",
             Self::NoActiveSession => "no_active_session",
             Self::StaleElement => "stale_element",
             Self::NotEditable => "not_editable",
@@ -256,14 +256,14 @@ impl ContextualError {
             },
             sequence_deadline_exceeded: error.bound_owner() == Some(glass_core::Whose::Caller),
             bound_dispatch,
-            result: input_mode_failure(&error),
+            result: unsupported_operation_failure(&error),
             siblings: Vec::new(),
             post_write,
         }
     }
 
     fn standalone_message(self, tool: &'static str) -> String {
-        if self.category == SafeErrorCategory::UnsupportedInputMode {
+        if self.category == SafeErrorCategory::UnsupportedOperation {
             json!({
                 "ok": false,
                 "tool": tool,
@@ -277,7 +277,7 @@ impl ContextualError {
 
     pub fn from_core(error: glass_core::GlassError, context: ToolContext) -> Self {
         let out = Self::from_error(error);
-        if out.category != SafeErrorCategory::UnsupportedInputMode
+        if out.category != SafeErrorCategory::UnsupportedOperation
             && context.owner == Some(glass_core::Whose::Caller)
             && context.deadline.has_passed()
         {
@@ -298,7 +298,7 @@ impl ContextualError {
     ) -> Self {
         let bounded = error.bound().is_some();
         let mut out = Self::from_error(error);
-        if out.category != SafeErrorCategory::UnsupportedInputMode
+        if out.category != SafeErrorCategory::UnsupportedOperation
             && context.owner == Some(glass_core::Whose::Caller)
             && context.deadline.has_passed()
         {
@@ -511,15 +511,13 @@ fn floor_from_var(v: Result<String, std::env::VarError>) -> Result<Option<String
     }
 }
 
-pub(crate) fn input_mode_failure(error: &glass_core::GlassError) -> Option<serde_json::Value> {
-    if let glass_core::GlassError::UnsupportedInputMode {
-        input_mode,
-        operation,
-    } = error.cause()
-    {
+pub(crate) fn unsupported_operation_failure(
+    error: &glass_core::GlassError,
+) -> Option<serde_json::Value> {
+    if let glass_core::GlassError::UnsupportedOperation { operation, reason } = error.cause() {
         let not_dispatched = error.bound_dispatch() == Some(BoundDispatch::NotDispatched);
         Some(json!({
-            "input_mode": input_mode,
+            "reason": reason,
             "operation": operation,
             "dispatch": if not_dispatched { "not_dispatched" } else { "may_have_dispatched" },
             "side_effects_may_have_occurred": !not_dispatched,
@@ -548,7 +546,6 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         floor_env.as_deref(),
     )?;
     let mut spec = AppSpec {
-        input_mode: a.input_mode.map(Into::into).unwrap_or_default(),
         build: a.build.clone(),
         run: a.run.clone(),
         cwd: a.cwd.clone().map(PathBuf::from),
@@ -580,9 +577,7 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         None => glass.start(&spec),
     }
     .map_err(|error| core_error_message("glass_start", error))?;
-    let mut result = geometry_value(&geo);
-    result["input_mode"] = json!(spec.input_mode);
-    Ok(ToolOutput::result("glass_start", result))
+    Ok(ToolOutput::result("glass_start", geometry_value(&geo)))
 }
 
 pub fn stop(glass: &mut Glass) -> ToolResult {
@@ -1073,6 +1068,6 @@ mod wait;
 pub(crate) mod testutil;
 
 #[cfg(test)]
-mod input_mode_tests;
+mod session_input_tests;
 #[cfg(test)]
 mod tests;

@@ -375,7 +375,6 @@ async fn verification_cost_semantic_beats_screenshot() {
 fn start_fixture_sync(glass: &mut Glass) {
     let (build, run, cwd) = mcp_cost::fixture_run_spec();
     let spec = AppSpec {
-        input_mode: Default::default(),
         build: Some(build),
         run: vec![run],
         cwd: Some(PathBuf::from(cwd)),

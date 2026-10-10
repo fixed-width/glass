@@ -32,7 +32,6 @@ pub fn run(platform: &mut MacosPlatform, fixture: &Path) -> Result<(), String> {
     with_stop_app(platform, "identity fixture", |platform| {
         let window = try_expect(
             platform.start_app(&AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec![
                     fixture.to_string_lossy().into_owned(),

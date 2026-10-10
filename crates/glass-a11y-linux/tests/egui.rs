@@ -59,7 +59,6 @@ fn missing_editable_text_refuses_before_dispatch_and_keyboard_recovery_works() {
     );
     glass
         .start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![fixture.to_string_lossy().into_owned()],
             cwd: None,

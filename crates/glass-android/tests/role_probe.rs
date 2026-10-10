@@ -224,7 +224,6 @@ fn probe_targets() -> Option<Vec<String>> {
 /// read ambiently, its value selects nothing and neither reader depends on it.
 fn spec_for(component: &str) -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec![component.to_string()],
         cwd: None,

@@ -79,7 +79,6 @@ impl Harness {
             .expect("clear fake-backend protection paths");
         glass
             .start(&glass_core::AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,
@@ -481,7 +480,6 @@ async fn oversized_snapshot_link_reads_exact_resource_over_http() {
             .expect("clear fake-backend protection paths");
         glass
             .start(&glass_core::AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,

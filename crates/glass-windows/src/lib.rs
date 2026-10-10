@@ -321,6 +321,13 @@ mod backend {
     }
 
     impl Platform for WindowsPlatform {
+        fn input_capabilities(&self) -> glass_core::InputCapabilities {
+            glass_core::InputCapabilities::uniform(
+                glass_core::CapabilityStatus::supported(),
+                glass_core::DesktopInterference::Possible,
+            )
+        }
+
         fn configure_protected_host_paths(
             &mut self,
             paths: &[ProtectedHostPath],
@@ -330,7 +337,6 @@ mod backend {
         }
 
         fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-            spec.input_mode.require_foreground("app start")?;
             // Resolve the containment provider before doing any work. `off` → Unconfined
             // (today's direct spawn); `default`/`strict` require an in-OS provider and
             // fail closed while Sandboxie availability is stubbed false (a later task).

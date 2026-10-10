@@ -47,7 +47,7 @@ impl Glass {
     }
 
     pub fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
-        if self.require_active()?.input_mode == crate::InputMode::Background {
+        if self.require_active()?.input_route == crate::InputRoute::WindowTargeted {
             let current = self.require_active()?.platform.observation_window_id();
             if current != Some(id) {
                 self.check_mutation(super::admission::Mutation::SelectWindow)?;

@@ -195,7 +195,6 @@ mod tests {
 
     fn spec() -> AppSpec {
         AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,

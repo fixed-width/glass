@@ -82,6 +82,9 @@ remove glass entirely.
 
 - **System requirements:** macOS 14+, developed and tested on Apple Silicon (the `.dmg` is universal,
   but Intel Macs aren't yet verified). Full list in [reference/platforms.md](../reference/platforms.md).
+- **Desktop interaction:** current native input can activate the target and move your pointer.
+  `glass_capabilities` with `scope: "session"` reports support and desktop interference. The existing
+  Accessibility grant authorizes control; no additional input-mode setting or permission is needed.
 - **Permissions:** why the two grants behave the way they do — surviving rebuilds, needing a relaunch to
   take effect — is explained in [the permission model](../explanation/macos-permissions.md).
 - **Sandboxing:** launched apps run under Seatbelt by default; the profile and the clipboard-isolation

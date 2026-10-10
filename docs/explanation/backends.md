@@ -57,8 +57,23 @@ through `simctl` without opening the Simulator app, so the app it drives never a
 
 On **Windows**, isolation is weaker. There is one interactive desktop, and even a virtual-display
 driver only adds a monitor to *that* desktop rather than walling the app off — for full isolation you
-run glass inside a VM. On **macOS**, glass drives the real Aqua session today; display isolation is
-planned.
+run glass inside a VM. On **macOS**, glass drives the real Aqua session today.
+
+## Input while you use your desktop
+
+The normal click, scroll and typing tools already leave your desktop alone when their input goes
+into an owned Linux display, Android emulator or iOS Simulator. The target can acquire focus and
+move its pointer inside that environment without changing your host pointer or foreground app.
+Native macOS and Windows input currently uses your interactive desktop and can interfere with it.
+macOS's existing Accessibility grant authorizes that control; it does not establish input isolation.
+
+`glass_capabilities` with `scope: "session"` reports ordinary click, scroll and text support alongside
+`desktop_interference: "none" | "possible" | "unknown"`. This reflects the active environment and
+connected input driver. An explicitly attached X11 display is conservatively shared because Glass
+did not create it. Supported input inside an owned display/device reports `none`; shared desktop
+input reports `possible`. An unclassified backend reports `unknown` rather than claiming isolation.
+There is no caller-selected input mode. These facts describe dispatch after startup; launching an
+app, copying through a shared clipboard and filesystem/network access have separate boundaries.
 
 ## The live-desktop non-goal on Wayland
 

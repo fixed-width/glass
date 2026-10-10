@@ -34,7 +34,6 @@ mod tests {
     fn started() -> Glass {
         let mut g = glass_with(FakePlatform::new(100, 100));
         let a = StartArgs {
-            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             backend: None,

@@ -1898,7 +1898,6 @@ mod tests {
             .expect("clear fake-backend-only protection paths");
         glass
             .start(&glass_core::AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,
@@ -2344,7 +2343,6 @@ mod tests {
         );
         glass
             .start(&glass_core::AppSpec {
-                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,
@@ -2646,113 +2644,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_capabilities_handler_keeps_foreground_support_and_mode_refusal_structured() {
-        let paths = std::sync::Arc::default();
-        let glass = crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform {
-            protected_paths: Some(paths),
-            ..crate::tools::testutil::FakePlatform::new(100, 100)
-        });
-        let server = GlassServer::new(glass, crate::audit::report_from_config(None, |_| None));
-        let output = server
-            .glass_capabilities(Parameters(CapabilitiesArgs {
-                scope: Some(CapabilitiesScope::Session),
-                backend: None,
-            }))
-            .await
-            .unwrap();
-        assert_eq!(output.is_error, Some(true));
-        let start: StartArgs =
-            serde_json::from_value(serde_json::json!({"run": ["app"], "a11y": false})).unwrap();
-        assert_eq!(
-            server
-                .glass_start(Parameters(start))
+    async fn session_capabilities_handler_reports_existing_input_and_desktop_effects() {
+        for route in [
+            glass_core::InputRoute::Isolated,
+            glass_core::InputRoute::SharedDesktop,
+        ] {
+            let glass = crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform {
+                protected_paths: Some(std::sync::Arc::default()),
+                ..crate::tools::testutil::FakePlatform::new(100, 100).with_input_route(route)
+            });
+            let server = GlassServer::new(glass, crate::audit::report_from_config(None, |_| None));
+            let output = server
+                .glass_capabilities(Parameters(CapabilitiesArgs {
+                    scope: Some(CapabilitiesScope::Session),
+                    backend: None,
+                }))
                 .await
-                .unwrap()
-                .is_error,
-            Some(false)
-        );
-        let output = server
-            .glass_capabilities(Parameters(CapabilitiesArgs {
-                scope: Some(CapabilitiesScope::Session),
-                backend: None,
-            }))
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&first_text(&output)).unwrap();
-        assert_eq!(value["result"]["input_mode"], "foreground");
-        assert_eq!(
-            value["result"]["background_input"]["click"]["status"],
-            "unsupported"
-        );
-        let start: StartArgs = serde_json::from_value(
-            serde_json::json!({"run": ["app"], "input_mode": "background", "a11y": false}),
-        )
-        .unwrap();
-        let output = server.glass_start(Parameters(start)).await.unwrap();
-        assert_eq!(output.is_error, Some(true));
-        let value: serde_json::Value = serde_json::from_str(&first_text(&output)).unwrap();
-        assert_eq!(value["error"]["code"], "unsupported_input_mode");
-        assert_eq!(value["result"]["dispatch"], "not_dispatched");
-        assert_eq!(value["result"]["side_effects_may_have_occurred"], false);
+                .unwrap();
+            assert_eq!(output.is_error, Some(true));
+            let start =
+                serde_json::from_value(serde_json::json!({"run": ["app"], "a11y": false})).unwrap();
+            let output = server.glass_start(Parameters(start)).await.unwrap();
+            assert_eq!(output.is_error, Some(false));
+            let started: serde_json::Value = serde_json::from_str(&first_text(&output)).unwrap();
+            assert!(started["result"].get("input_mode").is_none());
+            let output = server
+                .glass_capabilities(Parameters(CapabilitiesArgs {
+                    scope: Some(CapabilitiesScope::Session),
+                    backend: None,
+                }))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&first_text(&output)).unwrap();
+            assert_eq!(value["result"]["input"]["text"]["status"], "supported");
+            assert_eq!(
+                value["result"]["input"]["text"]["desktop_interference"],
+                if route == glass_core::InputRoute::Isolated {
+                    "none"
+                } else {
+                    "possible"
+                }
+            );
+        }
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn trace_retains_background_mode_refusal_without_claiming_dispatch() {
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let config = crate::trace::TraceConfig::new(root.path().to_owned(), None).unwrap();
-        let glass =
-            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
-        let server = GlassServer::new_configured(
-            glass,
-            crate::audit::report_from_config(None, |_| None),
-            ToolProfile::Full,
-            Some(&config),
-            "test",
-        )
-        .unwrap();
-        let trace = server.trace_recorder().unwrap();
-        let call = trace.begin_call("glass_start", 1).unwrap();
-        let args: StartArgs = serde_json::from_value(
-            serde_json::json!({"run": ["app"], "input_mode": "background", "a11y": false}),
-        )
-        .unwrap();
-        let response = crate::trace::ACTIVE_CALL
-            .scope(call, server.glass_start(Parameters(args)))
-            .await
-            .unwrap();
-        assert_eq!(response.is_error, Some(true));
-        trace.close().await;
-        let events = std::fs::read_to_string(trace.path().join("events.jsonl")).unwrap();
-        let logical: serde_json::Value = events
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|event| event["kind"] == "logical_outcome")
-            .unwrap();
-        assert_eq!(logical["data"]["is_error"], true);
-        let evidence = logical["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["payload"].is_object())
-            .unwrap();
-        let bytes = std::fs::read(
-            trace
-                .path()
-                .join(evidence["payload"]["path"].as_str().unwrap()),
-        )
-        .unwrap();
-        let refusal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(refusal["error"]["code"], "unsupported_input_mode");
-        assert_eq!(refusal["result"]["dispatch"], "not_dispatched");
-        assert_eq!(refusal["result"]["side_effects_may_have_occurred"], false);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn scroll_to_element_handler_and_trace_preserve_background_refusal() {
+    async fn scroll_to_element_handler_and_trace_preserve_operation_refusal() {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2761,16 +2699,16 @@ mod tests {
         let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
         let mut platform = Some(crate::tools::testutil::FakePlatform {
             protected_paths: Some(std::sync::Arc::default()),
-            ..crate::tools::testutil::FakePlatform::new(100, 100).with_event_log(events.clone())
+            ..crate::tools::testutil::FakePlatform::new(100, 100)
+                .with_event_log(events.clone())
+                .with_input_route(glass_core::InputRoute::WindowTargeted)
         });
-        let glass = Glass::new_with_input_modes(
-            Box::new(move |_, mode| {
-                assert_eq!(mode, glass_core::InputMode::Background);
+        let glass = Glass::new(
+            Box::new(move |_| {
                 Ok(glass_core::Backend::display_only(Box::new(
                     platform.take().unwrap(),
                 )))
             }),
-            Box::new(|_, _| Ok(())),
             "fake".into(),
             glass_core::BaselineStore::new(baselines.path()),
             10,
@@ -2783,10 +2721,8 @@ mod tests {
             "test",
         )
         .unwrap();
-        let start = serde_json::from_value(
-            serde_json::json!({"run": ["app"], "input_mode": "background", "a11y": false}),
-        )
-        .unwrap();
+        let start =
+            serde_json::from_value(serde_json::json!({"run": ["app"], "a11y": false})).unwrap();
         assert_eq!(
             server
                 .glass_start(Parameters(start))
@@ -2805,8 +2741,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.is_error, Some(true));
         let refusal: serde_json::Value = serde_json::from_str(&first_text(&response)).unwrap();
-        assert_eq!(refusal["error"]["code"], "unsupported_input_mode");
-        assert_eq!(refusal["result"]["input_mode"], "background");
+        assert_eq!(refusal["error"]["code"], "unsupported_operation");
+        assert!(refusal["result"].get("input_mode").is_none());
         assert_eq!(refusal["result"]["operation"], "scroll to element");
         assert_eq!(refusal["result"]["dispatch"], "not_dispatched");
         assert_eq!(refusal["result"]["side_effects_may_have_occurred"], false);

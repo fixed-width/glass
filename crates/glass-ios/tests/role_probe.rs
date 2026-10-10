@@ -241,7 +241,6 @@ fn role_histogram_probe() {
 
     for target in targets {
         let spec = AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec![target.to_string()],
             cwd: None,

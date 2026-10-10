@@ -235,7 +235,6 @@ fn browser_spec(exe: &str, profile: &str) -> AppSpec {
         ]
     };
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run,
         cwd: None,
@@ -258,7 +257,6 @@ fn browser_spec(exe: &str, profile: &str) -> AppSpec {
 /// pid-set membership.
 fn notepad_spec(file: &str) -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["notepad.exe".to_string(), file.to_string()],
         cwd: None,

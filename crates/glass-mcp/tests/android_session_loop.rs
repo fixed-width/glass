@@ -337,7 +337,6 @@ fn a_session_click_reports_the_native_accessibility_action() {
     let mut glass = session_glass(&device);
     glass
         .start(&AppSpec {
-            input_mode: Default::default(),
             build: None,
             run: vec!["com.fixedwidth.glassfixture/.InvokeViewFixtureActivity".to_string()],
             cwd: None,

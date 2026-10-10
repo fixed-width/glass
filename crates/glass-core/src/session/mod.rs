@@ -54,7 +54,7 @@ pub use wait::{
 };
 
 struct ActiveSession {
-    input_mode: crate::InputMode,
+    input_route: crate::InputRoute,
     backend: String,
     platform: Box<dyn Platform + Send>,
     // Held here so the session owns the backend's accessibility reader and the
@@ -103,20 +103,12 @@ impl Backend {
 /// stays platform-agnostic.
 pub type PlatformFactory = Box<dyn FnMut(&str) -> Result<Backend> + Send>;
 
-/// Constructs a backend for an already admitted session mode.
-pub type ModeAwarePlatformFactory =
-    Box<dyn FnMut(&str, crate::InputMode) -> Result<Backend> + Send>;
-
-/// Checks mode admission without constructing a backend or touching the target.
-pub type InputModePreflight = Box<dyn Fn(&str, crate::InputMode) -> Result<()> + Send>;
-
 /// The session manager: builds the active app's backend on demand, owns its
 /// geometry/logs and the baseline store, and routes tool ops to the backend with
 /// validation and log pumping. One active session at a time (v1); the backend is
 /// chosen per session via the factory.
 pub struct Glass {
-    factory: ModeAwarePlatformFactory,
-    input_mode_preflight: InputModePreflight,
+    factory: PlatformFactory,
     default_backend: String,
     baselines: BaselineStore,
     log_capacity: usize,
@@ -132,36 +124,14 @@ impl Glass {
     pub fn active_backend(&self) -> Option<&str> {
         self.active.as_ref().map(|session| session.backend.as_str())
     }
-    pub fn active_input_mode(&self) -> Option<crate::InputMode> {
-        self.active.as_ref().map(|session| session.input_mode)
-    }
     pub fn new(
-        mut factory: PlatformFactory,
-        default_backend: String,
-        baselines: BaselineStore,
-        log_capacity: usize,
-    ) -> Self {
-        Self::new_with_input_modes(
-            Box::new(move |backend, _mode| factory(backend)),
-            Box::new(|_backend, mode| mode.require_foreground("session start")),
-            default_backend,
-            baselines,
-            log_capacity,
-        )
-    }
-
-    /// Mode-aware construction with non-actuating preflight before invalidation,
-    /// teardown, backend construction, build, or launch.
-    pub fn new_with_input_modes(
-        factory: ModeAwarePlatformFactory,
-        input_mode_preflight: InputModePreflight,
+        factory: PlatformFactory,
         default_backend: String,
         baselines: BaselineStore,
         log_capacity: usize,
     ) -> Self {
         Self {
             factory,
-            input_mode_preflight,
             default_backend,
             baselines,
             log_capacity: log_capacity.max(1),

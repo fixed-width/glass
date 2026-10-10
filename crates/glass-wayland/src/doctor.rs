@@ -520,7 +520,6 @@ fn probe_sway_within(sway: &Path, budget: Duration) -> SwaySpawn {
     };
     let config = rt.path().join("sway.cfg");
     let spec = AppSpec {
-        input_mode: Default::default(),
         build: None,
         // Exits immediately, on purpose: the readiness loop breaks as soon as IPC answers, which
         // is before sway has finished `exec`ing its client, so a tree snapshot can miss one that

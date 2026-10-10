@@ -181,7 +181,7 @@ pub enum SemanticActionFailureKind {
     UnstableTarget,
     FocusUnconfirmed,
     UnsupportedMode,
-    UnsupportedInputMode,
+    UnsupportedOperation,
     ActionDeadlineExceeded,
     SequenceDeadlineExceeded,
     ActionFailed,
@@ -199,7 +199,7 @@ impl SemanticActionFailureKind {
             Self::UnstableTarget => "unstable_target",
             Self::FocusUnconfirmed => "focus_unconfirmed",
             Self::UnsupportedMode => "unsupported_mode",
-            Self::UnsupportedInputMode => "unsupported_input_mode",
+            Self::UnsupportedOperation => "unsupported_operation",
             Self::ActionDeadlineExceeded => "action_deadline_exceeded",
             Self::SequenceDeadlineExceeded => "sequence_deadline_exceeded",
             Self::ActionFailed => "action_failed",
@@ -443,10 +443,10 @@ fn request_error(summary: &'static str, sequence_deadline: Deadline) -> Box<Sema
 }
 
 fn input_admission_error(source: GlassError, deadline: Deadline) -> Box<SemanticActionError> {
-    let (kind, summary) = if matches!(source.cause(), GlassError::UnsupportedInputMode { .. }) {
+    let (kind, summary) = if matches!(source.cause(), GlassError::UnsupportedOperation { .. }) {
         (
-            SemanticActionFailureKind::UnsupportedInputMode,
-            "operation is unsupported in background input mode; start a foreground session",
+            SemanticActionFailureKind::UnsupportedOperation,
+            "operation is unsupported by this session; inspect session capabilities",
         )
     } else {
         (

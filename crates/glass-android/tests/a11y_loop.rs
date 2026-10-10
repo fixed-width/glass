@@ -22,7 +22,6 @@ use glass_core::{
 
 fn settings_spec() -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec!["com.android.settings/.Settings".to_string()],
         cwd: None,
@@ -667,7 +666,6 @@ const POST_TAP_SETTLE: std::time::Duration = std::time::Duration::from_millis(50
 
 fn web_fixture_spec() -> AppSpec {
     AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec![WEB_FIXTURE.to_string()],
         cwd: None,
@@ -822,7 +820,6 @@ fn uiautomator_semantic_fixture_exposes_unique_and_duplicate_resolution_inputs()
     let fixture = std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK")
         .expect("set GLASS_ANDROID_ROLE_FIXTURE_APK");
     let mut session = Session::start_spec(AppSpec {
-        input_mode: Default::default(),
         build: None,
         run: vec![
             fixture,
