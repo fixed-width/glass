@@ -165,6 +165,8 @@ jobs:
       # `-p glass-macos --lib` run is repeated by the workspace step below — kept because this
       # script is the standalone entry point on a dev box, where nothing else runs them.
       - run: ./scripts/test-macos.sh
+      - name: Check read-only native qualification diagnostics
+        run: cargo clippy -p glass-macos --all-targets --all-features --locked -- -D warnings
       # `--lib` rather than plain `--workspace`: it excludes the harness = false integration
       # targets, which need the TCC grants this runner lacks.
       - run: cargo test --workspace --lib --locked
