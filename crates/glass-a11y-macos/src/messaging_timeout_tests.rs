@@ -1,6 +1,6 @@
 use crate::messaging_timeout::{
     AxMessaging, TimeoutOwner, with_doctor_timeout_by as production_doctor,
-    with_window_query_by as production_window_query,
+    with_read_only_by as production_read_only, with_window_query_by as production_window_query,
 };
 use glass_core::{BoundDispatch, BoundKind, Deadline, GlassError, Result, Whose};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -385,7 +385,7 @@ fn doctor_waits_for_a_window_restore_before_installing_its_timeout() {
 }
 
 #[test]
-fn production_doctor_and_window_wrappers_share_one_owner_in_both_interleavings() {
+fn production_doctor_window_and_read_only_wrappers_share_one_owner() {
     let ax = Arc::new(FakeAx::default());
     let (doctor_entered_tx, doctor_entered_rx) = mpsc::channel();
     let (release_doctor_tx, release_doctor_rx) = mpsc::channel();
@@ -423,6 +423,12 @@ fn production_doctor_and_window_wrappers_share_one_owner_in_both_interleavings()
         error.bound_dispatch(),
         Some(BoundDispatch::MayHaveDispatched)
     );
+    let error = production_read_only(ax.as_ref(), Deadline::from_millis(25), |_| -> Result<()> {
+        panic!("read-only wrapper bypassed the doctor gate")
+    })
+    .unwrap_err();
+    assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+    assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
     release_doctor_tx.send(()).unwrap();
     doctor.join().unwrap();
 
@@ -471,6 +477,36 @@ fn production_doctor_and_window_wrappers_share_one_owner_in_both_interleavings()
         .recv_timeout(Duration::from_secs(2))
         .unwrap();
     second_doctor.join().unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let reader_ax = Arc::clone(&ax);
+    let reader = thread::spawn(move || {
+        production_read_only(reader_ax.as_ref(), Deadline::from_millis(2_000), |scope| {
+            scope.message("read-only AX probe", || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        })
+        .unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let error = production_window_query(
+        ax.as_ref(),
+        Deadline::from_millis(25),
+        || Ok(()),
+        |(), _| -> Result<()> { panic!("window wrapper bypassed the read-only gate") },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.bound_dispatch(),
+        Some(BoundDispatch::MayHaveDispatched)
+    );
+    release_tx.send(()).unwrap();
+    reader.join().unwrap();
+    let sets = ax.sets();
+    assert_eq!(sets.last(), Some(&0.0));
 }
 
 #[test]

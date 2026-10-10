@@ -29,17 +29,17 @@ unsafe extern "C" {
     fn dlclose(handle: *mut c_void) -> c_int;
 }
 
-struct Library(NonNull<c_void>);
+pub(super) struct Library(NonNull<c_void>);
 
 impl Library {
-    fn open(path: &CStr) -> Result<Self> {
+    pub(super) fn open(path: &CStr) -> Result<Self> {
         // SAFETY: NUL-terminated absolute framework path; RTLD_NOW | RTLD_LOCAL.
         NonNull::new(unsafe { dlopen(path.as_ptr(), 2 | 4) })
             .map(Self)
             .ok_or_else(|| refusal("required native library is unavailable"))
     }
 
-    fn symbol(&self, name: &CStr) -> Result<NonNull<c_void>> {
+    pub(super) fn symbol(&self, name: &CStr) -> Result<NonNull<c_void>> {
         // SAFETY: this retained dlopen handle and the NUL-terminated symbol name are live.
         NonNull::new(unsafe { dlsym(self.0.as_ptr(), name.as_ptr()) })
             .ok_or_else(|| refusal("required native symbol is unavailable"))
@@ -53,7 +53,7 @@ impl Drop for Library {
     }
 }
 
-struct NativeApi {
+pub(super) struct NativeApi {
     set_window_location: SetWindowLocation,
     get_window_location: GetWindowLocation,
     process_info: ProcessInfo,
@@ -61,7 +61,7 @@ struct NativeApi {
 }
 
 impl NativeApi {
-    fn load() -> Result<Self> {
+    pub(super) fn load() -> Result<Self> {
         let graphics =
             Library::open(c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")?;
         let system = Library::open(c"/usr/lib/libSystem.B.dylib")?;
@@ -83,7 +83,7 @@ impl NativeApi {
         Ok(api)
     }
 
-    fn process_identity(&self, pid: i32) -> Result<ProcessIdentity> {
+    pub(super) fn process_identity(&self, pid: i32) -> Result<ProcessIdentity> {
         if pid <= 0 {
             return Err(refusal("process identity requires a positive PID"));
         }

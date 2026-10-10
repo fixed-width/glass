@@ -323,6 +323,18 @@ where
         .with_deadline_by(ax, deadline, true, |scope| operation(query_result, scope))
 }
 
+/// Bound read-only AX messages with the shared timeout owner and no input dispatch.
+pub fn with_read_only_by<A, T>(
+    ax: &A,
+    deadline: Deadline,
+    operation: impl FnOnce(&mut MessageScope<'_, '_, A>) -> Result<T>,
+) -> Result<T>
+where
+    A: AxMessaging,
+{
+    AX_MESSAGING_TIMEOUT_OWNER.with_deadline_by(ax, deadline, false, operation)
+}
+
 /// Production fixed-timeout entry point used by `glass_doctor`.
 pub fn with_doctor_timeout_by<A, T>(
     ax: &A,

@@ -18,6 +18,11 @@ name = "glass-macos-window-input-readiness"
 path = "src/bin/window_input_readiness.rs"
 required-features = ["native-input-qualification"]
 
+[[test]]
+name = "window_target"
+harness = false
+required-features = ["native-input-qualification"]
+
 # Mac-gated capture integration test (crates/glass-macos/tests/capture.rs): harness =
 # false because it defines its own `fn main()` that must run on the process's true main
 # thread (AppKit's `MainThreadMarker` requirement — see the file's module doc), which

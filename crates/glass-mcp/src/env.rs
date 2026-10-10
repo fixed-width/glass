@@ -362,6 +362,8 @@ pub(crate) const INTERNAL_ENV: &[&str] = &[
     // the guard test scans for, so it needs an entry here even though `std::env::var` never
     // touches it.
     "GLASS_CLIP",
+    // Rejection prefix in the nondefault macOS target inspector, not a variable or override.
+    "GLASS_CLIP_",
     // Windows PID-discovery fixtures control the fake listpids delay, output, and PID record.
     "GLASS_LISTPIDS_TEST_DELAY_MS",
     "GLASS_LISTPIDS_TEST_OUTPUT",
