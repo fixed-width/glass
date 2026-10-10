@@ -1022,6 +1022,10 @@ impl Platform for MacosPlatform {
     fn app_pid(&self) -> Option<u32> {
         self.app_pid
     }
+
+    fn observation_window_id(&self) -> Option<WindowId> {
+        self.active_window.map(|id| WindowId(u64::from(id)))
+    }
     /// Read the clipboard, routed per `clipboard_route` (decided in `start_app`; see
     /// `crate::clipboard_route`'s module doc): `RealGeneral` (uncontained) reads the real
     /// system pasteboard; `Private(name)` (contained + injectable + shim-confirmed) reads the

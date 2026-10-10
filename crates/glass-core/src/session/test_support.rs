@@ -55,6 +55,8 @@ pub(crate) struct FakePlatform {
     capture_error_owners: VecDeque<Option<crate::Whose>>,
     geometry_delay: Option<Duration>,
     fail_geometry_before_dispatch: bool,
+    geometry_reads: usize,
+    geometry_error_at: Option<usize>,
     click_log: Arc<Mutex<Vec<(i32, i32)>>>,
     log_batches: std::collections::VecDeque<Vec<(Stream, String)>>,
     key_log: Arc<Mutex<Vec<KeyEvent>>>,
@@ -104,6 +106,10 @@ pub(crate) struct FakePlatform {
 }
 
 impl FakePlatform {
+    pub(crate) fn with_geometry_error_at(mut self, read: usize) -> Self {
+        self.geometry_error_at = Some(read);
+        self
+    }
     pub(crate) fn with_window_occlusion(
         mut self,
         result: Result<bool>,
@@ -487,6 +493,12 @@ impl Platform for FakePlatform {
     fn app_pid(&self) -> Option<u32> {
         Some(4242)
     }
+    fn observation_window_id(&self) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|window| window.active)
+            .map(|window| window.id)
+    }
     fn app_pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
         if let Some(log) = &self.pid_deadline_log {
             log.lock().unwrap().push(deadline);
@@ -543,6 +555,10 @@ impl Platform for FakePlatform {
             }
             WindowOp::Focus => {}
             WindowOp::Geometry => {
+                self.geometry_reads += 1;
+                if self.geometry_error_at == Some(self.geometry_reads) {
+                    return Err(GlassError::WindowNotFound);
+                }
                 if let Some(g) = self.resized_to.front().cloned() {
                     if self.resized_to.len() > 1 {
                         self.resized_to.pop_front(); // the last scripted geometry repeats
@@ -619,6 +635,9 @@ impl Platform for FakePlatform {
         if deadline.has_passed() {
             Err(GlassError::caller_deadline_elapsed("window selection"))
         } else {
+            for window in &mut self.windows {
+                window.active = window.id == id;
+            }
             Ok(geometry)
         }
     }
@@ -805,6 +824,12 @@ impl FakeAccessibility {
 }
 
 impl Accessibility for FakeAccessibility {
+    fn observation_scope(&self) -> Option<crate::AxObservationScope> {
+        Some(crate::AxObservationScope {
+            provider: "fake",
+            coordinate_basis: 1,
+        })
+    }
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         *self.ctx_log.lock().unwrap() = Some(ctx.clone());
         Ok(self.tree.clone())
@@ -1169,6 +1194,12 @@ impl SeqAccessibility {
 }
 
 impl Accessibility for SeqAccessibility {
+    fn observation_scope(&self) -> Option<crate::AxObservationScope> {
+        Some(crate::AxObservationScope {
+            provider: "fake",
+            coordinate_basis: 1,
+        })
+    }
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         self.deadlines.lock().unwrap().push(ctx.deadline);
         self.read_starts

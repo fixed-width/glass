@@ -16,6 +16,8 @@ use serde_json::json;
 pub(crate) use crate::output::{OutContent, ToolOutput};
 use crate::params::*;
 
+pub(crate) mod snapshot_diff;
+
 /// Tool result: Ok(content) or Err(agent-readable message).
 pub type ToolResult = Result<ToolOutput, String>;
 

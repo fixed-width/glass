@@ -21,6 +21,7 @@ impl Glass {
     }
 
     fn start_on_inner(&mut self, backend: &str, spec: &AppSpec) -> Result<WindowGeometry> {
+        self.observation_epoch.invalidate();
         // One active session: tear down any current one first.
         if let Some(mut s) = self.active.take() {
             let _ = s.platform.stop_app();
@@ -88,6 +89,7 @@ impl Glass {
     }
 
     fn stop_inner(&mut self) -> Result<()> {
+        self.observation_epoch.invalidate();
         let mut s = self.active.take().ok_or(GlassError::NoActiveSession)?;
         s.platform.stop_app()
         // `s` drops here, tearing down the spawned backend (Xvfb/sway).
@@ -111,6 +113,7 @@ impl Glass {
 
     /// Tear down the session and host hook, retaining any target-stop error.
     pub fn shutdown_report(&mut self, deadline: Deadline) -> Result<()> {
+        self.observation_epoch.invalidate();
         let outcome = if let Some(mut s) = self.active.take() {
             s.platform
                 .stop_app_by(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE))

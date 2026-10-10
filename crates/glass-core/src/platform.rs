@@ -509,6 +509,11 @@ pub trait Platform {
         None
     }
 
+    /// Selected window attested for fresh reads within an observation episode.
+    fn observation_window_id(&self) -> Option<WindowId> {
+        None
+    }
+
     /// Whether another native window intercepts this active-window-relative point.
     /// This is a read-only check: do not move the pointer, focus, or raise a window.
     /// `false` supplies no additional occlusion evidence; it does not prove a control clear.

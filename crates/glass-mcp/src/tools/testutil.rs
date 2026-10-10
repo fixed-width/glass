@@ -233,6 +233,12 @@ impl Platform for FakePlatform {
             active: true,
         }])
     }
+    fn observation_window_id(&self) -> Option<WindowId> {
+        Some(WindowId(0))
+    }
+    fn app_pid(&self) -> Option<u32> {
+        Some(4242)
+    }
     fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("window selection"));
@@ -309,6 +315,12 @@ pub struct FakeAccessibility {
 }
 
 impl Accessibility for FakeAccessibility {
+    fn observation_scope(&self) -> Option<glass_core::AxObservationScope> {
+        Some(glass_core::AxObservationScope {
+            provider: "fake",
+            coordinate_basis: 1,
+        })
+    }
     fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

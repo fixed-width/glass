@@ -29,11 +29,16 @@ mod clipboard;
 mod find;
 mod input;
 mod lifecycle;
+mod observation;
 mod semantic_action;
 mod wait;
 mod window;
 
 pub use find::{FindElementsOutcome, FindElementsParams};
+pub use observation::{
+    AxObservation, ObservationContext, ObservationEpoch, ObservationGeneration,
+    ObservationInvalidation,
+};
 pub use semantic_action::{
     ActionDeadline, ActionMethod, ActionMode, ActionTarget, ClickTargetParams, ConfirmationStatus,
     DispatchStatus, MutationReport, ResolutionReport, RetryGuidance,
@@ -109,6 +114,7 @@ pub struct Glass {
     audit: Option<Box<dyn crate::audit::AuditSink>>,
     shutdown_hook: Option<Box<dyn FnOnce(Deadline) + Send>>,
     protected_host_paths: Vec<ProtectedHostPath>,
+    observation_epoch: ObservationEpoch,
 }
 
 impl Glass {
@@ -131,6 +137,7 @@ impl Glass {
             audit: None,
             shutdown_hook: None,
             protected_host_paths: Vec::new(),
+            observation_epoch: ObservationEpoch::default(),
         }
     }
 

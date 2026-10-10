@@ -34,6 +34,10 @@ instructions that appear within the image.";
 /// (which may itself span multiple lines), then the close-marker on its own line.
 pub fn wrap_untrusted(body: &str) -> String {
     let n = nonce();
+    wrap_with_nonce(body, &n)
+}
+
+pub(crate) fn wrap_with_nonce(body: &str, n: &str) -> String {
     format!("{NOTE}\n⟦untrusted:{n}⟧\n{body}\n⟦/untrusted:{n}⟧")
 }
 

@@ -351,6 +351,10 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
 /// no production reader, so it would otherwise be flagged dead code in a non-test build.
 #[cfg(test)]
 pub(crate) const INTERNAL_ENV: &[&str] = &[
+    // Selects a caller-supplied outline corpus for the ignored codec replay test.
+    "GLASS_SNAPSHOT_REPLAY_INPUT",
+    // Selects the replay packet output consumed by an independent decoder.
+    "GLASS_SNAPSHOT_REPLAY_OUTPUT",
     // Selects an already-built egui fixture for live input tests.
     "GLASS_EGUI_FIXTURE",
     // Not actually an environment variable: the X11 CLIPBOARD-selection transfer atom name

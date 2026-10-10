@@ -95,6 +95,7 @@ impl SnapshotBoundary for NativeSnapshotAxBoundary {
 #[derive(Debug)]
 pub struct MacosA11y {
     snapshot_boundary: Box<dyn SnapshotBoundary>,
+    observation_scope: Option<glass_core::AxObservationScope>,
 }
 
 impl Default for MacosA11y {
@@ -107,21 +108,26 @@ impl MacosA11y {
     pub fn new() -> Self {
         Self {
             snapshot_boundary: Box::new(NativeSnapshotAxBoundary),
+            observation_scope: None,
         }
     }
 
     #[cfg(test)]
     fn with_snapshot_boundary(snapshot_boundary: Box<dyn SnapshotBoundary>) -> Self {
-        Self { snapshot_boundary }
+        Self {
+            snapshot_boundary,
+            observation_scope: None,
+        }
     }
 }
 
 impl Accessibility for MacosA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+        self.observation_scope = None;
         let snapshot_boundary = self.snapshot_boundary.as_ref();
-        run_snapshot(ctx.deadline, snapshot_boundary, |trusted, deadline| {
+        let (tree, scope) = run_snapshot(ctx.deadline, snapshot_boundary, |trusted, deadline| {
             require_accessibility_grant(trusted)?;
-            let (window_el, scale) = resolve_window_after_grant(ctx, deadline)?;
+            let (window_el, scale, unambiguous) = resolve_window_scoped_after_grant(ctx, deadline)?;
 
             let mut budget = WalkBudget::with_limits(ctx.limits);
             let root = walk(&window_el, &ctx.window, scale, 0, &mut budget, deadline)?;
@@ -130,9 +136,21 @@ impl Accessibility for MacosA11y {
                 tree.truncated = budget.truncation();
                 tree.unreadable = budget.unreadable();
                 // `glass-core` assigns ids after this walk, keeping numbering backend-independent.
-                Ok(tree)
+                Ok((
+                    tree,
+                    unambiguous.then_some(glass_core::AxObservationScope {
+                        provider: "macos-ax-v1",
+                        coordinate_basis: scale.to_bits(),
+                    }),
+                ))
             })
-        })
+        })?;
+        self.observation_scope = scope;
+        Ok(tree)
+    }
+
+    fn observation_scope(&self) -> Option<glass_core::AxObservationScope> {
+        self.observation_scope
     }
 
     fn state_coverage(&self) -> glass_core::AxStateCoverage {
@@ -555,6 +573,13 @@ fn resolve_window_after_grant(
     ctx: &AxContext,
     deadline: SemanticDeadline,
 ) -> Result<(CFRetained<AXUIElement>, f64)> {
+    resolve_window_scoped_after_grant(ctx, deadline).map(|(window, scale, _)| (window, scale))
+}
+
+fn resolve_window_scoped_after_grant(
+    ctx: &AxContext,
+    deadline: SemanticDeadline,
+) -> Result<(CFRetained<AXUIElement>, f64, bool)> {
     deadline.require()?;
     let &pid = ctx.pids.first().ok_or(GlassError::WindowNotFound)?;
     let app = deadline.observe(|| ffi::app_element(pid as i32))?;
@@ -605,8 +630,9 @@ fn select_window(
     win: &WindowGeometry,
     deadline: SemanticDeadline,
     resolution: EffectiveDeadline,
-) -> Result<Option<(CFRetained<AXUIElement>, f64)>> {
+) -> Result<Option<(CFRetained<AXUIElement>, f64, bool)>> {
     let mut best: Option<(i64, CFRetained<AXUIElement>, f64)> = None;
+    let mut root_scope = RootScopeProof::default();
     let mut diagnostics: Vec<String> = Vec::new();
     for w in windows {
         if resolution.callee_expired(deadline)? {
@@ -625,6 +651,7 @@ fn select_window(
         let (ax_w, ax_h) = match size {
             Ok(size) => size,
             Err(e) => {
+                root_scope.unresolved = true;
                 diagnostics.push(candidate_line(
                     role,
                     &CandidateOutcome::SizeUnreadable(e.to_string()),
@@ -632,7 +659,8 @@ fn select_window(
                 continue;
             }
         };
-        if ax_w <= 0.0 || ax_h <= 0.0 {
+        if !ax_w.is_finite() || !ax_h.is_finite() || ax_w <= 0.0 || ax_h <= 0.0 {
+            root_scope.unresolved = true;
             diagnostics.push(candidate_line(
                 role,
                 &CandidateOutcome::NonPositiveSize { ax_w, ax_h },
@@ -641,8 +669,10 @@ fn select_window(
         }
         // macOS backing scale is always an integer; snap out the border/content-vs-frame
         // inset noise in the raw width ratio (see doc comment above).
-        let scale = (win.width as f64 / ax_w).round().max(1.0);
-        if !scale.is_finite() || scale <= 0.0 {
+        let raw_scale = win.width as f64 / ax_w;
+        let scale = raw_scale.round().max(1.0);
+        if !raw_scale.is_finite() || raw_scale <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+            root_scope.unresolved = true;
             diagnostics.push(candidate_line(
                 role,
                 &CandidateOutcome::InvalidScale { ax_w, ax_h, scale },
@@ -655,6 +685,7 @@ fn select_window(
         let (ax_x, ax_y) = match position {
             Ok(pos) => pos,
             Err(e) => {
+                root_scope.unresolved = true;
                 diagnostics.push(candidate_line(
                     role,
                     &CandidateOutcome::PositionUnreadable {
@@ -667,10 +698,17 @@ fn select_window(
                 continue;
             }
         };
-        // Cast to `i64` before subtracting so `.abs()` can never wrap (`i32::MIN.abs()`
-        // panics) — the same no-overflow discipline `axwindow::within_tolerance` follows.
-        let dx = ((ax_x * scale).round() as i64 - i64::from(win.x)).abs();
-        let dy = ((ax_y * scale).round() as i64 - i64::from(win.y)).abs();
+        if !finite_scope_geometry(ax_x, ax_y, ax_w, ax_h, scale) {
+            root_scope.unresolved = true;
+            continue;
+        }
+        // Saturate native-coordinate subtraction so malformed values cannot overflow.
+        let dx = ((ax_x * scale).round() as i64)
+            .saturating_sub(i64::from(win.x))
+            .saturating_abs();
+        let dy = ((ax_y * scale).round() as i64)
+            .saturating_sub(i64::from(win.y))
+            .saturating_abs();
         diagnostics.push(candidate_line(
             role,
             &CandidateOutcome::Measured {
@@ -690,6 +728,7 @@ fn select_window(
             continue;
         }
         let dist = dx + dy;
+        root_scope.matching += 1;
         if best
             .as_ref()
             .is_none_or(|(best_dist, _, _)| dist < *best_dist)
@@ -712,7 +751,34 @@ fn select_window(
     if resolution.callee_expired(deadline)? {
         return Ok(None);
     }
-    Ok(best.map(|(_, w, scale)| (w, scale)))
+    Ok(best.map(|(_, w, scale)| (w, scale, root_scope.proven())))
+}
+
+#[derive(Default)]
+struct RootScopeProof {
+    matching: usize,
+    unresolved: bool,
+}
+
+impl RootScopeProof {
+    fn proven(&self) -> bool {
+        self.matching == 1 && !self.unresolved
+    }
+}
+
+fn finite_scope_geometry(x: f64, y: f64, width: f64, height: f64, scale: f64) -> bool {
+    [
+        x,
+        y,
+        width,
+        height,
+        scale,
+        x * scale,
+        y * scale,
+        height * scale,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
 }
 
 /// One of the label attributes a node's `name`/`description` come from (`AXTitle`,
@@ -1062,6 +1128,38 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn root_scope_requires_one_match_and_every_other_candidate_resolved() {
+        let mut proof = RootScopeProof {
+            matching: 1,
+            unresolved: false,
+        };
+        assert!(proof.proven());
+        proof.unresolved = true;
+        assert!(
+            !proof.proven(),
+            "an unreadable second window may overlap the match"
+        );
+        proof.unresolved = false;
+        proof.matching = 2;
+        assert!(
+            !proof.proven(),
+            "two matching windows do not attest a unique root"
+        );
+    }
+
+    #[test]
+    fn nonfinite_native_geometry_cannot_attest_root_scope() {
+        assert!(finite_scope_geometry(10.0, 20.0, 300.0, 400.0, 2.0));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!finite_scope_geometry(invalid, 20.0, 300.0, 400.0, 2.0));
+            assert!(!finite_scope_geometry(10.0, invalid, 300.0, 400.0, 2.0));
+            assert!(!finite_scope_geometry(10.0, 20.0, invalid, 400.0, 2.0));
+            assert!(!finite_scope_geometry(10.0, 20.0, 300.0, invalid, 2.0));
+        }
+        assert!(!finite_scope_geometry(f64::MAX, 20.0, 300.0, 400.0, 2.0));
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotBoundaryEvent {

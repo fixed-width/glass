@@ -46,12 +46,14 @@ pub struct GlassServer {
     tool_profile: ToolProfile,
     trace: Option<crate::trace::TraceRecorder>,
     trace_client: u64,
+    snapshot_revisions: Arc<tools::snapshot_diff::SnapshotRevisionStore>,
 }
 
 fn tool_effect(tool: &str) -> ToolEffect {
     match tool {
         "glass_a11y_marks"
         | "glass_a11y_snapshot"
+        | "glass_a11y_snapshot_diff"
         | "glass_capabilities"
         | "glass_clipboard_get"
         | "glass_diff"
@@ -273,6 +275,8 @@ impl GlassServer {
     }
 
     fn new_with_state(glass: Glass, report: AuditReport, artifacts: Option<ArtifactStore>) -> Self {
+        let snapshot_revisions =
+            tools::snapshot_diff::SnapshotRevisionStore::new(glass.observation_epoch());
         let artifact_server_id = artifacts
             .as_ref()
             .map_or_else(crate::artifacts::new_server_id, ArtifactStore::server_id);
@@ -335,6 +339,7 @@ impl GlassServer {
             tool_profile: ToolProfile::Full,
             trace: None,
             trace_client: 0,
+            snapshot_revisions,
         }
     }
 
@@ -415,6 +420,20 @@ impl GlassServer {
     where
         F: FnOnce(&mut Glass) -> (bool, ToolOutput) + Send + 'static,
     {
+        self.run_outcome_delivery(tool, effect, f)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    async fn run_outcome_delivery<F>(
+        &self,
+        tool: &'static str,
+        effect: ToolEffect,
+        f: F,
+    ) -> Result<(CallToolResult, bool), McpError>
+    where
+        F: FnOnce(&mut Glass) -> (bool, ToolOutput) + Send + 'static,
+    {
         let trace = crate::trace::current_call();
         if let Some(trace) = &trace
             && !trace.has_valid_arguments()
@@ -452,11 +471,14 @@ impl GlassServer {
             if let Some(trace) = &trace {
                 trace.worker_unavailable();
             }
-            return Ok(traced_call_result(
-                self.output_policy.apply(fallback()),
-                TargetAccess::NoActiveTarget,
-                trace.as_ref(),
-                self.artifacts.as_ref(),
+            return Ok((
+                traced_call_result(
+                    self.output_policy.apply(fallback()),
+                    TargetAccess::NoActiveTarget,
+                    trace.as_ref(),
+                    self.artifacts.as_ref(),
+                ),
+                false,
             ));
         };
         if jobs
@@ -466,11 +488,14 @@ impl GlassServer {
             if let Some(trace) = &trace {
                 trace.worker_unavailable();
             }
-            return Ok(traced_call_result(
-                self.output_policy.apply(fallback()),
-                TargetAccess::NoActiveTarget,
-                trace.as_ref(),
-                self.artifacts.as_ref(),
+            return Ok((
+                traced_call_result(
+                    self.output_policy.apply(fallback()),
+                    TargetAccess::NoActiveTarget,
+                    trace.as_ref(),
+                    self.artifacts.as_ref(),
+                ),
+                false,
             ));
         }
         let outcome = reply_rx.await.unwrap_or_else(|_| fallback());
@@ -479,7 +504,14 @@ impl GlassServer {
         let store = self.artifacts.clone();
         let result = tokio::task::spawn_blocking(move || {
             let applied = policy.apply(outcome);
-            traced_call_result(applied, access, trace.as_ref(), store.as_ref())
+            let complete = !applied.is_error
+                && applied
+                    .output_metadata()
+                    .is_none_or(|metadata| metadata.complete);
+            (
+                traced_call_result(applied, access, trace.as_ref(), store.as_ref()),
+                complete,
+            )
         })
         .await
         .map_err(|_| McpError::new(ErrorCode::INTERNAL_ERROR, "output processing failed", None))?;
@@ -926,6 +958,32 @@ impl GlassServer {
             move |g| tools::a11y_snapshot(g, &a),
         )
         .await
+    }
+
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "Experimental lossless compact-outline revisions for clients that reconstruct exact text. Every call reads fresh. Omit base_revision for full recovery; otherwise verify context, edits, byte/line counts and SHA-256 before advancing your caller-held baseline. Fetch and verify all output resources first. Partial observations retain their disclosures. IDs are immediate references from the latest read; revisions do not pin them. Full-profile only."
+    )]
+    async fn glass_a11y_snapshot_diff(
+        &self,
+        Parameters(a): Parameters<A11ySnapshotDiffArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
+        let pending = self
+            .snapshot_revisions
+            .reserve(&a)
+            .map_err(|message| McpError::new(ErrorCode::INVALID_PARAMS, message, None))?;
+        let request = pending.request.clone();
+        let (result, complete) = self
+            .run_outcome_delivery(tools::snapshot_diff::TOOL, ToolEffect::ReadOnly, move |g| {
+                match request.read(g, &a) {
+                    Ok(output) => (false, output),
+                    Err(message) => (true, ToolOutput(vec![OutContent::trusted_error(message)])),
+                }
+            })
+            .await?;
+        pending.complete(complete);
+        Ok(result)
     }
 
     #[tool(
@@ -2014,6 +2072,7 @@ mod tests {
         let expected = [
             "glass_a11y_marks",
             "glass_a11y_snapshot",
+            "glass_a11y_snapshot_diff",
             "glass_baseline_save",
             "glass_capabilities",
             "glass_click",
@@ -2048,6 +2107,284 @@ mod tests {
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
         assert_eq!(registered_tools(), expected);
+    }
+
+    #[tokio::test]
+    async fn revision_packets_publish_after_complete_resources_and_keep_reads_fresh() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let glass =
+            crate::tools::testutil::started_counted_a11y(reads.clone(), large_server_tree());
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).unwrap();
+        let server = GlassServer::new_with_state(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            Some(store),
+        );
+        let result = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+        let envelope: serde_json::Value =
+            serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(envelope["result"]["kind"], "full");
+        assert_eq!(envelope["result"]["output"]["complete"], true);
+        let link = result
+            .content
+            .iter()
+            .find_map(|content| content.as_resource_link())
+            .unwrap();
+        let resource = server.read_resource_for_test(&link.uri).unwrap();
+        let ResourceContents::TextResourceContents { text, .. } = &resource.contents[0] else {
+            panic!("text resource expected")
+        };
+        assert!(text.contains("application row 239"));
+        let revision = envelope["result"]["revision"].as_str().unwrap().to_owned();
+        let unchanged = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some(revision.clone()),
+            }))
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&unchanged.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(envelope["result"]["kind"], "unchanged");
+        assert_ne!(envelope["result"]["revision"], revision);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let invalid = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some("é".into()),
+            }))
+            .await;
+        assert!(invalid.is_err());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+        server.sessions().lock().await.stop().unwrap();
+        let error = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(error.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn incomplete_revision_output_cannot_establish_a_baseline() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let glass =
+            crate::tools::testutil::started_counted_a11y(reads.clone(), large_server_tree());
+        let mut server = GlassServer::new_with_state(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            None,
+        );
+        let failed = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: None,
+            }))
+            .await
+            .unwrap();
+        let failed_envelope: serde_json::Value =
+            serde_json::from_str(&failed.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(failed_envelope["result"]["output"]["complete"], false);
+        let undelivered = failed_envelope["result"]["revision"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).unwrap();
+        server.output_policy = Arc::new(OutputPolicy::new(store.clone()));
+        server.artifacts = Some(store);
+        let recovered = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some(undelivered),
+            }))
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&recovered.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(envelope["result"]["full_reason"], "baseline_unavailable");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn revision_tool_is_experimental_read_only_and_absent_from_lean() {
+        let tool = tool_inventory(ToolProfile::Full)
+            .into_iter()
+            .find(|tool| tool.name == tools::snapshot_diff::TOOL)
+            .unwrap();
+        assert_eq!(
+            tool.annotations.as_ref().unwrap().read_only_hint,
+            Some(true)
+        );
+        assert!(tool.description.as_ref().unwrap().contains("Experimental"));
+        assert!(!ToolProfile::Lean.includes(tools::snapshot_diff::TOOL));
+        assert_eq!(
+            tool_effect(tools::snapshot_diff::TOOL),
+            ToolEffect::ReadOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_revision_cannot_publish_its_late_worker_result() {
+        use std::future::Future;
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let glass = crate::tools::testutil::started_counted_a11y(
+            reads.clone(),
+            crate::tools::testutil::fake_tree(),
+        );
+        let server = GlassServer::new_with_state(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            None,
+        );
+        let first = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: None,
+            }))
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        let base = envelope["result"]["revision"].as_str().unwrap().to_owned();
+        let sessions = server.sessions();
+        let held = sessions.lock().await;
+        let mut cancelled = Box::pin(server.glass_a11y_snapshot_diff(Parameters(
+            A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some(base.clone()),
+            },
+        )));
+        std::future::poll_fn(|cx| {
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(cancelled);
+        drop(held);
+        let recovered = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some(base),
+            }))
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&recovered.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(envelope["result"]["full_reason"], "baseline_unavailable");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_running_revision_cannot_publish_after_native_read_finishes() {
+        use std::future::Future;
+        struct BlockingReader {
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+            began: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl glass_core::Accessibility for BlockingReader {
+            fn snapshot(
+                &mut self,
+                _: &glass_core::AxContext,
+            ) -> glass_core::Result<glass_core::AxTree> {
+                if self
+                    .reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == 1
+                {
+                    self.began.take().unwrap().send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(crate::tools::testutil::fake_tree())
+            }
+            fn observation_scope(&self) -> Option<glass_core::AxObservationScope> {
+                Some(glass_core::AxObservationScope {
+                    provider: "fake",
+                    coordinate_basis: 1,
+                })
+            }
+        }
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (began_tx, began_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut backend = Some(glass_core::Backend {
+            platform: Box::new(crate::tools::testutil::FakePlatform::new(100, 100)),
+            accessibility: Some(Box::new(BlockingReader {
+                reads: reads.clone(),
+                began: Some(began_tx),
+                release: release_rx,
+            })),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut glass = Glass::new(
+            Box::new(move |_| Ok(backend.take().unwrap())),
+            "fake".into(),
+            glass_core::BaselineStore::new(directory.path().join("baselines")),
+            100,
+        );
+        glass
+            .start(&glass_core::AppSpec {
+                build: None,
+                run: vec!["app".into()],
+                cwd: None,
+                env: vec![],
+                window_hint: None,
+                timeout_ms: 1,
+                sandbox: glass_core::SandboxLevel::Off,
+                a11y: true,
+            })
+            .unwrap();
+        let server = GlassServer::new_with_state(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            None,
+        );
+        let first = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: None,
+            }))
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        let base = envelope["result"]["revision"].as_str().unwrap().to_owned();
+        let mut cancelled = Box::pin(server.glass_a11y_snapshot_diff(Parameters(
+            A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some(base.clone()),
+            },
+        )));
+        std::future::poll_fn(|cx| {
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        began_rx.await.unwrap();
+        drop(cancelled);
+        release_tx.send(()).unwrap();
+        let recovered = server
+            .glass_a11y_snapshot_diff(Parameters(A11ySnapshotDiffArgs {
+                max_nodes: None,
+                base_revision: Some(base),
+            }))
+            .await
+            .unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&recovered.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(envelope["result"]["full_reason"], "baseline_unavailable");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
     #[test]
