@@ -81,6 +81,29 @@ command from Linux.
 - **You cannot link or run.** That needs the macOS SDK and a Mac. For anything past type-checking,
   push and let the macOS CI job run it, or run it on a Mac.
 
+The read-only macOS input diagnostics use a nondefault build feature. To compile their binary and
+tests from Linux:
+
+```bash
+cargo clippy --target x86_64-apple-darwin -p glass-macos --all-targets \
+  --features native-input-qualification --locked -- -D warnings
+```
+
+On a Mac with a logged-in WindowServer, run:
+
+```bash
+cargo run -p glass-macos --features native-input-qualification \
+  --bin glass-macos-window-input-readiness --locked
+```
+
+The diagnostic reads its own kernel process identity, constructs unposted click/scroll events,
+checks event field and local-coordinate round trips, and reads existing permission grants without
+requesting them. It posts no input, captures no screen content and activates no app. A successful
+report always says `input_admitted: false`: these checks establish neither window lifetime nor
+control, executable trust or routing qualification. The feature adds no MCP parameter or input route;
+ordinary builds and session capability reports retain their existing behavior. Missing private
+symbols or incomplete identity/ABI readings return an error.
+
 ## Integration suites (Linux)
 
 `#[ignore]`d, so the ordinary `cargo test` never starts them. Each self-starts what it needs.

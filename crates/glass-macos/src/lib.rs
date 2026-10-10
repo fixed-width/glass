@@ -26,6 +26,8 @@ pub mod settle; // settle policy + poll loop over successive readings — cross-
 #[cfg(any(target_os = "macos", test))]
 mod shareable_receive; // pure completion-channel receive classification — cross-platform, host-tested
 pub mod shim_path; // pure clip-shim dylib path resolution — cross-platform, host-tested
+#[cfg(any(test, feature = "native-input-qualification"))]
+pub mod window_directed;
 #[cfg(any(target_os = "macos", test))]
 mod window_resolve; // pure active-window deadline policy — cross-platform, host-tested
 
