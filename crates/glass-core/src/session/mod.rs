@@ -150,8 +150,8 @@ impl Glass {
         )
     }
 
-    /// Mode-aware construction. Preflight runs before invalidation, teardown,
-    /// backend construction, build, or launch. It must perform no external work.
+    /// Mode-aware construction with non-actuating preflight before invalidation,
+    /// teardown, backend construction, build, or launch.
     pub fn new_with_input_modes(
         factory: ModeAwarePlatformFactory,
         input_mode_preflight: InputModePreflight,

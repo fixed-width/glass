@@ -2750,6 +2750,94 @@ mod tests {
         assert_eq!(refusal["result"]["side_effects_may_have_occurred"], false);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scroll_to_element_handler_and_trace_preserve_background_refusal() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = crate::trace::TraceConfig::new(root.path().to_owned(), None).unwrap();
+        let baselines = tempfile::tempdir().unwrap();
+        let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let mut platform = Some(crate::tools::testutil::FakePlatform {
+            protected_paths: Some(std::sync::Arc::default()),
+            ..crate::tools::testutil::FakePlatform::new(100, 100).with_event_log(events.clone())
+        });
+        let glass = Glass::new_with_input_modes(
+            Box::new(move |_, mode| {
+                assert_eq!(mode, glass_core::InputMode::Background);
+                Ok(glass_core::Backend::display_only(Box::new(
+                    platform.take().unwrap(),
+                )))
+            }),
+            Box::new(|_, _| Ok(())),
+            "fake".into(),
+            glass_core::BaselineStore::new(baselines.path()),
+            10,
+        );
+        let server = GlassServer::new_configured(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            ToolProfile::Full,
+            Some(&config),
+            "test",
+        )
+        .unwrap();
+        let start = serde_json::from_value(
+            serde_json::json!({"run": ["app"], "input_mode": "background", "a11y": false}),
+        )
+        .unwrap();
+        assert_eq!(
+            server
+                .glass_start(Parameters(start))
+                .await
+                .unwrap()
+                .is_error,
+            Some(false)
+        );
+        events.lock().unwrap().clear();
+        let trace = server.trace_recorder().unwrap();
+        let call = trace.begin_call("glass_scroll_to_element", 1).unwrap();
+        let args = serde_json::from_value(serde_json::json!({"name": "Save"})).unwrap();
+        let response = crate::trace::ACTIVE_CALL
+            .scope(call, server.glass_scroll_to_element(Parameters(args)))
+            .await
+            .unwrap();
+        assert_eq!(response.is_error, Some(true));
+        let refusal: serde_json::Value = serde_json::from_str(&first_text(&response)).unwrap();
+        assert_eq!(refusal["error"]["code"], "unsupported_input_mode");
+        assert_eq!(refusal["result"]["input_mode"], "background");
+        assert_eq!(refusal["result"]["operation"], "scroll to element");
+        assert_eq!(refusal["result"]["dispatch"], "not_dispatched");
+        assert_eq!(refusal["result"]["side_effects_may_have_occurred"], false);
+        assert_eq!(refusal["result"]["retry"], "correct_request");
+        assert!(events.lock().unwrap().is_empty());
+        trace.close().await;
+        let events = std::fs::read_to_string(trace.path().join("events.jsonl")).unwrap();
+        let logical: serde_json::Value = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["kind"] == "logical_outcome")
+            .unwrap();
+        assert_eq!(logical["data"]["is_error"], true);
+        let evidence = logical["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["payload"].is_object())
+            .unwrap();
+        let bytes = std::fs::read(
+            trace
+                .path()
+                .join(evidence["payload"]["path"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            refusal
+        );
+    }
+
     #[test]
     fn get_info_identifies_the_server_as_glass_not_the_transport_crate() {
         let glass =

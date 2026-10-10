@@ -475,7 +475,7 @@ pub struct DoctorArgs {
 pub struct CapabilitiesArgs {
     /// backend (default) or active session.
     pub scope: Option<CapabilitiesScope>,
-    /// Backend name; defaults to active/default backend. Session scope requires a match.
+    /// Backend name, defaulting to active/default; session scope requires a match.
     pub backend: Option<String>,
 }
 

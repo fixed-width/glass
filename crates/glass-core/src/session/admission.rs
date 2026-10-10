@@ -16,8 +16,7 @@ pub(super) enum Mutation<'a> {
 mod tests;
 
 impl Glass {
-    /// Read-only support for the active session. Foreground sessions do not
-    /// authorize background actions, and background text is always unsupported.
+    /// Read-only session support, excluding background actions in Foreground and all background text.
     pub fn session_capabilities(&mut self) -> Result<crate::SessionCapabilities> {
         let session = self.active_mut()?;
         let mut background_input = if session.input_mode == crate::InputMode::Background {

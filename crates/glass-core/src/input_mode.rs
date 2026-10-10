@@ -19,8 +19,7 @@ impl InputMode {
         }
     }
 
-    /// Reject a mode before constructing a backend or performing external work.
-    /// Shipped backends use this until they have a qualified background route.
+    /// Reject background mode before backend construction or external work until a route is qualified.
     pub fn require_foreground(self, operation: &'static str) -> Result<()> {
         if self == Self::Foreground {
             Ok(())

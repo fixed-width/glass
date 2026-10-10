@@ -305,7 +305,7 @@ pub struct A11yBind<'a> {
 /// Everything a backend needs to build, launch, and locate an app's window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSpec {
-    /// Input routing for the whole session. Foreground preserves existing behavior.
+    /// Input routing for the whole session, with Foreground preserving existing behavior.
     pub input_mode: crate::InputMode,
     /// Optional shell command run (in `cwd`) before launching.
     pub build: Option<String>,
