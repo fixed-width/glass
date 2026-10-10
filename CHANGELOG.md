@@ -31,7 +31,6 @@ internal refactors, CI, or test-only changes.
   macOS attests unambiguous read scope; unqualified backends return full observations without retention.
 
 ### Changed
-- `glass_start` rejects unknown parameters instead of silently ignoring them.
 - macOS accessibility snapshots avoid duplicate value reads for checkboxes, radio buttons, and switches while preserving their reported values and checked states.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 

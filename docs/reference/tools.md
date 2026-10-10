@@ -198,7 +198,7 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   processes. Other backends read accessibility ambiently and ignore this flag.
 - `timeout_ms` (integer) — launch timeout.
 
-Returns the located window's geometry: `{x, y, width, height}`. Unknown start parameters are rejected.
+Returns the located window's geometry: `{x, y, width, height}`.
 
 ### `glass_stop`
 

@@ -13,15 +13,21 @@ mod session_capability_tests {
     use super::*;
 
     #[test]
-    fn start_rejects_removed_mode_and_unknown_arguments() {
-        for field in ["input_mode", "allow_desktop_control", "unknown"] {
-            let mut value = serde_json::json!({"run": ["app"]});
-            value[field] = serde_json::json!("background");
-            assert!(
-                serde_json::from_value::<StartArgs>(value).is_err(),
-                "{field}"
-            );
+    fn start_rejects_removed_mode_without_changing_unknown_field_compatibility() {
+        for mode in [
+            serde_json::json!("background"),
+            serde_json::json!("foreground"),
+            serde_json::Value::Null,
+        ] {
+            let value = serde_json::json!({"run": ["app"], "input_mode": mode});
+            assert!(serde_json::from_value::<StartArgs>(value).is_err());
         }
+        let args: StartArgs = serde_json::from_value(
+            serde_json::json!({"run": ["app"], "unrelated_extension": true}),
+        )
+        .unwrap();
+        let value = serde_json::to_value(args).unwrap();
+        assert!(value.get("input_mode").is_none());
     }
 
     #[test]
@@ -85,9 +91,24 @@ pub struct WindowHintArgs {
     pub class: Option<String>,
 }
 
+fn reject_input_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<()>, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(D::Error::custom(
+        "input_mode is not supported; use the normal input tools and inspect session capabilities",
+    ))
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct StartArgs {
+    // Reject cached requests for the unmerged mode without tightening the existing start schema.
+    #[serde(
+        default,
+        rename = "input_mode",
+        deserialize_with = "reject_input_mode",
+        skip_serializing
+    )]
+    #[schemars(skip)]
+    pub(crate) _rejected_input_mode: Option<()>,
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
     /// Desktop: [executable, args...]. iOS: [.app-or-bundle-id, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].

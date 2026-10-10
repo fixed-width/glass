@@ -4,6 +4,7 @@ use glass_core::{AppSpec, Frame, SandboxLevel};
 
 fn start_args() -> StartArgs {
     StartArgs {
+        _rejected_input_mode: None,
         build: None,
         run: vec!["app".into()],
         backend: None,

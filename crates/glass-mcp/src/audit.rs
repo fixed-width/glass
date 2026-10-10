@@ -1242,6 +1242,7 @@ mod tests {
         tools::start(
             &mut g,
             &StartArgs {
+                _rejected_input_mode: None,
                 build: None,
                 run: vec!["app".into()],
                 backend: None,
@@ -1360,6 +1361,7 @@ mod tests {
 
         fn args() -> StartArgs {
             StartArgs {
+                _rejected_input_mode: None,
                 build: None,
                 run: vec!["app".into()],
                 backend: None,
