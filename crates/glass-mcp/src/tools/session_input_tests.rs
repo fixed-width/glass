@@ -138,11 +138,11 @@ fn standalone_mutations_preserve_typed_operation_refusal_and_do_not_expose_text(
 }
 
 #[test]
-fn standalone_window_targeted_scroll_to_element_preserves_mode_refusal() {
+fn standalone_window_targeted_scroll_to_element_preserves_operation_refusal() {
     let (mut glass, _dir, events) = targeted();
     let error = scroll_to_element(&mut glass, &args(json!({"name": "Save"}))).unwrap_err();
     let value: serde_json::Value = serde_json::from_str(&error)
-        .unwrap_or_else(|_| panic!("expected structured mode refusal: {error}"));
+        .unwrap_or_else(|_| panic!("expected structured operation refusal: {error}"));
     assert_operation_refusal(&value);
     assert_eq!(value["tool"], "glass_scroll_to_element");
     assert_eq!(value["result"]["operation"], "scroll to element");
