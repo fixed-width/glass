@@ -271,7 +271,7 @@ impl OwnedTarget {
                     Ok((window, id, connection, psn, rect, controls))
                 },
             )?;
-        self.check_context()?;
+        self.check_context().map_err(GlassError::after_dispatch)?;
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("target observation"));
         }

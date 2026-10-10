@@ -332,7 +332,15 @@ pub fn with_read_only_by<A, T>(
 where
     A: AxMessaging,
 {
-    AX_MESSAGING_TIMEOUT_OWNER.with_deadline_by(ax, deadline, false, operation)
+    AX_MESSAGING_TIMEOUT_OWNER.with_deadline_by(ax, deadline, false, |scope| {
+        operation(scope).map_err(|error| {
+            if scope.dispatched {
+                error.after_dispatch()
+            } else {
+                error.before_dispatch()
+            }
+        })
+    })
 }
 
 /// Production fixed-timeout entry point used by `glass_doctor`.

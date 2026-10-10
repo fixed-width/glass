@@ -200,7 +200,13 @@ pub(crate) fn spawn(
     logs: LogSink,
     protected_paths: &[ProtectedHostPath],
 ) -> Result<Launch> {
-    spawn_with_clipboard_shim(spec, logs, protected_paths, true)
+    spawn_for(spec, logs, protected_paths, LaunchPurpose::Session)
+}
+
+enum LaunchPurpose {
+    Session,
+    #[cfg(any(test, feature = "native-input-qualification"))]
+    Inspection,
 }
 
 /// Direct child launch without Glass's clipboard injection or LaunchServices adoption.
@@ -244,15 +250,16 @@ pub(crate) fn spawn_window_target(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    spawn_with_clipboard_shim(spec, logs, &protected_paths, false)
+    spawn_for(spec, logs, &protected_paths, LaunchPurpose::Inspection)
 }
 
-fn spawn_with_clipboard_shim(
+fn spawn_for(
     spec: &AppSpec,
     logs: LogSink,
     protected_paths: &[ProtectedHostPath],
-    inject_clipboard: bool,
+    purpose: LaunchPurpose,
 ) -> Result<Launch> {
+    let session_launch = matches!(purpose, LaunchPurpose::Session);
     glass_sandbox_macos::profile::validate_protected_paths(protected_paths)?;
     let mut cmd = Command::new(&spec.run[0]);
 
@@ -297,8 +304,8 @@ fn spawn_with_clipboard_shim(
         // `dylib_path` is resolved once and reused below (rather than a second
         // `shim_dylib_path()` call) so a transient filesystem hiccup between the two checks
         // can't make `injectable` and the later `.expect` disagree.
-        let dylib_path = inject_clipboard.then(shim_dylib_path).flatten();
-        let injectable = inject_clipboard && target_is_injectable(&program) && dylib_path.is_some();
+        let dylib_path = session_launch.then(shim_dylib_path).flatten();
+        let injectable = session_launch && target_is_injectable(&program) && dylib_path.is_some();
         let allow_pasteboard = injectable;
         // The shim dylib FILE, re-allowed for read in the profile below when injecting (`None`
         // — no re-allow — otherwise, matching unchanged pre-injection behavior).
@@ -389,8 +396,14 @@ fn spawn_with_clipboard_shim(
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    if session_launch {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         // A PermissionDenied under containment could be `sandbox_init` rejecting the profile,
@@ -404,6 +417,14 @@ fn spawn_with_clipboard_shim(
             GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run))
         }
     })?;
+
+    if !session_launch {
+        return Ok(Launch {
+            child,
+            clip,
+            taps: Vec::new(),
+        });
+    }
 
     // `Stdio::piped()` guarantees these are `Some` immediately after a successful spawn.
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -618,6 +639,8 @@ mod tests {
             )
             .unwrap();
             assert!(launched.clip.is_none());
+            assert!(launched.taps.is_empty());
+            assert!(launched.child.stdout.is_none() && launched.child.stderr.is_none());
             let status = launched.child.wait().unwrap();
             drop(launched);
             assert!(status.success(), "{level}: {:?}", logs.lock().unwrap());

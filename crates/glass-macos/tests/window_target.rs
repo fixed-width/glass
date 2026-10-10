@@ -67,6 +67,10 @@ mod native {
                 Ok(observation) => remains_unqualified(&observation),
                 Err(error) => {
                     assert!(error.to_string().contains(reason), "{error}");
+                    assert_eq!(
+                        error.bound_dispatch(),
+                        Some(glass_core::BoundDispatch::MayHaveDispatched)
+                    );
                     println!("expected lifecycle refusal: {error}");
                     assert!(
                         target
@@ -112,6 +116,10 @@ mod native {
 
         let mut competing = launch("compete");
         let error = first(&mut competing).unwrap_err();
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
         assert!(
             error.to_string().contains("competing AX windows"),
             "{error}"

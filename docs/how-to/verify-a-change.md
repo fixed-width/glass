@@ -120,8 +120,10 @@ env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_INSERT_LIBRARIES 
 When the grant belongs to a signed app bundle, build with `--no-run` and run the resulting test
 binary through that bundle's established signing and GUI-session procedure. The test requires
 the grant; it never requests one. It launches fresh direct children with existing containment,
-without the clipboard shim, reads exact AX/WindowServer ownership and point geometry, and tests
-refresh, replacement, competing windows, child exit and cleanup. It reads no control values and
+without the clipboard shim, and reads exact AX/WindowServer ownership and point geometry.
+Child standard input/output is discarded. Post-read failures retain AX dispatch evidence even
+though no input event was posted. The test covers refresh, replacement, competing windows, child
+exit and cleanup. It reads no control values and
 posts no input. All observations retain false lifetime, configuration, pixel-geometry and input
 admission flags. Retained AX references detect some replacements; they supply no window lifetime
 guarantee. The reported AX subtree does not establish complete WindowServer inventory or a qualified

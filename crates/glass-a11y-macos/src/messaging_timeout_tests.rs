@@ -505,6 +505,22 @@ fn production_doctor_window_and_read_only_wrappers_share_one_owner() {
     );
     release_tx.send(()).unwrap();
     reader.join().unwrap();
+    let before = production_read_only(ax.as_ref(), Deadline::from_millis(1_000), |_| {
+        Err::<(), _>(GlassError::Backend(
+            "validation failed before an AX read".into(),
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(before.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    let after = production_read_only(ax.as_ref(), Deadline::from_millis(1_000), |scope| {
+        scope.message("AX read before validation", || Ok(()))?;
+        Err::<(), _>(GlassError::Backend("post-read validation failed".into()).before_dispatch())
+    })
+    .unwrap_err();
+    assert_eq!(
+        after.bound_dispatch(),
+        Some(BoundDispatch::MayHaveDispatched)
+    );
     let sets = ax.sets();
     assert_eq!(sets.last(), Some(&0.0));
 }
