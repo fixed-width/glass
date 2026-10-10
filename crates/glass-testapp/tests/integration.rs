@@ -149,6 +149,7 @@ fn invalid_artifact_path_fails_before_target_launch() {
 
 fn app_spec() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string()],
         cwd: None,
@@ -531,6 +532,7 @@ fn discovers_reparented_window_via_net_client_list() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string(), "--reparent".to_string()],
         cwd: None,
@@ -558,6 +560,7 @@ fn finds_window_by_class_when_no_net_wm_pid() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string(), "--no-wm-pid".to_string()],
         cwd: None,
@@ -656,6 +659,7 @@ fn failed_start_kills_the_child_process() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             "sh".to_string(),
@@ -703,6 +707,7 @@ fn enumerates_and_selects_multiple_windows() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string(), "--windows".into(), "2".into()],
         cwd: None,
@@ -762,6 +767,7 @@ fn capture_window_reads_a_specific_window_without_changing_the_active_one() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string(), "--windows".into(), "2".into()],
         cwd: None,
@@ -1331,6 +1337,7 @@ fn sandbox_default_app_still_runs_and_captures() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string()],
         cwd: None,
@@ -1373,6 +1380,7 @@ fn sandbox_off_build_step_writes_to_real_home() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: Some(format!("touch $HOME/{sentinel_name}")),
         run: vec![TESTAPP.to_string()],
         cwd: None,
@@ -1411,6 +1419,7 @@ fn sandbox_default_build_step_writes_real_home() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: Some(format!("touch $HOME/{sentinel_name}")),
         run: vec![TESTAPP.to_string()],
         cwd: None,
@@ -1457,6 +1466,7 @@ fn fail_closed_when_bwrap_missing() {
         };
         let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![TESTAPP.to_string()],
             cwd: None,
@@ -1530,6 +1540,7 @@ fn start_app_focuses_window_so_keys_reach_it() {
     // only if start_app focused it. (The default fixture self-focuses, which
     // would mask whether start_app does the focusing.)
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string(), "--no-self-focus".to_string()],
         cwd: None,
@@ -1560,6 +1571,7 @@ fn select_window_focuses_the_selected_window() {
     // presses (EVENT keysym=...); the EXTRA window has no KEY_PRESS mask, so it
     // is SILENT when focused — that silence is how we detect focus moved to it.
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             TESTAPP.to_string(),
@@ -1627,6 +1639,7 @@ fn sandbox_off_bypasses_bwrap_check() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string()],
         cwd: None,
@@ -1899,6 +1912,7 @@ fn stop_app_reaps_the_apps_forked_child() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string(), "--fork-child".to_string()],
         cwd: None,
@@ -2093,6 +2107,7 @@ fn sandbox_default_reaches_launch_target_via_argument_path() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["sh".to_string(), run_sh.to_string_lossy().into_owned()],
         cwd: None,
@@ -2155,6 +2170,7 @@ fn sandbox_default_reaches_relative_launch_token_with_defaulted_cwd() {
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         // Relative token; cwd is None so it must resolve against glass's defaulted cwd.
         run: vec!["sh".to_string(), "./run.sh".to_string()],
@@ -2218,6 +2234,7 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     let _path_guard = PathGuard(original_path);
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["glass-testapp-bare".to_string()], // bare name resolved via the shadowed PATH dir
         cwd: None,

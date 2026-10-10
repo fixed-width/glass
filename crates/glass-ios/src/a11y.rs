@@ -1103,6 +1103,7 @@ mod tests {
 
     fn test_spec() -> glass_core::AppSpec {
         glass_core::AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["fixture".into()],
             cwd: None,

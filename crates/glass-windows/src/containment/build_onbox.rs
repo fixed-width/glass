@@ -10,6 +10,7 @@ use super::sandboxie::{Sandboxie, available, sandboxie_dir};
 
 fn spec_with_build(build: String) -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: Some(build),
         run: vec!["notepad.exe".into()], // unused by run_build (it never launches)
         cwd: None,

@@ -470,6 +470,7 @@ fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFix
     start_tool(
         &mut glass,
         &StartArgs {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             backend: None,
@@ -549,6 +550,7 @@ fn deadline_a11y_glass_with_tree_behavior(
     start_tool(
         &mut glass,
         &StartArgs {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             backend: None,
@@ -1977,6 +1979,7 @@ fn unknown_mutation_failure_remains_conservatively_attempted() {
 fn started(platform: FakePlatform) -> Glass {
     let mut g = glass_with(platform);
     let a = StartArgs {
+        input_mode: Default::default(),
         build: None,
         run: vec!["app".into()],
         backend: None,
@@ -2001,6 +2004,7 @@ fn started_a11y_tree(platform: FakePlatform, tree: AxTree) -> Glass {
 
 fn started_a11y_session(mut g: Glass) -> Glass {
     let a = StartArgs {
+        input_mode: Default::default(),
         build: None,
         run: vec!["app".into()],
         backend: None,

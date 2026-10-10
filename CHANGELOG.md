@@ -21,6 +21,11 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- `glass_start` accepts an explicit `input_mode` and returns the chosen mode. Foreground remains
+  the default; background starts are refused before build, launch or existing-session teardown on
+  every shipped backend. `glass_capabilities` adds a read-only `scope: "session"` report for the
+  active mode and background click, scroll and text support.
+
 - Experimental `glass_a11y_snapshot_diff` in the full tool profile returns fresh, lossless
   compact-outline revisions with full-read recovery, bounded retention and completeness disclosures.
   macOS attests unambiguous read scope; unqualified backends return full observations without retention.

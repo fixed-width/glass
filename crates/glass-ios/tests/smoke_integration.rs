@@ -32,6 +32,7 @@ fn smoke_launch_capture_clipboard_stop() {
         .expect("GLASS_IOS_APP must be set to a built .app path for this test to launch");
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![app],
         cwd: None,

@@ -128,6 +128,7 @@ impl ArtifactOnboxFixture {
             lease.replace('\'', "''")
         );
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![
                 "powershell.exe".into(),

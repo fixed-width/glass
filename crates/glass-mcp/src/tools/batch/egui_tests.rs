@@ -183,6 +183,7 @@ fn consecutive_inputs(backend: &'static str, stall: bool) {
     };
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: fixture_run,
             cwd: None,

@@ -12,7 +12,7 @@ impl Glass {
         if !matches!(op, WindowOp::Geometry) {
             self.emit_audit(
                 &crate::audit::Actuation::Window { op },
-                crate::audit::AuditOutcome::from_result(&result),
+                crate::audit::AuditOutcome::from_core_result(&result),
                 t.elapsed(),
             );
         }
@@ -20,6 +20,7 @@ impl Glass {
     }
 
     fn window_inner_by(&mut self, op: &WindowOp, deadline: Deadline) -> Result<WindowGeometry> {
+        self.check_mutation(super::admission::Mutation::Window(op))?;
         if !matches!(op, WindowOp::Geometry) {
             self.observation_epoch.invalidate();
         }
@@ -46,6 +47,13 @@ impl Glass {
     }
 
     pub fn select_window_by(&mut self, id: WindowId, deadline: Deadline) -> Result<WindowGeometry> {
+        if self.require_active()?.input_mode == crate::InputMode::Background {
+            let current = self.require_active()?.platform.observation_window_id();
+            if current != Some(id) {
+                self.check_mutation(super::admission::Mutation::SelectWindow)?;
+            }
+            return self.window_by(&WindowOp::Geometry, deadline);
+        }
         self.observation_epoch.invalidate();
         let s = self.active_mut()?;
         let geometry = s.platform.select_window_by(id, deadline)?;

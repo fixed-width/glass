@@ -76,6 +76,7 @@ fn private_clipboard_isolation() {
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             probe.to_string_lossy().into_owned(),
@@ -169,6 +170,7 @@ fn private_clipboard_multiformat() {
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             probe.to_string_lossy().into_owned(),
@@ -295,6 +297,7 @@ fn private_clipboard_ole() {
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![probe.to_string_lossy().into_owned(), "roundtrip-ole".into()],
         cwd: None,
@@ -418,6 +421,7 @@ fn private_clipboard_hdrop() {
     sb.configure(SandboxLevel::Default).expect("configure box");
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             probe.to_string_lossy().into_owned(),

@@ -425,6 +425,7 @@ impl Platform for IosPlatform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        spec.input_mode.require_foreground("app start")?;
         // `self.app` is overwritten below, so an app still recorded here is one nothing would
         // reap again, `Drop` included. A no-op on the path `Glass` takes — a platform per
         // session.
@@ -1358,6 +1359,7 @@ mod teardown_tests {
 
     fn spec_for(bundle: &str) -> AppSpec {
         AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![bundle.to_string()],
             cwd: None,
@@ -1611,6 +1613,27 @@ mod teardown_tests {
             "all calls: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    fn background_start_preserves_the_previous_app_before_build_or_termination() {
+        let fake = FakeSimctl::new();
+        let mut platform = platform(&fake, true);
+        let calls = fake.calls();
+        let mut requested = spec_for("tech.fixedwidth.other");
+        requested.input_mode = glass_core::InputMode::Background;
+        requested.build = Some("exit 91".into());
+        let error = platform.start_app(&requested).unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            GlassError::UnsupportedInputMode { .. }
+        ));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        assert_eq!(fake.calls(), calls);
+        assert_eq!(platform.app.as_ref().unwrap().bundle_id, BUNDLE);
     }
 
     /// Starting a second app overwrites `self.app`, leaving the first running with nothing able

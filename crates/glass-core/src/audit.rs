@@ -33,6 +33,7 @@ pub struct ActuationContext {
 pub struct AuditOutcome {
     pub ok: bool,
     pub error: Option<String>,
+    pub dispatch: Option<crate::BoundDispatch>,
 }
 
 impl AuditOutcome {
@@ -42,12 +43,37 @@ impl AuditOutcome {
             Ok(_) => AuditOutcome {
                 ok: true,
                 error: None,
+                dispatch: None,
             },
             Err(e) => AuditOutcome {
                 ok: false,
                 error: Some(e.to_string()),
+                dispatch: None,
             },
         }
+    }
+
+    pub fn from_core_result<T>(result: &crate::Result<T>) -> Self {
+        let mut outcome = Self::from_result(result);
+        outcome.dispatch = result
+            .as_ref()
+            .err()
+            .and_then(crate::GlassError::bound_dispatch);
+        outcome
+    }
+
+    pub fn from_semantic_result<T>(
+        result: &std::result::Result<T, Box<crate::SemanticActionError>>,
+    ) -> Self {
+        let mut outcome = Self::from_result(result);
+        outcome.dispatch = result.as_ref().err().map(|error| {
+            if error.side_effects_may_have_occurred() {
+                crate::BoundDispatch::MayHaveDispatched
+            } else {
+                crate::BoundDispatch::NotDispatched
+            }
+        });
+        outcome
     }
 }
 

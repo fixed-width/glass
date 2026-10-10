@@ -283,6 +283,7 @@ mod tests {
 
     fn launch_spec(run: Vec<String>, cwd: Option<&str>) -> AppSpec {
         AppSpec {
+            input_mode: Default::default(),
             build: None,
             run,
             cwd: cwd.map(PathBuf::from),

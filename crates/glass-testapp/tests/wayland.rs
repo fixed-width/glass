@@ -21,6 +21,7 @@ const APP_TIMEOUT_MS: u64 = 15_000; // start_app: wait this long for sway's sock
 
 fn spec(run: Vec<String>, timeout_ms: u64) -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run,
         cwd: None,
@@ -766,6 +767,7 @@ fn assert_artifact_reads_denied(backend: ArtifactBackend, level: glass_core::San
         glass_core::HostPathProtectionMode::SandboxRules
     );
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             probe.into_os_string().into_string().unwrap(),
@@ -896,6 +898,7 @@ fn invalid_artifact_path_fails_before_wayland_target_launch() {
 fn sandbox_default_app_still_runs_and_captures() {
     let mut p = WaylandPlatform::new().unwrap();
     let sandboxed_spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string()],
         cwd: None,
@@ -948,6 +951,7 @@ fn fail_closed_when_bwrap_missing_wayland() {
         };
         let mut p = WaylandPlatform::new().unwrap();
         let sandboxed_spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![TESTAPP.to_string()],
             cwd: None,
@@ -998,6 +1002,7 @@ fn sandbox_default_reaches_launch_target_via_argument_path() {
 
     let mut p = WaylandPlatform::new().unwrap();
     let sandboxed_spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["sh".to_string(), run_sh.to_string_lossy().into_owned()],
         cwd: None,
@@ -1055,6 +1060,7 @@ fn sandbox_default_reaches_relative_launch_token_with_defaulted_cwd() {
 
     let mut p = WaylandPlatform::new().unwrap();
     let sandboxed_spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["sh".to_string(), "./run.sh".to_string()],
         cwd: None,
@@ -1113,6 +1119,7 @@ fn sandbox_default_reaches_bare_name_program_on_a_shadowed_path_dir() {
     let _path_guard = PathGuard(original_path);
 
     let sandboxed_spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["glass-testapp-bare".to_string()],
         cwd: None,
@@ -1154,6 +1161,7 @@ fn wayland_build_step_runs_before_launch() {
 
     let build_spec = AppSpec {
         // Use a relative path; cwd is the tempdir so the file lands there.
+        input_mode: Default::default(),
         build: Some("touch glass-wayland-build-marker".into()),
         run: vec![TESTAPP.to_string()],
         cwd: Some(tmp.path().to_path_buf()),

@@ -55,6 +55,7 @@ fn observe_only_survives_without_a_companion() {
     };
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![app],
         cwd: None,

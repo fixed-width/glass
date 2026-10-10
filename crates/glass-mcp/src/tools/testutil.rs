@@ -558,6 +558,7 @@ pub fn started_a11y_with(tree: AxTree) -> Glass {
     let mut glass = glass_with_a11y(FakePlatform::new(100, 100), tree);
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,
@@ -584,6 +585,7 @@ pub fn started_counted_a11y(
     );
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,
@@ -601,6 +603,7 @@ pub fn started_without_a11y() -> Glass {
     let mut glass = glass_with(FakePlatform::new(100, 100));
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,
@@ -639,6 +642,7 @@ pub fn started_failing_a11y(error: GlassError) -> Glass {
     let mut glass = Glass::new(factory, "x11".into(), BaselineStore::new(root), 100);
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,

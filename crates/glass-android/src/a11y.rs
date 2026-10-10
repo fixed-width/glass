@@ -2538,6 +2538,7 @@ exec "$real" "$@"
         );
         glass
             .start(&glass_core::AppSpec {
+                input_mode: Default::default(),
                 build: None,
                 run: vec!["test-app".into()],
                 cwd: None,

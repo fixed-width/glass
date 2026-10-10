@@ -105,6 +105,7 @@ fn describe(act: &Actuation) -> Option<(&'static str, Value, Option<String>)> {
                 json!({
                     "program": spec.run.first(),
                     "backend": backend,
+                    "input_mode": spec.input_mode,
                     "argc": spec.run.len(),
                     "has_build": spec.build.is_some()
                 }),
@@ -276,6 +277,8 @@ struct ResultRecord {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch: Option<&'static str>,
     duration_ms: u64,
 }
 
@@ -355,7 +358,8 @@ impl AuditSink for JsonlSink {
         // Monotonic event counter. `saturating_add` so an (unreachable) overflow can't
         // panic while the lock is held — `record` must never panic (trait contract).
         st.seq = st.seq.saturating_add(1);
-        if action == "launch" {
+        if action == "launch" && outcome.dispatch != Some(glass_core::BoundDispatch::NotDispatched)
+        {
             st.session = Some(mint_session());
         }
         let session = st.session.clone();
@@ -370,6 +374,10 @@ impl AuditSink for JsonlSink {
             content: raw.as_deref().and_then(|r| render_content(r, &self.cfg)),
             result: ResultRecord {
                 ok: outcome.ok,
+                dispatch: outcome.dispatch.map(|dispatch| match dispatch {
+                    glass_core::BoundDispatch::NotDispatched => "not_dispatched",
+                    glass_core::BoundDispatch::MayHaveDispatched => "may_have_dispatched",
+                }),
                 error: outcome.error.as_ref().map(|error| {
                     if raw.is_some() {
                         "action failed".into()
@@ -521,6 +529,7 @@ mod tests {
     }
     fn ok() -> AuditOutcome {
         AuditOutcome {
+            dispatch: None,
             ok: true,
             error: None,
         }
@@ -531,6 +540,29 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn refused_background_start_preserves_audit_session_and_dispatch_evidence() {
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let sink = JsonlSink::with_writer(Box::new(Buf(buffer.clone())), AuditConfig::default());
+        let mut glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        glass.set_audit_sink(Box::new(sink));
+        let start: crate::params::StartArgs =
+            serde_json::from_value(json!({"run": ["app"], "a11y": false})).unwrap();
+        crate::tools::start(&mut glass, &start).unwrap();
+        let requested: crate::params::StartArgs = serde_json::from_value(
+            json!({"run": ["app"], "input_mode": "background", "a11y": false}),
+        )
+        .unwrap();
+        crate::tools::start(&mut glass, &requested).unwrap_err();
+        let records = lines(&buffer);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["session"], records[1]["session"]);
+        assert_eq!(records[1]["args"]["input_mode"], "background");
+        assert_eq!(records[1]["result"]["ok"], false);
+        assert_eq!(records[1]["result"]["dispatch"], "not_dispatched");
     }
     fn win_ctx() -> ActuationContext {
         ActuationContext {
@@ -971,6 +1003,7 @@ mod tests {
             },
             &ActuationContext::default(),
             &AuditOutcome {
+                dispatch: None,
                 ok: false,
                 error: Some("element #1 changed since the snapshot; re-snapshot".into()),
             },
@@ -1002,6 +1035,7 @@ mod tests {
                 &act,
                 &ActuationContext::default(),
                 &AuditOutcome {
+                    dispatch: None,
                     ok: false,
                     error: Some(format!("backend echoed {SENTINEL}")),
                 },
@@ -1063,6 +1097,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
         let spec = glass_core::AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["app".into()],
             cwd: None,
@@ -1111,6 +1146,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let s = JsonlSink::with_writer(Box::new(Buf(buf.clone())), AuditConfig::default());
         let out = AuditOutcome {
+            dispatch: None,
             ok: false,
             error: Some("coords out of bounds".into()),
         };
@@ -1204,6 +1240,7 @@ mod tests {
         tools::start(
             &mut g,
             &StartArgs {
+                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 backend: None,
@@ -1322,6 +1359,7 @@ mod tests {
 
         fn args() -> StartArgs {
             StartArgs {
+                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 backend: None,

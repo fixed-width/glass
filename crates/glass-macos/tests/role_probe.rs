@@ -205,6 +205,7 @@ mod macos_main {
             MacosPlatform::new().map_err(|e| format!("MacosPlatform::new() for {run0}: {e}"))?;
 
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![run0.to_string()],
             cwd: None,

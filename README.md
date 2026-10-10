@@ -19,6 +19,10 @@ or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** 
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
 including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
+Session input defaults to foreground. Explicit background mode is reserved and currently refused
+on every shipped backend; `glass_capabilities` with `scope: "session"` reports current mode and
+background support.
+
 ## See it
 
 ![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)

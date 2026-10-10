@@ -305,6 +305,8 @@ pub struct A11yBind<'a> {
 /// Everything a backend needs to build, launch, and locate an app's window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSpec {
+    /// Input routing for the whole session. Foreground preserves existing behavior.
+    pub input_mode: crate::InputMode,
     /// Optional shell command run (in `cwd`) before launching.
     pub build: Option<String>,
     /// Program + args to launch. `run[0]` is the thing to launch and `run[1..]` are its
@@ -337,6 +339,10 @@ pub struct AppSpec {
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
 /// glass-core code depends on a concrete backend. Must stay object-safe.
 pub trait Platform {
+    /// Read current background-route support without focus, capture setup, or input.
+    fn background_input_capabilities(&mut self) -> Result<crate::BackgroundInputCapabilities> {
+        Ok(crate::BackgroundInputCapabilities::default())
+    }
     fn configure_protected_host_paths(
         &mut self,
         paths: &[ProtectedHostPath],
@@ -604,6 +610,7 @@ mod tests {
     #[test]
     fn app_spec_is_constructible() {
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: Some("cargo build".into()),
             run: vec!["./app".into()],
             cwd: None,

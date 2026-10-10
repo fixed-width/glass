@@ -64,7 +64,10 @@ pub mod doctor;
 pub use doctor::{Check, CheckStatus, Diagnosis, Palette, ProbeFailure, Section};
 
 pub mod capability;
-pub use capability::{CapabilityMap, CapabilityStatus, Support};
+pub use capability::{
+    BackgroundInputCapabilities, BackgroundOperation, BackgroundProfile, BackgroundSupport,
+    CapabilityMap, CapabilityStatus, SessionCapabilities, Support,
+};
 
 pub mod stability;
 pub use stability::StabilityTracker;
@@ -78,7 +81,9 @@ pub use baseline::BaselineStore;
 pub mod logbuf;
 pub use logbuf::{LogBuffer, LogLine, Stream};
 
+pub mod input_mode;
 pub mod platform;
+pub use input_mode::InputMode;
 pub use platform::{
     A11yBind, AppSpec, HostPathAccess, HostPathProtectionMode, KeyEvent, MAX_CLICK_COUNT,
     MAX_GESTURE_POINTERS, MAX_SCROLL_NOTCHES, MouseButton, Platform, PointerEvent,
@@ -124,13 +129,14 @@ pub mod session;
 pub use session::{
     ActionDeadline, ActionMethod, ActionMode, ActionTarget, AxObservation, Backend,
     ClickTargetParams, ConfirmationStatus, DispatchStatus, FindElementsOutcome, FindElementsParams,
-    Glass, MutationReport, ObservationContext, ObservationEpoch, ObservationGeneration,
-    ObservationInvalidation, PlatformFactory, ResolutionReport, RetryGuidance,
-    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS,
-    SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome, ScrollToElementParams,
-    SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticTarget,
-    SetValueTargetParams, TypeTargetParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome,
-    WaitLogParams, WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
+    Glass, InputModePreflight, ModeAwarePlatformFactory, MutationReport, ObservationContext,
+    ObservationEpoch, ObservationGeneration, ObservationInvalidation, PlatformFactory,
+    ResolutionReport, RetryGuidance, SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
+    SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScrollDirection,
+    ScrollToElementOutcome, ScrollToElementParams, SemanticActionError, SemanticActionFailureKind,
+    SemanticActionOutcome, SemanticTarget, SetValueTargetParams, TypeTargetParams,
+    WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams, WaitRegionOutcome,
+    WaitRegionParams, WaitStableOutcome, WaitStableParams,
 };
 
 fn simd_level() -> fearless_simd::Level {

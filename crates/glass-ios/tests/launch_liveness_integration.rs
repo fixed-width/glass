@@ -35,6 +35,7 @@ use glass_ios::{IosPlatform, SimulatorRegistry};
 /// treats as fatal.
 fn fatal_spec(app: &str) -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![app.to_string(), "--tab=no-such-screen".to_string()],
         cwd: None,

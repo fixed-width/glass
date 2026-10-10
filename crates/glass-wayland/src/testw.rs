@@ -135,6 +135,7 @@ impl Launch {
         let mut env = vec![(WINDOWS.to_string(), self.windows.join(","))];
         env.extend(self.env.iter().cloned());
         AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![
                 exe.to_string_lossy().into_owned(),

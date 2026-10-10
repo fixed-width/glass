@@ -7,6 +7,30 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::num::NonZeroU32;
 
 pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
+
+#[cfg(test)]
+mod input_mode_tests {
+    use super::*;
+
+    #[test]
+    fn start_rejects_unknown_input_mode() {
+        for mode in ["Background", "unknown", ""] {
+            let value = serde_json::json!({"run": ["app"], "input_mode": mode});
+            assert!(
+                serde_json::from_value::<StartArgs>(value).is_err(),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capabilities_reject_unknown_scope() {
+        assert!(
+            serde_json::from_value::<CapabilitiesArgs>(serde_json::json!({"scope": "unknown"}))
+                .is_err()
+        );
+    }
+}
 pub(crate) const MAX_SCROLL_NOTCHES: i32 = glass_core::MAX_SCROLL_NOTCHES as i32;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -62,6 +86,8 @@ pub struct WindowHintArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StartArgs {
+    /// foreground (default) or background (currently unsupported).
+    pub input_mode: Option<InputModeArg>,
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
     /// Desktop: [executable, args...]. iOS: [.app-or-bundle-id, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].
@@ -447,8 +473,36 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct CapabilitiesArgs {
-    /// x11, wayland, windows, macos, android or ios. Default active/default backend. Valid but unbuilt backends report available:false.
+    /// backend (default) or active session.
+    pub scope: Option<CapabilitiesScope>,
+    /// Backend name; defaults to active/default backend. Session scope requires a match.
     pub backend: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum InputModeArg {
+    Foreground,
+    Background,
+}
+
+impl From<InputModeArg> for glass_core::InputMode {
+    fn from(mode: InputModeArg) -> Self {
+        match mode {
+            InputModeArg::Foreground => Self::Foreground,
+            InputModeArg::Background => Self::Background,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum CapabilitiesScope {
+    #[default]
+    Backend,
+    Session,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

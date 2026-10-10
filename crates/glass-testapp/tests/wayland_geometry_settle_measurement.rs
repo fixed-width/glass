@@ -17,6 +17,7 @@ const APP_TIMEOUT_MS: u64 = 15_000; // start_app: wait this long for sway's sock
 
 fn spec(run: Vec<String>, timeout_ms: u64) -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run,
         cwd: None,

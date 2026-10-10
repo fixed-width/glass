@@ -11,13 +11,14 @@ impl Glass {
         let result = self.set_clipboard_inner(text);
         self.emit_audit(
             &crate::audit::Actuation::ClipboardSet { text },
-            crate::audit::AuditOutcome::from_result(&result),
+            crate::audit::AuditOutcome::from_core_result(&result),
             t.elapsed(),
         );
         result
     }
 
     fn set_clipboard_inner(&mut self, text: &str) -> Result<()> {
+        self.check_mutation(super::admission::Mutation::ClipboardWrite)?;
         self.active_mut()?.platform.set_clipboard(text)
     }
 }

@@ -496,6 +496,7 @@ mod tests {
 
     fn spec(run: &[&str]) -> AppSpec {
         AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: run.iter().map(|s| s.to_string()).collect(),
             cwd: None,

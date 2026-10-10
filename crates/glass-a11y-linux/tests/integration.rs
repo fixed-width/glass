@@ -104,6 +104,7 @@ fn fixture_spec() -> AppSpec {
         "/tests/fixtures/a11y_fixture.py"
     );
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["python3".into(), fixture.into()],
         cwd: None,
@@ -319,6 +320,7 @@ fn a11y_launch_succeeds_from_within_a_tokio_runtime() {
         let mut glass = glass_x11_with_a11y();
         glass
             .start(&AppSpec {
+                input_mode: Default::default(),
                 build: None,
                 run: vec!["python3".into(), fixture.into()],
                 cwd: None,
@@ -349,6 +351,7 @@ fn snapshot_finds_gtk_widgets() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -466,6 +469,7 @@ fn a11y_launch_is_fast_without_the_portal_hang() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -511,6 +515,7 @@ fn snapshot_reads_entry_value() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -554,6 +559,7 @@ fn set_value_changes_entry() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -603,6 +609,7 @@ fn set_value_on_button_is_not_editable() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -645,6 +652,7 @@ fn set_value_changes_spinbutton() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -1314,6 +1322,7 @@ fn snapshot_without_a11y_flag_errors() {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,
@@ -1352,6 +1361,7 @@ fn sandboxed_a11y_finds_widgets(level: glass_core::SandboxLevel) {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), "a11y_fixture.py".into()],
             cwd: Some(fixtures.into()),
@@ -1414,6 +1424,7 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
     let mut glass = glass_wayland_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), "a11y_fixture.py".into()],
             cwd: Some(fixtures.into()),
@@ -1568,6 +1579,7 @@ fn launch_bench() -> Glass {
     let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["python3".into(), fixture.into()],
             cwd: None,

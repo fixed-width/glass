@@ -81,6 +81,7 @@ mod macos_main {
         fixture_bin: &std::path::Path,
     ) -> Result<(), String> {
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![fixture_bin.to_string_lossy().into_owned()],
             cwd: None,

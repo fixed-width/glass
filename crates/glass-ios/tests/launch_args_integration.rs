@@ -46,6 +46,7 @@ fn spec_with_args(app: &str, args: &[&str]) -> AppSpec {
     let mut run = vec![app.to_string()];
     run.extend(args.iter().map(|a| (*a).to_string()));
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run,
         cwd: None,

@@ -179,6 +179,12 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   activity rather than a command line, so it has nowhere to put them and returns an error naming
   what it could not use rather than ignoring it.
 - `build` (string) — shell command run in `cwd` before launching.
+- `input_mode` (`"foreground"` or `"background"`, default `"foreground"`) — input routing for
+  the lifetime of the session. All shipped backends currently refuse background mode before
+  building, launching, constructing a backend or stopping an existing session. The error has
+  `code: "unsupported_input_mode"`, `dispatch: "not_dispatched"` and
+  `side_effects_may_have_occurred: false`. An existing session and its observations remain usable.
+  There is no environment or per-action override.
 - `cwd` (string) — working directory for `build` and `run`.
 - `env` (object) — extra environment variables, as `{ "KEY": "VALUE" }` pairs. They reach the
   launched app on the desktop backends and on `ios`; on `android` they configure the `build`
@@ -198,7 +204,7 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   processes. Other backends read accessibility ambiently and ignore this flag.
 - `timeout_ms` (integer) — launch timeout.
 
-Returns the located window's geometry: `{x, y, width, height}`.
+Returns the located window's geometry and chosen mode: `{x, y, width, height, input_mode}`.
 
 ### `glass_stop`
 
@@ -1177,9 +1183,26 @@ before `glass_start`.
 
 - `backend` (string, optional) — which backend to report: `x11`, `wayland`, `windows`, `macos`,
   `android`, `ios`. Omit for the active/default backend.
+- `scope` (`"backend"` or `"session"`, default `"backend"`) — retain the backend report or read
+  support for the active session. Session scope requires an active session; an explicit backend
+  must match it. The query does not focus a window, prepare input or request permissions.
+
+Session scope returns `{scope: "session", backend, input_mode, background_input, tool_profile}`.
+`background_input` contains `click`, `scroll` and `text`, each with `status`, `reasons`, `tools`
+and `restriction`, plus `profile` (null when there is no qualification). Session statuses are
+`supported`, `requires_setup` or `unsupported`. Foreground sessions report background operations
+as unsupported, and background text is always unsupported, including empty text.
+
+The reserved background subset is coordinate input: one unmodified left click or vertical wheel
+scroll with zero horizontal delta. Semantic/ID clicks in every action mode, scroll-to-element,
+keys/text, hover, drag, gestures, clipboard writes and window mutations are refused before input
+or accessibility resolution. Re-selecting the reliably identified current window only refreshes
+its geometry; another or unidentified window is refused. Tool lists are filtered for the server's
+full/lean profile, and `glass_do` membership applies only to the stated operation subset. These
+restrictions define the admission boundary; no shipped backend currently admits a background session.
 
 Returns JSON as `result` (no untrusted siblings — capability data is glass-computed, not read from
-the app). For a backend compiled into this binary:
+the app). For backend scope with a backend compiled into this binary:
 
 `{ "backend", "available": true, "tool_profile": "full" | "lean", "capabilities": { <operation>: { "status", "note"?, "tools" } } }`
 

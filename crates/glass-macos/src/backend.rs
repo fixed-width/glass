@@ -669,6 +669,7 @@ impl Platform for MacosPlatform {
     /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`]; every other
     /// `run[0]` takes the plain-exec path below.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        spec.input_mode.require_foreground("app start")?;
         Self::run_build(spec)?;
         let run0 = spec
             .run
@@ -1097,6 +1098,33 @@ mod tests {
     }
 
     #[test]
+    fn background_start_refuses_before_build_launch_or_permission_setup() {
+        let mut platform = test_platform();
+        let requested = AppSpec {
+            input_mode: glass_core::InputMode::Background,
+            build: Some("exit 91".into()),
+            run: vec!["/bin/false".into()],
+            cwd: None,
+            env: Vec::new(),
+            window_hint: None,
+            timeout_ms: 100,
+            sandbox: glass_core::SandboxLevel::Off,
+            a11y: false,
+        };
+        let error = platform.start_app(&requested).unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            GlassError::UnsupportedInputMode { .. }
+        ));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        assert!(platform.child.is_none());
+        assert!(platform.app_pid.is_none());
+    }
+
+    #[test]
     fn protected_host_path_configuration_validates_before_storing() {
         let root = std::env::temp_dir().join(format!(
             "glass-macos-platform-protected-{}",
@@ -1306,6 +1334,7 @@ mod tests {
             protected_host_paths: Vec::new(),
         };
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec![],
             cwd: None,

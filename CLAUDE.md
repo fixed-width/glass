@@ -71,6 +71,9 @@ do, most of which run from any host.
 - **Keep `glass-core` platform-agnostic** — no OS types in core; every OS detail lives behind `Platform`.
 - **No silent fallbacks** — a failed capture/input returns a structured error, never a blank/stale frame.
 - **Coordinates are window-relative** at the tool boundary; only the backend maps to global coords.
+- **Input mode belongs to the session.** Foreground is the default. Every shipped backend rejects
+  background starts before external work; the core also guards mutations for mode-aware adapters.
+  Session capability reporting is read-only and never authorizes background text.
 - **Permissively-licensed deps only** (MIT/Apache; no copyleft).
 - **Avoid `unsafe`** — prefer safe abstractions; isolate + document any required `unsafe` with `// SAFETY:`.
 

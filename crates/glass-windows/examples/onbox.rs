@@ -99,6 +99,7 @@ mod imp {
         // Notepad, it doesn't hand off to an out-of-process Store app and exit, and it ignores stdin so
         // it stays open. Ideal for exercising capture / input / window-ops / kill-tree.
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["charmap.exe".to_string()],
             cwd: None,

@@ -330,6 +330,7 @@ mod backend {
         }
 
         fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+            spec.input_mode.require_foreground("app start")?;
             // Resolve the containment provider before doing any work. `off` → Unconfined
             // (today's direct spawn); `default`/`strict` require an in-OS provider and
             // fail closed while Sandboxie availability is stubbed false (a later task).

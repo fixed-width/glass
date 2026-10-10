@@ -870,7 +870,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Report live backend operation status and the exposed tools it affects, plus tool_profile. Status: supported; degraded (reduced fidelity); requires_setup; unsupported. Notes explain limits/remedies. No session required; backend defaults to the active/default backend. Profile membership does not imply backend support."
+        description = "Backend support, or scope session: active mode/background support. Session requires a matching backend."
     )]
     async fn glass_capabilities(
         &self,
@@ -881,8 +881,16 @@ impl GlassServer {
         self.run(
             "glass_capabilities",
             tool_effect("glass_capabilities"),
-            move |_| {
-                crate::capabilities::render_value(a.backend.as_deref()).map(|mut value| {
+            move |glass| {
+                let result = match a.scope.unwrap_or_default() {
+                    CapabilitiesScope::Backend => {
+                        crate::capabilities::render_value(a.backend.as_deref())
+                    }
+                    CapabilitiesScope::Session => {
+                        crate::capabilities::render_session_value(glass, a.backend.as_deref())
+                    }
+                };
+                result.map(|mut value| {
                     crate::capabilities::apply_tool_profile(&mut value, profile);
                     ToolOutput::result("glass_capabilities", value)
                 })
@@ -1890,6 +1898,7 @@ mod tests {
             .expect("clear fake-backend-only protection paths");
         glass
             .start(&glass_core::AppSpec {
+                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,
@@ -2335,6 +2344,7 @@ mod tests {
         );
         glass
             .start(&glass_core::AppSpec {
+                input_mode: Default::default(),
                 build: None,
                 run: vec!["app".into()],
                 cwd: None,
@@ -2597,6 +2607,7 @@ mod tests {
 
         let out = server
             .glass_capabilities(Parameters(CapabilitiesArgs {
+                scope: None,
                 backend: Some("android".into()),
             }))
             .await
@@ -2624,6 +2635,7 @@ mod tests {
 
         let out = server
             .glass_capabilities(Parameters(CapabilitiesArgs {
+                scope: None,
                 backend: Some("nope".into()),
             }))
             .await
@@ -2631,6 +2643,111 @@ mod tests {
 
         assert_eq!(out.is_error, Some(true));
         assert!(first_text(&out).contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn session_capabilities_handler_keeps_foreground_support_and_mode_refusal_structured() {
+        let paths = std::sync::Arc::default();
+        let glass = crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform {
+            protected_paths: Some(paths),
+            ..crate::tools::testutil::FakePlatform::new(100, 100)
+        });
+        let server = GlassServer::new(glass, crate::audit::report_from_config(None, |_| None));
+        let output = server
+            .glass_capabilities(Parameters(CapabilitiesArgs {
+                scope: Some(CapabilitiesScope::Session),
+                backend: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(output.is_error, Some(true));
+        let start: StartArgs =
+            serde_json::from_value(serde_json::json!({"run": ["app"], "a11y": false})).unwrap();
+        assert_eq!(
+            server
+                .glass_start(Parameters(start))
+                .await
+                .unwrap()
+                .is_error,
+            Some(false)
+        );
+        let output = server
+            .glass_capabilities(Parameters(CapabilitiesArgs {
+                scope: Some(CapabilitiesScope::Session),
+                backend: None,
+            }))
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&first_text(&output)).unwrap();
+        assert_eq!(value["result"]["input_mode"], "foreground");
+        assert_eq!(
+            value["result"]["background_input"]["click"]["status"],
+            "unsupported"
+        );
+        let start: StartArgs = serde_json::from_value(
+            serde_json::json!({"run": ["app"], "input_mode": "background", "a11y": false}),
+        )
+        .unwrap();
+        let output = server.glass_start(Parameters(start)).await.unwrap();
+        assert_eq!(output.is_error, Some(true));
+        let value: serde_json::Value = serde_json::from_str(&first_text(&output)).unwrap();
+        assert_eq!(value["error"]["code"], "unsupported_input_mode");
+        assert_eq!(value["result"]["dispatch"], "not_dispatched");
+        assert_eq!(value["result"]["side_effects_may_have_occurred"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trace_retains_background_mode_refusal_without_claiming_dispatch() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = crate::trace::TraceConfig::new(root.path().to_owned(), None).unwrap();
+        let glass =
+            crate::tools::testutil::glass_with(crate::tools::testutil::FakePlatform::new(100, 100));
+        let server = GlassServer::new_configured(
+            glass,
+            crate::audit::report_from_config(None, |_| None),
+            ToolProfile::Full,
+            Some(&config),
+            "test",
+        )
+        .unwrap();
+        let trace = server.trace_recorder().unwrap();
+        let call = trace.begin_call("glass_start", 1).unwrap();
+        let args: StartArgs = serde_json::from_value(
+            serde_json::json!({"run": ["app"], "input_mode": "background", "a11y": false}),
+        )
+        .unwrap();
+        let response = crate::trace::ACTIVE_CALL
+            .scope(call, server.glass_start(Parameters(args)))
+            .await
+            .unwrap();
+        assert_eq!(response.is_error, Some(true));
+        trace.close().await;
+        let events = std::fs::read_to_string(trace.path().join("events.jsonl")).unwrap();
+        let logical: serde_json::Value = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["kind"] == "logical_outcome")
+            .unwrap();
+        assert_eq!(logical["data"]["is_error"], true);
+        let evidence = logical["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["payload"].is_object())
+            .unwrap();
+        let bytes = std::fs::read(
+            trace
+                .path()
+                .join(evidence["payload"]["path"].as_str().unwrap()),
+        )
+        .unwrap();
+        let refusal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refusal["error"]["code"], "unsupported_input_mode");
+        assert_eq!(refusal["result"]["dispatch"], "not_dispatched");
+        assert_eq!(refusal["result"]["side_effects_may_have_occurred"], false);
     }
 
     #[test]

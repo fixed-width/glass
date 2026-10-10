@@ -194,6 +194,7 @@ fn covering_windows_refuse_before_dispatch_and_pass_through_windows_allow_taps()
         let mut glass = Glass::new(factory, "android".into(), BaselineStore::new(baselines), 64);
         glass
             .start(&AppSpec {
+                input_mode: Default::default(),
                 build: None,
                 run: vec![format!("tech.fixedwidth.glassrolefixture/.{activity}")],
                 cwd: None,

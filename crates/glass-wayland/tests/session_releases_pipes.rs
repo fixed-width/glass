@@ -62,6 +62,7 @@ fn open_pipes() -> HashSet<String> {
 /// EOF and turn this gate into a vacuous pass.
 fn spec_leaving_a_survivor() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: [
             "sh",

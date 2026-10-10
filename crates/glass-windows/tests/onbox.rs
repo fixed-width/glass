@@ -42,6 +42,7 @@ fn dpi_aware_once() {
 
 fn charmap_spec() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["charmap.exe".to_string()],
         cwd: None,
@@ -62,6 +63,7 @@ fn charmap_spec() -> AppSpec {
 /// (see `onbox_role_histogram_probe`'s doc for why that shape was left out of the probe).
 fn notepad_spec() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["notepad.exe".to_string()],
         cwd: None,
@@ -81,6 +83,7 @@ fn notepad_spec() -> AppSpec {
 /// system-wide title-substring fallback rung picks up the pre-existing window instead.
 fn taskmgr_spec() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["taskmgr.exe".to_string()],
         cwd: None,
@@ -110,6 +113,7 @@ fn taskmgr_spec() -> AppSpec {
 /// exactly the thing this spec deliberately leaves unset.
 fn explorer_spec() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["explorer.exe".to_string()],
         cwd: None,
@@ -245,6 +249,7 @@ fn egui_fixture_spec(sandbox: glass_core::SandboxLevel) -> AppSpec {
     let fixture_exe =
         repo_root.join("crates/glass-fixture-egui/target/release/glass-fixture-egui.exe");
     AppSpec {
+        input_mode: Default::default(),
         build: Some(
             "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml"
                 .to_string(),
@@ -598,6 +603,7 @@ fn onbox_isolated_edge_killtree() {
 
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             edge,
@@ -670,6 +676,7 @@ fn onbox_stop_app_lets_edge_record_a_clean_exit() {
 
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             edge,
@@ -851,6 +858,7 @@ fn onbox_handoff_grace() {
     kill_notepad();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["notepad.exe".to_string()],
         cwd: None,
@@ -1599,6 +1607,7 @@ fn onbox_a11y_edge_multiprocess() {
 
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             edge,
@@ -1658,6 +1667,7 @@ fn onbox_contained_launch_adopts_app_not_console() {
     dpi_aware_once();
     let mut p = WindowsPlatform::new().expect("WindowsPlatform::new");
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec!["notepad.exe".to_string()],
         cwd: None,
@@ -2665,6 +2675,7 @@ fn onbox_a_wait_wakes_on_a_late_change_from_another_thread() {
 fn winforms_fixture_spec() -> AppSpec {
     let script = repo_root().join("crates/glass-windows/fixture/a11y_fixture.ps1");
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![
             "powershell.exe".to_string(),

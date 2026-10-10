@@ -133,6 +133,7 @@ fn pointer_click(query: &str, role: AxRole, timeout_ms: u64) -> ClickTargetParam
 
 fn semantic_fixture_spec(app: String) -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![app],
         cwd: None,
@@ -306,6 +307,7 @@ fn drive_fixture_snapshot_tap_and_type_end_to_end() {
         .expect("GLASS_IOS_APP must be set to the examples/ios-fixture GlassFixture.app path");
 
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![app],
         cwd: None,
@@ -857,6 +859,7 @@ fn web_fixture_button_and_field_respond() {
     // The web tab is chosen at launch: the tab bar's items are not accessibility elements and a
     // synthetic tap on one does not switch tabs (see the fixture's README).
     let spec = AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![app, "--tab".into(), "web".into()],
         cwd: None,

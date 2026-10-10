@@ -19,6 +19,7 @@ const TESTAPP: &str = env!("CARGO_BIN_EXE_glass-testapp");
 
 fn app_spec() -> AppSpec {
     AppSpec {
+        input_mode: Default::default(),
         build: None,
         run: vec![TESTAPP.to_string()],
         cwd: None,

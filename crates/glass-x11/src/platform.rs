@@ -1498,6 +1498,7 @@ impl Platform for X11Platform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        spec.input_mode.require_foreground("app start")?;
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never the host
@@ -4695,6 +4696,7 @@ mod display_tests {
         let x = TestX::start();
         let mut plat = x.platform();
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["sleep".to_string(), "30".to_string()],
             cwd: None,
@@ -4725,6 +4727,7 @@ mod display_tests {
         let mut plat = x.platform();
         plat.child = Some(LaunchedChild::Direct(spawn_stand_in()));
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["sleep".to_string(), "30".to_string()],
             cwd: None,
@@ -4843,6 +4846,7 @@ mod display_tests {
         let x = TestX::start();
         let mut plat = x.platform();
         let spec = AppSpec {
+            input_mode: Default::default(),
             build: None,
             run: vec!["/nonexistent/glass-test-binary".to_string()],
             cwd: None,

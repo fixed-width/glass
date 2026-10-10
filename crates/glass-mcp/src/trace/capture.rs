@@ -27,6 +27,7 @@ pub(crate) fn arguments(value: &impl Serialize) {
 pub(crate) fn start_arguments(args: &crate::params::StartArgs) {
     #[derive(Serialize)]
     struct Args<'a> {
+        input_mode: Option<crate::params::InputModeArg>,
         build: &'a Option<String>,
         run: &'a [String],
         backend: &'a Option<String>,
@@ -38,6 +39,7 @@ pub(crate) fn start_arguments(args: &crate::params::StartArgs) {
         a11y: Option<bool>,
     }
     arguments(&Args {
+        input_mode: args.input_mode,
         build: &args.build,
         run: &args.run,
         backend: &args.backend,

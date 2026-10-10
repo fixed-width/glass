@@ -8,6 +8,63 @@
 
 use serde::Serialize;
 
+/// Session background support has no degraded state: a route is admitted or refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundSupport {
+    Supported,
+    RequiresSetup,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackgroundOperation {
+    pub status: BackgroundSupport,
+    pub reasons: Vec<String>,
+}
+
+impl BackgroundOperation {
+    pub fn unsupported(reason: &str) -> Self {
+        Self {
+            status: BackgroundSupport::Unsupported,
+            reasons: vec![reason.to_owned()],
+        }
+    }
+}
+
+/// Identity of the qualification authorizing a background route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackgroundProfile {
+    pub id: String,
+    pub qualification_reference: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackgroundInputCapabilities {
+    pub click: BackgroundOperation,
+    pub scroll: BackgroundOperation,
+    pub text: BackgroundOperation,
+    pub profile: Option<BackgroundProfile>,
+}
+
+impl Default for BackgroundInputCapabilities {
+    fn default() -> Self {
+        Self {
+            click: BackgroundOperation::unsupported("no qualified background click route"),
+            scroll: BackgroundOperation::unsupported("no qualified background scroll route"),
+            text: BackgroundOperation::unsupported("background text input is unsupported"),
+            profile: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionCapabilities {
+    pub backend: String,
+    pub input_mode: crate::InputMode,
+    pub background_input: BackgroundInputCapabilities,
+}
+
 /// Whether an operation can be performed right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
