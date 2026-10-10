@@ -65,8 +65,7 @@ impl NativeApi {
         let graphics =
             Library::open(c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")?;
         let system = Library::open(c"/usr/lib/libSystem.B.dylib")?;
-        // SAFETY: fixed symbol names and signatures from the native C ABIs. Handles remain
-        // owned by NativeApi. Runtime round trips below check these ABIs without posting.
+        // SAFETY: fixed C ABI names/signatures with library handles retained by NativeApi.
         let api = unsafe {
             Self {
                 set_window_location: std::mem::transmute::<*mut c_void, SetWindowLocation>(
@@ -92,8 +91,7 @@ impl NativeApi {
         #[repr(C, align(8))]
         struct Record([u8; 56]);
         let mut record = Record([0; 56]);
-        // SAFETY: valid PID and flavor 17; the writable output buffer has the C ABI's
-        // exact size/alignment. No fields are consumed unless the complete size is returned.
+        // SAFETY: valid PID/flavor and writable output buffer with the C ABI's exact size/alignment.
         let count = unsafe { (self.process_info)(pid, 17, 0, record.0.as_mut_ptr().cast(), 56) };
         if count != 56 {
             return Err(refusal("kernel process identity response is incomplete"));
@@ -166,8 +164,7 @@ impl NativeApi {
         CGEvent::set_integer_value_field(Some(event), CONNECTION_FIELD, 456);
         CGEvent::set_integer_value_field(Some(event), CGEventField::EventSourceUserData, 789);
         let point = CGPoint { x: 11.25, y: 13.5 };
-        // SAFETY: event is a live owned CGEvent; the setter/getter use the C CGPoint ABI.
-        // Both mutate/read only this unposted event, never a window or the user's cursor.
+        // SAFETY: the C CGPoint setter/getter access only this live, owned, unposted CGEvent.
         let location = unsafe {
             (self.set_window_location)(event, point);
             (self.get_window_location)(event)
