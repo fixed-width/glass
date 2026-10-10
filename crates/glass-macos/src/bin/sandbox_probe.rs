@@ -27,6 +27,13 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--no-clipboard-shim" => {
+                for (key, _) in std::env::vars_os() {
+                    let key = key.to_string_lossy();
+                    assert!(!key.starts_with("DYLD_") && !key.starts_with("GLASS_CLIP_"));
+                }
+                i += 1;
+            }
             "--protected-file" => {
                 let path =
                     std::env::var_os(&args[i + 1]).expect("protected file environment variable");

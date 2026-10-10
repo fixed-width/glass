@@ -104,6 +104,32 @@ control, executable trust or routing qualification. The feature adds no MCP para
 ordinary builds and session capability reports retain their existing behavior. Missing private
 symbols or incomplete identity/ABI readings return an error.
 
+The same feature provides an owned-target inspector and an opt-in lifecycle test. On a Mac with
+an existing Accessibility grant, build the nonactivating fixture and run the test:
+
+```bash
+swiftc crates/glass-macos/fixture/window_target.swift -o /tmp/glass-window-target-fixture
+cargo test -p glass-macos --features native-input-qualification \
+  --test window_target --locked --no-run
+# Use the executable path printed by Cargo above. Run outside Cargo, which adds DYLD settings.
+env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_INSERT_LIBRARIES \
+  GLASS_WINDOW_TARGET_FIXTURE_BIN=/tmp/glass-window-target-fixture \
+  /path/to/window_target-test-binary --ignored
+```
+
+When the grant belongs to a signed app bundle, build with `--no-run` and run the resulting test
+binary through that bundle's established signing and GUI-session procedure. The test requires
+the grant; it never requests one. It launches fresh direct children with existing containment,
+without the clipboard shim, and reads exact AX/WindowServer ownership and point geometry.
+Child standard input/output is discarded. Post-read failures retain AX dispatch evidence even
+though no input event was posted. The test covers refresh, replacement, competing windows, child
+exit and cleanup. It reads no control values and
+posts no input. All observations retain false lifetime, configuration, pixel-geometry and input
+admission flags. Retained AX references detect some replacements; they supply no window lifetime
+guarantee. The reported AX subtree does not establish complete WindowServer inventory or a qualified
+action region. A failed observation invalidates the inspector, except while waiting for its first
+window. These checks require no operator input and establish no physical interference verdict.
+
 ## Integration suites (Linux)
 
 `#[ignore]`d, so the ordinary `cargo test` never starts them. Each self-starts what it needs.

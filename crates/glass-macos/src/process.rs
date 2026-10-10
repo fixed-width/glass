@@ -200,6 +200,66 @@ pub(crate) fn spawn(
     logs: LogSink,
     protected_paths: &[ProtectedHostPath],
 ) -> Result<Launch> {
+    spawn_for(spec, logs, protected_paths, LaunchPurpose::Session)
+}
+
+enum LaunchPurpose {
+    Session,
+    #[cfg(any(test, feature = "native-input-qualification"))]
+    Inspection,
+}
+
+/// Direct child launch without Glass's clipboard injection or LaunchServices adoption.
+#[cfg(any(test, feature = "native-input-qualification"))]
+pub(crate) fn spawn_window_target(
+    spec: &AppSpec,
+    logs: LogSink,
+    protected_paths: &[ProtectedHostPath],
+) -> Result<Launch> {
+    if spec.run.first().is_none_or(String::is_empty) {
+        return Err(crate::window_directed::refusal(
+            "a direct executable is required",
+        ));
+    }
+    crate::window_directed::validate_environment(spec.env.iter().map(|(key, _)| key.as_str()))?;
+    let inherited: Vec<_> = std::env::vars_os()
+        .map(|(key, _)| key.to_string_lossy().into_owned())
+        .collect();
+    crate::window_directed::validate_environment(inherited.iter().map(String::as_str))?;
+    if spec.sandbox == SandboxLevel::Off && !protected_paths.is_empty() {
+        return Err(crate::window_directed::refusal(
+            "protected paths require process containment",
+        ));
+    }
+    glass_sandbox_macos::profile::validate_protected_paths(protected_paths)
+        .map_err(GlassError::before_dispatch)?;
+    let protected_paths = protected_paths
+        .iter()
+        .map(|protected| {
+            std::fs::canonicalize(&protected.path)
+                .map(|path| ProtectedHostPath {
+                    path,
+                    kind: protected.kind,
+                })
+                .map_err(|error| {
+                    GlassError::Backend(format!(
+                        "cannot resolve protected target path {:?}: {error}",
+                        protected.path
+                    ))
+                    .before_dispatch()
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    spawn_for(spec, logs, &protected_paths, LaunchPurpose::Inspection)
+}
+
+fn spawn_for(
+    spec: &AppSpec,
+    logs: LogSink,
+    protected_paths: &[ProtectedHostPath],
+    purpose: LaunchPurpose,
+) -> Result<Launch> {
+    let session_launch = matches!(purpose, LaunchPurpose::Session);
     glass_sandbox_macos::profile::validate_protected_paths(protected_paths)?;
     let mut cmd = Command::new(&spec.run[0]);
 
@@ -244,8 +304,8 @@ pub(crate) fn spawn(
         // `dylib_path` is resolved once and reused below (rather than a second
         // `shim_dylib_path()` call) so a transient filesystem hiccup between the two checks
         // can't make `injectable` and the later `.expect` disagree.
-        let dylib_path = shim_dylib_path();
-        let injectable = target_is_injectable(&program) && dylib_path.is_some();
+        let dylib_path = session_launch.then(shim_dylib_path).flatten();
+        let injectable = session_launch && target_is_injectable(&program) && dylib_path.is_some();
         let allow_pasteboard = injectable;
         // The shim dylib FILE, re-allowed for read in the profile below when injecting (`None`
         // — no re-allow — otherwise, matching unchanged pre-injection behavior).
@@ -336,8 +396,14 @@ pub(crate) fn spawn(
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    if session_launch {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         // A PermissionDenied under containment could be `sandbox_init` rejecting the profile,
@@ -351,6 +417,14 @@ pub(crate) fn spawn(
             GlassError::AppNotStarted(format!("spawn {:?}: {e}", spec.run))
         }
     })?;
+
+    if !session_launch {
+        return Ok(Launch {
+            child,
+            clip,
+            taps: Vec::new(),
+        });
+    }
 
     // `Stdio::piped()` guarantees these are `Some` immediately after a successful spawn.
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -537,6 +611,61 @@ mod tests {
              scripts/test-macos.sh does this automatically"
         );
         probe
+    }
+
+    #[test]
+    #[ignore = "requires macOS Seatbelt and a launch environment without DYLD settings"]
+    #[cfg(target_os = "macos")]
+    fn window_target_launch_preserves_containment_without_clipboard_injection() {
+        let directory = tempfile::tempdir().unwrap();
+        let protected = directory.path().join("protected");
+        std::fs::write(&protected, "retained evidence").unwrap();
+        let probe = sandbox_probe_path();
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let mut launch = spec(&[
+                probe.to_str().unwrap(),
+                "--no-clipboard-shim",
+                "--protected-file",
+                "PROTECTED",
+            ]);
+            launch.cwd = Some(directory.path().to_owned());
+            launch.env = vec![("PROTECTED".into(), protected.to_str().unwrap().into())];
+            launch.sandbox = level;
+            let logs = empty_sink();
+            let mut launched = spawn_window_target(
+                &launch,
+                logs.clone(),
+                &[ProtectedHostPath::file(&protected)],
+            )
+            .unwrap();
+            assert!(launched.clip.is_none());
+            assert!(launched.taps.is_empty());
+            assert!(launched.child.stdout.is_none() && launched.child.stderr.is_none());
+            let status = launched.child.wait().unwrap();
+            drop(launched);
+            assert!(status.success(), "{level}: {:?}", logs.lock().unwrap());
+        }
+        assert_eq!(
+            std::fs::read_to_string(protected).unwrap(),
+            "retained evidence"
+        );
+    }
+
+    #[test]
+    fn window_target_launch_refuses_injection_before_spawning() {
+        let mut launch = spec(&["/nonexistent/window-target-fixture"]);
+        launch.env = vec![("DYLD_INSERT_LIBRARIES".into(), "/nonexistent/shim".into())];
+        let error = spawn_window_target(&launch, empty_sink(), &[])
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error.cause(),
+            GlassError::UnsupportedOperation { .. }
+        ));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
     }
 
     #[test]

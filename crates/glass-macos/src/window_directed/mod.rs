@@ -9,6 +9,11 @@
 mod native;
 #[cfg(target_os = "macos")]
 pub use native::{Readiness, probe_readiness};
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod target;
+#[cfg(target_os = "macos")]
+pub use target::{ControlObservation, OwnedTarget, TargetObservation};
 
 #[cfg(any(target_os = "macos", test))]
 use glass_core::{GlassError, Result};
@@ -62,7 +67,7 @@ fn require_same_process(before: ProcessIdentity, after: ProcessIdentity) -> Resu
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn refusal(reason: &'static str) -> GlassError {
+pub(crate) fn refusal(reason: &'static str) -> GlassError {
     GlassError::UnsupportedOperation {
         operation: "window-directed input qualification",
         reason,
@@ -70,9 +75,40 @@ fn refusal(reason: &'static str) -> GlassError {
     .before_dispatch()
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn validate_environment<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    if keys
+        .into_iter()
+        .any(|key| key.starts_with("DYLD_") || key.starts_with("GLASS_CLIP_"))
+    {
+        return Err(refusal(
+            "injection environment is incompatible with target inspection",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injection_settings_refuse_instead_of_being_silently_removed() {
+        for key in [
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_IMAGE_SUFFIX",
+            "GLASS_CLIP_PASTEBOARD",
+            "GLASS_CLIP_SHIM_DYLIB",
+        ] {
+            let error = validate_environment(["PATH", key]).unwrap_err();
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::NotDispatched)
+            );
+        }
+        validate_environment(["PATH", "LANG"]).unwrap();
+    }
 
     fn record() -> [u8; 56] {
         let mut bytes = [0; 56];
