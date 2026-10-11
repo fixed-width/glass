@@ -2,6 +2,7 @@
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <unistd.h>
+#include <string.h>
 
 @interface CGVirtualDisplayDescriptor : NSObject
 @property(nonatomic, strong) dispatch_queue_t queue;
@@ -163,10 +164,14 @@ static BOOL windowsPreserved(NSDictionary *baseline) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc != 2) { fprintf(stderr, "usage: display_lease /absolute/path/to/release-file\n"); return 2; }
-        NSString *release = [NSString stringWithUTF8String:argv[1]];
-        if (!release.isAbsolutePath || [NSFileManager.defaultManager fileExistsAtPath:release]) return 2;
         NSApplication *app = NSApplication.sharedApplication;
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+        if (strcmp(argv[1], "--inspect") == 0) {
+            emit(@"inventory", @{});
+            return 0;
+        }
+        NSString *release = [NSString stringWithUTF8String:argv[1]];
+        if (!release.isAbsolutePath || [NSFileManager.defaultManager fileExistsAtPath:release]) return 2;
         for (NSString *name in @[@"CGVirtualDisplayDescriptor", @"CGVirtualDisplayMode",
                                 @"CGVirtualDisplaySettings", @"CGVirtualDisplay"])
             if (!NSClassFromString(name)) { emit(@"missing-class", @{@"name": name}); return 1; }
