@@ -11,7 +11,7 @@ bench = false
 
 [features]
 # Read-only native diagnostics; does not enable an input route.
-native-input-qualification = []
+native-input-qualification = ["dep:sha2"]
 
 [[bin]]
 name = "glass-macos-window-input-readiness"
@@ -112,6 +112,7 @@ path = "src/bin/sandbox_probe.rs"
 glass-a11y-macos.workspace = true
 glass-core.workspace = true
 plist = "1"
+sha2 = { version = "0.11", optional = true }
 
 # macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
 # modules still build off macOS with zero macOS deps. Versions pinned to
@@ -264,6 +265,10 @@ glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+sha2 = "0.11"
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

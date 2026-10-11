@@ -1,6 +1,7 @@
 //! Dynamically loaded, read-only process and event ABI checks. No posting API is loaded.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 
 use objc2_core_foundation::CGPoint;
@@ -11,6 +12,7 @@ use objc2_core_graphics::{
 
 use glass_core::Result;
 
+use super::executable::kernel_path;
 use super::{ProcessIdentity, process_identity, refusal, require_same_process};
 
 const WINDOW_FIELD: CGEventField = CGEventField(51);
@@ -21,6 +23,7 @@ const _: () = assert!(std::mem::size_of::<CGPoint>() == 16);
 type SetWindowLocation = unsafe extern "C" fn(*const CGEvent, CGPoint);
 type GetWindowLocation = unsafe extern "C" fn(*const CGEvent) -> CGPoint;
 type ProcessInfo = unsafe extern "C" fn(i32, i32, u64, *mut c_void, i32) -> i32;
+type ProcessPath = unsafe extern "C" fn(i32, *mut c_void, u32) -> i32;
 
 #[link(name = "System")]
 unsafe extern "C" {
@@ -57,6 +60,7 @@ pub(super) struct NativeApi {
     set_window_location: SetWindowLocation,
     get_window_location: GetWindowLocation,
     process_info: ProcessInfo,
+    process_path: ProcessPath,
     _libraries: [Library; 2],
 }
 
@@ -76,6 +80,9 @@ impl NativeApi {
                 ),
                 process_info: std::mem::transmute::<*mut c_void, ProcessInfo>(
                     system.symbol(c"proc_pidinfo")?.as_ptr(),
+                ),
+                process_path: std::mem::transmute::<*mut c_void, ProcessPath>(
+                    system.symbol(c"proc_pidpath")?.as_ptr(),
                 ),
                 _libraries: [graphics, system],
             }
@@ -97,6 +104,16 @@ impl NativeApi {
             return Err(refusal("kernel process identity response is incomplete"));
         }
         process_identity(pid, &record.0)
+    }
+
+    pub(super) fn executable_path(&self, process: ProcessIdentity) -> Result<PathBuf> {
+        require_same_process(process, self.process_identity(process.pid)?)?;
+        let mut buffer = [0_u8; 4096];
+        // SAFETY: verified positive PID and writable PROC_PIDPATHINFO_MAXSIZE buffer.
+        let count = unsafe { (self.process_path)(process.pid, buffer.as_mut_ptr().cast(), 4096) };
+        let path = kernel_path(&buffer, count)?;
+        require_same_process(process, self.process_identity(process.pid)?)?;
+        Ok(path)
     }
 
     fn check_event_abi(&self) -> Result<()> {

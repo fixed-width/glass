@@ -125,7 +125,12 @@ Child standard input/output is discarded. Post-read failures retain AX dispatch 
 though no input event was posted. The test covers geometry refresh, closure, replacement, competing windows,
 child exit and cleanup. It reads no control values and posts no input. Successful observations
 report `window_identity_revalidated: true`; configuration, pixel-geometry and input admission remain
-false. Refreshes check the original process/window/connection/PSN tuple and retained AX reference.
+false. `executable_identity_revalidated: true` reports an unchanged canonical path, file identity,
+SHA-256 digest and Mach-O UUID matching the process's kernel image UUID. Inspection requires an
+absolute path to a regular, thin little-endian 64-bit Mach-O executable no larger than 64 MiB.
+File replacement or deletion invalidates the binding even when the old process remains live;
+matching bytes do not establish code trust, loaded-library identity or a qualified launch configuration.
+Refreshes check the original process/window/connection/PSN tuple and retained AX reference.
 Observed closure, replacement or unavailable readings invalidate the binding. Unobserved window-ID
 reuse within the same process lifetime and connection may compare equal; these checks establish
 no window birth token or continuous lifetime guarantee. The reported AX subtree does not establish
