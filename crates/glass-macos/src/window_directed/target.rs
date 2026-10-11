@@ -12,7 +12,7 @@ use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGRect};
 
 use super::native::{Library, NativeApi};
-use super::profiles::{self, FixtureProfile};
+use super::profiles::FixtureBinding;
 use super::{
     ExecutableIdentity, ProcessIdentity, WindowIdentity, refusal, require_same_process,
     require_same_window,
@@ -169,7 +169,7 @@ pub struct OwnedTarget {
     windows: WindowApi,
     process: ProcessIdentity,
     executable: ExecutableIdentity,
-    fixture_profile: Option<&'static FixtureProfile>,
+    fixture_profile: FixtureBinding,
     foreground: ProcessIdentity,
     selected: Option<SelectedWindow>,
     invalidated: bool,
@@ -196,18 +196,13 @@ impl OwnedTarget {
             .ok_or_else(|| refusal("a direct executable is required"))?;
         let executable = ExecutableIdentity::read(Path::new(command), deadline)?;
         let kernel = NativeApi::load()?;
-        let fixture_profile = if profiles::known_artifact(executable.sha256, executable.image_uuid)
-        {
-            profiles::matching_fixture(
-                executable.sha256,
-                executable.image_uuid,
-                spec,
-                &kernel.os_build()?,
-                std::env::consts::ARCH,
-            )
-        } else {
-            None
-        };
+        let mut fixture_profile = FixtureBinding::bind(
+            executable.sha256,
+            executable.image_uuid,
+            spec,
+            || kernel.os_build(),
+            std::env::consts::ARCH,
+        )?;
         let windows = WindowApi::load()?;
         let foreground = foreground(&kernel)?;
         if deadline.has_passed() {
@@ -224,9 +219,7 @@ impl OwnedTarget {
                     process.executable_uuid,
                     deadline,
                 )?;
-                if let Some(profile) = fixture_profile {
-                    profile.require_host(&kernel.os_build()?, std::env::consts::ARCH)?;
-                }
+                fixture_profile.revalidate(|| kernel.os_build(), std::env::consts::ARCH)?;
                 Ok(process)
             });
         match identity {
@@ -275,62 +268,67 @@ impl OwnedTarget {
         let windows = &self.windows;
         let process = self.process;
         let previous = self.selected.as_ref();
-        let (window, id, connection, psn, rect, controls) =
-            glass_a11y_macos::messaging_timeout::with_read_only_by(
-                &SystemWideAxMessaging,
-                deadline,
-                |scope| {
-                    // SAFETY: positive kernel-verified PID; the created application reference is owned.
-                    let app = unsafe { AXUIElement::new_application(process.pid) };
-                    let window = sole_window(scope, &app)?;
-                    if previous.is_some_and(|previous| previous.element != window) {
-                        return Err(refusal("selected AX window was replaced"));
-                    }
-                    require_pid(scope, &window, process.pid)?;
-                    let id = windows.window_id(scope, &window)?;
-                    let (connection, psn, rect) = windows.owner_and_bounds(id, process.pid)?;
-                    let identity = WindowIdentity {
-                        process,
-                        window_id: id,
-                        owner_connection: connection,
-                        owner_psn: psn,
-                    };
-                    if let Some(previous) = previous {
-                        require_same_window(previous.identity, identity)?;
-                    }
-                    let ax_rect = ax_rect(scope, &window)?;
-                    if rect_values(rect)
-                        .iter()
-                        .zip(rect_values(ax_rect))
-                        .any(|(a, b)| (a - b).abs() > 0.5)
-                    {
-                        return Err(refusal("AX and WindowServer geometry disagree"));
-                    }
-                    let mut controls = Vec::new();
-                    let mut seen = Vec::new();
-                    read_tree(
-                        scope,
-                        &window,
-                        &window,
-                        process.pid,
-                        (0, None),
-                        &mut controls,
-                        &mut seen,
-                    )?;
-                    let current = sole_window(scope, &app)?;
-                    if current != window || windows.window_id(scope, &window)? != id {
-                        return Err(refusal("selected window changed during observation"));
-                    }
-                    let current_owner = windows.owner_and_bounds(id, process.pid)?;
-                    if current_owner != (connection, psn, rect) {
-                        return Err(refusal(
-                            "window ownership or geometry changed during observation",
-                        ));
-                    }
-                    require_same_process(process, kernel.process_identity(process.pid)?)?;
-                    Ok((window, id, connection, psn, rect, controls))
-                },
-            )?;
+        let (window, id, connection, psn, rect, controls) = self.fixture_profile.observe(
+            || kernel.os_build(),
+            std::env::consts::ARCH,
+            || {
+                glass_a11y_macos::messaging_timeout::with_read_only_by(
+                    &SystemWideAxMessaging,
+                    deadline,
+                    |scope| {
+                        // SAFETY: positive kernel-verified PID; the created application reference is owned.
+                        let app = unsafe { AXUIElement::new_application(process.pid) };
+                        let window = sole_window(scope, &app)?;
+                        if previous.is_some_and(|previous| previous.element != window) {
+                            return Err(refusal("selected AX window was replaced"));
+                        }
+                        require_pid(scope, &window, process.pid)?;
+                        let id = windows.window_id(scope, &window)?;
+                        let (connection, psn, rect) = windows.owner_and_bounds(id, process.pid)?;
+                        let identity = WindowIdentity {
+                            process,
+                            window_id: id,
+                            owner_connection: connection,
+                            owner_psn: psn,
+                        };
+                        if let Some(previous) = previous {
+                            require_same_window(previous.identity, identity)?;
+                        }
+                        let ax_rect = ax_rect(scope, &window)?;
+                        if rect_values(rect)
+                            .iter()
+                            .zip(rect_values(ax_rect))
+                            .any(|(a, b)| (a - b).abs() > 0.5)
+                        {
+                            return Err(refusal("AX and WindowServer geometry disagree"));
+                        }
+                        let mut controls = Vec::new();
+                        let mut seen = Vec::new();
+                        read_tree(
+                            scope,
+                            &window,
+                            &window,
+                            process.pid,
+                            (0, None),
+                            &mut controls,
+                            &mut seen,
+                        )?;
+                        let current = sole_window(scope, &app)?;
+                        if current != window || windows.window_id(scope, &window)? != id {
+                            return Err(refusal("selected window changed during observation"));
+                        }
+                        let current_owner = windows.owner_and_bounds(id, process.pid)?;
+                        if current_owner != (connection, psn, rect) {
+                            return Err(refusal(
+                                "window ownership or geometry changed during observation",
+                            ));
+                        }
+                        require_same_process(process, kernel.process_identity(process.pid)?)?;
+                        Ok((window, id, connection, psn, rect, controls))
+                    },
+                )
+            },
+        )?;
         self.check_context(deadline)
             .map_err(GlassError::after_dispatch)?;
         if deadline.has_passed() {
@@ -356,7 +354,7 @@ impl OwnedTarget {
             controls,
             window_identity_revalidated: true,
             executable_identity_revalidated: true,
-            fixture_profile: self.fixture_profile.map(|profile| profile.name),
+            fixture_profile: self.fixture_profile.name(),
             configuration_verified: false,
             pixel_geometry_verified: false,
             input_admitted: false,
@@ -386,9 +384,6 @@ impl OwnedTarget {
             self.process.executable_uuid,
             deadline,
         )?;
-        if let Some(profile) = self.fixture_profile {
-            profile.require_host(&self.kernel.os_build()?, std::env::consts::ARCH)?;
-        }
         require_same_process(
             self.process,
             self.kernel.process_identity(self.process.pid)?,

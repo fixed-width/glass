@@ -29,6 +29,10 @@ const FIXTURES: &[FixtureProfile] = &[FixtureProfile {
 }];
 
 impl FixtureProfile {
+    fn matches_artifact(&self, sha256: [u8; 32], image_uuid: [u8; 16]) -> bool {
+        self.sha256 == sha256 && self.image_uuid == image_uuid
+    }
+
     pub(super) fn require_host(&self, os_build: &str, architecture: &str) -> Result<()> {
         if self.os_build != os_build || self.architecture != architecture {
             return Err(refusal("matched fixture host changed or is unavailable"));
@@ -37,28 +41,77 @@ impl FixtureProfile {
     }
 }
 
-pub(super) fn known_artifact(sha256: [u8; 32], image_uuid: [u8; 16]) -> bool {
-    FIXTURES
-        .iter()
-        .any(|profile| profile.sha256 == sha256 && profile.image_uuid == image_uuid)
+pub(super) struct FixtureBinding {
+    profile: Option<&'static FixtureProfile>,
+    invalidated: bool,
 }
 
-pub(super) fn matching_fixture(
-    sha256: [u8; 32],
-    image_uuid: [u8; 16],
-    spec: &AppSpec,
-    os_build: &str,
-    architecture: &str,
-) -> Option<&'static FixtureProfile> {
-    matching(FIXTURES, sha256, image_uuid, spec, os_build, architecture)
+impl FixtureBinding {
+    pub(super) fn bind(
+        sha256: [u8; 32],
+        image_uuid: [u8; 16],
+        spec: &AppSpec,
+        mut read_os_build: impl FnMut() -> Result<String>,
+        architecture: &str,
+    ) -> Result<Self> {
+        let candidate = unique_fixture_candidate(FIXTURES, sha256, image_uuid, spec, architecture);
+        let profile = if let Some(candidate) = candidate {
+            candidate
+                .require_host(&read_os_build()?, architecture)
+                .is_ok()
+                .then_some(candidate)
+        } else {
+            None
+        };
+        Ok(Self {
+            profile,
+            invalidated: false,
+        })
+    }
+
+    pub(super) fn name(&self) -> Option<&'static str> {
+        self.profile
+            .filter(|_| !self.invalidated)
+            .map(|profile| profile.name)
+    }
+
+    pub(super) fn revalidate(
+        &mut self,
+        mut read_os_build: impl FnMut() -> Result<String>,
+        architecture: &str,
+    ) -> Result<()> {
+        if self.invalidated {
+            return Err(refusal("matched fixture binding was invalidated"));
+        }
+        let Some(profile) = self.profile else {
+            return Ok(());
+        };
+        let result = read_os_build().and_then(|build| profile.require_host(&build, architecture));
+        if result.is_err() {
+            self.invalidated = true;
+        }
+        result
+    }
+
+    pub(super) fn observe<T>(
+        &mut self,
+        mut read_os_build: impl FnMut() -> Result<String>,
+        architecture: &str,
+        observation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.revalidate(&mut read_os_build, architecture)?;
+        let observed = observation()?;
+        self.revalidate(read_os_build, architecture)
+            .map_err(glass_core::GlassError::after_dispatch)?;
+        Ok(observed)
+    }
 }
 
-fn matching<'a>(
+fn unique_fixture_candidate<'a>(
     profiles: &'a [FixtureProfile],
     sha256: [u8; 32],
     image_uuid: [u8; 16],
     spec: &AppSpec,
-    os_build: &str,
     architecture: &str,
 ) -> Option<&'a FixtureProfile> {
     if spec.build.is_some()
@@ -76,12 +129,34 @@ fn matching<'a>(
         return None;
     }
     let mut matches = profiles.iter().filter(|profile| {
-        profile.sha256 == sha256
-            && profile.image_uuid == image_uuid
-            && profile.require_host(os_build, architecture).is_ok()
+        profile.matches_artifact(sha256, image_uuid) && profile.architecture == architecture
     });
     let profile = matches.next()?;
     matches.next().is_none().then_some(profile)
+}
+
+#[cfg(test)]
+fn matching_fixture(
+    sha256: [u8; 32],
+    image_uuid: [u8; 16],
+    spec: &AppSpec,
+    os_build: &str,
+    architecture: &str,
+) -> Option<&'static FixtureProfile> {
+    unique_matching_fixture(FIXTURES, sha256, image_uuid, spec, os_build, architecture)
+}
+
+#[cfg(test)]
+fn unique_matching_fixture<'a>(
+    profiles: &'a [FixtureProfile],
+    sha256: [u8; 32],
+    image_uuid: [u8; 16],
+    spec: &AppSpec,
+    os_build: &str,
+    architecture: &str,
+) -> Option<&'a FixtureProfile> {
+    unique_fixture_candidate(profiles, sha256, image_uuid, spec, architecture)
+        .filter(|profile| profile.require_host(os_build, architecture).is_ok())
 }
 
 pub(super) fn parse_os_build(bytes: &[u8], length: usize) -> Result<&str> {
@@ -148,7 +223,6 @@ mod tests {
         let profile = &FIXTURES[0];
         let mut digest = profile.sha256;
         digest[0] ^= 1;
-        assert!(!known_artifact(digest, profile.image_uuid));
         assert!(
             matching_fixture(digest, profile.image_uuid, &spec(), "26A428", "aarch64").is_none()
         );
@@ -159,7 +233,6 @@ mod tests {
         let profile = &FIXTURES[0];
         let mut uuid = profile.image_uuid;
         uuid[0] ^= 1;
-        assert!(!known_artifact(profile.sha256, uuid));
         assert!(matching_fixture(profile.sha256, uuid, &spec(), "26A428", "aarch64").is_none());
     }
 
@@ -195,7 +268,7 @@ mod tests {
     fn missing_or_ambiguous_registry_entries_do_not_match() {
         let profile = &FIXTURES[0];
         assert!(
-            matching(
+            unique_matching_fixture(
                 &[],
                 profile.sha256,
                 profile.image_uuid,
@@ -207,7 +280,7 @@ mod tests {
         );
         let duplicates = [FIXTURES, FIXTURES].concat();
         assert!(
-            matching(
+            unique_matching_fixture(
                 &duplicates,
                 profile.sha256,
                 profile.image_uuid,
@@ -242,6 +315,116 @@ mod tests {
                 Some(BoundDispatch::NotDispatched)
             );
         }
+    }
+
+    fn binding() -> FixtureBinding {
+        let profile = &FIXTURES[0];
+        FixtureBinding::bind(
+            profile.sha256,
+            profile.image_uuid,
+            &spec(),
+            || Ok("26A428".into()),
+            "aarch64",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unmatched_candidates_never_read_host_facts_or_gain_a_profile() {
+        let profile = &FIXTURES[0];
+        let mut launch = spec();
+        launch.run[1] = "unknown".into();
+        let mut binding = FixtureBinding::bind(
+            profile.sha256,
+            profile.image_uuid,
+            &launch,
+            || panic!("unmatched shape read host"),
+            "aarch64",
+        )
+        .unwrap();
+        assert_eq!(binding.name(), None);
+        binding
+            .observe(
+                || panic!("unmatched observation read host"),
+                "aarch64",
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(binding.name(), None);
+        let unknown = FixtureBinding::bind(
+            [0; 32],
+            profile.image_uuid,
+            &spec(),
+            || panic!("unknown artifact read host"),
+            "aarch64",
+        )
+        .unwrap();
+        assert_eq!(unknown.name(), None);
+    }
+
+    #[test]
+    fn lost_host_before_observation_invalidates_without_running_it() {
+        let mut binding = binding();
+        let error = binding
+            .observe(
+                || Err(refusal("host unavailable")),
+                "aarch64",
+                || -> Result<()> { panic!("observation ran after host loss") },
+            )
+            .unwrap_err();
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert!(
+            binding
+                .observe(
+                    || panic!("invalidated binding read host"),
+                    "aarch64",
+                    || Ok(())
+                )
+                .is_err()
+        );
+        assert_eq!(binding.name(), None);
+    }
+
+    #[test]
+    fn host_is_read_on_both_sides_and_post_read_loss_never_rebinds() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let observed = Cell::new(false);
+        let mut binding = binding();
+        binding
+            .revalidate(
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok("26A428".into())
+                },
+                "aarch64",
+            )
+            .unwrap();
+        let error = binding
+            .observe(
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok(if reads.get() < 3 { "26A428" } else { "26A429" }.into())
+                },
+                "aarch64",
+                || {
+                    observed.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(observed.get());
+        assert_eq!(reads.get(), 3);
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(
+            binding
+                .revalidate(|| panic!("restored host was adopted"), "aarch64")
+                .is_err()
+        );
+        assert_eq!(binding.name(), None);
     }
 
     #[test]

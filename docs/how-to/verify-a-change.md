@@ -143,7 +143,8 @@ read-only fixture artifact on kernel build `26A428` in a native `aarch64` inspec
 entry pins SHA-256 and Mach-O UUID and matches one scenario argument (`stable`, `replace`, `close`,
 `move`, `compete`, `exit`), no build/window hint/cwd/env, Default containment and requested accessibility.
 Other artifacts, hosts and declared startup shapes report `None`; names and framework labels
-cannot enroll an artifact. Matched host facts are freshly checked after launch and around each
+cannot enroll an artifact. Unmatched startup shapes skip the host query. Unavailable kernel facts
+for an otherwise matching candidate refuse inspection. Matched host facts are freshly checked after launch and around each
 observation; lost or changed facts invalidate the original binding. No runtime profile selector
 or manifest is accepted, and ordinary builds contain no entries.
 
