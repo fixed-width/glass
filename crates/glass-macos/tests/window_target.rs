@@ -19,14 +19,20 @@ fn main() {
 mod native {
     use glass_core::{AppSpec, Deadline, GlassError, SandboxLevel};
     use glass_macos::window_directed::{OwnedTarget, TargetObservation};
+    use std::fs;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn launch(scenario: &str) -> OwnedTarget {
         let fixture = std::env::var("GLASS_WINDOW_TARGET_FIXTURE_BIN")
             .expect("build fixture/window_target.swift and set GLASS_WINDOW_TARGET_FIXTURE_BIN");
+        launch_path(Path::new(&fixture), scenario)
+    }
+
+    fn launch_path(fixture: &Path, scenario: &str) -> OwnedTarget {
         let spec = AppSpec {
             build: None,
-            run: vec![fixture, scenario.into()],
+            run: vec![fixture.to_str().unwrap().into(), scenario.into()],
             cwd: None,
             env: vec![],
             window_hint: None,
@@ -55,6 +61,11 @@ mod native {
 
     fn remains_unqualified(observation: &TargetObservation) {
         assert!(observation.window_identity_revalidated);
+        assert!(observation.executable_identity_revalidated);
+        assert_eq!(
+            observation.executable.image_uuid,
+            observation.process.executable_uuid
+        );
         assert!(!observation.configuration_verified);
         assert!(!observation.pixel_geometry_verified);
         assert!(!observation.input_admitted);
@@ -103,6 +114,7 @@ mod native {
             .observe(Deadline::from_millis(1_000))
             .expect("refresh original window");
         assert_eq!(refreshed.process, observation.process);
+        assert_eq!(refreshed.executable, observation.executable);
         assert_eq!(refreshed.window_id, observation.window_id);
         assert_eq!(refreshed.owner_connection, observation.owner_connection);
         assert_eq!(refreshed.owner_psn, observation.owner_psn);
@@ -163,6 +175,40 @@ mod native {
         );
         exited.stop().unwrap();
         println!("exited child refused without adoption");
+        executable_changes();
         println!("read-only lifecycle checks passed; input remains unadmitted");
+    }
+
+    fn executable_changes() {
+        let original = std::env::var("GLASS_WINDOW_TARGET_FIXTURE_BIN").unwrap();
+        for replace in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("fixture");
+            fs::copy(&original, &path).unwrap();
+            let mut target = launch_path(&path, "stable");
+            let observed = first(&mut target).expect("observe copied executable");
+            remains_unqualified(&observed);
+            if replace {
+                let replacement = directory.path().join("replacement");
+                fs::copy(&original, &replacement).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            let error = target.observe(Deadline::from_millis(1_000)).unwrap_err();
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::NotDispatched)
+            );
+            assert!(error.to_string().contains("executable"), "{error}");
+            println!("expected executable refusal (replacement={replace}): {error}");
+            if !replace {
+                fs::copy(&original, &path).unwrap();
+            }
+            let error = target.observe(Deadline::from_millis(1_000)).unwrap_err();
+            assert!(error.to_string().contains("invalidated"), "{error}");
+            target.stop().expect("confirm copied executable cleanup");
+        }
+        println!("executable replacement and deletion invalidate permanently");
     }
 }

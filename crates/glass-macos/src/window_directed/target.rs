@@ -1,6 +1,7 @@
 //! Read-only observation of a direct child, with no capture, activation or input.
 
 use std::ffi::c_void;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +12,10 @@ use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGRect};
 
 use super::native::{Library, NativeApi};
-use super::{ProcessIdentity, WindowIdentity, refusal, require_same_process, require_same_window};
+use super::{
+    ExecutableIdentity, ProcessIdentity, WindowIdentity, refusal, require_same_process,
+    require_same_window,
+};
 use crate::axwindow::{AxMessageScope, SystemWideAxMessaging};
 
 const MAX_NODES: usize = 128;
@@ -140,6 +144,7 @@ pub struct ControlObservation {
 #[derive(Debug)]
 pub struct TargetObservation {
     pub process: ProcessIdentity,
+    pub executable: ExecutableIdentity,
     pub window_id: u32,
     pub owner_connection: i32,
     pub owner_psn: [u32; 2],
@@ -148,6 +153,7 @@ pub struct TargetObservation {
     pub controls: Vec<ControlObservation>,
     /// Current checks passed; this does not distinguish unobserved same-owner window-ID reuse.
     pub window_identity_revalidated: bool,
+    pub executable_identity_revalidated: bool,
     pub configuration_verified: bool,
     pub pixel_geometry_verified: bool,
     pub input_admitted: bool,
@@ -159,6 +165,7 @@ pub struct OwnedTarget {
     kernel: NativeApi,
     windows: WindowApi,
     process: ProcessIdentity,
+    executable: ExecutableIdentity,
     foreground: ProcessIdentity,
     selected: Option<SelectedWindow>,
     invalidated: bool,
@@ -178,20 +185,38 @@ impl OwnedTarget {
             ));
         }
         require_console_and_permission()?;
+        let deadline = Deadline::from_millis(spec.timeout_ms);
+        let command = spec
+            .run
+            .first()
+            .ok_or_else(|| refusal("a direct executable is required"))?;
+        let executable = ExecutableIdentity::read(Path::new(command), deadline)?;
         let kernel = NativeApi::load()?;
         let windows = WindowApi::load()?;
         let foreground = foreground(&kernel)?;
+        if deadline.has_passed() {
+            return Err(GlassError::caller_deadline_elapsed("target launch"));
+        }
         let logs = Arc::new(Mutex::new(Vec::new()));
         let mut launch = crate::process::spawn_window_target(spec, logs, protected_paths)?;
         let identity = i32::try_from(launch.child.id())
             .map_err(|_| refusal("owned child PID is invalid"))
-            .and_then(|pid| kernel.process_identity(pid));
+            .and_then(|pid| kernel.process_identity(pid))
+            .and_then(|process| {
+                executable.revalidate(
+                    &kernel.executable_path(process)?,
+                    process.executable_uuid,
+                    deadline,
+                )?;
+                Ok(process)
+            });
         match identity {
             Ok(process) => Ok(Self {
                 launch: Some(launch),
                 kernel,
                 windows,
                 process,
+                executable,
                 foreground,
                 selected: None,
                 invalidated: false,
@@ -225,7 +250,7 @@ impl OwnedTarget {
     }
 
     fn observe_inner(&mut self, deadline: Deadline) -> Result<TargetObservation> {
-        self.check_context()?;
+        self.check_context(deadline)?;
         let kernel = &self.kernel;
         let windows = &self.windows;
         let process = self.process;
@@ -286,7 +311,8 @@ impl OwnedTarget {
                     Ok((window, id, connection, psn, rect, controls))
                 },
             )?;
-        self.check_context().map_err(GlassError::after_dispatch)?;
+        self.check_context(deadline)
+            .map_err(GlassError::after_dispatch)?;
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("target observation"));
         }
@@ -301,6 +327,7 @@ impl OwnedTarget {
         });
         Ok(TargetObservation {
             process,
+            executable: self.executable.clone(),
             window_id: id,
             owner_connection: connection,
             owner_psn: psn,
@@ -308,13 +335,14 @@ impl OwnedTarget {
             foreground: self.foreground,
             controls,
             window_identity_revalidated: true,
+            executable_identity_revalidated: true,
             configuration_verified: false,
             pixel_geometry_verified: false,
             input_admitted: false,
         })
     }
 
-    fn check_context(&mut self) -> Result<()> {
+    fn check_context(&mut self, deadline: Deadline) -> Result<()> {
         let launch = self
             .launch
             .as_mut()
@@ -328,6 +356,15 @@ impl OwnedTarget {
             return Err(refusal("owned child exited"));
         }
         require_console_and_permission()?;
+        require_same_process(
+            self.process,
+            self.kernel.process_identity(self.process.pid)?,
+        )?;
+        self.executable.revalidate(
+            &self.kernel.executable_path(self.process)?,
+            self.process.executable_uuid,
+            deadline,
+        )?;
         require_same_process(
             self.process,
             self.kernel.process_identity(self.process.pid)?,

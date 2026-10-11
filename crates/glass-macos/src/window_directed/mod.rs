@@ -4,6 +4,10 @@
 //! Current ownership cannot distinguish unobserved window-ID reuse within the same process
 //! and connection, or establish control qualification. This module admits no input.
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod executable;
+#[cfg(target_os = "macos")]
+pub use executable::ExecutableIdentity;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod native;

@@ -1377,6 +1377,7 @@ dependencies = [
  "objc2-screen-capture-kit",
  "plist",
  "rustix",
+ "sha2",
  "tempfile",
 ]
 
