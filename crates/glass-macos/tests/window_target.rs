@@ -30,7 +30,12 @@ mod native {
     }
 
     fn launch_path(fixture: &Path, scenario: &str) -> OwnedTarget {
-        let spec = AppSpec {
+        OwnedTarget::launch(&fixture_spec(fixture, scenario), &[])
+            .expect("launch fresh owned fixture")
+    }
+
+    fn fixture_spec(fixture: &Path, scenario: &str) -> AppSpec {
+        AppSpec {
             build: None,
             run: vec![fixture.to_str().unwrap().into(), scenario.into()],
             cwd: None,
@@ -39,8 +44,7 @@ mod native {
             timeout_ms: 3_000,
             sandbox: SandboxLevel::Default,
             a11y: true,
-        };
-        OwnedTarget::launch(&spec, &[]).expect("launch fresh owned fixture")
+        }
     }
 
     fn first(target: &mut OwnedTarget) -> Result<TargetObservation, GlassError> {
@@ -181,6 +185,18 @@ mod native {
 
     fn executable_changes() {
         let original = std::env::var("GLASS_WINDOW_TARGET_FIXTURE_BIN").unwrap();
+        let mut expired = fixture_spec(Path::new(&original), "stable");
+        expired.timeout_ms = 0;
+        let error = OwnedTarget::launch(&expired, &[])
+            .err()
+            .expect("expired launch refused");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        println!("expired launch refused before dispatch");
         for replace in [true, false] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("fixture");

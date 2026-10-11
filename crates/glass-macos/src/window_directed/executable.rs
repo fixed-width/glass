@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use glass_core::{Deadline, GlassError, Result};
+use glass_core::{BoundDispatch, Deadline, GlassError, Result};
 use rustix::fs::{Mode, OFlags};
 use sha2::{Digest, Sha256};
 
@@ -49,7 +49,9 @@ impl FileStamp {
 
 impl ExecutableIdentity {
     pub(super) fn read(path: &Path, deadline: Deadline) -> Result<Self> {
-        check_deadline(deadline)?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("executable observation"));
+        }
         if !path.is_absolute() {
             return Err(refusal("executable inspection requires an absolute path"));
         }
@@ -118,9 +120,12 @@ impl ExecutableIdentity {
 
 fn check_deadline(deadline: Deadline) -> Result<()> {
     if deadline.has_passed() {
-        Err(GlassError::caller_deadline_elapsed(
-            "executable observation",
-        ))
+        let mut error = GlassError::caller_deadline_elapsed("executable observation");
+        // Only file reads ran; compound callers preserve earlier dispatch with after_dispatch.
+        if let GlassError::Bounded { dispatch, .. } = &mut error {
+            *dispatch = BoundDispatch::NotDispatched;
+        }
+        Err(error)
     } else {
         Ok(())
     }
@@ -189,6 +194,7 @@ pub(super) fn kernel_path(bytes: &[u8], count: i32) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glass_core::{BoundKind, Whose};
 
     fn image() -> Vec<u8> {
         let mut bytes = vec![0; 56];
@@ -288,7 +294,22 @@ mod tests {
         assert!(
             ExecutableIdentity::read(Path::new("fixture"), Deadline::from_millis(1_000)).is_err()
         );
-        assert!(ExecutableIdentity::read(&path, Deadline::from_millis(0)).is_err());
+        let error = ExecutableIdentity::read(&path, Deadline::from_millis(0)).unwrap_err();
+        assert_eq!(error.bound(), Some(BoundKind::NotStarted));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+    }
+
+    #[test]
+    fn file_read_expiry_is_pre_dispatch_and_preserves_prior_external_work() {
+        let error = check_deadline(Deadline::from_millis(0)).unwrap_err();
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(error.bound_owner(), Some(Whose::Caller));
+        assert_eq!(error.bound_dispatch(), Some(BoundDispatch::NotDispatched));
+        assert_eq!(
+            error.after_dispatch().bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
     }
 
     #[test]

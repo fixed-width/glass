@@ -195,7 +195,7 @@ impl OwnedTarget {
         let windows = WindowApi::load()?;
         let foreground = foreground(&kernel)?;
         if deadline.has_passed() {
-            return Err(GlassError::caller_deadline_elapsed("target launch"));
+            return Err(GlassError::deadline_not_started("target launch"));
         }
         let logs = Arc::new(Mutex::new(Vec::new()));
         let mut launch = crate::process::spawn_window_target(spec, logs, protected_paths)?;
