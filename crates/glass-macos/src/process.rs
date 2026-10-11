@@ -206,7 +206,7 @@ pub(crate) fn spawn(
 enum LaunchPurpose {
     Session,
     #[cfg(any(test, feature = "native-input-qualification"))]
-    Inspection,
+    Inspection(Option<Arc<crate::window_directed::context::LaunchContext>>),
 }
 
 /// Direct child launch without Glass's clipboard injection or LaunchServices adoption.
@@ -215,6 +215,7 @@ pub(crate) fn spawn_window_target(
     spec: &AppSpec,
     logs: LogSink,
     protected_paths: &[ProtectedHostPath],
+    context: Option<Arc<crate::window_directed::context::LaunchContext>>,
 ) -> Result<Launch> {
     if spec.run.first().is_none_or(String::is_empty) {
         return Err(crate::window_directed::refusal(
@@ -225,7 +226,9 @@ pub(crate) fn spawn_window_target(
     let inherited: Vec<_> = std::env::vars_os()
         .map(|(key, _)| key.to_string_lossy().into_owned())
         .collect();
-    crate::window_directed::validate_environment(inherited.iter().map(String::as_str))?;
+    if context.is_none() {
+        crate::window_directed::validate_environment(inherited.iter().map(String::as_str))?;
+    }
     if spec.sandbox == SandboxLevel::Off && !protected_paths.is_empty() {
         return Err(crate::window_directed::refusal(
             "protected paths require process containment",
@@ -250,7 +253,12 @@ pub(crate) fn spawn_window_target(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    spawn_for(spec, logs, &protected_paths, LaunchPurpose::Inspection)
+    spawn_for(
+        spec,
+        logs,
+        &protected_paths,
+        LaunchPurpose::Inspection(context),
+    )
 }
 
 fn spawn_for(
@@ -262,6 +270,15 @@ fn spawn_for(
     let session_launch = matches!(purpose, LaunchPurpose::Session);
     glass_sandbox_macos::profile::validate_protected_paths(protected_paths)?;
     let mut cmd = Command::new(&spec.run[0]);
+    #[cfg(any(test, feature = "native-input-qualification"))]
+    let pinned_cwd = if let LaunchPurpose::Inspection(Some(context)) = &purpose {
+        context.apply(&mut cmd);
+        Some(context.cwd().to_path_buf())
+    } else {
+        None
+    };
+    #[cfg(not(any(test, feature = "native-input-qualification")))]
+    let pinned_cwd: Option<PathBuf> = None;
 
     // Apply the caller's env FIRST, so glass's own containment/injection vars are written LAST
     // and win. Otherwise a caller could blank `DYLD_INSERT_LIBRARIES`/`GLASS_CLIP_PASTEBOARD`
@@ -279,18 +296,19 @@ fn spawn_for(
         // Effective working dir for the profile + reachability: the caller's cwd, else glass's own
         // current dir. A failure to read current_dir() is surfaced (not silently substituted with
         // "/", which would misroot relative launch tokens) and leaves the cwd unset.
-        let effective_cwd: Option<PathBuf> = spec.cwd.clone().or_else(|| {
-            std::env::current_dir()
-                .map_err(|e| {
-                    logs.lock().expect("log sink mutex").push((
-                        Stream::Stderr,
-                        format!(
-                            "glass: could not determine current directory for sandbox cwd: {e}"
-                        ),
-                    ));
-                })
-                .ok()
-        });
+        let effective_cwd: Option<PathBuf> =
+            pinned_cwd.or_else(|| spec.cwd.clone()).or_else(|| {
+                std::env::current_dir()
+                    .map_err(|e| {
+                        logs.lock().expect("log sink mutex").push((
+                            Stream::Stderr,
+                            format!(
+                                "glass: could not determine current directory for sandbox cwd: {e}"
+                            ),
+                        ));
+                    })
+                    .ok()
+            });
         // Canonicalize for the profile's cwd field (same as the pre-diff code did), non-fatally.
         let cwd_canon: Option<PathBuf> = effective_cwd
             .as_ref()
@@ -393,7 +411,9 @@ fn spawn_for(
     }
 
     cmd.args(&spec.run[1..]);
-    if let Some(cwd) = &spec.cwd {
+    if cmd.get_current_dir().is_none()
+        && let Some(cwd) = &spec.cwd
+    {
         cmd.current_dir(cwd);
     }
     if session_launch {
@@ -636,6 +656,7 @@ mod tests {
                 &launch,
                 logs.clone(),
                 &[ProtectedHostPath::file(&protected)],
+                None,
             )
             .unwrap();
             assert!(launched.clip.is_none());
@@ -655,7 +676,7 @@ mod tests {
     fn window_target_launch_refuses_injection_before_spawning() {
         let mut launch = spec(&["/nonexistent/window-target-fixture"]);
         launch.env = vec![("DYLD_INSERT_LIBRARIES".into(), "/nonexistent/shim".into())];
-        let error = spawn_window_target(&launch, empty_sink(), &[])
+        let error = spawn_window_target(&launch, empty_sink(), &[], None)
             .err()
             .unwrap();
         assert!(matches!(

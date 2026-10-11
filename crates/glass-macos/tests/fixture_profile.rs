@@ -55,11 +55,13 @@ mod native {
         let observed = first(&mut target);
         println!("{observed:#?}");
         assert_eq!(observed.fixture_profile, expected);
+        assert_eq!(observed.startup_context_revalidated, expected.is_some());
         assert!(!observed.configuration_verified);
         assert!(!observed.pixel_geometry_verified);
         assert!(!observed.input_admitted);
         let refreshed = target.observe(Deadline::from_millis(1_000)).unwrap();
         assert_eq!(refreshed.fixture_profile, expected);
+        assert_eq!(refreshed.startup_context_revalidated, expected.is_some());
         assert_eq!(refreshed.executable, observed.executable);
         target.stop().expect("confirm owned child cleanup");
         target.stop().unwrap();
@@ -88,6 +90,50 @@ mod native {
             .expect("supply an independently rebuilt unrecognized fixture path after --ignored");
         check(&spec(Path::new(&unknown)), None);
         println!("unrecognized AppKit artifact remained unmatched");
+        context_lifecycle(Path::new(&fixture));
         println!("compiled fixture recognition passed; configuration and input remain unqualified");
+    }
+
+    fn context_lifecycle(fixture: &Path) {
+        let original = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("cwd");
+        let old_cwd = directory.path().join("old-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+        let mut target = OwnedTarget::launch(&spec(fixture), &[]).unwrap();
+        let observed = first(&mut target);
+        assert!(observed.startup_context_revalidated);
+        std::env::set_current_dir(&original).unwrap();
+        assert!(
+            target
+                .observe(Deadline::from_millis(1_000))
+                .unwrap()
+                .startup_context_revalidated
+        );
+        println!("parent cwd change preserves the bound child startup context");
+
+        std::fs::rename(&cwd, &old_cwd).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let error = target.observe(Deadline::from_millis(1_000)).unwrap_err();
+        assert!(error.to_string().contains("startup"), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        std::fs::remove_dir(&cwd).unwrap();
+        std::fs::rename(&old_cwd, &cwd).unwrap();
+        assert!(
+            target
+                .observe(Deadline::from_millis(1_000))
+                .unwrap_err()
+                .to_string()
+                .contains("invalidated")
+        );
+        target
+            .stop()
+            .expect("confirm original context child cleanup");
+        target.stop().unwrap();
+        println!("cwd replacement refuses before AX and restoration never rebinds; cleanup passed");
     }
 }

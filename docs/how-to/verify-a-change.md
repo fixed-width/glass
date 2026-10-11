@@ -148,8 +148,19 @@ for an otherwise matching candidate refuse inspection. Matched host facts are fr
 observation; lost or changed facts invalidate the original binding. No runtime profile selector
 or manifest is accepted, and ordinary builds contain no entries.
 
-This recognition does not verify the inherited environment, effective cwd, loaded dependencies,
-preferences, signer or controls. Configuration, pixel geometry and input admission remain false.
+Matched fixtures also report `startup_context_revalidated: true`. The inspector retains the effective
+inherited environment with explicit overrides and a canonical cwd/device/inode before launch, then
+applies that snapshot explicitly to the contained direct child. Fresh kernel argument and cwd reads
+must match after launch and before/after each AX callback, including failed reads. Renaming, deleting
+or replacing the named cwd invalidates the binding permanently; restoring it does not revive the
+target. Parent cwd/environment changes cannot change the already captured command. Unmatched targets
+report `false` and retain generic inspection startup. Environment values are absent from diagnostics.
+
+The argument response is bounded to 128 KiB and 4,096 arguments; startup strings are bounded to half
+that byte budget. Incomplete/unavailable records refuse rather than adopting new facts. These checks
+verify startup provenance and current argv/cwd, not a live `getenv` view, trusted environment values,
+loaded dependencies, preferences, signer or controls. Configuration, pixel geometry and input
+admission remain false.
 The separate `fixture_profile` opt-in test requires the exact frozen Swift 6.4 build above
 (`swiftc -swift-version 5`) and a separately rebuilt, changed fixture for its unknown-artifact case.
 Build it with `cargo test -p glass-macos --features native-input-qualification --test fixture_profile

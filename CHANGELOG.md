@@ -21,6 +21,8 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Matched fixtures in the opt-in macOS target inspector bind the effective startup environment and working directory, then report `startup_context_revalidated` after fresh child argument/directory checks. Directory changes invalidate permanently; this remains read-only and does not verify live environment changes or qualify configuration/input.
+
 - The opt-in macOS target inspector reports a compiled fixture profile when the exact executable, OS/architecture and declared startup shape match. Fixture recognition remains read-only and does not qualify configuration or enable input.
 
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,

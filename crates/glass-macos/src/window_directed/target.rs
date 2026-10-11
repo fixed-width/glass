@@ -11,6 +11,7 @@ use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGRect};
 
+use super::context::LaunchContext;
 use super::native::{Library, NativeApi};
 use super::profiles::FixtureBinding;
 use super::{
@@ -157,6 +158,8 @@ pub struct TargetObservation {
     pub executable_identity_revalidated: bool,
     /// Compiled artifact and declared startup shape matched; configuration remains unqualified.
     pub fixture_profile: Option<&'static str>,
+    /// The applied startup snapshot and current argv/cwd match; live environment is unverified.
+    pub startup_context_revalidated: bool,
     pub configuration_verified: bool,
     pub pixel_geometry_verified: bool,
     pub input_admitted: bool,
@@ -170,6 +173,7 @@ pub struct OwnedTarget {
     process: ProcessIdentity,
     executable: ExecutableIdentity,
     fixture_profile: FixtureBinding,
+    launch_context: Option<Arc<LaunchContext>>,
     foreground: ProcessIdentity,
     selected: Option<SelectedWindow>,
     invalidated: bool,
@@ -178,6 +182,17 @@ pub struct OwnedTarget {
 struct SelectedWindow {
     element: CFRetained<AXUIElement>,
     identity: WindowIdentity,
+}
+
+fn require_launch_context(
+    kernel: &NativeApi,
+    process: ProcessIdentity,
+    context: Option<&LaunchContext>,
+) -> Result<()> {
+    if let Some(context) = context {
+        context.require_current(&kernel.arguments(process)?, &kernel.directory(process)?)?;
+    }
+    Ok(())
 }
 
 impl OwnedTarget {
@@ -204,12 +219,21 @@ impl OwnedTarget {
             std::env::consts::ARCH,
         )?;
         let windows = WindowApi::load()?;
+        let launch_context = fixture_profile
+            .name()
+            .map(|_| LaunchContext::capture(spec).map(Arc::new))
+            .transpose()?;
         let foreground = foreground(&kernel)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("target launch"));
         }
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let mut launch = crate::process::spawn_window_target(spec, logs, protected_paths)?;
+        let mut launch = crate::process::spawn_window_target(
+            spec,
+            logs,
+            protected_paths,
+            launch_context.clone(),
+        )?;
         let identity = i32::try_from(launch.child.id())
             .map_err(|_| refusal("owned child PID is invalid"))
             .and_then(|pid| kernel.process_identity(pid))
@@ -219,7 +243,13 @@ impl OwnedTarget {
                     process.executable_uuid,
                     deadline,
                 )?;
-                fixture_profile.revalidate(|| kernel.os_build(), std::env::consts::ARCH)?;
+                fixture_profile.revalidate(
+                    || {
+                        require_launch_context(&kernel, process, launch_context.as_deref())?;
+                        kernel.os_build()
+                    },
+                    std::env::consts::ARCH,
+                )?;
                 Ok(process)
             });
         match identity {
@@ -230,6 +260,7 @@ impl OwnedTarget {
                 process,
                 executable,
                 fixture_profile,
+                launch_context,
                 foreground,
                 selected: None,
                 invalidated: false,
@@ -268,8 +299,12 @@ impl OwnedTarget {
         let windows = &self.windows;
         let process = self.process;
         let previous = self.selected.as_ref();
+        let context = self.launch_context.as_deref();
         let (window, id, connection, psn, rect, controls) = self.fixture_profile.observe(
-            || kernel.os_build(),
+            || {
+                require_launch_context(kernel, process, context)?;
+                kernel.os_build()
+            },
             std::env::consts::ARCH,
             || {
                 glass_a11y_macos::messaging_timeout::with_read_only_by(
@@ -355,6 +390,7 @@ impl OwnedTarget {
             window_identity_revalidated: true,
             executable_identity_revalidated: true,
             fixture_profile: self.fixture_profile.name(),
+            startup_context_revalidated: self.launch_context.is_some(),
             configuration_verified: false,
             pixel_geometry_verified: false,
             input_admitted: false,

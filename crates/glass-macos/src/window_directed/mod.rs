@@ -5,6 +5,8 @@
 //! and connection, or establish control qualification. This module admits no input.
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) mod context;
+#[cfg(any(target_os = "macos", all(test, unix)))]
 mod executable;
 #[cfg(target_os = "macos")]
 pub use executable::ExecutableIdentity;
