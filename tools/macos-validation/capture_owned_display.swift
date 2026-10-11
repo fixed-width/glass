@@ -259,15 +259,13 @@ func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID,
     let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
     let range = try writeImage(image, root.appendingPathComponent("\(variant).png"))
     let after = try context()
-    guard child.isRunning, try windowNumber(window) == id,
-          NSDictionary(dictionary: baseline).isEqual(to: after) else {
-        throw ProbeError("display/foreground/cursor context changed during owned app observation")
-    }
+    guard child.isRunning, try windowNumber(window) == id else { throw ProbeError("owned window identity changed during capture") }
     return ["variant": variant, "pid": child.processIdentifier, "window_id": id,
             "original_frame": rectangle(original), "placed_frame": rectangle(placed),
             "sck_frame": rectangle(candidate.frame), "display": display,
             "image_size": [image.width, image.height], "luminance_range": range,
-            "observed_button_ids": identifiers, "context_preserved": true]
+            "observed_button_ids": identifiers, "context_preserved": NSDictionary(dictionary: baseline).isEqual(to: after),
+            "context_before": baseline, "context_after": after]
 }
 
 @main

@@ -58,7 +58,8 @@ cleanup. `display-lease --inspect` reads current inventory without creating a di
 owned ID is absent; an absent ID's `CGDisplayIsOnline` value is not a reliable membership test.
 Check the final display inventory and existing window positions, including after failed trials.
 
-The capture result reports rendering separately from context preservation across the whole sequence.
+The capture result reports rendering separately from context preservation within each observation
+and across the whole sequence, retaining changed context as evidence without treating it as a rendering failure.
 Neither a nonblank image nor unchanged observations within each individual capture proves unchanged
 foreground during child startup/cleanup or between captures. No input is posted and no permission
 request API is called. A capture API can still cause macOS UI or notifications; absence of permission
