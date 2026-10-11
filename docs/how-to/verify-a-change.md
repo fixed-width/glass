@@ -122,11 +122,14 @@ binary through that bundle's established signing and GUI-session procedure. The 
 the grant; it never requests one. It launches fresh direct children with existing containment,
 without the clipboard shim, and reads exact AX/WindowServer ownership and point geometry.
 Child standard input/output is discarded. Post-read failures retain AX dispatch evidence even
-though no input event was posted. The test covers refresh, replacement, competing windows, child
-exit and cleanup. It reads no control values and
-posts no input. All observations retain false lifetime, configuration, pixel-geometry and input
-admission flags. Retained AX references detect some replacements; they supply no window lifetime
-guarantee. The reported AX subtree does not establish complete WindowServer inventory or a qualified
+though no input event was posted. The test covers geometry refresh, closure, replacement, competing windows,
+child exit and cleanup. It reads no control values and posts no input. Successful observations
+report `window_identity_revalidated: true`; configuration, pixel-geometry and input admission remain
+false. Refreshes check the original process/window/connection/PSN tuple and retained AX reference.
+Observed closure, replacement or unavailable readings invalidate the binding. Unobserved window-ID
+reuse within the same process lifetime and connection may compare equal; these checks establish
+no window birth token or continuous lifetime guarantee. The reported AX subtree does not establish
+complete WindowServer inventory or a qualified
 action region. A failed observation invalidates the inspector, except while waiting for its first
 window. These checks require no operator input and establish no physical interference verdict.
 

@@ -24,10 +24,14 @@ final class Fixture: NSObject, NSApplicationDelegate {
         panels = [panel()]
         if scenario == "compete" {
             panels.append(panel())
-        } else if scenario == "replace" || scenario == "exit" {
+        } else if ["replace", "close", "move", "exit"].contains(scenario) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [self] in
                 if scenario == "exit" {
                     NSApplication.shared.terminate(nil)
+                } else if scenario == "close" {
+                    panels[0].close()
+                } else if scenario == "move" {
+                    panels[0].setFrameOrigin(NSPoint(x: 160, y: 100))
                 } else {
                     panels[0].close()
                     panels = [panel()]
