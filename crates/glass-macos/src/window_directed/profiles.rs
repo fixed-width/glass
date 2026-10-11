@@ -4,7 +4,8 @@ use glass_core::{AppSpec, Result, SandboxLevel};
 
 use super::refusal;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct FixtureProfile {
     pub name: &'static str,
     sha256: [u8; 32],
@@ -204,7 +205,7 @@ mod tests {
             )
             .is_none()
         );
-        let duplicates = [&FIXTURES[..], &FIXTURES[..]].concat();
+        let duplicates = [FIXTURES, FIXTURES].concat();
         assert!(
             matching(
                 &duplicates,
