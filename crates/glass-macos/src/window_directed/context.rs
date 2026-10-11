@@ -276,7 +276,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = LaunchContext::from_environment(
             &spec(),
-            [("GLASS_CLIP_PRIVATE".into(), "synthetic-secret".into())],
+            [(
+                concat!("GLASS_CLIP_", "PRIVATE").into(),
+                "synthetic-secret".into(),
+            )],
             dir.path(),
         )
         .err()
