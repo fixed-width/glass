@@ -13,6 +13,7 @@ use objc2_core_graphics::{
 use glass_core::Result;
 
 use super::executable::kernel_path;
+use super::profiles::parse_os_build;
 use super::{ProcessIdentity, process_identity, refusal, require_same_process};
 
 const WINDOW_FIELD: CGEventField = CGEventField(51);
@@ -24,6 +25,8 @@ type SetWindowLocation = unsafe extern "C" fn(*const CGEvent, CGPoint);
 type GetWindowLocation = unsafe extern "C" fn(*const CGEvent) -> CGPoint;
 type ProcessInfo = unsafe extern "C" fn(i32, i32, u64, *mut c_void, i32) -> i32;
 type ProcessPath = unsafe extern "C" fn(i32, *mut c_void, u32) -> i32;
+type ReadSysctl =
+    unsafe extern "C" fn(*const c_char, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
 
 #[link(name = "System")]
 unsafe extern "C" {
@@ -61,10 +64,30 @@ pub(super) struct NativeApi {
     get_window_location: GetWindowLocation,
     process_info: ProcessInfo,
     process_path: ProcessPath,
+    read_sysctl: ReadSysctl,
     _libraries: [Library; 2],
 }
 
 impl NativeApi {
+    pub(super) fn os_build(&self) -> Result<String> {
+        let mut bytes = [0_u8; 64];
+        let mut length = bytes.len();
+        // SAFETY: fixed NUL-terminated key, writable bounded buffer/length, and no write request.
+        let result = unsafe {
+            (self.read_sysctl)(
+                c"kern.osversion".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(refusal("kernel OS build is unavailable"));
+        }
+        parse_os_build(&bytes, length).map(String::from)
+    }
+
     pub(super) fn load() -> Result<Self> {
         let graphics =
             Library::open(c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")?;
@@ -83,6 +106,9 @@ impl NativeApi {
                 ),
                 process_path: std::mem::transmute::<*mut c_void, ProcessPath>(
                     system.symbol(c"proc_pidpath")?.as_ptr(),
+                ),
+                read_sysctl: std::mem::transmute::<*mut c_void, ReadSysctl>(
+                    system.symbol(c"sysctlbyname")?.as_ptr(),
                 ),
                 _libraries: [graphics, system],
             }

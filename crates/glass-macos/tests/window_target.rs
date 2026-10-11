@@ -23,6 +23,8 @@ mod native {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    const SCHEDULED_CHANGE_WAIT: Duration = Duration::from_secs(6);
+
     fn launch(scenario: &str) -> OwnedTarget {
         let fixture = std::env::var("GLASS_WINDOW_TARGET_FIXTURE_BIN")
             .expect("build fixture/window_target.swift and set GLASS_WINDOW_TARGET_FIXTURE_BIN");
@@ -130,16 +132,17 @@ mod native {
 
         let mut replacement = launch("replace");
         first(&mut replacement).expect("read initial replacement-test window");
+        std::thread::sleep(SCHEDULED_CHANGE_WAIT);
         changed(&mut replacement, "replaced");
 
         let mut closed = launch("close");
         first(&mut closed).expect("read initial close-test window");
-        std::thread::sleep(Duration::from_secs(6));
+        std::thread::sleep(SCHEDULED_CHANGE_WAIT);
         changed(&mut closed, "window not found");
 
         let mut moved = launch("move");
         let original = first(&mut moved).expect("read initial move-test window");
-        std::thread::sleep(Duration::from_secs(6));
+        std::thread::sleep(SCHEDULED_CHANGE_WAIT);
         let refreshed = moved
             .observe(Deadline::from_millis(1_000))
             .expect("refresh moved original window");
@@ -167,7 +170,7 @@ mod native {
 
         let mut exited = launch("exit");
         first(&mut exited).expect("read initial exit-test window");
-        std::thread::sleep(Duration::from_secs(6));
+        std::thread::sleep(SCHEDULED_CHANGE_WAIT);
         let error = exited.observe(Deadline::from_millis(1_000)).unwrap_err();
         assert!(error.to_string().contains("owned child exited"), "{error}");
         assert!(

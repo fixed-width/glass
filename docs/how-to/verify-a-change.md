@@ -138,6 +138,26 @@ complete WindowServer inventory or a qualified
 action region. A failed observation invalidates the inspector, except while waiting for its first
 window. These checks require no operator input and establish no physical interference verdict.
 
+The inspector also reports `fixture_profile: Some("appkit-ownership-v1")` for the frozen
+read-only fixture artifact on kernel build `26A428` in a native `aarch64` inspector. Its compiled
+entry pins SHA-256 and Mach-O UUID and matches one scenario argument (`stable`, `replace`, `close`,
+`move`, `compete`, `exit`), no build/window hint/cwd/env, Default containment and requested accessibility.
+Other artifacts, hosts and declared startup shapes report `None`; names and framework labels
+cannot enroll an artifact. Unmatched startup shapes skip the host query. Unavailable kernel facts
+for an otherwise matching candidate refuse inspection. Matched host facts are freshly checked after launch and around each
+observation; lost or changed facts invalidate the original binding. No runtime profile selector
+or manifest is accepted, and ordinary builds contain no entries.
+
+This recognition does not verify the inherited environment, effective cwd, loaded dependencies,
+preferences, signer or controls. Configuration, pixel geometry and input admission remain false.
+The separate `fixture_profile` opt-in test requires the exact frozen Swift 6.4 build above
+(`swiftc -swift-version 5`) and a separately rebuilt, changed fixture for its unknown-artifact case.
+Build it with `cargo test -p glass-macos --features native-input-qualification --test fixture_profile
+--locked --no-run`, then run its printed executable with the same clean launch environment and
+fixture locator as above, followed by `--ignored /absolute/path/to/unrecognized-fixture`.
+A compiler/OS/artifact change requires a reviewed compiled entry update; never enroll an observed
+digest automatically. The generic `window_target` lifecycle test remains available on other hosts.
+
 ## Integration suites (Linux)
 
 `#[ignore]`d, so the ordinary `cargo test` never starts them. Each self-starts what it needs.

@@ -21,6 +21,8 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- The opt-in macOS target inspector reports a compiled fixture profile when the exact executable, OS/architecture and declared startup shape match. Fixture recognition remains read-only and does not qualify configuration or enable input.
+
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
   isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
