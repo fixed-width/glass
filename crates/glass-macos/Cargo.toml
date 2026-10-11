@@ -11,22 +11,17 @@ bench = false
 
 [features]
 # Read-only native diagnostics; does not enable an input route.
-native-input-qualification = ["dep:sha2"]
+native-diagnostics = []
 
 [[bin]]
 name = "glass-macos-window-input-readiness"
 path = "src/bin/window_input_readiness.rs"
-required-features = ["native-input-qualification"]
+required-features = ["native-diagnostics"]
 
 [[test]]
 name = "window_target"
 harness = false
-required-features = ["native-input-qualification"]
-
-[[test]]
-name = "fixture_profile"
-harness = false
-required-features = ["native-input-qualification"]
+required-features = ["native-diagnostics"]
 
 # Mac-gated capture integration test (crates/glass-macos/tests/capture.rs): harness =
 # false because it defines its own `fn main()` that must run on the process's true main
@@ -117,7 +112,6 @@ path = "src/bin/sandbox_probe.rs"
 glass-a11y-macos.workspace = true
 glass-core.workspace = true
 plist = "1"
-sha2 = { version = "0.11", optional = true }
 
 # macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
 # modules still build off macOS with zero macOS deps. Versions pinned to
@@ -270,7 +264,6 @@ glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-sha2 = "0.11"
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix.workspace = true

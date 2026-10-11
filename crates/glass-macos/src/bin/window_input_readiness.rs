@@ -1,4 +1,4 @@
-//! Read-only qualification diagnostic. It never loads an event-posting API.
+//! Read-only native event diagnostic. It never loads an event-posting API.
 
 #[cfg(target_os = "macos")]
 fn main() {

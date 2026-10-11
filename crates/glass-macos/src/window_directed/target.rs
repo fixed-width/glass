@@ -1,7 +1,6 @@
 //! Read-only observation of a direct child, with no capture, activation or input.
 
 use std::ffi::c_void;
-use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
@@ -11,13 +10,8 @@ use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGRect};
 
-use super::context::LaunchContext;
 use super::native::{Library, NativeApi};
-use super::profiles::FixtureBinding;
-use super::{
-    ExecutableIdentity, ProcessIdentity, WindowIdentity, refusal, require_same_process,
-    require_same_window,
-};
+use super::{ProcessIdentity, WindowIdentity, refusal, require_same_process, require_same_window};
 use crate::axwindow::{AxMessageScope, SystemWideAxMessaging};
 
 const MAX_NODES: usize = 128;
@@ -131,7 +125,7 @@ impl WindowApi {
     }
 }
 
-/// An observed AX node, not a qualified control or an instruction to perform its action.
+/// An observed AX node and its owning window.
 #[derive(Debug)]
 pub struct ControlObservation {
     pub role: String,
@@ -142,11 +136,10 @@ pub struct ControlObservation {
     pub parent: Option<usize>,
 }
 
-/// Current owner/AX facts; these never constitute an input-admission lease.
+/// Current process/window ownership and AX facts from a read-only inspection.
 #[derive(Debug)]
 pub struct TargetObservation {
     pub process: ProcessIdentity,
-    pub executable: ExecutableIdentity,
     pub window_id: u32,
     pub owner_connection: i32,
     pub owner_psn: [u32; 2],
@@ -155,14 +148,6 @@ pub struct TargetObservation {
     pub controls: Vec<ControlObservation>,
     /// Current checks passed; this does not distinguish unobserved same-owner window-ID reuse.
     pub window_identity_revalidated: bool,
-    pub executable_identity_revalidated: bool,
-    /// Compiled artifact and declared startup shape matched; configuration remains unqualified.
-    pub fixture_profile: Option<&'static str>,
-    /// The applied startup snapshot and current argv/cwd match; live environment is unverified.
-    pub startup_context_revalidated: bool,
-    pub configuration_verified: bool,
-    pub pixel_geometry_verified: bool,
-    pub input_admitted: bool,
 }
 
 /// Owns one direct child and its selected AX reference; it never adopts another process/window.
@@ -171,9 +156,6 @@ pub struct OwnedTarget {
     kernel: NativeApi,
     windows: WindowApi,
     process: ProcessIdentity,
-    executable: ExecutableIdentity,
-    fixture_profile: FixtureBinding,
-    launch_context: Option<Arc<LaunchContext>>,
     foreground: ProcessIdentity,
     selected: Option<SelectedWindow>,
     invalidated: bool,
@@ -184,17 +166,6 @@ struct SelectedWindow {
     identity: WindowIdentity,
 }
 
-fn require_launch_context(
-    kernel: &NativeApi,
-    process: ProcessIdentity,
-    context: Option<&LaunchContext>,
-) -> Result<()> {
-    if let Some(context) = context {
-        context.require_current(&kernel.arguments(process)?, &kernel.directory(process)?)?;
-    }
-    Ok(())
-}
-
 impl OwnedTarget {
     /// Launch without a build, bundle adoption, clipboard shim or permission request.
     pub fn launch(spec: &AppSpec, protected_paths: &[ProtectedHostPath]) -> Result<Self> {
@@ -203,64 +174,28 @@ impl OwnedTarget {
                 "target inspection requires a direct launch without build or window hint",
             ));
         }
-        require_console_and_permission()?;
         let deadline = Deadline::from_millis(spec.timeout_ms);
-        let command = spec
-            .run
-            .first()
-            .ok_or_else(|| refusal("a direct executable is required"))?;
-        let executable = ExecutableIdentity::read(Path::new(command), deadline)?;
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started("target launch"));
+        }
+        require_console_and_permission()?;
         let kernel = NativeApi::load()?;
-        let mut fixture_profile = FixtureBinding::bind(
-            executable.sha256,
-            executable.image_uuid,
-            spec,
-            || kernel.os_build(),
-            std::env::consts::ARCH,
-        )?;
         let windows = WindowApi::load()?;
-        let launch_context = fixture_profile
-            .name()
-            .map(|_| LaunchContext::capture(spec).map(Arc::new))
-            .transpose()?;
         let foreground = foreground(&kernel)?;
         if deadline.has_passed() {
             return Err(GlassError::deadline_not_started("target launch"));
         }
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let mut launch = crate::process::spawn_window_target(
-            spec,
-            logs,
-            protected_paths,
-            launch_context.clone(),
-        )?;
+        let mut launch = crate::process::spawn_window_target(spec, logs, protected_paths)?;
         let identity = i32::try_from(launch.child.id())
             .map_err(|_| refusal("owned child PID is invalid"))
-            .and_then(|pid| kernel.process_identity(pid))
-            .and_then(|process| {
-                executable.revalidate(
-                    &kernel.executable_path(process)?,
-                    process.executable_uuid,
-                    deadline,
-                )?;
-                fixture_profile.revalidate(
-                    || {
-                        require_launch_context(&kernel, process, launch_context.as_deref())?;
-                        kernel.os_build()
-                    },
-                    std::env::consts::ARCH,
-                )?;
-                Ok(process)
-            });
+            .and_then(|pid| kernel.process_identity(pid));
         match identity {
             Ok(process) => Ok(Self {
                 launch: Some(launch),
                 kernel,
                 windows,
                 process,
-                executable,
-                fixture_profile,
-                launch_context,
                 foreground,
                 selected: None,
                 invalidated: false,
@@ -294,78 +229,68 @@ impl OwnedTarget {
     }
 
     fn observe_inner(&mut self, deadline: Deadline) -> Result<TargetObservation> {
-        self.check_context(deadline)?;
+        self.check_context()?;
         let kernel = &self.kernel;
         let windows = &self.windows;
         let process = self.process;
         let previous = self.selected.as_ref();
-        let context = self.launch_context.as_deref();
-        let (window, id, connection, psn, rect, controls) = self.fixture_profile.observe(
-            || {
-                require_launch_context(kernel, process, context)?;
-                kernel.os_build()
+        let observed = glass_a11y_macos::messaging_timeout::with_read_only_by(
+            &SystemWideAxMessaging,
+            deadline,
+            |scope| {
+                // SAFETY: positive kernel-verified PID; the created application reference is owned.
+                let app = unsafe { AXUIElement::new_application(process.pid) };
+                let window = sole_window(scope, &app)?;
+                if previous.is_some_and(|previous| previous.element != window) {
+                    return Err(refusal("selected AX window was replaced"));
+                }
+                require_pid(scope, &window, process.pid)?;
+                let id = windows.window_id(scope, &window)?;
+                let (connection, psn, rect) = windows.owner_and_bounds(id, process.pid)?;
+                let identity = WindowIdentity {
+                    process,
+                    window_id: id,
+                    owner_connection: connection,
+                    owner_psn: psn,
+                };
+                if let Some(previous) = previous {
+                    require_same_window(previous.identity, identity)?;
+                }
+                let ax_rect = ax_rect(scope, &window)?;
+                if rect_values(rect)
+                    .iter()
+                    .zip(rect_values(ax_rect))
+                    .any(|(a, b)| (a - b).abs() > 0.5)
+                {
+                    return Err(refusal("AX and WindowServer geometry disagree"));
+                }
+                let mut controls = Vec::new();
+                let mut seen = Vec::new();
+                read_tree(
+                    scope,
+                    &window,
+                    &window,
+                    process.pid,
+                    (0, None),
+                    &mut controls,
+                    &mut seen,
+                )?;
+                let current = sole_window(scope, &app)?;
+                if current != window || windows.window_id(scope, &window)? != id {
+                    return Err(refusal("selected window changed during observation"));
+                }
+                let current_owner = windows.owner_and_bounds(id, process.pid)?;
+                if current_owner != (connection, psn, rect) {
+                    return Err(refusal(
+                        "window ownership or geometry changed during observation",
+                    ));
+                }
+                require_same_process(process, kernel.process_identity(process.pid)?)?;
+                Ok((window, id, connection, psn, rect, controls))
             },
-            std::env::consts::ARCH,
-            || {
-                glass_a11y_macos::messaging_timeout::with_read_only_by(
-                    &SystemWideAxMessaging,
-                    deadline,
-                    |scope| {
-                        // SAFETY: positive kernel-verified PID; the created application reference is owned.
-                        let app = unsafe { AXUIElement::new_application(process.pid) };
-                        let window = sole_window(scope, &app)?;
-                        if previous.is_some_and(|previous| previous.element != window) {
-                            return Err(refusal("selected AX window was replaced"));
-                        }
-                        require_pid(scope, &window, process.pid)?;
-                        let id = windows.window_id(scope, &window)?;
-                        let (connection, psn, rect) = windows.owner_and_bounds(id, process.pid)?;
-                        let identity = WindowIdentity {
-                            process,
-                            window_id: id,
-                            owner_connection: connection,
-                            owner_psn: psn,
-                        };
-                        if let Some(previous) = previous {
-                            require_same_window(previous.identity, identity)?;
-                        }
-                        let ax_rect = ax_rect(scope, &window)?;
-                        if rect_values(rect)
-                            .iter()
-                            .zip(rect_values(ax_rect))
-                            .any(|(a, b)| (a - b).abs() > 0.5)
-                        {
-                            return Err(refusal("AX and WindowServer geometry disagree"));
-                        }
-                        let mut controls = Vec::new();
-                        let mut seen = Vec::new();
-                        read_tree(
-                            scope,
-                            &window,
-                            &window,
-                            process.pid,
-                            (0, None),
-                            &mut controls,
-                            &mut seen,
-                        )?;
-                        let current = sole_window(scope, &app)?;
-                        if current != window || windows.window_id(scope, &window)? != id {
-                            return Err(refusal("selected window changed during observation"));
-                        }
-                        let current_owner = windows.owner_and_bounds(id, process.pid)?;
-                        if current_owner != (connection, psn, rect) {
-                            return Err(refusal(
-                                "window ownership or geometry changed during observation",
-                            ));
-                        }
-                        require_same_process(process, kernel.process_identity(process.pid)?)?;
-                        Ok((window, id, connection, psn, rect, controls))
-                    },
-                )
-            },
-        )?;
-        self.check_context(deadline)
-            .map_err(GlassError::after_dispatch)?;
+        );
+        self.check_context().map_err(GlassError::after_dispatch)?;
+        let (window, id, connection, psn, rect, controls) = observed?;
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("target observation"));
         }
@@ -380,7 +305,6 @@ impl OwnedTarget {
         });
         Ok(TargetObservation {
             process,
-            executable: self.executable.clone(),
             window_id: id,
             owner_connection: connection,
             owner_psn: psn,
@@ -388,16 +312,10 @@ impl OwnedTarget {
             foreground: self.foreground,
             controls,
             window_identity_revalidated: true,
-            executable_identity_revalidated: true,
-            fixture_profile: self.fixture_profile.name(),
-            startup_context_revalidated: self.launch_context.is_some(),
-            configuration_verified: false,
-            pixel_geometry_verified: false,
-            input_admitted: false,
         })
     }
 
-    fn check_context(&mut self, deadline: Deadline) -> Result<()> {
+    fn check_context(&mut self) -> Result<()> {
         let launch = self
             .launch
             .as_mut()
@@ -411,15 +329,6 @@ impl OwnedTarget {
             return Err(refusal("owned child exited"));
         }
         require_console_and_permission()?;
-        require_same_process(
-            self.process,
-            self.kernel.process_identity(self.process.pid)?,
-        )?;
-        self.executable.revalidate(
-            &self.kernel.executable_path(self.process)?,
-            self.process.executable_uuid,
-            deadline,
-        )?;
         require_same_process(
             self.process,
             self.kernel.process_identity(self.process.pid)?,

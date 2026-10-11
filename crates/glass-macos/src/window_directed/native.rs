@@ -1,7 +1,6 @@
 //! Dynamically loaded, read-only process and event ABI checks. No posting API is loaded.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::path::PathBuf;
 use std::ptr::NonNull;
 
 use objc2_core_foundation::CGPoint;
@@ -12,11 +11,6 @@ use objc2_core_graphics::{
 
 use glass_core::Result;
 
-use super::context::{
-    DirectoryIdentity, MAX_ARGUMENT_BYTES, VNODE_RECORD_BYTES, parse_arguments, parse_directory,
-};
-use super::executable::kernel_path;
-use super::profiles::parse_os_build;
 use super::{ProcessIdentity, process_identity, refusal, require_same_process};
 
 const WINDOW_FIELD: CGEventField = CGEventField(51);
@@ -27,11 +21,6 @@ const _: () = assert!(std::mem::size_of::<CGPoint>() == 16);
 type SetWindowLocation = unsafe extern "C" fn(*const CGEvent, CGPoint);
 type GetWindowLocation = unsafe extern "C" fn(*const CGEvent) -> CGPoint;
 type ProcessInfo = unsafe extern "C" fn(i32, i32, u64, *mut c_void, i32) -> i32;
-type ProcessPath = unsafe extern "C" fn(i32, *mut c_void, u32) -> i32;
-type ReadSysctl =
-    unsafe extern "C" fn(*const c_char, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
-type ReadSysctlMib =
-    unsafe extern "C" fn(*mut c_int, u32, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
 
 #[link(name = "System")]
 unsafe extern "C" {
@@ -68,32 +57,10 @@ pub(super) struct NativeApi {
     set_window_location: SetWindowLocation,
     get_window_location: GetWindowLocation,
     process_info: ProcessInfo,
-    process_path: ProcessPath,
-    read_sysctl: ReadSysctl,
-    read_sysctl_mib: ReadSysctlMib,
     _libraries: [Library; 2],
 }
 
 impl NativeApi {
-    pub(super) fn os_build(&self) -> Result<String> {
-        let mut bytes = [0_u8; 64];
-        let mut length = bytes.len();
-        // SAFETY: fixed NUL-terminated key, writable bounded buffer/length, and no write request.
-        let result = unsafe {
-            (self.read_sysctl)(
-                c"kern.osversion".as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                &mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if result != 0 {
-            return Err(refusal("kernel OS build is unavailable"));
-        }
-        parse_os_build(&bytes, length).map(String::from)
-    }
-
     pub(super) fn load() -> Result<Self> {
         let graphics =
             Library::open(c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")?;
@@ -109,15 +76,6 @@ impl NativeApi {
                 ),
                 process_info: std::mem::transmute::<*mut c_void, ProcessInfo>(
                     system.symbol(c"proc_pidinfo")?.as_ptr(),
-                ),
-                process_path: std::mem::transmute::<*mut c_void, ProcessPath>(
-                    system.symbol(c"proc_pidpath")?.as_ptr(),
-                ),
-                read_sysctl: std::mem::transmute::<*mut c_void, ReadSysctl>(
-                    system.symbol(c"sysctlbyname")?.as_ptr(),
-                ),
-                read_sysctl_mib: std::mem::transmute::<*mut c_void, ReadSysctlMib>(
-                    system.symbol(c"sysctl")?.as_ptr(),
                 ),
                 _libraries: [graphics, system],
             }
@@ -139,76 +97,6 @@ impl NativeApi {
             return Err(refusal("kernel process identity response is incomplete"));
         }
         process_identity(pid, &record.0)
-    }
-
-    pub(super) fn executable_path(&self, process: ProcessIdentity) -> Result<PathBuf> {
-        require_same_process(process, self.process_identity(process.pid)?)?;
-        let mut buffer = [0_u8; 4096];
-        // SAFETY: verified positive PID and writable PROC_PIDPATHINFO_MAXSIZE buffer.
-        let count = unsafe { (self.process_path)(process.pid, buffer.as_mut_ptr().cast(), 4096) };
-        let path = kernel_path(&buffer, count)?;
-        require_same_process(process, self.process_identity(process.pid)?)?;
-        Ok(path)
-    }
-
-    pub(super) fn arguments(&self, process: ProcessIdentity) -> Result<Vec<std::ffi::OsString>> {
-        require_same_process(process, self.process_identity(process.pid)?)?;
-        let mut mib = [1, 49, process.pid]; // CTL_KERN, KERN_PROCARGS2, owned PID.
-        let mut length = 0_usize;
-        // SAFETY: fixed three-entry MIB, writable length, no output or write buffer in this size query.
-        let result = unsafe {
-            (self.read_sysctl_mib)(
-                mib.as_mut_ptr(),
-                3,
-                std::ptr::null_mut(),
-                &mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if result != 0 || !(4..=MAX_ARGUMENT_BYTES).contains(&length) {
-            return Err(refusal(
-                "kernel startup arguments are unavailable or exceed bounds",
-            ));
-        }
-        let mut bytes = vec![0_u8; length];
-        // SAFETY: verified owned PID, bounded writable buffer/length, fixed read-only MIB.
-        let result = unsafe {
-            (self.read_sysctl_mib)(
-                mib.as_mut_ptr(),
-                3,
-                bytes.as_mut_ptr().cast(),
-                &mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if result != 0 {
-            return Err(refusal("kernel startup argument read failed"));
-        }
-        let arguments = parse_arguments(&bytes, length)?;
-        require_same_process(process, self.process_identity(process.pid)?)?;
-        Ok(arguments)
-    }
-
-    pub(super) fn directory(&self, process: ProcessIdentity) -> Result<DirectoryIdentity> {
-        require_same_process(process, self.process_identity(process.pid)?)?;
-        #[repr(C, align(8))]
-        struct Record([u8; VNODE_RECORD_BYTES]);
-        let mut record = Record([0; VNODE_RECORD_BYTES]);
-        // SAFETY: verified PID, PROC_PIDVNODEPATHINFO and the SDK-verified exact buffer size/alignment.
-        let count = unsafe {
-            (self.process_info)(
-                process.pid,
-                9,
-                0,
-                record.0.as_mut_ptr().cast(),
-                VNODE_RECORD_BYTES as i32,
-            )
-        };
-        let directory = parse_directory(&record.0, count)?;
-        require_same_process(process, self.process_identity(process.pid)?)?;
-        Ok(directory)
     }
 
     fn check_event_abi(&self) -> Result<()> {
@@ -307,14 +195,13 @@ impl NativeApi {
     }
 }
 
-/// Diagnostic evidence only. This is neither session support nor an input-admission lease.
+/// Read-only process, permission and unposted event ABI facts.
 #[derive(Debug)]
 pub struct Readiness {
     pub process: ProcessIdentity,
     pub accessibility_granted: bool,
     pub screen_recording_granted: bool,
     pub event_abi_verified: bool,
-    pub input_admitted: bool,
 }
 
 /// Probe the current process and unposted events without capture, activation or input.
@@ -329,7 +216,6 @@ pub fn probe_readiness() -> Result<Readiness> {
         accessibility_granted: crate::permissions::accessibility_granted(),
         screen_recording_granted: crate::permissions::screen_recording_granted(),
         event_abi_verified: true,
-        input_admitted: false,
     })
 }
 
@@ -418,6 +304,5 @@ mod tests {
     fn native_readiness_does_not_authorize_input() {
         let report = probe_readiness().unwrap();
         assert!(report.event_abi_verified);
-        assert!(!report.input_admitted);
     }
 }

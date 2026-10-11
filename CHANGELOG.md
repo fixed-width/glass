@@ -21,10 +21,6 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
-- Matched fixtures in the opt-in macOS target inspector bind the effective startup environment and working directory, then report `startup_context_revalidated` after fresh child argument/directory checks. Directory changes invalidate permanently; this remains read-only and does not verify live environment changes or qualify configuration/input.
-
-- The opt-in macOS target inspector reports a compiled fixture profile when the exact executable, OS/architecture and declared startup shape match. Fixture recognition remains read-only and does not qualify configuration or enable input.
-
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
   isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
@@ -35,7 +31,7 @@ internal refactors, CI, or test-only changes.
   macOS attests unambiguous read scope; unqualified backends return full observations without retention.
 
 ### Changed
-- The opt-in macOS target inspector now verifies the original executable file and refuses observations after it is replaced or deleted. It accepts only absolute paths to regular thin little-endian 64-bit Mach-O executables up to 64 MiB and remains read-only.
+- The opt-in macOS native diagnostics inspect live process/window ownership without requiring fixed test-app identities or unchanged executable files, arguments, cwd or environment. The developer build feature is now `native-diagnostics`; it remains read-only and does not provide headless input.
 - macOS accessibility snapshots avoid duplicate value reads for checkboxes, radio buttons, and switches while preserving their reported values and checked states.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
