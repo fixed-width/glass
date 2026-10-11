@@ -12,6 +12,7 @@ use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGRect};
 
 use super::native::{Library, NativeApi};
+use super::profiles::{self, FixtureProfile};
 use super::{
     ExecutableIdentity, ProcessIdentity, WindowIdentity, refusal, require_same_process,
     require_same_window,
@@ -154,6 +155,8 @@ pub struct TargetObservation {
     /// Current checks passed; this does not distinguish unobserved same-owner window-ID reuse.
     pub window_identity_revalidated: bool,
     pub executable_identity_revalidated: bool,
+    /// Compiled artifact and declared startup shape matched; configuration remains unqualified.
+    pub fixture_profile: Option<&'static str>,
     pub configuration_verified: bool,
     pub pixel_geometry_verified: bool,
     pub input_admitted: bool,
@@ -166,6 +169,7 @@ pub struct OwnedTarget {
     windows: WindowApi,
     process: ProcessIdentity,
     executable: ExecutableIdentity,
+    fixture_profile: Option<&'static FixtureProfile>,
     foreground: ProcessIdentity,
     selected: Option<SelectedWindow>,
     invalidated: bool,
@@ -192,6 +196,18 @@ impl OwnedTarget {
             .ok_or_else(|| refusal("a direct executable is required"))?;
         let executable = ExecutableIdentity::read(Path::new(command), deadline)?;
         let kernel = NativeApi::load()?;
+        let fixture_profile = if profiles::known_artifact(executable.sha256, executable.image_uuid)
+        {
+            profiles::matching_fixture(
+                executable.sha256,
+                executable.image_uuid,
+                spec,
+                &kernel.os_build()?,
+                std::env::consts::ARCH,
+            )
+        } else {
+            None
+        };
         let windows = WindowApi::load()?;
         let foreground = foreground(&kernel)?;
         if deadline.has_passed() {
@@ -208,6 +224,9 @@ impl OwnedTarget {
                     process.executable_uuid,
                     deadline,
                 )?;
+                if let Some(profile) = fixture_profile {
+                    profile.require_host(&kernel.os_build()?, std::env::consts::ARCH)?;
+                }
                 Ok(process)
             });
         match identity {
@@ -217,6 +236,7 @@ impl OwnedTarget {
                 windows,
                 process,
                 executable,
+                fixture_profile,
                 foreground,
                 selected: None,
                 invalidated: false,
@@ -336,6 +356,7 @@ impl OwnedTarget {
             controls,
             window_identity_revalidated: true,
             executable_identity_revalidated: true,
+            fixture_profile: self.fixture_profile.map(|profile| profile.name),
             configuration_verified: false,
             pixel_geometry_verified: false,
             input_admitted: false,
@@ -365,6 +386,9 @@ impl OwnedTarget {
             self.process.executable_uuid,
             deadline,
         )?;
+        if let Some(profile) = self.fixture_profile {
+            profile.require_host(&self.kernel.os_build()?, std::env::consts::ARCH)?;
+        }
         require_same_process(
             self.process,
             self.kernel.process_identity(self.process.pid)?,

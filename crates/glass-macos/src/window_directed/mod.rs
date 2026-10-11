@@ -13,6 +13,8 @@ pub use executable::ExecutableIdentity;
 mod native;
 #[cfg(target_os = "macos")]
 pub use native::{Readiness, probe_readiness};
+#[cfg(any(target_os = "macos", test))]
+mod profiles;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod target;
