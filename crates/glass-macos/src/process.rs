@@ -205,12 +205,12 @@ pub(crate) fn spawn(
 
 enum LaunchPurpose {
     Session,
-    #[cfg(any(test, feature = "native-input-qualification"))]
+    #[cfg(any(test, feature = "native-diagnostics"))]
     Inspection,
 }
 
 /// Direct child launch without Glass's clipboard injection or LaunchServices adoption.
-#[cfg(any(test, feature = "native-input-qualification"))]
+#[cfg(any(test, feature = "native-diagnostics"))]
 pub(crate) fn spawn_window_target(
     spec: &AppSpec,
     logs: LogSink,
@@ -221,11 +221,6 @@ pub(crate) fn spawn_window_target(
             "a direct executable is required",
         ));
     }
-    crate::window_directed::validate_environment(spec.env.iter().map(|(key, _)| key.as_str()))?;
-    let inherited: Vec<_> = std::env::vars_os()
-        .map(|(key, _)| key.to_string_lossy().into_owned())
-        .collect();
-    crate::window_directed::validate_environment(inherited.iter().map(String::as_str))?;
     if spec.sandbox == SandboxLevel::Off && !protected_paths.is_empty() {
         return Err(crate::window_directed::refusal(
             "protected paths require process containment",
@@ -614,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires macOS Seatbelt and a launch environment without DYLD settings"]
+    #[ignore = "requires macOS Seatbelt"]
     #[cfg(target_os = "macos")]
     fn window_target_launch_preserves_containment_without_clipboard_injection() {
         let directory = tempfile::tempdir().unwrap();
@@ -648,23 +643,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(protected).unwrap(),
             "retained evidence"
-        );
-    }
-
-    #[test]
-    fn window_target_launch_refuses_injection_before_spawning() {
-        let mut launch = spec(&["/nonexistent/window-target-fixture"]);
-        launch.env = vec![("DYLD_INSERT_LIBRARIES".into(), "/nonexistent/shim".into())];
-        let error = spawn_window_target(&launch, empty_sink(), &[])
-            .err()
-            .unwrap();
-        assert!(matches!(
-            error.cause(),
-            GlassError::UnsupportedOperation { .. }
-        ));
-        assert_eq!(
-            error.bound_dispatch(),
-            Some(glass_core::BoundDispatch::NotDispatched)
         );
     }
 

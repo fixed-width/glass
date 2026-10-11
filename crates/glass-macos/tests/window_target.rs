@@ -65,23 +65,17 @@ mod native {
         }
     }
 
-    fn remains_unqualified(observation: &TargetObservation) {
+    fn observed_owner(observation: &TargetObservation) {
         assert!(observation.window_identity_revalidated);
-        assert!(observation.executable_identity_revalidated);
-        assert_eq!(
-            observation.executable.image_uuid,
-            observation.process.executable_uuid
-        );
-        assert!(!observation.configuration_verified);
-        assert!(!observation.pixel_geometry_verified);
-        assert!(!observation.input_admitted);
+        assert!(observation.process.pid > 0);
+        assert_ne!(observation.process.executable_uuid, [0; 16]);
     }
 
     fn changed(target: &mut OwnedTarget, reason: &str) {
         let end = Instant::now() + Duration::from_secs(8);
         loop {
             match target.observe(Deadline::from_millis(1_000)) {
-                Ok(observation) => remains_unqualified(&observation),
+                Ok(observation) => observed_owner(&observation),
                 Err(error) => {
                     assert!(error.to_string().contains(reason), "{error}");
                     assert_eq!(
@@ -109,7 +103,7 @@ mod native {
         let mut stable = launch("stable");
         let observation = first(&mut stable).expect("read one owned window");
         println!("{observation:#?}");
-        remains_unqualified(&observation);
+        observed_owner(&observation);
         assert!(observation.controls.iter().any(|node| {
             node.role == "AXButton"
                 && node.identifier.as_deref() == Some("observed-button")
@@ -120,11 +114,10 @@ mod native {
             .observe(Deadline::from_millis(1_000))
             .expect("refresh original window");
         assert_eq!(refreshed.process, observation.process);
-        assert_eq!(refreshed.executable, observation.executable);
         assert_eq!(refreshed.window_id, observation.window_id);
         assert_eq!(refreshed.owner_connection, observation.owner_connection);
         assert_eq!(refreshed.owner_psn, observation.owner_psn);
-        remains_unqualified(&refreshed);
+        observed_owner(&refreshed);
         stable.stop().unwrap();
         stable.stop().unwrap();
         assert!(stable.observe(Deadline::from_millis(1_000)).is_err());
@@ -151,7 +144,7 @@ mod native {
         assert_eq!(refreshed.owner_connection, original.owner_connection);
         assert_eq!(refreshed.owner_psn, original.owner_psn);
         assert_ne!(refreshed.global_frame_points, original.global_frame_points);
-        remains_unqualified(&refreshed);
+        observed_owner(&refreshed);
         moved.stop().unwrap();
         println!("same-window geometry refresh passed");
 
@@ -182,12 +175,16 @@ mod native {
         );
         exited.stop().unwrap();
         println!("exited child refused without adoption");
-        executable_changes();
-        println!("read-only lifecycle checks passed; input remains unadmitted");
+        development_changes();
+        println!("read-only lifecycle and development changes passed; no input posted");
     }
 
-    fn executable_changes() {
+    fn development_changes() {
         let original = std::env::var("GLASS_WINDOW_TARGET_FIXTURE_BIN").unwrap();
+        let changed = std::env::args()
+            .filter(|arg| arg != "--ignored" && arg != "--include-ignored")
+            .nth(1)
+            .expect("supply an independently changed app binary after --ignored");
         let mut expired = fixture_spec(Path::new(&original), "stable");
         expired.timeout_ms = 0;
         let error = OwnedTarget::launch(&expired, &[])
@@ -200,34 +197,67 @@ mod native {
             Some(glass_core::BoundDispatch::NotDispatched)
         );
         println!("expired launch refused before dispatch");
-        for replace in [true, false] {
-            let directory = tempfile::tempdir().unwrap();
-            let path = directory.path().join("fixture");
-            fs::copy(&original, &path).unwrap();
-            let mut target = launch_path(&path, "stable");
-            let observed = first(&mut target).expect("observe copied executable");
-            remains_unqualified(&observed);
-            if replace {
-                let replacement = directory.path().join("replacement");
-                fs::copy(&original, &replacement).unwrap();
-                fs::rename(replacement, &path).unwrap();
-            } else {
-                fs::remove_file(&path).unwrap();
-            }
-            let error = target.observe(Deadline::from_millis(1_000)).unwrap_err();
-            assert_eq!(
-                error.bound_dispatch(),
-                Some(glass_core::BoundDispatch::NotDispatched)
-            );
-            assert!(error.to_string().contains("executable"), "{error}");
-            println!("expected executable refusal (replacement={replace}): {error}");
-            if !replace {
-                fs::copy(&original, &path).unwrap();
-            }
-            let error = target.observe(Deadline::from_millis(1_000)).unwrap_err();
-            assert!(error.to_string().contains("invalidated"), "{error}");
-            target.stop().expect("confirm copied executable cleanup");
-        }
-        println!("executable replacement and deletion invalidate permanently");
+
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let moved_project = directory.path().join("moved-project");
+        fs::create_dir(&project).unwrap();
+        let app = project.join("app");
+        fs::copy(&original, &app).unwrap();
+        let mut spec = fixture_spec(Path::new("./app"), "development");
+        spec.run.push("extra".into());
+        spec.cwd = Some(project.clone());
+        spec.env = vec![
+            ("DEVELOPMENT_MARKER".into(), "custom".into()),
+            ("DYLD_LIBRARY_PATH".into(), project.to_str().unwrap().into()),
+        ];
+        let mut target = OwnedTarget::launch(&spec, &[]).unwrap();
+        let first_build = first(&mut target).expect("inspect an arbitrary development launch");
+        observed_owner(&first_build);
+        let replacement = project.join("replacement");
+        fs::copy(&changed, &replacement).unwrap();
+        fs::rename(&replacement, &app).unwrap();
+        let observed = target.observe(Deadline::from_millis(1_000)).unwrap();
+        assert_eq!(observed.process, first_build.process);
+        assert_eq!(observed.window_id, first_build.window_id);
+        fs::rename(&project, &moved_project).unwrap();
+        let observed = target.observe(Deadline::from_millis(1_000)).unwrap();
+        assert_eq!(observed.process, first_build.process);
+        assert_eq!(observed.window_id, first_build.window_id);
+        target.stop().unwrap();
+        target.stop().unwrap();
+        println!("executable replacement and cwd rename preserve the live owned process");
+
+        spec.cwd = Some(moved_project.clone());
+        spec.env[1].1 = moved_project.to_str().unwrap().into();
+        let mut next = OwnedTarget::launch(&spec, &[]).unwrap();
+        let next_build =
+            first(&mut next).expect("inspect the rebuilt application without enrollment");
+        observed_owner(&next_build);
+        assert_ne!(next_build.process.lifetime, first_build.process.lifetime);
+        assert_ne!(
+            next_build.process.executable_uuid,
+            first_build.process.executable_uuid
+        );
+        let expected = format!(
+            "changed-custom-development-extra-{}",
+            fs::canonicalize(&moved_project).unwrap().display()
+        );
+        assert!(
+            next_build
+                .controls
+                .iter()
+                .any(|node| node.identifier.as_deref() == Some(expected.as_str())),
+            "changed app did not receive caller argv/cwd/env"
+        );
+        fs::remove_file(moved_project.join("app")).unwrap();
+        let observed = next.observe(Deadline::from_millis(1_000)).unwrap();
+        assert_eq!(observed.process, next_build.process);
+        assert_eq!(observed.window_id, next_build.window_id);
+        next.stop().unwrap();
+        next.stop().unwrap();
+        println!(
+            "changed build relaunch honors argv/cwd/env and loader settings; executable deletion preserves live ownership"
+        );
     }
 }

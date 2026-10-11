@@ -1,20 +1,14 @@
 #![deny(unsafe_code)]
-//! Read-only prerequisites for window-directed input in qualification builds.
+//! Read-only native event and live process/window ownership diagnostics.
 //!
 //! Current ownership cannot distinguish unobserved window-ID reuse within the same process
-//! and connection, or establish control qualification. This module admits no input.
+//! and connection. These diagnostics do not post input or provide a headless session.
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-mod executable;
-#[cfg(target_os = "macos")]
-pub use executable::ExecutableIdentity;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod native;
 #[cfg(target_os = "macos")]
 pub use native::{Readiness, probe_readiness};
-#[cfg(any(target_os = "macos", test))]
-mod profiles;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod target;
@@ -24,7 +18,7 @@ pub use target::{ControlObservation, OwnedTarget, TargetObservation};
 #[cfg(any(target_os = "macos", test))]
 use glass_core::{GlassError, Result};
 
-/// Kernel facts distinguishing process reuse and re-exec, without qualifying an application.
+/// Kernel facts distinguishing process reuse and re-exec, for the process being inspected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: i32,
@@ -97,46 +91,15 @@ fn require_same_process(before: ProcessIdentity, after: ProcessIdentity) -> Resu
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn refusal(reason: &'static str) -> GlassError {
     GlassError::UnsupportedOperation {
-        operation: "window-directed input qualification",
+        operation: "native window inspection",
         reason,
     }
     .before_dispatch()
 }
 
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn validate_environment<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    if keys
-        .into_iter()
-        .any(|key| key.starts_with("DYLD_") || key.starts_with("GLASS_CLIP_"))
-    {
-        return Err(refusal(
-            "injection environment is incompatible with target inspection",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn injection_settings_refuse_instead_of_being_silently_removed() {
-        for key in [
-            "DYLD_INSERT_LIBRARIES",
-            "DYLD_LIBRARY_PATH",
-            "DYLD_IMAGE_SUFFIX",
-            "GLASS_CLIP_PASTEBOARD",
-            "GLASS_CLIP_SHIM_DYLIB",
-        ] {
-            let error = validate_environment(["PATH", key]).unwrap_err();
-            assert_eq!(
-                error.bound_dispatch(),
-                Some(glass_core::BoundDispatch::NotDispatched)
-            );
-        }
-        validate_environment(["PATH", "LANG"]).unwrap();
-    }
 
     fn record() -> [u8; 56] {
         let mut bytes = [0; 56];

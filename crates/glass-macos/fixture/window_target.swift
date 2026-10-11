@@ -13,8 +13,16 @@ final class Fixture: NSObject, NSApplicationDelegate {
         panel.setAccessibilityIdentifier("target-window")
         panel.isReleasedWhenClosed = false
         let button = NSButton(frame: NSRect(x: 30, y: 70, width: 160, height: 40))
+        #if DEVELOPMENT_REBUILD
+        button.title = "Changed build"
+        button.setAccessibilityIdentifier(
+            "changed-" + (ProcessInfo.processInfo.environment["DEVELOPMENT_MARKER"] ?? "unset")
+            + "-" + CommandLine.arguments.dropFirst().joined(separator: "-")
+            + "-" + FileManager.default.currentDirectoryPath)
+        #else
         button.title = "Observed control"
         button.setAccessibilityIdentifier("observed-button")
+        #endif
         panel.contentView?.addSubview(button)
         panel.orderFront(nil)
         return panel

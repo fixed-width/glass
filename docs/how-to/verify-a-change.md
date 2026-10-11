@@ -86,22 +86,21 @@ tests from Linux:
 
 ```bash
 cargo clippy --target x86_64-apple-darwin -p glass-macos --all-targets \
-  --features native-input-qualification --locked -- -D warnings
+  --features native-diagnostics --locked -- -D warnings
 ```
 
 On a Mac with a logged-in WindowServer, run:
 
 ```bash
-cargo run -p glass-macos --features native-input-qualification \
+cargo run -p glass-macos --features native-diagnostics \
   --bin glass-macos-window-input-readiness --locked
 ```
 
 The diagnostic reads its own kernel process identity, constructs unposted click/scroll events,
 checks event field and local-coordinate round trips, and reads existing permission grants without
-requesting them. It posts no input, captures no screen content and activates no app. A successful
-report always says `input_admitted: false`: these checks establish neither window lifetime nor
-control, executable trust or routing qualification. The feature adds no MCP parameter or input route;
-ordinary builds and session capability reports retain their existing behavior. Missing private
+requesting them. It posts no input, captures no screen content and activates no app. These checks establish event round trips and live process facts, not actual input delivery or
+headless/display isolation. The feature adds no MCP parameter or input route; ordinary builds and
+session capability reports retain their existing behavior. Missing private
 symbols or incomplete identity/ABI readings return an error.
 
 The same feature provides an owned-target inspector and an opt-in lifecycle test. On a Mac with
@@ -109,12 +108,13 @@ an existing Accessibility grant, build the nonactivating fixture and run the tes
 
 ```bash
 swiftc crates/glass-macos/fixture/window_target.swift -o /tmp/glass-window-target-fixture
-cargo test -p glass-macos --features native-input-qualification \
+swiftc -D DEVELOPMENT_REBUILD crates/glass-macos/fixture/window_target.swift \
+  -o /tmp/glass-window-target-rebuilt
+cargo test -p glass-macos --features native-diagnostics \
   --test window_target --locked --no-run
-# Use the executable path printed by Cargo above. Run outside Cargo, which adds DYLD settings.
-env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_INSERT_LIBRARIES \
-  GLASS_WINDOW_TARGET_FIXTURE_BIN=/tmp/glass-window-target-fixture \
-  /path/to/window_target-test-binary --ignored
+# Use the executable path printed by Cargo above.
+GLASS_WINDOW_TARGET_FIXTURE_BIN=/tmp/glass-window-target-fixture \
+  /path/to/window_target-test-binary --ignored /tmp/glass-window-target-rebuilt
 ```
 
 When the grant belongs to a signed app bundle, build with `--no-run` and run the resulting test
@@ -123,40 +123,27 @@ the grant; it never requests one. It launches fresh direct children with existin
 without the clipboard shim, and reads exact AX/WindowServer ownership and point geometry.
 Child standard input/output is discarded. Post-read failures retain AX dispatch evidence even
 though no input event was posted. The test covers geometry refresh, closure, replacement, competing windows,
-child exit and cleanup. It reads no control values and posts no input. Successful observations
-report `window_identity_revalidated: true`; configuration, pixel-geometry and input admission remain
-false. `executable_identity_revalidated: true` reports an unchanged canonical path, file identity,
-SHA-256 digest and Mach-O UUID matching the process's kernel image UUID. Inspection requires an
-absolute path to a regular, thin little-endian 64-bit Mach-O executable no larger than 64 MiB.
-File replacement or deletion invalidates the binding even when the old process remains live;
-matching bytes do not establish code trust, loaded-library identity or a qualified launch configuration.
-Refreshes check the original process/window/connection/PSN tuple and retained AX reference.
-Observed closure, replacement or unavailable readings invalidate the binding. Unobserved window-ID
-reuse within the same process lifetime and connection may compare equal; these checks establish
-no window birth token or continuous lifetime guarantee. The reported AX subtree does not establish
-complete WindowServer inventory or a qualified
-action region. A failed observation invalidates the inspector, except while waiting for its first
-window. These checks require no operator input and establish no physical interference verdict.
+child exit and cleanup. It reads no control values and posts no input. Successful observations report `window_identity_revalidated: true` for fresh checks of the original
+process/window/connection/PSN tuple and retained AX reference. The live process image identity comes
+from the kernel. No application, compiler or OS-build allowlist is involved. There is no executable
+file hash/format/size requirement, and replacement or deletion of a file on disk does not invalidate
+an unchanged running process. Caller cwd/environment and development loader settings are preserved.
 
-The inspector also reports `fixture_profile: Some("appkit-ownership-v1")` for the frozen
-read-only fixture artifact on kernel build `26A428` in a native `aarch64` inspector. Its compiled
-entry pins SHA-256 and Mach-O UUID and matches one scenario argument (`stable`, `replace`, `close`,
-`move`, `compete`, `exit`), no build/window hint/cwd/env, Default containment and requested accessibility.
-Other artifacts, hosts and declared startup shapes report `None`; names and framework labels
-cannot enroll an artifact. Unmatched startup shapes skip the host query. Unavailable kernel facts
-for an otherwise matching candidate refuse inspection. Matched host facts are freshly checked after launch and around each
-observation; lost or changed facts invalidate the original binding. No runtime profile selector
-or manifest is accepted, and ordinary builds contain no entries.
+The inspector is a diagnostic for an already built direct child with one reported window. Build and
+window-hint requests are outside this helper's scope; the normal application launcher retains its
+existing build/window-selection behavior. A failed observation invalidates the inspector, except
+while waiting for its first window. Observed closure/replacement or unavailable ownership facts
+refuse. Unobserved window-ID reuse in the same process/connection and changes between checks remain
+possible. Point geometry and the AX subtree are observations, not a complete pixel mapping or a
+supported input route. No operator input is needed and no physical interference verdict follows.
 
-This recognition does not verify the inherited environment, effective cwd, loaded dependencies,
-preferences, signer or controls. Configuration, pixel geometry and input admission remain false.
-The separate `fixture_profile` opt-in test requires the exact frozen Swift 6.4 build above
-(`swiftc -swift-version 5`) and a separately rebuilt, changed fixture for its unknown-artifact case.
-Build it with `cargo test -p glass-macos --features native-input-qualification --test fixture_profile
---locked --no-run`, then run its printed executable with the same clean launch environment and
-fixture locator as above, followed by `--ignored /absolute/path/to/unrecognized-fixture`.
-A compiler/OS/artifact change requires a reviewed compiled entry update; never enroll an observed
-digest automatically. The generic `window_target` lifecycle test remains available on other hosts.
+The two Swift commands compile ordinary sample apps locally. The `DEVELOPMENT_REBUILD` variant
+changes the UI and reports its launch arguments, cwd and a caller environment value through an AX
+identifier for test assertions. Supply that second binary after `--ignored`. The test checks
+custom arguments/cwd/env and relative launch paths,
+executable replacement/deletion and cwd rename during a live process, and relaunch after replacing
+its binary with the changed build. Expected app behavior stays in tests; no binary/source identity
+is embedded in the inspector. Neither these tests nor the diagnostic provide headless macOS support.
 
 ## Integration suites (Linux)
 
