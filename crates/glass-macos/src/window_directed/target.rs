@@ -189,7 +189,14 @@ impl OwnedTarget {
         let mut launch = crate::process::spawn_window_target(spec, logs, protected_paths)?;
         let identity = i32::try_from(launch.child.id())
             .map_err(|_| refusal("owned child PID is invalid"))
-            .and_then(|pid| kernel.process_identity(pid));
+            .and_then(|pid| kernel.process_identity(pid))
+            .and_then(|process| {
+                if deadline.has_passed() {
+                    Err(GlassError::caller_deadline_elapsed("target launch"))
+                } else {
+                    Ok(process)
+                }
+            });
         match identity {
             Ok(process) => Ok(Self {
                 launch: Some(launch),
