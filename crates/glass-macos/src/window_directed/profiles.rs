@@ -100,10 +100,10 @@ impl FixtureBinding {
         observation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         self.revalidate(&mut read_os_build, architecture)?;
-        let observed = observation()?;
+        let observed = observation();
         self.revalidate(read_os_build, architecture)
             .map_err(glass_core::GlassError::after_dispatch)?;
-        Ok(observed)
+        observed
     }
 }
 
@@ -425,6 +425,52 @@ mod tests {
                 .is_err()
         );
         assert_eq!(binding.name(), None);
+    }
+
+    #[test]
+    fn failed_observation_still_checks_host_and_only_healthy_host_can_retry() {
+        use std::cell::Cell;
+        for host_lost in [false, true] {
+            let reads = Cell::new(0);
+            let mut binding = binding();
+            let error = binding
+                .observe(
+                    || {
+                        reads.set(reads.get() + 1);
+                        if host_lost && reads.get() == 2 {
+                            Err(refusal("host unavailable"))
+                        } else {
+                            Ok("26A428".into())
+                        }
+                    },
+                    "aarch64",
+                    || Err::<(), _>(glass_core::GlassError::WindowNotFound),
+                )
+                .unwrap_err();
+            assert_eq!(reads.get(), 2);
+            if host_lost {
+                assert_eq!(
+                    error.bound_dispatch(),
+                    Some(BoundDispatch::MayHaveDispatched)
+                );
+                assert!(
+                    binding
+                        .observe(
+                            || panic!("lost host was restored after failed observation"),
+                            "aarch64",
+                            || Ok(())
+                        )
+                        .is_err()
+                );
+                assert_eq!(binding.name(), None);
+            } else {
+                assert!(matches!(error, glass_core::GlassError::WindowNotFound));
+                binding
+                    .observe(|| Ok("26A428".into()), "aarch64", || Ok(()))
+                    .unwrap();
+                assert_eq!(binding.name(), Some("appkit-ownership-v1"));
+            }
+        }
     }
 
     #[test]
