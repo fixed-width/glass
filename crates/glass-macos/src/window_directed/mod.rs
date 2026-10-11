@@ -1,8 +1,8 @@
 #![deny(unsafe_code)]
 //! Read-only prerequisites for window-directed input in qualification builds.
 //!
-//! An executable UUID identifies an image, not its trustworthiness. Window ownership does
-//! not establish window lifetime or control qualification. This module admits no input.
+//! Current ownership cannot distinguish unobserved window-ID reuse within the same process
+//! and connection, or establish control qualification. This module admits no input.
 
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
@@ -26,6 +26,28 @@ pub struct ProcessIdentity {
     pub parent_lifetime: u64,
     pub exec_version: u32,
     pub executable_uuid: [u8; 16],
+}
+
+/// A current owner tuple; unobserved same-process/connection window-ID reuse can compare equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowIdentity {
+    pub process: ProcessIdentity,
+    pub window_id: u32,
+    pub owner_connection: i32,
+    pub owner_psn: [u32; 2],
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn require_same_window(before: WindowIdentity, after: WindowIdentity) -> Result<()> {
+    require_same_process(before.process, after.process)?;
+    if before.window_id == 0
+        || before.owner_connection <= 0
+        || before.owner_psn == [0; 2]
+        || before != after
+    {
+        return Err(refusal("bound window identity changed or is unavailable"));
+    }
+    Ok(())
 }
 
 /// Validate the complete private kernel response before using its identity fields.
@@ -158,6 +180,53 @@ mod tests {
                 error.bound_dispatch(),
                 Some(glass_core::BoundDispatch::NotDispatched)
             );
+        }
+    }
+
+    fn window() -> WindowIdentity {
+        WindowIdentity {
+            process: process_identity(123, &record()).unwrap(),
+            window_id: 47,
+            owner_connection: 11,
+            owner_psn: [0, 31],
+        }
+    }
+
+    #[test]
+    fn reused_window_number_with_a_changed_process_or_owner_refuses() {
+        let original = window();
+        require_same_window(original, original).unwrap();
+        let mut changed = [original; 5];
+        changed[0].process.lifetime += 1;
+        changed[1].process.exec_version += 1;
+        changed[2].owner_connection += 1;
+        changed[3].owner_psn[0] += 1;
+        changed[4].owner_psn[1] += 1;
+        for current in changed {
+            let error = require_same_window(original, current).unwrap_err();
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::NotDispatched)
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_window_number_in_the_same_process_and_connection_refuses() {
+        let original = window();
+        let mut current = original;
+        current.window_id += 1;
+        assert!(require_same_window(original, current).is_err());
+    }
+
+    #[test]
+    fn equal_but_unavailable_window_readings_refuse() {
+        let mut unavailable = [window(); 3];
+        unavailable[0].window_id = 0;
+        unavailable[1].owner_connection = 0;
+        unavailable[2].owner_psn = [0; 2];
+        for reading in unavailable {
+            assert!(require_same_window(reading, reading).is_err());
         }
     }
 }

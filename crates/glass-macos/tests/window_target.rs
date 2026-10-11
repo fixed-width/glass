@@ -54,7 +54,7 @@ mod native {
     }
 
     fn remains_unqualified(observation: &TargetObservation) {
-        assert!(!observation.window_lifetime_verified);
+        assert!(observation.window_identity_revalidated);
         assert!(!observation.configuration_verified);
         assert!(!observation.pixel_geometry_verified);
         assert!(!observation.input_admitted);
@@ -104,6 +104,8 @@ mod native {
             .expect("refresh original window");
         assert_eq!(refreshed.process, observation.process);
         assert_eq!(refreshed.window_id, observation.window_id);
+        assert_eq!(refreshed.owner_connection, observation.owner_connection);
+        assert_eq!(refreshed.owner_psn, observation.owner_psn);
         remains_unqualified(&refreshed);
         stable.stop().unwrap();
         stable.stop().unwrap();
@@ -113,6 +115,26 @@ mod native {
         let mut replacement = launch("replace");
         first(&mut replacement).expect("read initial replacement-test window");
         changed(&mut replacement, "replaced");
+
+        let mut closed = launch("close");
+        first(&mut closed).expect("read initial close-test window");
+        std::thread::sleep(Duration::from_secs(6));
+        changed(&mut closed, "window not found");
+
+        let mut moved = launch("move");
+        let original = first(&mut moved).expect("read initial move-test window");
+        std::thread::sleep(Duration::from_secs(6));
+        let refreshed = moved
+            .observe(Deadline::from_millis(1_000))
+            .expect("refresh moved original window");
+        assert_eq!(refreshed.process, original.process);
+        assert_eq!(refreshed.window_id, original.window_id);
+        assert_eq!(refreshed.owner_connection, original.owner_connection);
+        assert_eq!(refreshed.owner_psn, original.owner_psn);
+        assert_ne!(refreshed.global_frame_points, original.global_frame_points);
+        remains_unqualified(&refreshed);
+        moved.stop().unwrap();
+        println!("same-window geometry refresh passed");
 
         let mut competing = launch("compete");
         let error = first(&mut competing).unwrap_err();

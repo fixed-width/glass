@@ -11,7 +11,7 @@ use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFArray, CFBoolean, CFRetained, CFString, CFType, CGRect};
 
 use super::native::{Library, NativeApi};
-use super::{ProcessIdentity, refusal, require_same_process};
+use super::{ProcessIdentity, WindowIdentity, refusal, require_same_process, require_same_window};
 use crate::axwindow::{AxMessageScope, SystemWideAxMessaging};
 
 const MAX_NODES: usize = 128;
@@ -146,7 +146,8 @@ pub struct TargetObservation {
     pub global_frame_points: [f64; 4],
     pub foreground: ProcessIdentity,
     pub controls: Vec<ControlObservation>,
-    pub window_lifetime_verified: bool,
+    /// Current checks passed; this does not distinguish unobserved same-owner window-ID reuse.
+    pub window_identity_revalidated: bool,
     pub configuration_verified: bool,
     pub pixel_geometry_verified: bool,
     pub input_admitted: bool,
@@ -159,8 +160,13 @@ pub struct OwnedTarget {
     windows: WindowApi,
     process: ProcessIdentity,
     foreground: ProcessIdentity,
-    selected: Option<CFRetained<AXUIElement>>,
+    selected: Option<SelectedWindow>,
     invalidated: bool,
+}
+
+struct SelectedWindow {
+    element: CFRetained<AXUIElement>,
+    identity: WindowIdentity,
 }
 
 impl OwnedTarget {
@@ -223,7 +229,7 @@ impl OwnedTarget {
         let kernel = &self.kernel;
         let windows = &self.windows;
         let process = self.process;
-        let previous = self.selected.as_deref();
+        let previous = self.selected.as_ref();
         let (window, id, connection, psn, rect, controls) =
             glass_a11y_macos::messaging_timeout::with_read_only_by(
                 &SystemWideAxMessaging,
@@ -232,12 +238,21 @@ impl OwnedTarget {
                     // SAFETY: positive kernel-verified PID; the created application reference is owned.
                     let app = unsafe { AXUIElement::new_application(process.pid) };
                     let window = sole_window(scope, &app)?;
-                    if previous.is_some_and(|previous| previous != &*window) {
+                    if previous.is_some_and(|previous| previous.element != window) {
                         return Err(refusal("selected AX window was replaced"));
                     }
                     require_pid(scope, &window, process.pid)?;
                     let id = windows.window_id(scope, &window)?;
                     let (connection, psn, rect) = windows.owner_and_bounds(id, process.pid)?;
+                    let identity = WindowIdentity {
+                        process,
+                        window_id: id,
+                        owner_connection: connection,
+                        owner_psn: psn,
+                    };
+                    if let Some(previous) = previous {
+                        require_same_window(previous.identity, identity)?;
+                    }
                     let ax_rect = ax_rect(scope, &window)?;
                     if rect_values(rect)
                         .iter()
@@ -275,7 +290,15 @@ impl OwnedTarget {
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed("target observation"));
         }
-        self.selected = Some(window);
+        self.selected = Some(SelectedWindow {
+            element: window,
+            identity: WindowIdentity {
+                process,
+                window_id: id,
+                owner_connection: connection,
+                owner_psn: psn,
+            },
+        });
         Ok(TargetObservation {
             process,
             window_id: id,
@@ -284,7 +307,7 @@ impl OwnedTarget {
             global_frame_points: rect_values(rect),
             foreground: self.foreground,
             controls,
-            window_lifetime_verified: false,
+            window_identity_revalidated: true,
             configuration_verified: false,
             pixel_geometry_verified: false,
             input_admitted: false,
