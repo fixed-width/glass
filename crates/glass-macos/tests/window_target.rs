@@ -130,6 +130,7 @@ mod native {
 
         let mut replacement = launch("replace");
         first(&mut replacement).expect("read initial replacement-test window");
+        std::thread::sleep(Duration::from_secs(6));
         changed(&mut replacement, "replaced");
 
         let mut closed = launch("close");
