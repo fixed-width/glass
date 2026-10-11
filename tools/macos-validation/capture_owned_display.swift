@@ -132,7 +132,15 @@ func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID,
     child.standardOutput = output
     child.standardError = output
     try child.run()
-    defer { if child.isRunning { child.terminate() }; child.waitUntilExit() }
+    defer {
+        if child.isRunning {
+            child.terminate()
+            let end = ProcessInfo.processInfo.systemUptime + 2
+            while child.isRunning && ProcessInfo.processInfo.systemUptime < end { usleep(10_000) }
+            if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+        }
+        child.waitUntilExit()
+    }
     let app = AXUIElementCreateApplication(child.processIdentifier)
     guard AXUIElementSetMessagingTimeout(app, 0.5) == .success else { throw ProbeError("AX timeout setup failed") }
     var selected: AXUIElement?
@@ -195,7 +203,7 @@ struct Main {
         _ = NSApplication.shared
         NSApplication.shared.setActivationPolicy(.accessory)
         let root = URL(fileURLWithPath: args[4]).standardizedFileURL.resolvingSymlinksInPath()
-        var result: [String: Any] = ["input_posted": false, "permission_requested": false]
+        var result: [String: Any] = ["input_posted": false, "permission_request_api_called": false]
         var status: Int32 = 1
         do {
             guard AXIsProcessTrusted(), CGPreflightScreenCaptureAccess() else {
@@ -203,13 +211,16 @@ struct Main {
             }
             let ids = try inventory().compactMap { $0["id"] as? CGDirectDisplayID }
             guard ids.contains(display), display != CGMainDisplayID() else { throw ProbeError("specified secondary display unavailable") }
-            result["before"] = try context()
+            let before = try context()
+            result["before"] = before
             result["apps"] = try await [exercise(args[2], "original", display, root),
                                          exercise(args[3], "rebuilt", display, root)]
-            result["after"] = try context()
-            result["passed"] = true
+            let after = try context()
+            result["after"] = after
+            result["sequence_context_preserved"] = NSDictionary(dictionary: before).isEqual(to: after)
+            result["render_capture_passed"] = true
             status = 0
-        } catch { result["passed"] = false; result["error"] = String(describing: error) }
+        } catch { result["render_capture_passed"] = false; result["error"] = String(describing: error) }
         do {
             let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted])
             try data.write(to: root.appendingPathComponent("capture-result.json"), options: .atomic)
