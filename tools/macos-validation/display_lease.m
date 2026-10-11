@@ -1,4 +1,4 @@
-// Bounded display-lifecycle probe. Creates only owned displays and posts no input.
+// Creates bounded owned displays without posting input.
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <unistd.h>
@@ -225,6 +225,7 @@ int main(int argc, const char *argv[]) {
         secondary = nil;
         anchor = nil;
         NSTimeInterval endRemoval = NSProcessInfo.processInfo.systemUptime + 5;
+        BOOL cleanupVerified = NO;
         while (NSProcessInfo.processInfo.systemUptime < endRemoval) {
             NSArray *online = displayList(YES);
             BOOL remains = !online;
@@ -232,10 +233,13 @@ int main(int argc, const char *argv[]) {
                 uint32_t id = [row[@"id"] unsignedIntValue];
                 if (id == secondaryID || id == anchorID) remains = YES;
             }
-            if (!remains) break;
+            if (!remains) { cleanupVerified = YES; break; }
             pump(0.05);
         }
-        emit(@"released", @{@"owned_anchor": @(anchorID), @"owned_secondary": @(secondaryID),
+        if (!cleanupVerified) result = 1;
+        emit(cleanupVerified ? @"released" : @"release-unverified",
+                         @{@"owned_anchor": @(anchorID), @"owned_secondary": @(secondaryID),
+                          @"cleanup_verified": @(cleanupVerified),
                           @"exit_code": @(result)});
         return result;
     }

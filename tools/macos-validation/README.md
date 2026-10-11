@@ -49,8 +49,11 @@ button identifiers without requiring specific identifiers or application identit
 assertions belong to a separate test grader. These probes are diagnostics, not the production
 application launcher: real integration must use Glass's existing build/run/log/containment pipeline.
 
-The holder releases its displays when the release file appears or after 45 seconds, then checks list
-membership during removal. Create the release file and wait for the holder to exit before auditing
+The capture process has a 25-second deadline, including stalled framework awaits, with up to four
+seconds for terminating its current child; timeout results explicitly mark final context unavailable.
+It exits unsuccessfully if child cleanup or result writing fails. The holder releases its displays
+when the release file appears or after 45 seconds, then checks list membership for up to five seconds
+during removal and fails if removal cannot be verified. Create the release file and wait for the holder to exit before auditing
 cleanup. `display-lease --inspect` reads current inventory without creating a display. Verify every
 owned ID is absent; an absent ID's `CGDisplayIsOnline` value is not a reliable membership test.
 Check the final display inventory and existing window positions, including after failed trials.

@@ -1,4 +1,4 @@
-// Captures only freshly launched children on a specified owned display. No input is posted.
+// Captures freshly launched children on a specified owned display without posting input.
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -11,6 +11,88 @@ import UniformTypeIdentifiers
 struct ProbeError: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }
+}
+
+// SAFETY: The lock serializes progress and child ownership, and only the winning finalizer cancels the timer.
+final class ProbeLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var child: Process?
+    private var finishing = false
+    private var cleanupVerified = true
+    private var progress: [String: Any] = ["input_posted": false, "permission_request_api_called": false]
+    private let root: URL
+    private var watchdog: DispatchSourceTimer?
+
+    init(root: URL) { self.root = root }
+
+    func startDeadline() {
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+        timer.schedule(deadline: .now() + 25)
+        timer.setEventHandler { [self] in
+            finish(nil, status: 1, deadline: true)
+        }
+        watchdog = timer
+        timer.resume()
+    }
+
+    func record(_ result: [String: Any]) {
+        lock.lock()
+        progress = result
+        lock.unlock()
+    }
+
+    func launch(_ process: Process) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finishing, child == nil else { throw ProbeError("probe no longer accepts a child") }
+        child = process
+        do { try process.run() } catch { child = nil; throw error }
+    }
+
+    func stopChild() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let process = child else { return }
+        for signal in [SIGTERM, SIGKILL] {
+            if !process.isRunning { break }
+            kill(process.processIdentifier, signal)
+            let end = ProcessInfo.processInfo.systemUptime + 2
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < end { usleep(10_000) }
+        }
+        if process.isRunning { cleanupVerified = false } else { child = nil }
+    }
+
+    func finish(_ supplied: [String: Any]?, status: Int32, deadline: Bool = false) -> Never {
+        lock.lock()
+        if finishing {
+            lock.unlock()
+            while true { pause() }
+        }
+        finishing = true
+        var result = supplied ?? progress
+        lock.unlock()
+        watchdog?.cancel()
+        stopChild()
+        lock.lock()
+        let cleaned = cleanupVerified
+        result["child_cleanup_verified"] = cleaned
+        lock.unlock()
+        result["deadline_exceeded"] = deadline
+        if deadline {
+            result["render_capture_passed"] = false
+            result["error"] = "25-second capture deadline exceeded"
+            result["final_context_unavailable"] = true
+        }
+        var finalStatus = cleaned ? status : 1
+        do {
+            let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted])
+            try data.write(to: root.appendingPathComponent("capture-result.json"), options: .atomic)
+        } catch {
+            FileHandle.standardError.write(Data("result write failed: \(error)\n".utf8))
+            finalStatus = 1
+        }
+        exit(finalStatus)
+    }
 }
 
 func rectangle(_ value: CGRect) -> [Double] {
@@ -66,6 +148,7 @@ func windowNumber(_ window: AXUIElement) throws -> CGWindowID {
     }
     defer { dlclose(library) }
     guard let symbol = dlsym(library, "_AXUIElementGetWindow") else { throw ProbeError("AX window ID reader unavailable") }
+    // SAFETY: The loaded symbol has this C ABI and is called before its library handle is closed.
     let read = unsafeBitCast(symbol, to: ReadWindow.self)
     var id: CGWindowID = 0
     guard read(window, &id) == .success, id != 0 else { throw ProbeError("AX window ID unavailable") }
@@ -118,7 +201,8 @@ func writeImage(_ image: CGImage, _ path: URL) throws -> Int {
 }
 
 @MainActor
-func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID, _ root: URL) async throws -> [String: Any] {
+func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID, _ root: URL,
+              _ lifetime: ProbeLifetime) async throws -> [String: Any] {
     let baseline = try context()
     let child = Process()
     child.executableURL = URL(fileURLWithPath: binary)
@@ -131,16 +215,8 @@ func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID,
     defer { try? output.close() }
     child.standardOutput = output
     child.standardError = output
-    try child.run()
-    defer {
-        if child.isRunning {
-            child.terminate()
-            let end = ProcessInfo.processInfo.systemUptime + 2
-            while child.isRunning && ProcessInfo.processInfo.systemUptime < end { usleep(10_000) }
-            if child.isRunning { kill(child.processIdentifier, SIGKILL) }
-        }
-        child.waitUntilExit()
-    }
+    try lifetime.launch(child)
+    defer { lifetime.stopChild() }
     let app = AXUIElementCreateApplication(child.processIdentifier)
     guard AXUIElementSetMessagingTimeout(app, 0.5) == .success else { throw ProbeError("AX timeout setup failed") }
     var selected: AXUIElement?
@@ -203,6 +279,8 @@ struct Main {
         _ = NSApplication.shared
         NSApplication.shared.setActivationPolicy(.accessory)
         let root = URL(fileURLWithPath: args[4]).standardizedFileURL.resolvingSymlinksInPath()
+        let lifetime = ProbeLifetime(root: root)
+        lifetime.startDeadline()
         var result: [String: Any] = ["input_posted": false, "permission_request_api_called": false]
         var status: Int32 = 1
         do {
@@ -213,18 +291,24 @@ struct Main {
             guard ids.contains(display), display != CGMainDisplayID() else { throw ProbeError("specified secondary display unavailable") }
             let before = try context()
             result["before"] = before
-            result["apps"] = try await [exercise(args[2], "original", display, root),
-                                         exercise(args[3], "rebuilt", display, root)]
+            lifetime.record(result)
+            var apps = [[String: Any]]()
+            for (binary, variant) in [(args[2], "original"), (args[3], "rebuilt")] {
+                apps.append(try await exercise(binary, variant, display, root, lifetime))
+                result["apps"] = apps
+                lifetime.record(result)
+            }
             let after = try context()
             result["after"] = after
             result["sequence_context_preserved"] = NSDictionary(dictionary: before).isEqual(to: after)
             result["render_capture_passed"] = true
             status = 0
-        } catch { result["render_capture_passed"] = false; result["error"] = String(describing: error) }
-        do {
-            let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .prettyPrinted])
-            try data.write(to: root.appendingPathComponent("capture-result.json"), options: .atomic)
-        } catch { FileHandle.standardError.write(Data("result write failed: \(error)\n".utf8)) }
-        exit(status)
+        } catch {
+            result["render_capture_passed"] = false
+            result["error"] = String(describing: error)
+            if let after = try? context() { result["after"] = after }
+            else { result["final_context_unavailable"] = true }
+        }
+        lifetime.finish(result, status: status)
     }
 }
