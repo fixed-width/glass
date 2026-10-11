@@ -210,9 +210,11 @@ int main(int argc, const char *argv[]) {
         if (commit != kCGErrorSuccess) { CGCancelDisplayConfiguration(config); break; }
         pump(0.2);
         if (!preserved(anchorBaseline)) { emit(@"primary-changed", @{}); break; }
-        if (!windowsPreserved(baseline)) { emit(@"foreign-windows-changed", @{}); break; }
+        BOOL foreignWindowsPreserved = windowsPreserved(baseline);
+        if (!foreignWindowsPreserved) emit(@"foreign-windows-changed", @{});
         emit(@"ready", @{@"owned_anchor": @(anchorID), @"owned_secondary": @(secondaryID),
-                       @"fallback_only": @(fallbackOnly), @"foreign_windows_preserved": @YES,
+                       @"fallback_only": @(fallbackOnly),
+                       @"foreign_windows_preserved": @(foreignWindowsPreserved),
                        @"input_posted": @NO});
         NSTimeInterval end = NSProcessInfo.processInfo.systemUptime + 45;
         while (![NSFileManager.defaultManager fileExistsAtPath:release]

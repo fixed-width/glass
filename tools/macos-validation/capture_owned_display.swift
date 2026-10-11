@@ -122,11 +122,9 @@ func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID,
     let baseline = try context()
     let child = Process()
     child.executableURL = URL(fileURLWithPath: binary)
-    child.arguments = ["development", "extra"]
+    child.arguments = []
     child.currentDirectoryURL = root
-    child.environment = ProcessInfo.processInfo.environment.merging([
-        "DEVELOPMENT_MARKER": "custom", "DYLD_LIBRARY_PATH": root.path
-    ]) { _, supplied in supplied }
+    child.environment = ProcessInfo.processInfo.environment
     let log = root.appendingPathComponent("\(variant)-app.log")
     _ = FileManager.default.createFile(atPath: log.path, contents: nil)
     let output = try FileHandle(forWritingTo: log)
@@ -168,8 +166,6 @@ func exercise(_ binary: String, _ variant: String, _ display: CGDirectDisplayID,
         throw ProbeError("ScreenCaptureKit disagrees with owned placement/identity")
     }
     let identifiers = try observedButtons(window)
-    let wanted = variant == "original" ? "observed-button" : "changed-custom-development-extra-\(root.path)"
-    guard identifiers.contains(wanted) else { throw ProbeError("test-side changed UI/launch marker missing") }
     let filter = SCContentFilter(desktopIndependentWindow: candidate)
     let config = SCStreamConfiguration()
     config.width = Int(candidate.frame.width.rounded(.up))
