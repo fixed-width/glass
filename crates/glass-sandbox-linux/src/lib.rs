@@ -343,7 +343,9 @@ pub fn validate_protected_paths(paths: &[ProtectedHostPath]) -> Result<()> {
 fn build_command_for(spec: &AppSpec) -> Option<Command> {
     let build = spec.build.as_ref()?;
     let mut c = Command::new(sh_bin());
-    c.arg("-c").arg(build);
+    c.arg("-c")
+        .arg(build)
+        .envs(spec.env.iter().map(|(key, value)| (key, value)));
     if let Some(dir) = &spec.cwd {
         c.current_dir(dir);
     }
@@ -351,8 +353,8 @@ fn build_command_for(spec: &AppSpec) -> Option<Command> {
 }
 
 /// Run `spec.build` (if any) as `sh -c <build>` with the full developer environment — the build
-/// is the developer's own code and is NOT sandboxed; only the launched run is contained. `cwd` is
-/// applied; a spawn failure or non-zero exit → `AppNotStarted`.
+/// is the developer's own code and is NOT sandboxed; only the launched run is contained. `cwd`
+/// and `env` are applied; a spawn failure or non-zero exit → `AppNotStarted`.
 pub fn run_build(spec: &AppSpec) -> Result<()> {
     let Some(mut cmd) = build_command_for(spec) else {
         return Ok(());
@@ -1594,6 +1596,25 @@ mod tests {
                 "build must run via the shell, never bwrap, at {level:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_receives_requested_environment_in_requested_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut launch = make_spec(
+            Some("printf '%s' \"$GLASS_BUILD_TEST_VALUE\" > build-result"),
+            SandboxLevel::Default,
+        );
+        launch.cwd = Some(directory.path().to_path_buf());
+        launch.env = vec![(
+            "GLASS_BUILD_TEST_VALUE".into(),
+            "dependency Ω\nsecond line".into(),
+        )];
+        run_build(&launch).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("build-result")).unwrap(),
+            "dependency Ω\nsecond line"
+        );
     }
 
     #[test]

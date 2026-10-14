@@ -36,6 +36,8 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.
+- macOS contained launches inspect relative executable paths in the requested working directory, so eligible rebuilt apps retain clipboard support. Bare commands use the launch PATH rather than a same-named file in Glass's directory.
 - macOS accessibility actions can recover a target whose tree position changed when one complete bounded search finds the same role and name at its original bounds. Ambiguous matches, unreadable searches and moved targets still refuse the action.
 - macOS double and triple clicks now send the full sequence of paired mouse events, allowing Qt controls to recognize word selection correctly. Multi-click deadlines still release a pressed button before stopping.
 - macOS typing now sends Unicode characters, including accented text, CJK and emoji, through keyboard events while preserving ASCII keys and keyboard chords.

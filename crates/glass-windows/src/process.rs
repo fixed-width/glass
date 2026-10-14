@@ -70,7 +70,9 @@ pub(crate) fn run_build_unconfined(spec: &AppSpec) -> Result<()> {
         return Ok(());
     };
     let mut cmd = Command::new("cmd");
-    cmd.arg("/C").arg(build);
+    cmd.arg("/C")
+        .arg(build)
+        .envs(spec.env.iter().map(|(key, value)| (key, value)));
     if let Some(dir) = &spec.cwd {
         cmd.current_dir(dir);
     }
@@ -617,6 +619,26 @@ mod tests {
             "process::tests::app_spawn_is_suspended_without_a_console_window",
         ]);
         spawn_suspended_in_job(&mut cmd, SandboxLevel::Off).unwrap()
+    }
+
+    #[test]
+    fn build_receives_requested_environment_in_requested_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let spec = AppSpec {
+            build: Some("echo %GLASS_BUILD_TEST_VALUE%> build-result".into()),
+            run: Vec::new(),
+            cwd: Some(directory.path().to_path_buf()),
+            env: vec![("GLASS_BUILD_TEST_VALUE".into(), "dependency-setting".into())],
+            window_hint: None,
+            timeout_ms: 1000,
+            sandbox: SandboxLevel::Default,
+            a11y: false,
+        };
+        run_build_unconfined(&spec).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("build-result")).unwrap(),
+            "dependency-setting\r\n"
+        );
     }
 
     #[test]

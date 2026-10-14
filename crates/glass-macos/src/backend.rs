@@ -159,29 +159,6 @@ impl MacosPlatform {
         })
     }
 
-    /// Run the optional `spec.build` shell step in `spec.cwd`, mirroring the X11/Windows
-    /// backends' `sh -c`/`cmd /C` build step. A nonzero exit maps to
-    /// `GlassError::AppNotStarted` — no launch is attempted if the build failed.
-    fn run_build(spec: &AppSpec) -> Result<()> {
-        let Some(build) = &spec.build else {
-            return Ok(());
-        };
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(build);
-        if let Some(dir) = &spec.cwd {
-            cmd.current_dir(dir);
-        }
-        let status = cmd
-            .status()
-            .map_err(|e| GlassError::AppNotStarted(format!("build command: {e}")))?;
-        if !status.success() {
-            return Err(GlassError::AppNotStarted(format!(
-                "build command failed with status {status}"
-            )));
-        }
-        Ok(())
-    }
-
     /// Poll for `child`'s window, alternating a single
     /// [`crate::scwindow::query_once_with_candidates`] discovery attempt with
     /// `child.try_wait()` so a crashed launch fails fast with [`GlassError::AppExited`]
@@ -692,7 +669,7 @@ impl Platform for MacosPlatform {
     /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`]; every other
     /// `run[0]` takes the plain-exec path below.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        Self::run_build(spec)?;
+        crate::build::run(spec)?;
         let run0 = spec
             .run
             .first()
