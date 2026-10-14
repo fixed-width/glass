@@ -2899,7 +2899,15 @@ mod tests {
             .unwrap();
 
         let text = first_text(&out);
-        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if v["result"]["output"]["mode"] == "response_manifest" {
+            let path = v["result"]["output"]["externalized"][0]["local_path"]
+                .as_str()
+                .unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            v = serde_json::from_str(manifest["blocks"][0]["text"].as_str().unwrap()).unwrap();
+        }
         assert_eq!(v["ok"], true);
         assert_eq!(v["tool"], "glass_doctor");
         // Escape-free as well as non-empty — this is the seam where a styled render would reach

@@ -25,7 +25,7 @@ pub use query::{
 /// Normalized accessibility role — the union of the AT-SPI / AX / UIA
 /// vocabularies. A backend maps its native role in; anything unmapped becomes
 /// [`AxRole::Other`] with the native string preserved in [`AxNode::raw_role`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AxRole {
     Application,
     Window,
@@ -178,7 +178,7 @@ impl AxRole {
 }
 
 /// Normalized state flags — the subset all three OS vocabularies expose.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxStates {
     pub focused: bool,
     pub focusable: bool,
@@ -232,7 +232,7 @@ impl AxStates {
 /// Window-relative bounds (0,0 = window top-left). `i32` origin: an element may
 /// extend past / be partially off the window. Distinct from the capture
 /// [`crate::frame::Region`], which must fit inside the window for cropping.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxRect {
     pub x: i32,
     pub y: i32,
@@ -349,11 +349,11 @@ impl AxRect {
 /// A synthetic node id, assigned by `glass-core` (not the backend) in pre-order
 /// DFS so numbering is deterministic and identical across OS backends. Stable
 /// only within one snapshot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxNodeId(pub u32);
 
 /// One accessibility element.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxNode {
     /// Assigned by [`AxTree::assign_ids`]; backends may leave it as `AxNodeId(0)`.
     pub id: AxNodeId,
@@ -407,7 +407,7 @@ pub const MAX_SIBLINGS: usize = 4096;
 /// (`MAX_NODES`/`MAX_DEPTH`/`MAX_SIBLINGS`). `usize::MAX` in a field means "unbounded"; a
 /// plain `>=`/`>` check never trips there, so unbounded needs no special-casing. Carried by
 /// [`WalkBudget`] and threaded through [`AxContext`] so a caller can raise or lift the caps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WalkLimits {
     pub nodes: usize,
     pub depth: usize,
@@ -452,7 +452,7 @@ impl Default for WalkLimits {
 }
 
 /// Which bound stopped a walk early.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TruncationLimit {
     Nodes,
     Depth,
@@ -472,7 +472,7 @@ impl TruncationLimit {
 
 /// Record of a walk that stopped early. Its presence on an [`AxTree`] means elements are
 /// missing from the tree — and therefore cannot be addressed by id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Truncation {
     pub limit: TruncationLimit,
     /// The actual limit value that fired — the runtime [`WalkLimits`] field in effect, not the
@@ -650,14 +650,14 @@ impl WalkBudget {
 ///
 /// Only a backend addressed by *name* can tell — the desktop readers are handed a window and have
 /// nothing to compare. `None` on a tree means no claim either way, not agreement.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Subject {
     pub asked: String,
     pub actual: String,
 }
 
 /// The active window's accessibility subtree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxTree {
     pub root: AxNode,
     /// Total node count; set by [`AxTree::assign_ids`].
@@ -984,7 +984,7 @@ pub struct AxContext {
 /// present; on the two mobile backends the value too) so a stale id — or tree
 /// drift that lands a *different* same-role+name element on the id — errors
 /// rather than overwriting the wrong element.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxTarget {
     pub id: AxNodeId,
     pub role: AxRole,

@@ -124,7 +124,7 @@ impl Deadline {
 /// Whose bound a step ran under: settled before it starts, never inferred from how it ended
 /// (glass#341). [`Deadline::resolve`] answers it where both a caller's bound and the callee's own
 /// exist; a step bounded by one side alone names that side directly.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Whose {
     /// The caller's deadline fell first: a spent budget, not a fault.
     Caller,

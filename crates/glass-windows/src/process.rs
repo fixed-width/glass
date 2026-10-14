@@ -625,10 +625,10 @@ mod tests {
     fn build_receives_requested_environment_in_requested_cwd() {
         let directory = tempfile::tempdir().unwrap();
         let spec = AppSpec {
-            build: Some("echo %GLASS_BUILD_TEST_VALUE%> build-result".into()),
+            build: Some("echo %BUILD_TEST_VALUE%> build-result".into()),
             run: Vec::new(),
             cwd: Some(directory.path().to_path_buf()),
-            env: vec![("GLASS_BUILD_TEST_VALUE".into(), "dependency-setting".into())],
+            env: vec![("BUILD_TEST_VALUE".into(), "dependency-setting".into())],
             window_hint: None,
             timeout_ms: 1000,
             sandbox: SandboxLevel::Default,

@@ -1088,14 +1088,14 @@ mod tests {
             let support = session_input_support(false, accessibility);
             assert_eq!(support.status, glass_core::Support::RequiresSetup);
             assert_eq!(
-                support.note,
+                support.note.as_deref(),
                 Some(crate::permissions::screen_recording_remedy())
             );
         }
         let support = session_input_support(true, false);
         assert_eq!(support.status, glass_core::Support::RequiresSetup);
         assert_eq!(
-            support.note,
+            support.note.as_deref(),
             Some(crate::permissions::accessibility_remedy())
         );
         let support = session_input_support(true, true);

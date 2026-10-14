@@ -183,7 +183,7 @@ mod capability_tests {
         let msg = glass_core::GlassError::unsupported(
             "multi_touch",
             crate::BACKEND,
-            crate::MULTI_TOUCH.note,
+            crate::MULTI_TOUCH.note.as_deref(),
         )
         .to_string();
         assert!(msg.contains("macos backend"), "{msg}");

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 /// Which stream a log line came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stream {
     Stdout,
     Stderr,

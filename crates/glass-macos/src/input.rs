@@ -77,7 +77,7 @@ pub(crate) fn send_pointer_by(
         return Err(GlassError::unsupported(
             "multi_touch",
             crate::BACKEND,
-            crate::MULTI_TOUCH.note,
+            crate::MULTI_TOUCH.note.as_deref(),
         ));
     }
     focus_by(pid, deadline)?;
@@ -182,7 +182,7 @@ pub(crate) fn send_pointer_by(
             return Err(GlassError::unsupported(
                 "multi_touch",
                 crate::BACKEND,
-                crate::capabilities().multi_touch.note,
+                crate::capabilities().multi_touch.note.as_deref(),
             ));
         }
     }

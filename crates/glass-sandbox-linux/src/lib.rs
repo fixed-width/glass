@@ -1602,12 +1602,12 @@ mod tests {
     fn build_receives_requested_environment_in_requested_cwd() {
         let directory = tempfile::tempdir().unwrap();
         let mut launch = make_spec(
-            Some("printf '%s' \"$GLASS_BUILD_TEST_VALUE\" > build-result"),
+            Some("printf '%s' \"$BUILD_TEST_VALUE\" > build-result"),
             SandboxLevel::Default,
         );
         launch.cwd = Some(directory.path().to_path_buf());
         launch.env = vec![(
-            "GLASS_BUILD_TEST_VALUE".into(),
+            "BUILD_TEST_VALUE".into(),
             "dependency Ω\nsecond line".into(),
         )];
         run_build(&launch).unwrap();

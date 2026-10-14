@@ -47,9 +47,9 @@ mod tests {
     fn requested_environment_reaches_build_in_requested_directory() {
         let directory = tempfile::tempdir().unwrap();
         let mut launch = spec(directory.path());
-        launch.build = Some("printf '%s' \"$GLASS_BUILD_TEST_VALUE\" > build-result".into());
+        launch.build = Some("printf '%s' \"$BUILD_TEST_VALUE\" > build-result".into());
         launch.env = vec![(
-            "GLASS_BUILD_TEST_VALUE".into(),
+            "BUILD_TEST_VALUE".into(),
             "dependency Ω\nsecond line".into(),
         )];
         run(&launch).unwrap();

@@ -127,7 +127,7 @@ impl IdbInjector {
                     .ok()
                     .and_then(|count| count.checked_mul(2))
                     .ok_or_else(|| {
-                        GlassError::InvalidPointerInput("click event count overflowed")
+                        GlassError::InvalidPointerInput("click event count overflowed".into())
                             .before_dispatch()
                     })?;
                 let mut v = Vec::with_capacity(capacity);
