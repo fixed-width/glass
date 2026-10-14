@@ -349,6 +349,29 @@ impl Sharing {
         self.grant(file, access, true)
     }
 
+    /// Share an explicitly selected file or directory, resolving the selected root's symlink.
+    /// Descendant symlinks are still skipped; search-only access requires a directory.
+    pub fn path(&mut self, path: &Path, access: Access) -> io::Result<()> {
+        let canonical = path.canonicalize()?;
+        let file = File::from(descriptor_capacity(|| {
+            Ok(open(
+                &canonical,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?)
+        })?);
+        let metadata = file.metadata()?;
+        if (!metadata.is_dir() && !metadata.is_file())
+            || (access == Access::Search && !metadata.is_dir())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace access requires a regular file or directory",
+            ));
+        }
+        self.grant(file, access, access != Access::Search)
+    }
+
     fn grant(&mut self, file: File, access: Access, recursive: bool) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_dir() && !metadata.is_file() {
@@ -617,6 +640,28 @@ mod tests {
         sharing.tree(root.path(), Access::ReadWrite).unwrap();
         assert_eq!(entries(&file), before);
         sharing.restore().unwrap();
+    }
+
+    #[test]
+    fn explicitly_selected_executable_does_not_share_its_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("program");
+        let sibling = root.path().join("unrelated");
+        std::fs::write(&program, "program").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&sibling, "private sibling").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&program, &alias).unwrap();
+        let file = File::open(&program).unwrap();
+        let other = File::open(&sibling).unwrap();
+        let before = entries(&file);
+        let other_before = entries(&other);
+        let mut sharing = same_user_sharing();
+        sharing.path(&alias, Access::Read).unwrap();
+        assert_ne!(entries(&file), before);
+        assert_eq!(entries(&other), other_before);
+        sharing.restore().unwrap();
+        assert_eq!(entries(&file), before);
     }
 
     #[test]
