@@ -204,15 +204,17 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         // check is deliberately duplicated: here it answers "will the a11y tools work",
         // there "is this Mac set up at all". Both read the same
         // `glass_macos::accessibility_granted()` fact and remedy string.
-        sections.push(Section::new(
-            "accessibility (macos)",
-            Some("macos".into()),
-            macos_a11y_checks(
-                glass_a11y_macos::doctor::probe(),
-                glass_macos::accessibility_granted(),
-                console_session(glass_macos::session_state()),
-            ),
-        ));
+        if std::fs::symlink_metadata(glass_macos::private_session::ROOT).is_err() {
+            sections.push(Section::new(
+                "accessibility (macos)",
+                Some("macos".into()),
+                macos_a11y_checks(
+                    glass_a11y_macos::doctor::probe(),
+                    glass_macos::accessibility_granted(),
+                    console_session(glass_macos::session_state()),
+                ),
+            ));
+        }
     }
 
     // Android is host-OS-agnostic, so the crate is always compiled in. Its basic presence
@@ -411,6 +413,9 @@ fn macos_checks_from(
 /// [`macos_checks_from`].
 #[cfg(target_os = "macos")]
 fn macos_checks(resolved_backend: &str) -> Vec<Check> {
+    if std::fs::symlink_metadata(glass_macos::private_session::ROOT).is_ok() {
+        return crate::macos_environment::checks();
+    }
     macos_checks_from(
         resolved_backend,
         glass_macos::screen_recording_granted(),

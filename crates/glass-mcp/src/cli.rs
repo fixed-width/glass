@@ -39,6 +39,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosWorker,
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    NativeBackend,
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosEnroll { account: String },
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosUnenroll,
+
     /// Inspect or export a stopped session trace without starting a backend.
     Trace {
         #[command(subcommand)]
@@ -95,6 +108,9 @@ pub enum Command {
     },
     /// Guided macOS first-run: request the TCC grants, install the run integration, confirm.
     Setup {
+        /// Enroll an existing standard macOS account for apps off your desktop.
+        #[arg(long)]
+        account: Option<String>,
         /// Fail instead of prompting (scripting/CI).
         #[arg(long)]
         non_interactive: bool,
@@ -324,11 +340,13 @@ mod tests {
             .unwrap();
         match cli.command {
             Some(Command::Setup {
+                account,
                 non_interactive,
                 launchagent,
                 no_launchagent,
                 addr,
             }) => {
+                assert!(account.is_none());
                 assert!(non_interactive);
                 assert!(launchagent);
                 assert!(!no_launchagent);
@@ -344,6 +362,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Setup {
+                account: None,
                 non_interactive: false,
                 launchagent: false,
                 no_launchagent: false,

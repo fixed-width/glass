@@ -107,3 +107,12 @@ a partial configuration will run and fail at the first missing value rather than
 brand icon). `build-app.sh` installs it into `GlassMcp.app/Contents/Resources` and
 `Info.plist`'s `CFBundleIconFile` (`AppIcon`) names it, so Finder/Dock show the mark.
 Regenerate after editing the SVG: `python3 packaging/macos/make-appicon.py` (needs Pillow).
+
+## Separate-account setup preview
+
+The same signed bundle contains the ordinary MCP server and its internal macOS backend worker.
+After installation, `glass-mcp setup --account ACCOUNT --no-launchagent` registers only the latter
+in an existing standard account; `--launchagent` additionally installs the existing owner-side
+HTTP/menu-bar server. No extra helper binary, relay, application registry or alternate tool API is
+required. Follow [the account setup guide](../../docs/how-to/setup-macos.md#apps-off-your-desktop-preview)
+for grants, login reuse, stop/uninstall behavior and current qualification limits.

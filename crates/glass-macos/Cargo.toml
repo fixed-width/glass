@@ -112,6 +112,7 @@ path = "src/bin/sandbox_probe.rs"
 glass-a11y-macos.workspace = true
 glass-core.workspace = true
 plist = "1"
+serde = { version = "1", features = ["derive"] }
 
 # macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
 # modules still build off macOS with zero macOS deps. Versions pinned to
@@ -267,6 +268,10 @@ tempfile.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix.workspace = true
+glass-pipe-unix.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+cc = "1"

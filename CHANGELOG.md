@@ -21,6 +21,12 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Preview macOS account setup with `glass-mcp setup --account ACCOUNT`: enroll an existing standard
+  account for off-desktop development using the normal MCP tools over stdio or HTTP. Glass reuses
+  its login and grants, releases per-app workers and temporary workspace permissions on stop, and
+  recovers recorded permission changes after an interrupted client. `status` reports account use;
+  uninstall removes Glass's registration while retaining the account, home and app data.
+
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
   isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
@@ -36,6 +42,8 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- macOS build output is captured in application logs instead of reaching the MCP transport; build failures include bounded diagnostic output.
+- Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.
 - Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.
 - macOS contained launches inspect relative executable paths in the requested working directory, so eligible rebuilt apps retain clipboard support. Bare commands use the launch PATH rather than a same-named file in Glass's directory.
 - macOS accessibility actions can recover a target whose tree position changed when one complete bounded search finds the same role and name at its original bounds. Ambiguous matches, unreadable searches and moved targets still refuse the action.

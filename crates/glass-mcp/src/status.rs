@@ -9,17 +9,21 @@
 const DEFAULT_ADDR: &str = "127.0.0.1:7300";
 
 pub(crate) fn run(addr: Option<&str>) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    crate::macos_environment::status()?;
     let addr = addr.unwrap_or(DEFAULT_ADDR);
     match crate::setup::fetch_health(addr) {
         Some(h) => {
             println!("glass: running");
             println!("endpoint: http://{addr}/");
             #[cfg(target_os = "macos")]
-            println!(
-                "grants: screen-recording {}, accessibility {}",
-                yes_no(h.screen_recording),
-                yes_no(h.accessibility)
-            );
+            if matches!(glass_macos::private_session::configured(), Ok(false)) {
+                println!(
+                    "grants: screen-recording {}, accessibility {}",
+                    yes_no(h.screen_recording),
+                    yes_no(h.accessibility)
+                );
+            }
             let _ = &h;
             Ok(())
         }

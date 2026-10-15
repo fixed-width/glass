@@ -29,13 +29,15 @@ impl HealthStatus {
 }
 
 /// Snapshot the running process's grant state.
+#[cfg(feature = "network")]
 pub fn current_health() -> HealthStatus {
     #[cfg(target_os = "macos")]
     {
+        let shared = matches!(glass_macos::private_session::configured(), Ok(false));
         HealthStatus {
             ok: true,
-            screen_recording: Some(glass_macos::screen_recording_granted()),
-            accessibility: Some(glass_macos::accessibility_granted()),
+            screen_recording: shared.then(glass_macos::screen_recording_granted),
+            accessibility: shared.then(glass_macos::accessibility_granted),
         }
     }
     #[cfg(not(target_os = "macos"))]

@@ -1,28 +1,126 @@
 //! Run the requested build with its working directory and environment.
 
-use glass_core::{AppSpec, GlassError, Result};
+use std::collections::VecDeque;
+use std::process::{Child, Stdio};
+use std::sync::{Arc, Mutex};
 
-pub(crate) fn run(spec: &AppSpec) -> Result<()> {
+use glass_core::{AppSpec, GlassError, Result, Stream};
+use glass_pipe_unix::{ChunkSink, PipeTap};
+
+const OUTPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Default)]
+struct Tail {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
+
+struct Capture(Arc<Mutex<Tail>>);
+impl ChunkSink for Capture {
+    fn chunk(&mut self, bytes: &[u8]) {
+        let mut tail = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let overflow = tail
+            .bytes
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(OUTPUT_LIMIT);
+        tail.truncated |= overflow > 0;
+        let discard = overflow.min(tail.bytes.len());
+        tail.bytes.drain(..discard);
+        tail.bytes
+            .extend(bytes.iter().skip(overflow - discard).copied());
+    }
+}
+
+fn output(tail: &Mutex<Tail>) -> String {
+    let tail = tail
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let bytes: Vec<_> = tail.bytes.iter().copied().collect();
+    let prefix = if tail.truncated {
+        "[earlier build output omitted]\n"
+    } else {
+        ""
+    };
+    format!("{prefix}{}", String::from_utf8_lossy(&bytes))
+}
+
+fn tap<R: std::io::Read + std::os::fd::AsFd + Send + 'static>(
+    pipe: R,
+    name: &str,
+    capture: &Arc<Mutex<Tail>>,
+    child: &mut Child,
+) -> Result<PipeTap> {
+    PipeTap::start(pipe, name, Capture(Arc::clone(capture))).map_err(|error| {
+        let stopped = child.kill().and_then(|()| child.wait().map(|_| ()));
+        let primary = GlassError::AppNotStarted(format!("reading build output: {error}"));
+        match stopped {
+            Ok(()) => primary,
+            Err(cleanup) => GlassError::cleanup_failed(
+                "stopping build after output reader failure",
+                primary,
+                cleanup.into(),
+            ),
+        }
+    })
+}
+
+pub(crate) fn run(spec: &AppSpec) -> Result<Vec<(Stream, String)>> {
     let Some(build) = &spec.build else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let mut command = std::process::Command::new("/bin/sh");
     command
         .arg("-c")
         .arg(build)
-        .envs(spec.env.iter().map(|(key, value)| (key, value)));
+        .envs(spec.env.iter().map(|(key, value)| (key, value)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(directory) = &spec.cwd {
         command.current_dir(directory);
     }
-    let status = command
-        .status()
+    let mut child = command
+        .spawn()
         .map_err(|error| GlassError::AppNotStarted(format!("build command: {error}")))?;
+    let stdout = Arc::new(Mutex::new(Tail::default()));
+    let stderr = Arc::new(Mutex::new(Tail::default()));
+    let out = child
+        .stdout
+        .take()
+        .ok_or_else(|| GlassError::Backend("build stdout pipe missing".into()))?;
+    let err = child
+        .stderr
+        .take()
+        .ok_or_else(|| GlassError::Backend("build stderr pipe missing".into()))?;
+    let taps = [
+        tap(out, "glass-build-out", &stdout, &mut child)?,
+        tap(err, "glass-build-err", &stderr, &mut child)?,
+    ];
+    let status = child.wait();
+    drop(taps);
+    let status =
+        status.map_err(|error| GlassError::AppNotStarted(format!("waiting for build: {error}")))?;
+    let output = [
+        (Stream::Stdout, output(&stdout)),
+        (Stream::Stderr, output(&stderr)),
+    ];
     if !status.success() {
         return Err(GlassError::AppNotStarted(format!(
-            "build command failed with status {status}"
+            "build command failed with status {status}\nstdout:\n{}\nstderr:\n{}",
+            output[0].1, output[1].1,
         )));
     }
-    Ok(())
+    Ok(output
+        .into_iter()
+        .flat_map(|(stream, text)| {
+            text.lines()
+                .map(|line| (stream, line.to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -90,5 +188,35 @@ mod tests {
     #[test]
     fn missing_build_does_not_use_working_directory() {
         assert!(run(&spec(std::path::Path::new("/nonexistent-glass-build-test"))).is_ok());
+    }
+    #[test]
+    fn build_output_is_captured_outside_the_backend_protocol() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut launch = spec(directory.path());
+        launch.build = Some("printf 'compiler output\\n'; printf 'warning\\n' >&2".into());
+        let logs = run(&launch).unwrap();
+        assert!(logs.contains(&(Stream::Stdout, "compiler output".into())));
+        assert!(logs.contains(&(Stream::Stderr, "warning".into())));
+    }
+
+    #[test]
+    fn failed_build_exposes_its_diagnostic_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut launch = spec(directory.path());
+        launch.build = Some("printf 'compiler failure' >&2; exit 23".into());
+        let error = run(&launch).unwrap_err();
+        assert!(error.to_string().contains("compiler failure"));
+        assert!(error.to_string().contains("23"));
+    }
+
+    #[test]
+    fn build_capture_bounds_a_long_unterminated_stream() {
+        let capture = Arc::new(Mutex::new(Tail::default()));
+        let mut sink = Capture(Arc::clone(&capture));
+        sink.chunk(&vec![b'x'; OUTPUT_LIMIT * 2]);
+        sink.chunk(b"tail");
+        assert_eq!(capture.lock().unwrap().bytes.len(), OUTPUT_LIMIT);
+        assert!(output(&capture).starts_with("[earlier build output omitted]"));
+        assert!(output(&capture).ends_with("tail"));
     }
 }

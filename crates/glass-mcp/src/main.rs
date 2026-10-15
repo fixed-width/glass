@@ -9,12 +9,24 @@ use glass_mcp::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(target_os = "macos")]
+    match cli.command {
+        Some(Command::MacosWorker) => return glass_mcp::macos_worker::worker().await,
+        Some(Command::NativeBackend) => return glass_mcp::native_backend::run(),
+        Some(Command::MacosEnroll { account }) => {
+            return glass_mcp::macos_environment::enroll(&account);
+        }
+        Some(Command::MacosUnenroll) => return glass_mcp::macos_environment::unenroll(),
+        _ => {}
+    }
     // AppKit setup precedes platform workers; offline evidence commands need none.
     #[cfg(target_os = "macos")]
     if !matches!(
         cli.command,
         Some(Command::Tools { .. } | Command::Trace { .. })
-    ) {
+    ) && (!glass_macos::private_session::is_owner()
+        || matches!(cli.command, Some(Command::Serve { menubar: true, .. })))
+    {
         glass_macos::init_main_thread();
     }
     let audit_log = cli.audit_log;
@@ -26,6 +38,15 @@ async fn main() -> anyhow::Result<()> {
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
+        #[cfg(target_os = "macos")]
+        Some(
+            Command::MacosWorker
+            | Command::NativeBackend
+            | Command::MacosEnroll { .. }
+            | Command::MacosUnenroll,
+        ) => {
+            anyhow::bail!("internal macOS command was not dispatched before AppKit initialization")
+        }
         Some(Command::Trace { command }) => {
             let report = match command {
                 TraceCommand::Inspect { directory, json } => {
@@ -55,7 +76,13 @@ async fn main() -> anyhow::Result<()> {
         // No subcommand: a LaunchServices double-click routes to onboarding; an MCP client's
         // stdio spawn (the default, and the only case off macOS) serves MCP over stdio.
         None => match launch::detect_no_arg_launch() {
-            NoArgLaunch::Onboarding => onboarding::run(onboarding::DEFAULT_ADDR),
+            NoArgLaunch::Onboarding => {
+                #[cfg(target_os = "macos")]
+                if glass_macos::private_session::is_worker() {
+                    return onboarding::run_worker();
+                }
+                onboarding::run(onboarding::DEFAULT_ADDR)
+            }
             NoArgLaunch::StdioServe => {
                 let (sink, report) =
                     glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
@@ -152,12 +179,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Command::Setup {
+            account,
             non_interactive,
             launchagent,
             no_launchagent,
             addr,
         }) => {
             setup::run(setup::SetupArgs {
+                account,
                 non_interactive,
                 launchagent,
                 no_launchagent,

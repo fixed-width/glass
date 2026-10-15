@@ -416,6 +416,11 @@ impl MacosPlatform {
         crate::bundle::handoff_gate(spec.sandbox)?;
         let id = crate::bundle::bundle_identifier(bundle)?;
         let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
+            Some(_) if crate::private_session::attached() => {
+                return Err(GlassError::AppNotStarted(
+                    "this bundle is already running in the development account; close that instance before starting a new Glass session".into(),
+                ));
+            }
             Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
             // `ffi::launch_bundle` blocks this thread on a channel until `NSWorkspace`'s
             // completion handler fires — on the true main thread, that handler could need a
@@ -431,6 +436,10 @@ impl MacosPlatform {
                 // `None` just found above means any instance running now is one we
                 // spawned, so best-effort reclaim it before propagating the error.
                 Err(e) => {
+                    if crate::private_session::attached() {
+                        return Err(GlassError::cleanup_failed("launching a private bundle", e,
+                            GlassError::Backend("LaunchServices returned no owned process; unverified instances were left untouched".into())));
+                    }
                     if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id)
                         && !crate::ffi::terminate_app(pid)
                     {
@@ -638,13 +647,38 @@ fn session_input_support(
 }
 
 impl Platform for MacosPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        if crate::private_session::attached() {
+            glass_core::InputRoute::Isolated
+        } else {
+            glass_core::InputRoute::SharedDesktop
+        }
+    }
+
     fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        if crate::private_session::attached() && crate::private_session::require_private().is_err()
+        {
+            return glass_core::InputCapabilities::uniform(
+                glass_core::CapabilityStatus::requires_setup(
+                    "the enrolled account must retain its off-console Aqua login",
+                ),
+                glass_core::DesktopInterference::Unknown,
+            );
+        }
         glass_core::InputCapabilities::uniform(
             session_input_support(
                 crate::permissions::screen_recording_granted(),
                 crate::permissions::accessibility_granted(),
             ),
-            glass_core::DesktopInterference::Possible,
+            if crate::private_session::attached() {
+                if crate::private_session::require_private().is_ok() {
+                    glass_core::DesktopInterference::None
+                } else {
+                    glass_core::DesktopInterference::Unknown
+                }
+            } else {
+                glass_core::DesktopInterference::Possible
+            },
         )
     }
 
@@ -669,7 +703,12 @@ impl Platform for MacosPlatform {
     /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`]; every other
     /// `run[0]` takes the plain-exec path below.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        crate::build::run(spec)?;
+        crate::private_session::require_if_attached()?;
+        self.logs
+            .lock()
+            .map_err(|_| GlassError::Backend("build log sink poisoned".into()))?
+            .extend(crate::build::run(spec)?);
+        crate::private_session::require_if_attached()?;
         let run0 = spec
             .run
             .first()
@@ -719,6 +758,32 @@ impl Platform for MacosPlatform {
         };
         // Activate the launched app so its window registers with the AX API (best-effort — see
         // `activate_launched`); the launch itself already succeeded above.
+        if crate::private_session::attached()
+            && self
+                .app_pid
+                .is_some_and(|pid| !crate::private_session::owns_pid(pid))
+        {
+            let primary = GlassError::Backend(
+                "launched application is outside the private account; activation refused".into(),
+            )
+            .after_dispatch();
+            let unverified_handoff = self.adopted.take().is_some();
+            if let Some(mut child) = self.child.take() {
+                process::terminate(&mut child);
+            }
+            self.app_pid = None;
+            self.active_window = None;
+            self.taps.clear();
+            release_clip(self.clip.as_ref());
+            self.clip = None;
+            self.clipboard_route = ClipboardRoute::Unsupported;
+            return if unverified_handoff {
+                Err(GlassError::cleanup_failed("rejecting an unverified LaunchServices process", primary,
+                    GlassError::Backend("unverified process left untouched; its launch/cleanup could not be attributed".into())))
+            } else {
+                Err(primary)
+            };
+        }
         activate_launched(self.app_pid);
         Ok(geometry)
     }

@@ -31,8 +31,8 @@ Serve MCP over the network (Streamable HTTP) instead of stdio.
 - `--http` — use the HTTP transport.
 - `--addr <host:port>` — bind address, e.g. `0.0.0.0:7300`. A non-loopback bind requires a token.
 - `--token-file <path>` — read the bearer token from this file (alternative: `GLASS_TOKEN`).
-- `--menubar` — run as the visible **`glass ●`** menu-bar app (macOS); without it the server stays
-  headless (no menu bar, MCP served silently).
+- `--menubar` — run as the visible **`glass ●`** menu-bar app (macOS); otherwise the server has
+  no menu bar. This does not itself isolate the application desktop.
 - `--audit-log <path>` — as above.
 - `--tool-profile full|lean` — as above, including menu-bar mode.
 - `--trace-dir` and `--trace-max-bytes` — as above, including menu-bar mode.
@@ -95,10 +95,26 @@ List every `GLASS_*` variable with its purpose, default, and current value (see
 - `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
   Ignored with `--json`. A non-empty `NO_COLOR`, or `TERM=dumb`, suppresses `auto`.
 
+## `setup`
+
+Guided macOS setup. `--account ACCOUNT` enrolls an existing standard account for off-desktop apps
+(preview); administrator authentication registers an on-demand native backend worker. Complete its
+real login and the existing permission checklist once, then keep it logged in. Existing healthy
+registration is reused. Without enrollment, setup retains the shared-desktop flow.
+
+- `--launchagent` — install the ordinary user's HTTP/menu-bar server.
+- `--no-launchagent` — use your MCP client's normal stdio server.
+- `--non-interactive` — require existing authorization and report pending steps without prompting.
+- `--addr ADDR` — the HTTP server's address.
+
+See [macOS account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview) for prerequisites,
+workspace access, recovery and qualification limits.
+
 ## `status`
 
 Report whether glass is running and at what endpoint (reads `/healthz`). Primarily used with the
-macOS menu-bar LaunchAgent — see [how-to/setup-macos.md](../how-to/setup-macos.md).
+macOS menu-bar LaunchAgent. An enrolled macOS account also reports whether it is idle, in use or
+disabled, without starting a worker — see [how-to/setup-macos.md](../how-to/setup-macos.md).
 
 ## `update`
 
@@ -163,4 +179,7 @@ memory until it is restarted — `update` replaces the file on disk, not the run
 ## `uninstall`
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
-not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
+not remove the app bundle. For account setup, stop active work first: uninstall restores recoverable
+workspace permissions and removes only Glass’s worker registration with administrator authentication.
+The account, home and app data remain. A disabled enrollment prevents an automatic shared-desktop
+fallback. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).

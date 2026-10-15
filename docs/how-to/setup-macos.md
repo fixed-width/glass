@@ -1,11 +1,69 @@
 # Set up glass on macOS
 
-On macOS, end users install a **notarized `.dmg`** — no build, no signing, no Terminal. glass drives
-the logged-in Aqua session, gated by two one-time macOS privacy grants. (Contributors and anyone
+On macOS, install a **notarized `.dmg`**. Glass uses a real Aqua login and two one-time macOS privacy
+grants. The existing shared-desktop setup is below; separate-account setup is available as a preview. (Contributors and anyone
 running an unreleased checkout build from source instead — see
 [build-from-source.md](build-from-source.md).)
 
-## Install the notarized `.dmg`
+## Apps off your desktop (preview)
+
+This setup keeps development apps in a separate standard account in the same macOS installation.
+The ordinary MCP server stays in your account. Its macOS backend owns an on-demand worker in the
+selected account; Android and iOS continue through their existing backends. Use the same
+`glass_start`, capture, accessibility, input, logs and `glass_stop` tools. No second MCP server is
+needed.
+
+1. Install the signed `GlassMcp.app` in `/Applications`. Account setup requires Glass's hardened
+   runtime signature; a source build with debugging or library-validation exceptions cannot serve
+   as the private worker. This requirement applies to Glass, not your development applications.
+2. In **System Settings → Users & Groups**, create a standard account for development, or select
+   an existing standard account dedicated to that work. You own its password, home and app data;
+   Glass does not create or delete the account or store its password. Log into it once to finish
+   macOS's first-login setup, then switch back without logging it out.
+3. From Terminal in your normal account, run the following, replacing `glassdev` with its short name:
+
+   ```bash
+   /Applications/GlassMcp.app/Contents/MacOS/glass-mcp setup --account glassdev --no-launchagent
+   ```
+
+   Administrator authentication registers only Glass's worker. A pending-login or missing-grant
+   error means registration is saved and the next step remains; it does not mean the account must
+   be recreated. Authentication and setup have no test timer.
+4. Log into the selected account, complete macOS's first-login setup, and open `/Applications/GlassMcp.app`.
+   Use the existing checklist to enable **Accessibility** and **Screen Recording** for Glass there.
+   Accept a requested restart. Switch back to your normal account **without logging the development
+   account out**. Fast User Switching changes the account you are viewing while keeping both logged in.
+5. Run the same setup command again to verify readiness. A healthy existing registration is reused
+   without another administrator request. Register the bundle binary with your stdio MCP client, or
+   use `--launchagent` instead for the existing HTTP/menu-bar integration.
+
+Routine launches and rebuilds require no account switching or extra display in your VNC view. If
+login, permissions or attachment are unavailable, the macOS backend refuses work; it does not launch
+on your normal desktop. Only one Glass macOS backend can use the enrolled environment at a time. This preview has one
+owner/account registration per Mac and does not support changing the selected account.
+
+The requested workspace is shared read/write for the run. Existing executable search paths and
+existing file/directory arguments receive read access; unrelated environment values are not treated
+as file-sharing requests. Temporary access is recorded before changes and restored after owned work
+has stopped. Generated files may belong to the development account; inherited permissions retain
+your read/write access. A surviving process, new background activity in that account or an unavailable
+filesystem can defer recovery; Glass reports that failure and preserves its journal for retry. Account homes, keychains and credentials are not copied.
+Default Seatbelt containment and protected artifact/trace paths still apply.
+
+Use `glass-mcp status` to inspect enrollment and whether the environment is in use. Use `glass_stop`
+in the owning MCP client to stop its app, or quit that client's Glass process. To inspect the desktop
+in person, switch to the selected account: Glass refuses further private input while it is the console
+account. Return to your normal account before resuming agent work.
+
+This is a preview. The underlying development loop and automated desktop coexistence have been
+exercised on Apple Silicon; the supported installer and account lifecycle still need native end-to-end
+qualification. Physical concurrent input, unattended cold-boot login and monitor-free operation are
+not qualified. Keep the account logged in; after a restart, log into it again. This does not change
+Windows's shared-desktop behavior.
+
+## Shared-desktop setup
+
+### Install the notarized `.dmg`
 
 Every tagged release attaches a **notarized, universal** `GlassMcp.app` in a `.dmg` to the
 [Releases page](https://github.com/fixed-width/glass/releases). Because it's signed and notarized,
@@ -48,7 +106,7 @@ LaunchAgent won't relaunch it behind your back — until you next log in or rela
 
 ## Keep the Mac awake
 
-glass captures and drives the real desktop, so a sleeping or locked display has nothing to grab. On a
+With shared-desktop setup, glass captures and drives the real desktop, so a sleeping or locked display has nothing to grab. On a
 box you're not actively using, hold it awake and unlocked:
 
 ```bash
@@ -73,7 +131,13 @@ commands (see [reference/cli.md](../reference/cli.md)).
 ## Uninstall
 
 From the **`glass ●`** menu bar, click **Uninstall glass…** (it confirms first, since uninstalling
-also quits glass). Or from a terminal, `glass-mcp uninstall`. Either one removes
+also quits glass). Or from a terminal, `glass-mcp uninstall`. Stop active application work first.
+For an enrolled account, uninstall restores recoverable workspace permissions and requests administrator
+authentication to remove its worker registration. It retains the account, home, permissions and app
+data. A disabled registration marker prevents clients from silently returning to shared-desktop
+control; rerun `setup --account ACCOUNT` to enroll again.
+
+Either path also removes
 `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` and boots out the running job, so glass stops
 starting at login. Neither touches the app bundle — drag `GlassMcp.app` to the Trash afterward to
 remove glass entirely.

@@ -69,6 +69,7 @@ glass-a11y-windows = { path = "../glass-a11y-windows" }
 windows = { version = "0.62", features = ["Win32_Storage_FileSystem", "Win32_UI_HiDpi"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
 glass-macos = { path = "../glass-macos" }
 glass-a11y-macos = { path = "../glass-a11y-macos" }
 glass-sandbox-macos.workspace = true

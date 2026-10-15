@@ -28,13 +28,13 @@ pub(crate) fn run_scroll_wheel_by<T>(
     deadline: Deadline,
     move_cursor: impl FnOnce() -> Result<()>,
     build_wheel: impl FnOnce() -> Result<T>,
-    post_wheel: impl FnOnce(T),
+    post_wheel: impl FnOnce(T) -> Result<()>,
 ) -> Result<()> {
     move_cursor()?;
     require_payload_time(deadline)?;
     let wheel = build_wheel()?;
     require_payload_time(deadline)?;
-    post_wheel(wheel);
+    post_wheel(wheel)?;
     require_payload_time(deadline)
 }
 
@@ -42,16 +42,16 @@ pub(crate) fn run_click_pairs_by<T>(
     deadline: Deadline,
     count: u32,
     mut build_pair: impl FnMut(u32) -> Result<(T, T)>,
-    mut post: impl FnMut(T),
+    mut post: impl FnMut(T) -> Result<()>,
     mut pause: impl FnMut(Duration),
 ) -> Result<()> {
     for ordinal in 1..=count {
         require_payload_time(deadline)?;
         let (down, up) = build_pair(ordinal)?;
         require_payload_time(deadline)?;
-        post(down);
+        post(down)?;
         let down_result = require_payload_time(deadline);
-        post(up);
+        post(up)?;
         down_result?;
         require_payload_time(deadline)?;
         if ordinal < count {
@@ -80,7 +80,10 @@ mod tests {
             Deadline::UNBOUNDED,
             3,
             |ordinal| Ok(((ordinal, true), (ordinal, false))),
-            |event| events.push(event),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
             |duration| pauses.push(duration),
         )
         .unwrap();
@@ -111,6 +114,7 @@ mod tests {
                 if event.1 {
                     std::thread::sleep(Duration::from_millis(150));
                 }
+                Ok(())
             },
             |_| panic!("must stop before the inter-click pause"),
         )
@@ -130,7 +134,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(150));
                 Ok(((ordinal, true), (ordinal, false)))
             },
-            |event| events.push(event),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
             |_| panic!("must stop before the inter-click pause"),
         )
         .unwrap_err();
@@ -264,7 +271,10 @@ mod tests {
                 built.set(true);
                 Ok(())
             },
-            |_| posted.set(true),
+            |_| {
+                posted.set(true);
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -283,7 +293,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
                 Ok(())
             },
-            |_| posted.set(true),
+            |_| {
+                posted.set(true);
+                Ok(())
+            },
         )
         .unwrap_err();
 
@@ -301,6 +314,7 @@ mod tests {
             |_| {
                 posted.set(true);
                 std::thread::sleep(Duration::from_millis(10));
+                Ok(())
             },
         )
         .unwrap_err();
@@ -331,5 +345,65 @@ mod tests {
             error.bound_dispatch(),
             Some(BoundDispatch::MayHaveDispatched)
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_refusal_tests {
+    use super::{run_click_pairs_by, run_scroll_wheel_by};
+    use glass_core::{Deadline, GlassError};
+
+    #[test]
+    fn first_click_refusal_stops_without_attempting_another_payload() {
+        let mut attempts = Vec::new();
+        let result = run_click_pairs_by(
+            Deadline::UNBOUNDED,
+            3,
+            |i| Ok(((i, true), (i, false))),
+            |event| {
+                attempts.push(event);
+                Err(GlassError::Backend("attachment lost".into()))
+            },
+            |_| panic!("no pause after refusal"),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, [(1, true)]);
+    }
+
+    #[test]
+    fn release_refusal_stops_before_the_next_click() {
+        let mut attempts = Vec::new();
+        let result = run_click_pairs_by(
+            Deadline::UNBOUNDED,
+            3,
+            |i| Ok(((i, true), (i, false))),
+            |event| {
+                attempts.push(event);
+                if event.1 {
+                    Ok(())
+                } else {
+                    Err(GlassError::Backend("attachment lost".into()))
+                }
+            },
+            |_| panic!("no pause after refusal"),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, [(1, true), (1, false)]);
+    }
+
+    #[test]
+    fn scroll_dispatch_refusal_is_returned_without_replay() {
+        let mut attempts = 0;
+        let result = run_scroll_wheel_by(
+            Deadline::UNBOUNDED,
+            || Ok(()),
+            || Ok(()),
+            |_| {
+                attempts += 1;
+                Err(GlassError::Backend("attachment lost".into()))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
     }
 }

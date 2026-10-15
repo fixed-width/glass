@@ -191,3 +191,8 @@ mod capability_tests {
         assert!(!msg.contains("android"), "{msg}");
     }
 }
+
+#[cfg(target_os = "macos")]
+pub mod private_session;
+#[cfg(target_os = "macos")]
+pub mod worker_socket;

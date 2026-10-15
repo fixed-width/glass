@@ -163,7 +163,25 @@ pub fn capabilities_for(backend: &str) -> Option<CapabilityReport> {
     #[cfg(target_os = "macos")]
     {
         match backend {
-            "macos" => return Some(CapabilityReport::Available(glass_macos::capabilities())),
+            "macos" => {
+                let mut map = glass_macos::capabilities();
+                match glass_macos::private_session::configured() {
+                    Ok(true) => {
+                        map.accessibility = CapabilityStatus::degraded(
+                            "uses the enrolled account's grants; scope=session reports the active worker's actual support",
+                        )
+                    }
+                    Err(_) => {
+                        let pending = CapabilityStatus::requires_setup(
+                            "private macOS enrollment is unavailable; run glass-mcp setup",
+                        );
+                        map.input = pending.clone();
+                        map.accessibility = pending;
+                    }
+                    Ok(false) => {}
+                }
+                return Some(CapabilityReport::Available(map));
+            }
             "ios" => return Some(CapabilityReport::Available(glass_ios::capabilities())),
             _ => {}
         }

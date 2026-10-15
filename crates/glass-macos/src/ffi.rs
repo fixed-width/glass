@@ -175,6 +175,11 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
 
     let url = NSURL::fileURLWithPath(&NSString::from_str(&bundle.to_string_lossy()));
     let configuration = NSWorkspaceOpenConfiguration::configuration();
+    if crate::private_session::attached() {
+        configuration.setCreatesNewApplicationInstance(true);
+        configuration.setAllowsRunningApplicationSubstitution(false);
+        configuration.setActivates(false);
+    }
     // `AppSpec::run[1..]` are the app's arguments, and this path must not lose them: the direct
     // spawn above passes them to the process, so a bundle that falls back to LaunchServices has
     // to carry them too, or the same spec launches two different apps depending on which arm ran.

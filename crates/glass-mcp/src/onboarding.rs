@@ -47,6 +47,18 @@ use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
 pub fn run(addr: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
+        if glass_macos::private_session::configured()? {
+            if crate::setup::fetch_health(addr).is_some() {
+                return Ok(());
+            }
+            let exe = std::env::current_exe()?;
+            if let Some((label, instruction)) =
+                crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
+            {
+                anyhow::bail!("{label}: {instruction}");
+            }
+            return Ok(());
+        }
         // A. A healthy agent is already serving with both grants held — nothing to onboard.
         //    Don't re-request grants (would pop dialogs for nothing) or reinstall over a working
         //    agent.
@@ -200,6 +212,24 @@ pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
         .write_all(text.as_bytes())?;
     child.wait()?;
     Ok(())
+}
+
+/// Grant-bearing onboarding in the selected account's real login.
+#[cfg(target_os = "macos")]
+pub fn run_worker() -> anyhow::Result<()> {
+    glass_macos::private_session::attach(true)?;
+    if glass_macos::accessibility_granted() && glass_macos::screen_recording_granted() {
+        eprintln!(
+            "glass: permissions ready; switch back to your normal account without logging this account out"
+        );
+        return Ok(());
+    }
+    let app = crate::setup::app_bundle_path(&std::env::current_exe()?);
+    run_checklist(ChecklistActions {
+        rows: grant_row_widgets(),
+        on_recheck: Box::new(move || relaunch(&app)),
+    })
+    .map_err(|error| anyhow::anyhow!(error))
 }
 
 #[cfg(test)]

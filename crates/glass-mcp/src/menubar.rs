@@ -65,7 +65,9 @@ mod macos {
         // in place — `launchctl kickstart -k` via `restart_launch_agent` — NOT the onboarder's
         // `open -n` relaunch (`relaunch` `exit(0)`s the caller, which here would kill the running
         // server). Once the restarted job reads both grants, it skips this branch and serves.
-        if !(glass_macos::accessibility_granted() && glass_macos::screen_recording_granted()) {
+        if matches!(glass_macos::private_session::configured(), Ok(false))
+            && !(glass_macos::accessibility_granted() && glass_macos::screen_recording_granted())
+        {
             let actions = ChecklistActions {
                 rows: crate::onboarding::grant_row_widgets(),
                 on_recheck: Box::new(|| {
@@ -99,7 +101,6 @@ mod macos {
             Err(e) => return Err(anyhow::anyhow!("binding {}: {e}", cfg.addr)),
         };
 
-        let trace_enabled = cfg.trace.is_some() && listener.is_some();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
@@ -152,7 +153,7 @@ mod macos {
         // LaunchAgent `kickstart -k`); their errors go loudly to stderr (the menu action
         // has no dialog surface), matching onboarding's best-effort osascript fallback.
         let endpoint_for_copy = endpoint;
-        let on_quit: Option<Box<dyn Fn()>> = trace_enabled.then(|| {
+        let on_quit: Option<Box<dyn Fn()>> = Some({
             Box::new(move || {
                 shutdown.cancel();
                 let _ = finished_rx
@@ -194,7 +195,7 @@ mod macos {
                         // Best-effort: a menu action has no further error surface, so log loudly to
                         // stderr rather than crash the action if bootout/plist-removal fails. On
                         // success this process is terminated as part of the uninstall.
-                        if let Err(e) = crate::setup::uninstall_launch_agent() {
+                        if let Err(e) = crate::run_uninstall() {
                             eprintln!("glass: menu 'Uninstall glass' failed: {e}");
                         }
                     }

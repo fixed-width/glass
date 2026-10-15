@@ -82,6 +82,12 @@ pub fn make_platform(
     #[cfg(target_os = "macos")] sim_registry: &glass_ios::SimulatorRegistry,
 ) -> Result<Backend> {
     #[cfg(target_os = "macos")]
+    if backend == "macos" && glass_macos::private_session::configured()? {
+        return remote_backend::backend(
+            macos_worker::backend_transport::NativeConnection::connect()?,
+        );
+    }
+    #[cfg(target_os = "macos")]
     if backend == "ios" {
         let platform = glass_ios::IosPlatform::from_env(sim_registry)?;
         // The accessibility tree needs idb_companion. When it's present, the reader opens
@@ -243,6 +249,7 @@ pub async fn run_update(
 /// the `.app` is a Finder action the user does by hand.
 #[cfg(target_os = "macos")]
 pub fn run_uninstall() -> anyhow::Result<()> {
+    macos_environment::uninstall()?;
     setup::uninstall_launch_agent()?;
     println!("glass no longer starts at login. To remove the app, drag GlassMcp.app to the Trash.");
     Ok(())
@@ -858,3 +865,19 @@ mod tests {
         }
     }
 }
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod backend_worker;
+#[cfg(target_os = "macos")]
+pub mod macos_worker;
+#[cfg(target_os = "macos")]
+pub mod native_backend;
+#[cfg(target_os = "macos")]
+mod permission_journal;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod remote_backend;
+#[cfg(target_os = "macos")]
+mod workspace_permissions;
+
+#[cfg(target_os = "macos")]
+pub mod macos_environment;

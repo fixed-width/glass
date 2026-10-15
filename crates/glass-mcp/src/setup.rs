@@ -251,6 +251,8 @@ pub(crate) fn launch_agent_plist_path(home: &str) -> std::path::PathBuf {
 /// be transposed at the call site without a field-name mismatch.
 #[derive(Debug, Clone)]
 pub struct SetupArgs {
+    /// Existing standard account used for private macOS application work.
+    pub account: Option<String>,
     /// Fail/assume-a-default instead of prompting (scripting/CI).
     pub non_interactive: bool,
     /// Force the `gui/<uid>` LaunchAgent (unattended `serve --http`) instead of asking.
@@ -270,6 +272,7 @@ pub struct SetupArgs {
 /// asking; `addr` overrides the LaunchAgent's HTTP bind address.
 pub fn run(args: SetupArgs) -> Result<()> {
     let SetupArgs {
+        account,
         non_interactive,
         launchagent,
         no_launchagent,
@@ -277,13 +280,31 @@ pub fn run(args: SetupArgs) -> Result<()> {
     } = args;
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (non_interactive, launchagent, no_launchagent, addr);
+        let _ = (account, non_interactive, launchagent, no_launchagent, addr);
         Err(glass_core::GlassError::Backend(
             "setup is macOS-only".into(),
         ))
     }
     #[cfg(target_os = "macos")]
     {
+        if let Some(account) = account.as_deref() {
+            let mode = match run_mode_from_flags(launchagent, no_launchagent) {
+                Some(mode) => mode,
+                None if non_interactive => RunMode::Stdio,
+                None => macos_impl::prompt_run_mode(),
+            };
+            return crate::macos_environment::setup(
+                account,
+                non_interactive,
+                mode == RunMode::Http,
+                addr.as_deref(),
+            )
+            .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
+        }
+        if glass_macos::private_session::configured()? {
+            return crate::macos_environment::verify()
+                .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
+        }
         // Step 1: preconditions. Resolve the running binary's own path — used for the
         // signing-identity warning right below, and later as both the LaunchAgent's
         // `ProgramArguments[0]` and the registration line's binary path.
@@ -1164,6 +1185,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn run_fails_fast_off_macos() {
         let err = run(SetupArgs {
+            account: None,
             non_interactive: false,
             launchagent: false,
             no_launchagent: false,

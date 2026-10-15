@@ -20,8 +20,13 @@ apps in the Simulator over `xcrun simctl`, with input and the accessibility tree
 including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
 The same input tools work across backends. Default Linux displays and mobile emulators keep input
-separate from your desktop; native Windows and macOS currently share it. `glass_capabilities` with
+separate from your desktop. Windows shares it; macOS adds a preview of separate-account setup for
+apps off your desktop, alongside its existing shared-desktop setup. `glass_capabilities` with
 `scope: "session"` reports click, scroll and text support and whether each can affect your desktop.
+
+The [macOS account setup](docs/how-to/setup-macos.md#apps-off-your-desktop-preview) reuses the normal
+MCP tools and permissions. It needs a real login in a separate standard account, retained between
+runs. Cold-boot login and operation without a monitor are not qualified.
 
 ## See it
 
@@ -128,8 +133,8 @@ thing you can add** when pointing an agent at glass.
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ the Simulator | ✓ Seatbelt |
-| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | – shared desktop |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | – shared desktop |
+| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
 
 Full matrix, per-capability detail, and system requirements:
 [docs/reference/platforms.md](docs/reference/platforms.md). Transport is MCP over stdio (default) or
