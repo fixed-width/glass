@@ -1690,4 +1690,111 @@ mod transport_tests {
             _ => panic!("wrong IO category"),
         }
     }
+
+    #[test]
+    fn serialized_custom_io_errors_preserve_each_supported_kind_and_message() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::NetworkDown,
+            ErrorKind::BrokenPipe,
+            ErrorKind::AlreadyExists,
+            ErrorKind::WouldBlock,
+            ErrorKind::NotADirectory,
+            ErrorKind::IsADirectory,
+            ErrorKind::DirectoryNotEmpty,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+            ErrorKind::WriteZero,
+            ErrorKind::StorageFull,
+            ErrorKind::NotSeekable,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::FileTooLarge,
+            ErrorKind::ResourceBusy,
+            ErrorKind::ExecutableFileBusy,
+            ErrorKind::Deadlock,
+            ErrorKind::CrossesDevices,
+            ErrorKind::TooManyLinks,
+            ErrorKind::InvalidFilename,
+            ErrorKind::ArgumentListTooLong,
+            ErrorKind::Interrupted,
+            ErrorKind::Unsupported,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+        ] {
+            let message = "worker resource unavailable: Ω";
+            let error = GlassError::Io(std::io::Error::new(kind, message));
+            let wire = serde_json::to_value(&error).unwrap();
+            assert_eq!(wire["Io"]["kind"], format!("{kind:?}"));
+            let copy: GlassError = serde_json::from_value(wire)
+                .unwrap_or_else(|error| panic!("{kind:?} failed to deserialize: {error}"));
+            let GlassError::Io(copy) = copy else {
+                panic!("{kind:?} lost its IO category");
+            };
+            assert_eq!(
+                (copy.kind(), copy.raw_os_error(), copy.to_string()),
+                (kind, None, message.to_owned()),
+                "{kind:?} lost transport data"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_os_io_errors_preserve_errno_kind_and_platform_message() {
+        let original = std::io::Error::from_raw_os_error(13);
+        let expected = (
+            original.kind(),
+            original.raw_os_error(),
+            original.to_string(),
+        );
+        let wire = serde_json::to_vec(&GlassError::Io(original)).unwrap();
+        let copy: GlassError = serde_json::from_slice(&wire).unwrap();
+        let GlassError::Io(copy) = copy else {
+            panic!("OS error lost its IO category");
+        };
+        assert_eq!(
+            (copy.kind(), copy.raw_os_error(), copy.to_string()),
+            expected
+        );
+    }
+
+    #[test]
+    fn io_errno_remains_authoritative_when_the_named_kind_is_unrecognized() {
+        let wire = serde_json::json!({
+            "Io": {"errno": 13, "kind": "FutureKind", "message": "remote message"}
+        });
+        let copy: GlassError = serde_json::from_value(wire).unwrap();
+        let GlassError::Io(copy) = copy else {
+            panic!("OS error lost its IO category");
+        };
+        assert_eq!(copy.raw_os_error(), Some(13));
+    }
+
+    #[test]
+    fn custom_io_errors_with_unrecognized_kinds_are_rejected() {
+        let wire = serde_json::json!({
+            "Io": {"errno": null, "kind": "FutureKind", "message": "remote message"}
+        });
+        let error = serde_json::from_value::<GlassError>(wire).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported IO error kind: FutureKind"),
+            "{error}"
+        );
+    }
 }
