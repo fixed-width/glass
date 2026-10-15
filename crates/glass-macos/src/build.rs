@@ -108,10 +108,12 @@ pub(crate) fn run(spec: &AppSpec) -> Result<Vec<(Stream, String)>> {
         (Stream::Stderr, output(&stderr)),
     ];
     if !status.success() {
-        return Err(GlassError::AppNotStarted(format!(
-            "build command failed with status {status}\nstdout:\n{}\nstderr:\n{}",
-            output[0].1, output[1].1,
-        )));
+        let [(_, stdout), (_, stderr)] = output;
+        return Err(GlassError::BuildFailed {
+            status: status.to_string(),
+            stdout,
+            stderr,
+        });
     }
     Ok(output
         .into_iter()
@@ -181,7 +183,7 @@ mod tests {
         let mut launch = spec(directory.path());
         launch.build = Some("exit 23".into());
         assert!(
-            matches!(run(&launch), Err(GlassError::AppNotStarted(message)) if message.contains("23"))
+            matches!(run(&launch), Err(GlassError::BuildFailed { status, .. }) if status.contains("23"))
         );
     }
 
@@ -205,8 +207,12 @@ mod tests {
         let mut launch = spec(directory.path());
         launch.build = Some("printf 'compiler failure' >&2; exit 23".into());
         let error = run(&launch).unwrap_err();
-        assert!(error.to_string().contains("compiler failure"));
+        assert!(!error.to_string().contains("compiler failure"));
         assert!(error.to_string().contains("23"));
+        let GlassError::BuildFailed { stderr, .. } = error else {
+            panic!("build failure lost its diagnostic data");
+        };
+        assert_eq!(stderr, "compiler failure");
     }
 
     #[test]

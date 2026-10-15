@@ -163,8 +163,10 @@ leave occlusion unproven.
 capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem and
 process are contained at `default`/`strict`, and `strict` additionally blocks outbound network. Under
 containment the clipboard is isolated **and working** for an app not built with Apple's hardened
-runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. Display isolation (the
-app fully off your desktop) is planned. Details in
+runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. The opt-in
+[separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
+apps off your desktop using an existing initialized login. Physical concurrent input, cold-boot login
+and monitor-free operation remain unqualified. Containment details are in
 [explanation/containment.md](../explanation/containment.md).
 
 ## Status

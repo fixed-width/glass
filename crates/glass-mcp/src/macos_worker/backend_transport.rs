@@ -66,7 +66,8 @@ fn exit_and_cleanup(receipt: Result<()>, cleanup: Result<()>) -> Result<()> {
 pub(crate) struct NativeConnection {
     stream: UnixStream,
     lease: File,
-    prepare: NativePrepare,
+    prepare: Option<NativePrepare>,
+    established: bool,
     base: PathBuf,
     buffer: Vec<u8>,
     sequence: u64,
@@ -241,7 +242,43 @@ impl NativeConnection {
             )
             .map_err(error)?,
         ));
-        let journal_root = journal
+        let mut connection = Self {
+            stream,
+            lease,
+            prepare: None,
+            established: false,
+            base: PathBuf::new(),
+            buffer: Vec::new(),
+            sequence: 0,
+            clean_exit: false,
+            exit_received: false,
+            cleanup: CleanupPhase::default(),
+            receipt_failure: None,
+            poisoned: false,
+            journal,
+        };
+        let initialized = connection.initialize();
+        connection.finish_connect(initialized)
+    }
+
+    fn finish_connect(mut self, initialized: Result<()>) -> Result<Self> {
+        if let Err(primary) = initialized {
+            return match self.abort_connect(Deadline::from_millis(8000)) {
+                Ok(()) => Err(primary),
+                Err(cleanup) => Err(GlassError::cleanup_failed(
+                    "restoring failed private backend bootstrap",
+                    primary,
+                    cleanup,
+                )),
+            };
+        }
+        self.established = true;
+        Ok(self)
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let journal_root = self
+            .journal
             .lock()
             .map_err(|_| error("permission journal is poisoned"))?
             .protected_root()
@@ -251,63 +288,44 @@ impl NativeConnection {
             .ok_or_else(|| error("enrolled owner home unavailable"))?
             .canonicalize()
             .map_err(error)?;
-        let mut prepare = NativePrepare::for_backend(
-            glass_macos::private_session::worker_uid(),
-            bootstrap.cwd.clone(),
-            home,
-            bootstrap.env.get("PATH").cloned(),
-            vec![PathBuf::from(native::ROOT), journal_root],
-            journal.clone(),
-        )
-        .map_err(error)?;
-        let connected = (|| {
-            let deadline = Deadline::from_millis(10_000);
-            send(
-                &mut stream,
-                HELLO,
-                &serde_json::to_vec(&bootstrap).map_err(error)?,
-                deadline,
-                None,
-            )?;
-            let (kind, data) = receive(&mut stream, deadline, None)?;
-            if kind == FAILED {
-                return Err(error(
-                    serde_json::from_slice::<String>(&data).map_err(error)?,
-                ));
-            }
-            let admitted: Admission = serde_json::from_slice(&data).map_err(error)?;
-            if kind != ACCEPTED
-                || admitted.version != PROTOCOL
-                || !admitted.private_attachment_checked
-            {
-                return Err(error("private worker did not attest its attachment"));
-            }
-            Ok(stream)
-        })();
-        match connected {
-            Ok(stream) => Ok(Self {
-                stream,
-                lease,
-                prepare,
-                base: bootstrap.cwd,
-                buffer: Vec::new(),
-                sequence: 0,
-                clean_exit: false,
-                exit_received: false,
-                cleanup: CleanupPhase::default(),
-                receipt_failure: None,
-                poisoned: false,
-                journal,
-            }),
-            Err(primary) => {
-                prepare.restore().map_err(|cleanup| {
-                    error(format!(
-                        "{primary}; bootstrap permission cleanup: {cleanup}"
-                    ))
-                })?;
-                Err(primary)
-            }
+        self.prepare = Some(
+            NativePrepare::for_backend(
+                glass_macos::private_session::worker_uid(),
+                bootstrap.cwd.clone(),
+                home,
+                bootstrap.env.get("PATH").cloned(),
+                vec![PathBuf::from(native::ROOT), journal_root],
+                self.journal.clone(),
+            )
+            .map_err(error)?,
+        );
+        self.base = bootstrap.cwd.clone();
+        let deadline = Deadline::from_millis(10_000);
+        send(
+            &mut self.stream,
+            HELLO,
+            &serde_json::to_vec(&bootstrap).map_err(error)?,
+            deadline,
+            None,
+        )?;
+        let (kind, data) = receive(&mut self.stream, deadline, None)?;
+        if kind == FAILED {
+            return Err(error(
+                serde_json::from_slice::<String>(&data).map_err(error)?,
+            ));
         }
+        let admitted: Admission = serde_json::from_slice(&data).map_err(error)?;
+        if kind != ACCEPTED || admitted.version != PROTOCOL || !admitted.private_attachment_checked
+        {
+            return Err(error("private worker did not attest its attachment"));
+        }
+        Ok(())
+    }
+
+    fn abort_connect(&mut self, deadline: Deadline) -> Result<()> {
+        // EOF cancels both pre-HELLO setup and an in-flight native-backend spawn.
+        let _ = self.stream.shutdown(Shutdown::Both);
+        self.restore_permissions(deadline)
     }
 
     fn receipt(&mut self, bytes: &[u8]) -> Result<()> {
@@ -336,18 +354,23 @@ impl NativeConnection {
         let lease = &self.lease;
         self.cleanup.advance(
             || {
-                journal
+                let journal = journal
                     .lock()
-                    .map_err(|_| error("permission journal is poisoned"))?
-                    .wait_idle(deadline)
-                    .map_err(error)
+                    .map_err(|_| error("permission journal is poisoned"))?;
+                if !self.established {
+                    journal.wait_admission_exit(deadline).map_err(error)?;
+                }
+                journal.wait_idle(deadline).map_err(error)
             },
             || {
-                prepare.restore().map_err(|failure| {
-                    error(format!(
-                        "restoring backend workspace permissions: {failure:#}"
-                    ))
-                })
+                prepare
+                    .as_mut()
+                    .map_or(Ok(()), NativePrepare::restore)
+                    .map_err(|failure| {
+                        error(format!(
+                            "restoring backend workspace permissions: {failure:#}"
+                        ))
+                    })
             },
             || {
                 journal
@@ -377,6 +400,10 @@ impl Connection for NativeConnection {
                 .before_dispatch()
             })?);
         }
+        let prepare = self
+            .prepare
+            .as_mut()
+            .ok_or_else(|| error("private backend was not initialized").before_dispatch())?;
         match &mut operation {
             Operation::Configure(paths) => {
                 let root = self
@@ -388,7 +415,7 @@ impl Connection for NativeConnection {
                 if !paths.iter().any(|path| path.path == root) {
                     paths.push(glass_core::ProtectedHostPath::directory(root));
                 }
-                match self.prepare.protect(paths) {
+                match prepare.protect(paths) {
                     Ok(()) => {}
                     Err(PreparationError::Refused(refused)) => {
                         return Err(error(refused).before_dispatch());
@@ -399,7 +426,7 @@ impl Connection for NativeConnection {
                     }
                 }
             }
-            Operation::Start(spec) => match self.prepare.prepare_spec(spec) {
+            Operation::Start(spec) => match prepare.prepare_spec(spec) {
                 Ok(()) => {}
                 Err(PreparationError::Refused(refused)) => {
                     return Err(error(refused).before_dispatch());
@@ -516,9 +543,14 @@ impl Connection for NativeConnection {
 
 impl Drop for NativeConnection {
     fn drop(&mut self) {
-        if self.cleanup != CleanupPhase::Complete
-            && let Err(error) = self.close(Deadline::from_millis(1500))
-        {
+        let result = if self.cleanup == CleanupPhase::Complete {
+            Ok(())
+        } else if self.established {
+            self.close(Deadline::from_millis(1500))
+        } else {
+            self.abort_connect(Deadline::from_millis(1500))
+        };
+        if let Err(error) = result {
             eprintln!("glass: private worker/workspace cleanup unconfirmed: {error}");
         }
     }
@@ -527,6 +559,59 @@ impl Drop for NativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_construction_closes_even_an_empty_journal_and_releases_the_account_lease() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = crate::permission_journal::PermissionJournal::open(
+            root.path(),
+            u32::MAX,
+            "test-account".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let lease_file = tempfile::NamedTempFile::new().unwrap();
+        let lease = File::open(lease_file.path()).unwrap();
+        let observed_lease = File::open(lease_file.path()).unwrap();
+        fs4::FileExt::try_lock(&lease).unwrap();
+        assert!(fs4::FileExt::try_lock(&observed_lease).is_err());
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let connection = NativeConnection {
+            stream,
+            lease,
+            prepare: None,
+            established: false,
+            base: PathBuf::new(),
+            buffer: Vec::new(),
+            sequence: 0,
+            clean_exit: false,
+            exit_received: false,
+            cleanup: CleanupPhase::default(),
+            receipt_failure: None,
+            poisoned: false,
+            journal: Arc::new(Mutex::new(journal)),
+        };
+        let failed = connection.finish_connect(Err(error("native-backend spawn failed")));
+        assert!(
+            matches!(failed, Err(ref failure) if failure.to_string().contains("native-backend spawn failed"))
+        );
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        let events = std::fs::read_to_string(root.path().join("pending.jsonl")).unwrap();
+        assert!(events.lines().last().unwrap().contains("Closed"));
+        fs4::FileExt::try_lock(&observed_lease).unwrap();
+        let reopened = crate::permission_journal::PermissionJournal::open(
+            root.path(),
+            u32::MAX,
+            "test-account".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        drop(reopened);
+    }
 
     #[test]
     fn queued_exit_is_read_after_both_sides_close_their_input() {

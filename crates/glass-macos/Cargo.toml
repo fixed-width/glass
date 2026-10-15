@@ -265,6 +265,7 @@ glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json = "1"
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix.workspace = true

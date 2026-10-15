@@ -1379,6 +1379,7 @@ dependencies = [
  "plist",
  "rustix",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

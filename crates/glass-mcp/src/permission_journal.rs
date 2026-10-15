@@ -179,7 +179,6 @@ impl PermissionJournal {
         result.header.boot = Some(boot_identity()?);
         result.header.session = session;
         result.header.baseline = account_processes(worker)?;
-        result.admission = None;
         result.reset()?;
         Ok(result)
     }
@@ -356,6 +355,27 @@ impl PermissionJournal {
         &self.root
     }
 
+    /// A failed bootstrap must stop its broker before checking the child-process baseline.
+    pub(crate) fn wait_admission_exit(&self, deadline: Deadline) -> io::Result<()> {
+        while let Some(admission) = &self.admission {
+            if !account_processes(self.header.worker)?.contains(admission) {
+                return Ok(());
+            }
+            if deadline.has_passed() {
+                return Err(io::Error::other(
+                    "private bootstrap broker is still running; recovery deferred",
+                ));
+            }
+            std::thread::sleep(
+                deadline
+                    .remaining()
+                    .unwrap_or(Duration::from_millis(100))
+                    .min(Duration::from_millis(100)),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn wait_idle(&self, deadline: Deadline) -> io::Result<()> {
         let mut stable = 0;
         loop {
@@ -451,6 +471,30 @@ mod tests {
 
     fn journal(root: &Path) -> PermissionJournal {
         PermissionJournal::open(root, u32::MAX, "test-account".into(), None, None).unwrap()
+    }
+
+    #[test]
+    fn an_empty_journal_does_not_close_while_its_bootstrap_broker_can_spawn_work() {
+        let root = test_root();
+        let admission = glass_macos::private_session::current_process().unwrap();
+        let mut journal = PermissionJournal::open(
+            root.path(),
+            u32::MAX,
+            "test-account".into(),
+            None,
+            Some(admission),
+        )
+        .unwrap();
+        journal.header.worker = rustix::process::geteuid().as_raw();
+        assert!(journal.pending.is_empty());
+        assert!(
+            journal
+                .wait_admission_exit(Deadline::from_millis(5))
+                .is_err()
+        );
+        assert!(!journal.closed);
+        let events = std::fs::read_to_string(root.path().join("pending.jsonl")).unwrap();
+        assert!(!events.contains("Closed"));
     }
 
     #[test]

@@ -65,6 +65,14 @@ pub enum GlassError {
     #[error("app failed to start: {0}")]
     AppNotStarted(String),
 
+    /// A build failed; its output is application-controlled diagnostic data.
+    #[error("build command failed with status {status}")]
+    BuildFailed {
+        status: String,
+        stdout: String,
+        stderr: String,
+    },
+
     #[error("app exited (code {0:?})")]
     AppExited(Option<i32>),
 
@@ -1795,6 +1803,35 @@ mod transport_tests {
                 .to_string()
                 .contains("unsupported IO error kind: FutureKind"),
             "{error}"
+        );
+    }
+    #[test]
+    fn serialized_build_failure_preserves_diagnostics_without_trusting_their_display() {
+        let error = GlassError::cleanup_failed(
+            "start cleanup",
+            GlassError::BuildFailed {
+                status: "exit status: 23".into(),
+                stdout: "project stdout".into(),
+                stderr: "project stderr".into(),
+            }
+            .after_dispatch(),
+            GlassError::Backend("cleanup detail".into()),
+        );
+        let copy: GlassError =
+            serde_json::from_slice(&serde_json::to_vec(&error).unwrap()).unwrap();
+        assert!(copy.to_string().contains("exit status: 23"));
+        assert!(!copy.to_string().contains("project"));
+        let GlassError::BuildFailed {
+            status,
+            stdout,
+            stderr,
+        } = copy.cause()
+        else {
+            panic!("lost build failure");
+        };
+        assert_eq!(
+            (status.as_str(), stdout.as_str(), stderr.as_str()),
+            ("exit status: 23", "project stdout", "project stderr")
         );
     }
 }

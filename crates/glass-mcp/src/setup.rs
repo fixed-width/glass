@@ -446,6 +446,33 @@ pub(crate) fn install_launch_agent(
     macos_impl::install_launch_agent(app_bin, addr)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_private_launch_agent(addr: &str) -> Result<()> {
+    macos_impl::verify_private_launch_agent(addr)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn loaded_agent_pid(output: &str) -> Option<u32> {
+    let mut depth = 0_usize;
+    let mut pid = None;
+    for line in output.lines().map(str::trim) {
+        if line == "}" {
+            depth = depth.checked_sub(1)?;
+        } else if depth == 1
+            && let Some(value) = line.strip_prefix("pid = ")
+        {
+            if pid.is_some() {
+                return None;
+            }
+            pid = Some(value.parse::<u32>().ok().filter(|&pid| pid != 0)?);
+        }
+        if line.ends_with(" = {") {
+            depth += 1;
+        }
+    }
+    if depth == 0 { pid } else { None }
+}
+
 /// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
 /// [`macos_impl::restart_launch_agent`] (see this module's doc). A fresh process re-reads TCC
 /// (the Screen Recording grant is cached per-process at launch), so the menu-bar app's
@@ -779,6 +806,38 @@ mod macos_impl {
             );
             println!("\n  \u{2717} {instruction}");
             Ok(Some(("LaunchAgent", instruction)))
+        }
+    }
+
+    pub(super) fn verify_private_launch_agent(addr: &str) -> Result<()> {
+        let target = super::launch_agent_target(self_uid());
+        let ready = poll_until(
+            || {
+                let Ok(job) = Command::new("/bin/launchctl")
+                    .args(["print", &target])
+                    .output()
+                else {
+                    return false;
+                };
+                if !job.status.success() {
+                    return false;
+                }
+                let Some(pid) = super::loaded_agent_pid(&String::from_utf8_lossy(&job.stdout))
+                else {
+                    return false;
+                };
+                super::fetch_health(addr).is_some_and(|health| health.private_account_ready(pid))
+            },
+            LIVENESS_POLL_INTERVAL,
+            LIVENESS_TIMEOUT,
+            || {},
+        );
+        if ready {
+            Ok(())
+        } else {
+            Err(GlassError::Backend(format!(
+                "the managed Glass HTTP server at {addr} did not confirm account routing; check for a port conflict and rerun setup --account ACCOUNT --launchagent"
+            )))
         }
     }
 
@@ -1177,6 +1236,26 @@ mod tests {
                        Authority=glass-mcp signing\n\
                        TeamIdentifier=not set\n";
         assert!(!codesign_report_is_unstable(report));
+    }
+
+    #[test]
+    fn managed_pid_is_read_only_from_the_loaded_job() {
+        assert_eq!(
+            loaded_agent_pid(
+                "gui/501/job = {\n state = running\n child = {\n pid = 9\n }\n pid = 42\n}\n"
+            ),
+            Some(42)
+        );
+        for invalid in [
+            "job = {\n child = {\n pid = 9\n }\n}",
+            "job = {\n pid = 0\n}",
+            "job = {\n pid = invalid\n}",
+            "job = {\n pid = 42\n pid = 43\n}",
+            "job = {\n pid = 42\n",
+            "pid = 42\n}",
+        ] {
+            assert_eq!(loaded_agent_pid(invalid), None, "{invalid}");
+        }
     }
 
     // --- run (non-macOS stub) -----------------------------------------------------------

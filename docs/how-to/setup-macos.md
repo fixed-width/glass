@@ -38,7 +38,9 @@ needed.
    run setup again to check readiness. Restoring access to a recreated worker socket may require
    administrator authentication; a connection refusal needs the recovery sequence below.
    Register the bundle binary with your stdio MCP client, or
-   use `--launchagent` instead for the existing HTTP/menu-bar integration.
+   use `--launchagent` instead for the existing HTTP/menu-bar integration. Setup reloads that
+   LaunchAgent from the current executable and verifies that its HTTP server uses the enrolled
+   account. An unrelated process using the address causes setup to fail; stop it and rerun setup.
 
 Routine launches and rebuilds require no account switching or extra display in your VNC view. If
 login, permissions or attachment are unavailable, the macOS backend refuses work; it does not launch

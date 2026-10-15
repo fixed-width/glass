@@ -195,16 +195,11 @@ impl NativePrepare {
         use std::os::unix::fs::MetadataExt;
         let path = literal.canonicalize()?;
         let metadata = path.metadata()?;
-        let recursive = access != Access::Search
-            && metadata.is_dir()
-            && path != self.home
-            && (metadata.uid() == self.owner || metadata.uid() == self.worker);
         anyhow::ensure!(
             !self
                 .protected
                 .iter()
-                .any(|protected| path.starts_with(protected)
-                    || (recursive && protected.starts_with(&path))),
+                .any(|protected| path.starts_with(protected)),
             "requested workspace overlaps protected Glass evidence or service state"
         );
         for ancestor in literal.ancestors().skip(1).chain(path.ancestors().skip(1)) {
@@ -214,13 +209,14 @@ impl NativePrepare {
             }
         }
         if metadata.uid() == self.owner || metadata.uid() == self.worker {
-            scope.path(
+            scope.path_excluding(
                 &path,
                 if path == self.home {
                     Access::Search
                 } else {
                     access
                 },
+                &self.protected,
             )?;
         }
         Ok(())
@@ -296,5 +292,43 @@ impl Prepare for NativePrepare {
                 }
             },
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trace_directory_below_the_requested_project_does_not_refuse_the_launch() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let project = root.path().join("project");
+        let trace = project.join(".traces");
+        std::fs::create_dir_all(&trace).unwrap();
+        std::fs::write(project.join("source"), "source").unwrap();
+        let mut prepare = NativePrepare {
+            owner: rustix::process::geteuid().as_raw(),
+            worker: u32::MAX,
+            base: project.canonicalize().unwrap(),
+            home: root.path().canonicalize().unwrap(),
+            inherited_path: None,
+            protected: vec![trace.canonicalize().unwrap()],
+            closed: false,
+            scopes: Vec::new(),
+            recorder: None,
+        };
+        let args =
+            serde_json::from_value(serde_json::json!({"run":["/usr/bin/true"], "a11y":false}))
+                .unwrap();
+        if let Err(failure) = prepare.prepare(&args) {
+            let error = match failure {
+                PreparationError::Refused(error) | PreparationError::CleanupUnconfirmed(error) => {
+                    error
+                }
+            };
+            panic!("workspace with nested trace root was refused: {error:#}");
+        }
+        prepare.restore().unwrap();
+        std::fs::write(project.join("source"), "owner can still edit").unwrap();
     }
 }

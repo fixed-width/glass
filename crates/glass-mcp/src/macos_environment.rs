@@ -538,13 +538,14 @@ pub fn setup(
     }
 
     let addr = addr.unwrap_or("127.0.0.1:7300");
-    if launchagent && crate::setup::fetch_health(addr).is_none() {
+    if launchagent {
         let exe = std::env::current_exe()?;
         if let Some((label, pending)) =
             crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
         {
             bail!("{label}: {pending}");
         }
+        crate::setup::verify_private_launch_agent(addr)?;
     }
     verify()
 }

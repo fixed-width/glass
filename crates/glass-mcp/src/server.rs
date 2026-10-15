@@ -544,7 +544,7 @@ impl GlassServer {
         Parameters(a): Parameters<StartArgs>,
     ) -> Result<CallToolResult, McpError> {
         crate::trace::start_arguments(&a);
-        self.run("glass_start", tool_effect("glass_start"), move |g| {
+        self.run_batch("glass_start", tool_effect("glass_start"), move |g| {
             tools::start(g, &a)
         })
         .await
@@ -1490,6 +1490,77 @@ mod tests {
             .expect("bounded tool result");
         assert_eq!(result.is_error, Some(true));
         assert!(first_text(&result).len() < 160);
+    }
+
+    #[tokio::test]
+    async fn failed_build_diagnostics_keep_their_trust_and_error_status_through_mcp() {
+        for size in [10, 20_000] {
+            let root = tempfile::tempdir().unwrap();
+            let store = ArtifactStore::for_test(root.path(), 64 * 1024 * 1024).unwrap();
+            let stdout = format!("project stdout {}", "x".repeat(size));
+            let expected_stdout = stdout.clone();
+            let glass = Glass::new(
+                Box::new(move |_| {
+                    Err(glass_core::GlassError::BuildFailed {
+                        status: "exit status: 23".into(),
+                        stdout: stdout.clone(),
+                        stderr: "project stderr".into(),
+                    }
+                    .after_dispatch())
+                }),
+                "fake".into(),
+                glass_core::BaselineStore::new(root.path().join("baselines")),
+                100,
+            );
+            let server = GlassServer::new_with_store(
+                glass,
+                crate::audit::report_from_config(None, |_| None),
+                store.clone(),
+            )
+            .unwrap();
+            let args =
+                serde_json::from_value(serde_json::json!({"run":["app"], "a11y":false})).unwrap();
+            let result = server.glass_start(Parameters(args)).await.unwrap();
+            assert_eq!(result.is_error, Some(true));
+            if size < 100 {
+                assert!(first_text(&result).contains("exit status: 23"));
+                assert!(!first_text(&result).contains("project"));
+                let diagnostic = &result.content[1].as_text().unwrap().text;
+                assert!(diagnostic.starts_with(crate::untrusted::NOTE));
+                assert!(diagnostic.contains(&expected_stdout));
+                assert!(diagnostic.contains("project stderr"));
+            } else {
+                let wire = serde_json::to_value(&result).unwrap();
+                let uri = wire["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|block| block.get("uri").and_then(serde_json::Value::as_str))
+                    .unwrap();
+                let diagnostic = store.read(uri).unwrap();
+                assert!(diagnostic.untrusted);
+                let manifest: serde_json::Value = serde_json::from_str(&diagnostic.text).unwrap();
+                assert_eq!(manifest["is_error"], true);
+                assert_eq!(manifest["blocks"][0]["trust"], "trusted");
+                let status = manifest["blocks"][0]["text"].as_str().unwrap();
+                assert!(status.contains("exit status: 23"));
+                assert!(!status.contains("project"));
+                assert_eq!(manifest["blocks"][1]["trust"], "untrusted_application");
+                let text = manifest["blocks"][1]["text"].as_str().unwrap();
+                assert!(text.starts_with(crate::untrusted::NOTE));
+                assert!(text.contains(&expected_stdout));
+                assert!(text.contains("project stderr"));
+                assert!(
+                    result
+                        .content
+                        .iter()
+                        .filter_map(|content| content.as_text())
+                        .map(|block| block.text.len())
+                        .sum::<usize>()
+                        <= crate::output_policy::MAX_TEXT_BYTES
+                );
+            }
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! different responsible process, cannot read the agent's grant from themselves, so they poll this.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthStatus {
     /// The server is up and answering. Always true from a live handler.
     pub ok: bool,
@@ -13,6 +13,12 @@ pub struct HealthStatus {
     /// This process's Accessibility grant (macOS). `None` off macOS.
     #[serde(default)]
     pub accessibility: Option<bool>,
+    /// PID of this responding server, used to verify its managed LaunchAgent.
+    #[serde(default)]
+    pub process_id: Option<u32>,
+    /// Whether this process routes macOS sessions through an enrolled account.
+    #[serde(default)]
+    pub macos_account: bool,
 }
 
 impl HealthStatus {
@@ -26,6 +32,11 @@ impl HealthStatus {
     pub fn grants_ready(&self) -> bool {
         self.screen_recording == Some(true) && self.accessibility == Some(true)
     }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub fn private_account_ready(&self, managed_pid: u32) -> bool {
+        self.ok && managed_pid != 0 && self.process_id == Some(managed_pid) && self.macos_account
+    }
 }
 
 /// Snapshot the running process's grant state.
@@ -33,11 +44,14 @@ impl HealthStatus {
 pub fn current_health() -> HealthStatus {
     #[cfg(target_os = "macos")]
     {
-        let shared = matches!(glass_macos::private_session::configured(), Ok(false));
+        let configured = glass_macos::private_session::configured();
+        let shared = matches!(configured, Ok(false));
         HealthStatus {
             ok: true,
             screen_recording: shared.then(glass_macos::screen_recording_granted),
             accessibility: shared.then(glass_macos::accessibility_granted),
+            process_id: Some(std::process::id()),
+            macos_account: matches!(configured, Ok(true)),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -46,6 +60,8 @@ pub fn current_health() -> HealthStatus {
             ok: true,
             screen_recording: None,
             accessibility: None,
+            process_id: Some(std::process::id()),
+            macos_account: false,
         }
     }
 }
@@ -60,6 +76,7 @@ mod tests {
             ok: true,
             screen_recording: Some(true),
             accessibility: Some(false),
+            ..Default::default()
         };
         let s = serde_json::to_string(&h).unwrap();
         assert!(s.contains("\"screen_recording\":true"));
@@ -75,7 +92,8 @@ mod tests {
             HealthStatus {
                 ok: true,
                 screen_recording: Some(true),
-                accessibility: Some(true)
+                accessibility: Some(true),
+                ..Default::default()
             }
             .grants_ready()
         );
@@ -83,7 +101,8 @@ mod tests {
             !HealthStatus {
                 ok: true,
                 screen_recording: Some(true),
-                accessibility: Some(false)
+                accessibility: Some(false),
+                ..Default::default()
             }
             .grants_ready()
         );
@@ -91,9 +110,42 @@ mod tests {
             !HealthStatus {
                 ok: true,
                 screen_recording: None,
-                accessibility: None
+                accessibility: None,
+                ..Default::default()
             }
             .grants_ready()
         );
+    }
+    #[test]
+    fn private_readiness_requires_the_managed_process_and_account_route() {
+        let ready = HealthStatus {
+            ok: true,
+            process_id: Some(42),
+            macos_account: true,
+            ..Default::default()
+        };
+        assert!(ready.private_account_ready(42));
+        assert!(!ready.private_account_ready(43));
+        assert!(!ready.private_account_ready(0));
+        assert!(!HealthStatus { ok: false, ..ready }.private_account_ready(42));
+        assert!(
+            !HealthStatus {
+                macos_account: false,
+                ..ready
+            }
+            .private_account_ready(42)
+        );
+        assert!(
+            !HealthStatus {
+                process_id: None,
+                ..ready
+            }
+            .private_account_ready(42)
+        );
+        let legacy: HealthStatus =
+            serde_json::from_str(r#"{"ok":true,"screen_recording":true,"accessibility":true}"#)
+                .unwrap();
+        assert!(legacy.grants_ready());
+        assert!(!legacy.private_account_ready(42));
     }
 }

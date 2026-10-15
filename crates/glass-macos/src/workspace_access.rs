@@ -1,6 +1,6 @@
 //! Scoped ACL additions for a private worker and normal-owner access to its outputs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::io;
@@ -23,6 +23,7 @@ const DIRECTORY_INHERIT: u32 = 1 << 6;
 const LIMIT_INHERIT: u32 = 1 << 7;
 const ONLY_INHERIT: u32 = 1 << 8;
 const READ: u32 = (1 << 1) | (1 << 7) | (1 << 9) | (1 << 11);
+const DELETE: u32 = 1 << 4;
 const WRITE: u32 = (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 10);
 const PERMISSIONS: &[u32] = &[
     1 << 1,
@@ -76,7 +77,7 @@ unsafe extern "C" {
     fn acl_init(count: c_int) -> *mut c_void;
     fn acl_free(value: *mut c_void) -> c_int;
     fn acl_get_entry(acl: *mut c_void, index: c_int, output: *mut *mut c_void) -> c_int;
-    fn acl_create_entry(acl: *mut *mut c_void, output: *mut *mut c_void) -> c_int;
+    fn acl_create_entry_np(acl: *mut *mut c_void, output: *mut *mut c_void, index: c_int) -> c_int;
     fn acl_delete_entry(acl: *mut c_void, entry: *mut c_void) -> c_int;
     fn acl_get_tag_type(entry: *mut c_void, output: *mut u32) -> c_int;
     fn acl_set_tag_type(entry: *mut c_void, kind: u32) -> c_int;
@@ -105,9 +106,18 @@ pub enum Access {
     ReadWrite,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum Tag {
+    #[default]
+    Allow,
+    Deny,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
+    #[serde(default)]
+    tag: Tag,
     principal: [u8; 16],
     permissions: u32,
     flags: u32,
@@ -172,10 +182,9 @@ pub fn require_owner_private(file: &File) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(code));
     }
     if file.metadata()?.uid() != owner
-        || Acl::read(file)?
-            .entries()?
-            .iter()
-            .any(|(_, entry)| entry.principal != principal && entry.permissions != 0)
+        || Acl::read(file)?.entries()?.iter().any(|(_, entry)| {
+            entry.tag == Tag::Allow && entry.principal != principal && entry.permissions != 0
+        })
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -191,10 +200,17 @@ impl PermissionChange {
     pub fn restore(&self, worker_uid: u32) -> io::Result<()> {
         let sharing = Sharing::new(worker_uid)?;
         if self.additions.is_empty()
-            || self.additions.iter().any(|entry| {
-                ![sharing.worker, sharing.owner].contains(&entry.principal)
-                    || entry.permissions & !(READ | WRITE | EXECUTE | WRITE_SECURITY) != 0
-                    || entry.flags & !(FILE_INHERIT | DIRECTORY_INHERIT) != 0
+            || self.additions.iter().any(|entry| match entry.tag {
+                Tag::Allow => {
+                    ![sharing.worker, sharing.owner].contains(&entry.principal)
+                        || entry.permissions & !(READ | WRITE | EXECUTE | WRITE_SECURITY) != 0
+                        || entry.flags & !(FILE_INHERIT | DIRECTORY_INHERIT) != 0
+                }
+                Tag::Deny => {
+                    entry.principal != sharing.worker
+                        || entry.permissions != DELETE
+                        || entry.flags != 0
+                }
             })
         {
             return Err(io::Error::new(
@@ -258,7 +274,11 @@ impl PermissionChange {
                 .filter(|(_, entry)| entry == owned)
                 .collect();
             if current.len() > baseline
-                && let Some((entry, _)) = current.last()
+                && let Some((entry, _)) = if owned.tag == Tag::Deny {
+                    current.first()
+                } else {
+                    current.last()
+                }
             {
                 // SAFETY: this descriptor belongs to the live ACL and is discarded after deletion.
                 check(unsafe { acl_delete_entry(acl.0.as_ptr(), *entry) })?;
@@ -274,7 +294,8 @@ impl PermissionChange {
 
 impl Entry {
     fn covers(&self, requested: &Self) -> bool {
-        self.principal == requested.principal
+        self.tag == requested.tag
+            && self.principal == requested.principal
             && self.permissions & requested.permissions == requested.permissions
             && self.flags & ONLY_INHERIT == 0
             && self.flags & requested.flags == requested.flags
@@ -326,7 +347,7 @@ impl Acl {
             let mut tag = 0;
             // SAFETY: entry belongs to this live ACL, and tag is writable storage.
             check(unsafe { acl_get_tag_type(entry, &mut tag) })?;
-            if tag == ALLOW {
+            if tag == ALLOW || tag == 2 {
                 // SAFETY: the API returns a caller-owned 16-byte membership UUID for this entry.
                 let qualifier = unsafe { acl_get_qualifier(entry) };
                 if qualifier.is_null() {
@@ -374,6 +395,7 @@ impl Acl {
                 result.push((
                     entry,
                     Entry {
+                        tag: if tag == ALLOW { Tag::Allow } else { Tag::Deny },
                         principal,
                         permissions: permission_mask,
                         flags: flag_mask,
@@ -385,17 +407,24 @@ impl Acl {
     }
 
     fn append(&mut self, value: &Entry) -> io::Result<()> {
+        self.insert(value, if value.tag == Tag::Deny { 0 } else { -2 })
+    }
+
+    fn insert(&mut self, value: &Entry, index: c_int) -> io::Result<()> {
         let mut pointer = self.0.as_ptr();
         let mut entry = std::ptr::null_mut();
         // SAFETY: the API may reallocate this owned ACL and fills a descriptor into its new storage.
-        let code = unsafe { acl_create_entry(&mut pointer, &mut entry) };
+        let code = unsafe { acl_create_entry_np(&mut pointer, &mut entry, index) };
         self.0 = NonNull::new(pointer).ok_or_else(io::Error::last_os_error)?;
         check(code)?;
         let mut permissions = std::ptr::null_mut();
         let mut flags = std::ptr::null_mut();
         // SAFETY: entry belongs to the owned ACL; UUID storage stays live during the copying setter.
         unsafe {
-            check(acl_set_tag_type(entry, ALLOW))?;
+            check(acl_set_tag_type(
+                entry,
+                if value.tag == Tag::Deny { 2 } else { ALLOW },
+            ))?;
             check(acl_set_qualifier(entry, value.principal.as_ptr().cast()))?;
             check(acl_get_permset(entry, &mut permissions))?;
             check(acl_get_flagset_np(entry, &mut flags))?;
@@ -435,6 +464,146 @@ impl Drop for Acl {
         unsafe {
             acl_free(self.0.as_ptr());
         }
+    }
+}
+
+fn children(file: &File, mut visit: impl FnMut(File) -> io::Result<()>) -> io::Result<()> {
+    for entry in descriptor_capacity(|| Ok(Dir::read_from(file)?))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        if !matches!(
+            entry.file_type(),
+            FileType::RegularFile | FileType::Directory | FileType::Unknown
+        ) {
+            continue;
+        }
+        let opened = match descriptor_capacity(|| {
+            Ok(openat(
+                file,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?)
+        }) {
+            Ok(file) => File::from(file),
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        visit(opened)?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Exclusions {
+    roots: BTreeSet<(u64, u64)>,
+    ancestors: BTreeSet<(u64, u64)>,
+    guards: BTreeSet<(u64, u64)>,
+    // Pin protected identities until the traversal has finished, including hard-link aliases.
+    files: Vec<File>,
+    bindings: Vec<(std::path::PathBuf, FileIdentity)>,
+}
+
+impl Exclusions {
+    fn new(paths: &[std::path::PathBuf], selected: &Path) -> io::Result<Self> {
+        let mut result = Self::default();
+        for path in paths {
+            let canonical = path.canonicalize()?;
+            for (index, path) in canonical.ancestors().enumerate() {
+                let file = File::from(descriptor_capacity(|| {
+                    Ok(open(
+                        path,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )?)
+                })?);
+                let metadata = file.metadata()?;
+                let identity = (metadata.dev(), metadata.ino());
+                if path.starts_with(selected)
+                    || (index == 0 && metadata.is_file() && metadata.nlink() > 1)
+                {
+                    result.guards.insert(identity);
+                }
+                if index == 0 {
+                    result.roots.insert(identity);
+                    result
+                        .bindings
+                        .push((canonical.clone(), FileIdentity::read(&file)?));
+                    if metadata.is_dir() {
+                        result.hard_links(&file)?;
+                    }
+                } else {
+                    result.ancestors.insert(identity);
+                }
+                result.files.push(file);
+            }
+        }
+        Ok(result)
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        for (path, identity) in &self.bindings {
+            let file = File::from(open(
+                path,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            if FileIdentity::read(&file)? != *identity {
+                return Err(io::Error::other(
+                    "protected path changed during workspace preparation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn hard_links(&mut self, directory: &File) -> io::Result<()> {
+        for entry in descriptor_capacity(|| Ok(Dir::read_from(directory)?))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let metadata =
+                match rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(metadata) => metadata,
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+            let kind = FileType::from_raw_mode(metadata.st_mode);
+            if kind != FileType::Directory
+                && !(kind == FileType::RegularFile && metadata.st_nlink > 1)
+            {
+                continue;
+            }
+            let file = File::from(descriptor_capacity(|| {
+                Ok(openat(
+                    directory,
+                    name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?)
+            })?);
+            let pinned = file.metadata()?;
+            if pinned.dev() != metadata.st_dev as u64 || pinned.ino() != metadata.st_ino {
+                return Err(io::Error::other(
+                    "protected evidence changed during hard-link inspection",
+                ));
+            }
+            if kind == FileType::Directory {
+                self.hard_links(&file)?;
+            } else {
+                self.roots.insert((pinned.dev(), pinned.ino()));
+                self.guards.insert((pinned.dev(), pinned.ino()));
+                self.files.push(file);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -503,7 +672,7 @@ impl Sharing {
                 Mode::empty(),
             )?)
         })?);
-        self.grant(file, Access::Search, false)
+        self.grant(file, Access::Search, false, &Exclusions::default())
     }
 
     /// Grant a selected tree, preserving hard-link identity and skipping outgoing symlinks.
@@ -519,13 +688,33 @@ impl Sharing {
                 Mode::empty(),
             )?)
         })?);
-        self.grant(file, access, true)
+        self.grant(file, access, true, &Exclusions::default())
     }
 
     /// Share an explicitly selected file or directory, resolving the selected root's symlink.
     /// Descendant symlinks are still skipped; search-only access requires a directory.
     pub fn path(&mut self, path: &Path, access: Access) -> io::Result<()> {
+        self.path_excluding(path, access, &[])
+    }
+
+    /// Share a selected path without granting access to protected trees or their hard-link aliases.
+    /// Journaled delete denials protect the evidence roots and their ancestors during the lease.
+    pub fn path_excluding(
+        &mut self,
+        path: &Path,
+        access: Access,
+        protected: &[std::path::PathBuf],
+    ) -> io::Result<()> {
         let canonical = path.canonicalize()?;
+        for protected in protected {
+            if canonical.starts_with(protected.canonicalize()?) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "selected path is protected Glass evidence or service state",
+                ));
+            }
+        }
+        let exclusions = Exclusions::new(protected, &canonical)?;
         let file = File::from(descriptor_capacity(|| {
             Ok(open(
                 &canonical,
@@ -542,19 +731,58 @@ impl Sharing {
                 "workspace access requires a regular file or directory",
             ));
         }
-        self.grant(file, access, access != Access::Search)
+        let identity = (metadata.dev(), metadata.ino());
+        if exclusions.roots.contains(&identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "selected path is protected Glass evidence or service state",
+            ));
+        }
+        let mut guarded = BTreeSet::new();
+        for protected in &exclusions.files {
+            let metadata = protected.metadata()?;
+            let identity = (metadata.dev(), metadata.ino());
+            if exclusions.guards.contains(&identity) && guarded.insert(identity) {
+                if metadata.uid() == self.worker_uid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "protected evidence and its workspace ancestors must be controlled by the normal owner",
+                    ));
+                }
+                self.add_entries(
+                    protected,
+                    vec![Entry {
+                        tag: Tag::Deny,
+                        principal: self.worker,
+                        permissions: DELETE,
+                        flags: 0,
+                    }],
+                )?;
+            }
+        }
+        exclusions.verify()?;
+        self.grant(file, access, access != Access::Search, &exclusions)?;
+        exclusions.verify()
     }
 
-    fn grant(&mut self, file: File, access: Access, recursive: bool) -> io::Result<()> {
+    fn grant(
+        &mut self,
+        file: File,
+        access: Access,
+        recursive: bool,
+        exclusions: &Exclusions,
+    ) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_dir() && !metadata.is_file() {
             return Ok(());
         }
         let identity = (metadata.dev(), metadata.ino());
+        let protected = exclusions.roots.contains(&identity);
         let directory = metadata.is_dir();
+        let ancestor = directory && exclusions.ancestors.contains(&identity);
         let mut rights = if access == Access::Search { 0 } else { READ };
         if access == Access::ReadWrite {
-            rights |= WRITE;
+            rights |= if ancestor { WRITE & !DELETE } else { WRITE };
         }
         if directory || metadata.mode() & 0o111 != 0 {
             rights |= EXECUTE;
@@ -574,29 +802,53 @@ impl Sharing {
         let worker_already_owns_access =
             metadata.uid() == self.worker_uid && metadata.mode() & required_mode == required_mode;
         let mut entries = Vec::new();
-        if !worker_already_owns_access {
+        if !protected && !worker_already_owns_access {
             entries.push(Entry {
+                tag: Tag::Allow,
                 principal: self.worker,
                 permissions: rights,
                 flags: inherited,
             });
         }
-        if directory && access == Access::ReadWrite {
+        if !protected && directory && access == Access::ReadWrite {
             entries.push(Entry {
+                tag: Tag::Allow,
                 principal: self.owner,
                 permissions: READ | WRITE | EXECUTE | WRITE_SECURITY,
                 flags: inherited,
             });
         }
-        let mut acl = Acl::read(&file)?;
+        self.add_entries(&file, entries)?;
+        if recursive && directory && !protected {
+            children(&file, |child| self.grant(child, access, true, exclusions))?;
+        }
+        Ok(())
+    }
+
+    fn add_entries(&mut self, file: &File, entries: Vec<Entry>) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        let mut acl = Acl::read(file)?;
         let existing = acl.entries()?;
         let additions: Vec<Entry> = entries
             .into_iter()
-            .filter(|entry| !existing.iter().any(|(_, current)| current.covers(entry)))
+            .filter(|entry| {
+                if entry.tag == Tag::Deny {
+                    !(self
+                        .nodes
+                        .get(&identity)
+                        .is_some_and(|node| node.owned.contains(entry))
+                        && existing
+                            .first()
+                            .is_some_and(|(_, current)| current == entry))
+                } else {
+                    !existing.iter().any(|(_, current)| current.covers(entry))
+                }
+            })
             .collect();
         if !additions.is_empty() {
             let change = PermissionChange {
-                identity: FileIdentity::read(&file)?,
+                identity: FileIdentity::read(file)?,
                 before: existing.iter().map(|(_, entry)| entry.clone()).collect(),
                 additions: additions.clone(),
             };
@@ -637,39 +889,7 @@ impl Sharing {
             for entry in &additions {
                 acl.append(entry)?;
             }
-            acl.write(&file)?;
-        }
-        if recursive && directory {
-            for entry in descriptor_capacity(|| Ok(Dir::read_from(&file)?))? {
-                let entry = entry?;
-                let name = entry.file_name();
-                if name.to_bytes() == b"." || name.to_bytes() == b".." {
-                    continue;
-                }
-                if !matches!(
-                    entry.file_type(),
-                    FileType::RegularFile | FileType::Directory | FileType::Unknown
-                ) {
-                    continue;
-                }
-                let opened = match descriptor_capacity(|| {
-                    Ok(openat(
-                        &file,
-                        name,
-                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    )?)
-                }) {
-                    Ok(file) => File::from(file),
-                    Err(error)
-                        if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                self.grant(opened, access, true)?;
-            }
+            acl.write(file)?;
         }
         Ok(())
     }
@@ -677,49 +897,56 @@ impl Sharing {
     /// Remove only this connection's additions from the current ACLs, retaining user edits.
     /// Errors keep unresolved entries owned by this object for an explicit retry or inspection.
     pub fn restore(&mut self) -> io::Result<()> {
-        let mut failure = None;
-        for node in self.nodes.values_mut() {
-            if node.owned.is_empty() {
-                continue;
+        // Keep evidence denials until every temporary allow has been removed.
+        for tag in [Tag::Allow, Tag::Deny] {
+            let mut failure = None;
+            for node in self.nodes.values_mut() {
+                if !node.owned.iter().any(|entry| entry.tag == tag) {
+                    continue;
+                }
+                let result = (|| {
+                    if let Some(recorder) = &self.recorder {
+                        for index in (0..node.records.len()).rev() {
+                            let (record, change) = &node.records[index];
+                            if !change.additions.iter().any(|entry| entry.tag == tag) {
+                                continue;
+                            }
+                            change.restore_file(&node.file)?;
+                            recorder
+                                .lock()
+                                .map_err(|_| io::Error::other("permission recorder is poisoned"))?
+                                .settled(*record)?;
+                            node.records.remove(index);
+                        }
+                    } else {
+                        let acl = Acl::read(&node.file)?;
+                        for owned in node.owned.iter().filter(|entry| entry.tag == tag) {
+                            let entries = acl.entries()?;
+                            let entry = if tag == Tag::Deny {
+                                entries.into_iter().find(|(_, entry)| entry == owned)
+                            } else {
+                                entries.into_iter().rev().find(|(_, entry)| entry == owned)
+                            };
+                            if let Some((entry, _)) = entry {
+                                // SAFETY: entry belongs to this live ACL and is discarded after deletion.
+                                check(unsafe { acl_delete_entry(acl.0.as_ptr(), entry) })?;
+                            }
+                        }
+                        acl.write(&node.file)?;
+                    }
+                    node.owned.retain(|entry| entry.tag != tag);
+                    Ok::<_, io::Error>(())
+                })();
+                if let Err(error) = result {
+                    failure = Some(error);
+                }
             }
-            let result = (|| {
-                if let Some(recorder) = &self.recorder {
-                    for (record, change) in node.records.iter().rev() {
-                        change.restore_file(&node.file)?;
-                        recorder
-                            .lock()
-                            .map_err(|_| io::Error::other("permission recorder is poisoned"))?
-                            .settled(*record)?;
-                    }
-                    node.records.clear();
-                    node.owned.clear();
-                    return Ok(());
-                }
-                let acl = Acl::read(&node.file)?;
-                for owned in &node.owned {
-                    let entry = acl
-                        .entries()?
-                        .into_iter()
-                        .rev()
-                        .find(|(_, entry)| entry == owned);
-                    if let Some((entry, _)) = entry {
-                        // SAFETY: entry is borrowed from this ACL and is discarded after deletion.
-                        check(unsafe { acl_delete_entry(acl.0.as_ptr(), entry) })?;
-                    }
-                }
-                acl.write(&node.file)?;
-                node.owned.clear();
-                Ok::<_, io::Error>(())
-            })();
-            if let Err(error) = result {
-                failure = Some(error);
+            self.nodes.retain(|_, node| !node.owned.is_empty());
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
-        self.nodes.retain(|_, node| !node.owned.is_empty());
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -759,6 +986,7 @@ mod tests {
         changes: Vec<PermissionChange>,
         settled: Vec<u64>,
         refuse: bool,
+        protected: Option<File>,
     }
 
     impl RecordChanges for Recorded {
@@ -774,10 +1002,43 @@ mod tests {
             if self.refuse {
                 return Err(io::Error::other("injected journal failure"));
             }
+            if let Some(protected) = &self.protected
+                && change.additions.iter().any(|entry| entry.tag == Tag::Allow)
+            {
+                assert!(
+                    entries(protected)
+                        .iter()
+                        .any(|entry| entry.tag == Tag::Deny && entry.permissions == DELETE),
+                    "evidence denial must precede every allow"
+                );
+            }
             self.changes.push(change.clone());
             Ok(self.changes.len() as u64)
         }
         fn settled(&mut self, id: u64) -> io::Result<()> {
+            if self.protected.is_some()
+                && self.changes[id as usize - 1]
+                    .additions
+                    .iter()
+                    .any(|entry| entry.tag == Tag::Deny)
+            {
+                for change in &self.changes {
+                    if let Some(file) = change.resolved_file()? {
+                        let current = entries(&file);
+                        for entry in change
+                            .additions
+                            .iter()
+                            .filter(|entry| entry.tag == Tag::Allow)
+                        {
+                            assert!(
+                                current.iter().filter(|value| *value == entry).count()
+                                    <= change.before.iter().filter(|value| *value == entry).count(),
+                                "all temporary allows must be removed before any denial"
+                            );
+                        }
+                    }
+                }
+            }
             self.settled.push(id);
             Ok(())
         }
@@ -826,6 +1087,7 @@ mod tests {
         sharing.path(&source, Access::Read).unwrap();
         let change = recorder.lock().unwrap().changes[0].clone();
         let edit = Entry {
+            tag: Tag::Allow,
             principal: sharing.owner,
             permissions: WRITE_SECURITY,
             flags: 0,
@@ -902,8 +1164,304 @@ mod tests {
     }
 
     #[test]
+    fn evidence_protection_precedes_allows_and_outlives_them_during_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join("nested/.traces");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::write(root.path().join("source"), "source").unwrap();
+        let recorder = Arc::new(Mutex::new(Recorded {
+            protected: Some(File::open(&evidence).unwrap()),
+            ..Default::default()
+        }));
+        let mut sharing = same_user_sharing();
+        sharing.recorder = Some(recorder.clone());
+        sharing
+            .path_excluding(root.path(), Access::ReadWrite, &[evidence])
+            .unwrap();
+        let changes = recorder.lock().unwrap().changes.clone();
+        let first_allow = changes
+            .iter()
+            .position(|change| change.additions.iter().any(|entry| entry.tag == Tag::Allow))
+            .unwrap();
+        assert!(
+            changes[..first_allow]
+                .iter()
+                .all(|change| change.additions.iter().all(|entry| entry.tag == Tag::Deny))
+        );
+        assert!(
+            changes[first_allow..]
+                .iter()
+                .all(|change| change.additions.iter().all(|entry| entry.tag == Tag::Allow))
+        );
+        sharing.restore().unwrap();
+        assert_eq!(recorder.lock().unwrap().settled.len(), changes.len());
+    }
+
+    #[test]
+    fn overlapping_project_shares_keep_one_guard_until_reverse_recovery_removes_the_allows() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join(".traces");
+        std::fs::create_dir(&evidence).unwrap();
+        let evidence_file = File::open(&evidence).unwrap();
+        let recorder = Arc::new(Mutex::new(Recorded::default()));
+        let mut sharing = same_user_sharing();
+        sharing.recorder = Some(recorder.clone());
+        sharing
+            .path_excluding(
+                root.path(),
+                Access::ReadWrite,
+                std::slice::from_ref(&evidence),
+            )
+            .unwrap();
+        let initial = recorder.lock().unwrap().changes.len();
+        sharing
+            .path_excluding(&root.path().join("."), Access::Read, &[evidence])
+            .unwrap();
+        assert_eq!(recorder.lock().unwrap().changes.len(), initial);
+        let changes = recorder.lock().unwrap().changes.clone();
+        for change in changes.iter().rev() {
+            if change.additions.iter().any(|entry| entry.tag == Tag::Allow) {
+                assert!(
+                    entries(&evidence_file)
+                        .iter()
+                        .any(|entry| entry.tag == Tag::Deny)
+                );
+            }
+            change
+                .restore_file(&change.resolved_file().unwrap().unwrap())
+                .unwrap();
+        }
+        sharing.restore().unwrap();
+    }
+
+    #[test]
+    fn owner_created_and_atomically_replaced_files_remain_shared_while_evidence_does_not_inherit() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join(".traces");
+        std::fs::create_dir(&evidence).unwrap();
+        let source = root.path().join("source");
+        std::fs::write(&source, "old").unwrap();
+        let mut sharing = same_user_sharing();
+        sharing.owner = [1; 16];
+        sharing
+            .path_excluding(
+                root.path(),
+                Access::ReadWrite,
+                std::slice::from_ref(&evidence),
+            )
+            .unwrap();
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, "new").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+        let current = File::open(&source).unwrap();
+        assert!(entries(&current).iter().any(|entry| entry.tag == Tag::Allow
+            && entry.principal == sharing.worker
+            && entry.permissions & READ != 0));
+        let secret = evidence.join("new-evidence");
+        std::fs::write(&secret, "private").unwrap();
+        assert!(
+            !entries(&File::open(secret).unwrap())
+                .iter()
+                .any(|entry| entry.tag == Tag::Allow && entry.principal == sharing.worker)
+        );
+        sharing.restore().unwrap();
+    }
+
+    #[test]
+    fn recorded_evidence_denials_recover_from_serialized_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join(".traces");
+        std::fs::create_dir(&evidence).unwrap();
+        let file = File::open(&evidence).unwrap();
+        let before = entries(&file);
+        let recorder = Arc::new(Mutex::new(Recorded::default()));
+        let mut sharing = same_user_sharing();
+        sharing.recorder = Some(recorder.clone());
+        sharing
+            .path_excluding(root.path(), Access::ReadWrite, &[evidence])
+            .unwrap();
+        let changes = recorder.lock().unwrap().changes.clone();
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.additions.iter().any(|entry| entry.tag == Tag::Deny))
+        );
+        for change in changes.iter().rev() {
+            let copy: PermissionChange =
+                serde_json::from_slice(&serde_json::to_vec(change).unwrap()).unwrap();
+            let resolved = copy.resolved_file().unwrap().unwrap();
+            copy.restore_file(&resolved).unwrap();
+            copy.restore_file(&resolved).unwrap();
+        }
+        sharing.restore().unwrap();
+        assert_eq!(entries(&file), before);
+        assert_eq!(recorder.lock().unwrap().settled.len(), changes.len());
+    }
+
+    #[test]
+    fn legacy_journal_entries_default_to_allow_without_losing_their_permissions() {
+        let entry: Entry = serde_json::from_value(serde_json::json!({
+            "principal": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1], "permissions": READ, "flags": FILE_INHERIT
+        })).unwrap();
+        assert_eq!(entry.tag, Tag::Allow);
+        assert_eq!(entry.permissions, READ);
+        assert_eq!(entry.flags, FILE_INHERIT);
+    }
+
+    #[test]
+    fn a_replaced_protected_path_is_not_accepted_as_the_pinned_evidence_root() {
+        let root = tempfile::tempdir().unwrap();
+        let protected = root.path().join("evidence");
+        std::fs::create_dir(&protected).unwrap();
+        let exclusions = Exclusions::new(std::slice::from_ref(&protected), root.path()).unwrap();
+        std::fs::rename(&protected, root.path().join("original-evidence")).unwrap();
+        std::fs::create_dir(&protected).unwrap();
+        assert!(exclusions.verify().is_err());
+    }
+
+    #[test]
+    fn excluded_evidence_and_its_ancestors_remain_in_place_while_outputs_are_writable() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let evidence = project.join("nested/.traces");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::write(evidence.join("secret"), "evidence").unwrap();
+        let source = project.join("source");
+        std::fs::write(&source, "source").unwrap();
+        let project_file = File::open(&project).unwrap();
+        let evidence_file = File::open(&evidence).unwrap();
+        let secret_file = File::open(evidence.join("secret")).unwrap();
+        let original = entries(&evidence_file);
+        let secret_original = entries(&secret_file);
+        let mut sharing = same_user_sharing();
+        // A distinct output-owner principal lets this test exercise worker ACLs as an ordinary user.
+        sharing.owner = [1; 16];
+        sharing
+            .path_excluding(&project, Access::ReadWrite, std::slice::from_ref(&evidence))
+            .unwrap();
+        assert_eq!(entries(&secret_file), secret_original);
+        assert_eq!(entries(&evidence_file)[0].tag, Tag::Deny);
+        assert_eq!(entries(&project_file)[0].permissions, DELETE);
+        assert!(std::fs::rename(&evidence, project.join("moved-evidence")).is_err());
+        assert!(std::fs::rename(&project, root.path().join("moved-project")).is_err());
+        assert!(std::fs::rename(project.join("nested"), project.join("moved-parent")).is_err());
+        std::fs::write(&source, "updated source").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        let output = project.join("output");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("new"), "build output").unwrap();
+        let output_file = File::open(&output).unwrap();
+        assert!(
+            entries(&output_file)
+                .iter()
+                .any(|entry| entry.tag == Tag::Allow
+                    && entry.principal == sharing.worker
+                    && entry.permissions & READ != 0)
+        );
+        assert!(entries(&output_file).iter().any(
+            |entry| entry.principal == sharing.owner && entry.permissions & WRITE_SECURITY != 0
+        ));
+        std::fs::remove_dir_all(&output).unwrap();
+        sharing.restore().unwrap();
+        assert_eq!(entries(&evidence_file), original);
+        std::fs::rename(&project, root.path().join("moved-project")).unwrap();
+    }
+
+    #[test]
+    fn protected_descendant_hardlinks_are_not_granted_through_workspace_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join(".traces");
+        std::fs::create_dir(&evidence).unwrap();
+        let secret = evidence.join("secret");
+        std::fs::write(&secret, "evidence").unwrap();
+        let alias = root.path().join("innocent-alias");
+        std::fs::hard_link(&secret, &alias).unwrap();
+        let secret_file = File::open(&secret).unwrap();
+        let before = entries(&secret_file);
+        let mut sharing = same_user_sharing();
+        sharing.owner = [1; 16];
+        sharing
+            .path_excluding(
+                root.path(),
+                Access::ReadWrite,
+                std::slice::from_ref(&evidence),
+            )
+            .unwrap();
+        let after = entries(&secret_file);
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(
+            after[0],
+            Entry {
+                tag: Tag::Deny,
+                principal: sharing.worker,
+                permissions: DELETE,
+                flags: 0
+            }
+        );
+        assert!(std::fs::remove_file(&alias).is_err());
+        sharing.restore().unwrap();
+        assert_eq!(entries(&secret_file), before);
+    }
+
+    #[test]
+    fn selecting_an_excluded_path_or_alias_refuses_before_any_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join(".traces");
+        std::fs::create_dir(&evidence).unwrap();
+        let secret = evidence.join("secret");
+        std::fs::write(&secret, "evidence").unwrap();
+        let alias = root.path().join("alias");
+        std::fs::hard_link(&secret, &alias).unwrap();
+        for (selected, protected) in [
+            (&evidence, &evidence),
+            (&secret, &evidence),
+            (&alias, &secret),
+        ] {
+            let mut sharing = same_user_sharing();
+            assert!(
+                sharing
+                    .path_excluding(selected, Access::ReadWrite, std::slice::from_ref(protected))
+                    .is_err()
+            );
+            assert!(sharing.nodes.is_empty());
+        }
+    }
+
+    #[test]
+    fn evidence_delete_denial_precedes_existing_allow_and_restores_its_original_order() {
+        let root = tempfile::tempdir().unwrap();
+        let evidence = root.path().join("evidence");
+        std::fs::create_dir(&evidence).unwrap();
+        let file = File::open(&evidence).unwrap();
+        let mut sharing = same_user_sharing();
+        let allow = Entry {
+            tag: Tag::Allow,
+            principal: sharing.worker,
+            permissions: DELETE,
+            flags: 0,
+        };
+        let deny = Entry {
+            tag: Tag::Deny,
+            ..allow.clone()
+        };
+        let mut acl = Acl::read(&file).unwrap();
+        acl.append(&allow).unwrap();
+        acl.insert(&deny, -2).unwrap();
+        acl.write(&file).unwrap();
+        let before = entries(&file);
+        sharing
+            .path_excluding(root.path(), Access::ReadWrite, &[evidence])
+            .unwrap();
+        assert_eq!(entries(&file)[0], deny);
+        sharing.restore().unwrap();
+        assert_eq!(entries(&file), before);
+    }
+
+    #[test]
     fn inherited_permissions_cover_access_without_rewriting_their_acl() {
         let requested = Entry {
+            tag: Tag::Allow,
             principal: [1; 16],
             permissions: READ | WRITE,
             flags: FILE_INHERIT | DIRECTORY_INHERIT,
@@ -959,6 +1517,7 @@ mod tests {
         let before = entries(&file);
         sharing.tree(root.path(), Access::ReadWrite).unwrap();
         let user_entry = Entry {
+            tag: Tag::Allow,
             principal: sharing.owner,
             permissions: 1 << 9,
             flags: 0,
