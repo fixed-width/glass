@@ -211,7 +211,6 @@ fn job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
         "SockPathName".into(),
         format!("{}/worker.sock", private_session::ROOT).into(),
     );
-    worker.insert("SockPathOwner".into(), account.owner_uid.into());
     worker.insert("SockPathMode".into(), 0o600.into());
     let mut sockets = plist::Dictionary::new();
     sockets.insert("Worker".into(), worker.into());
@@ -219,6 +218,54 @@ fn job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     plist::to_writer_xml(&mut bytes, &value)?;
     Ok(bytes)
+}
+
+fn normalize_socket(parent: &File, owner: u32, worker: u32) -> anyhow::Result<()> {
+    use rustix::fs::{AtFlags, FileType, chownat, statat};
+
+    let before = statat(parent, "worker.sock", AtFlags::SYMLINK_NOFOLLOW)?;
+    ensure!(
+        FileType::from_raw_mode(before.st_mode) == FileType::Socket
+            && before.st_nlink == 1
+            && before.st_mode & 0o777 == 0o600
+            && [0, owner, worker].contains(&before.st_uid),
+        "private worker socket has unexpected identity or permissions"
+    );
+    if before.st_uid != owner {
+        chownat(
+            parent,
+            "worker.sock",
+            Some(rustix::process::Uid::from_raw(owner)),
+            None,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+    }
+    let after = statat(parent, "worker.sock", AtFlags::SYMLINK_NOFOLLOW)?;
+    ensure!(
+        before.st_dev == after.st_dev
+            && before.st_ino == after.st_ino
+            && FileType::from_raw_mode(after.st_mode) == FileType::Socket
+            && after.st_uid == owner
+            && after.st_mode & 0o777 == 0o600,
+        "private worker socket changed while assigning owner access"
+    );
+    Ok(())
+}
+
+fn wait_for_socket(parent: &File, owner: u32, worker: u32) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match rustix::fs::statat(parent, "worker.sock", rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => return normalize_socket(parent, owner, worker),
+            Err(rustix::io::Errno::NOENT) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error)
+                    .context("launchd did not create the private worker activation socket");
+            }
+        }
+    }
 }
 
 fn create_file(parent: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -337,12 +384,12 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{LABEL}");
-    if !Command::new("/bin/launchctl")
+    let mut registered = Command::new("/bin/launchctl")
         .args(["print", &target])
         .output()?
         .status
-        .success()
-    {
+        .success();
+    if !registered {
         // A real login loads this persistent agent too; absence is a pending setup step.
         let result = Command::new("/bin/launchctl")
             .arg("bootstrap")
@@ -354,6 +401,11 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
                 "glass: registration saved; log into the selected account once to load its worker"
             );
         }
+        registered = result.status.success();
+    }
+    if registered {
+        // launchd cannot create this cross-account socket with an explicit foreign owner.
+        wait_for_socket(&root, account.owner_uid, account.uid)?;
     }
     match rustix::fs::unlinkat(&root, "disabled", rustix::fs::AtFlags::empty()) {
         Ok(()) => root.sync_all()?,
@@ -461,7 +513,7 @@ pub fn verify() -> anyhow::Result<()> {
     );
     let account = read_enrollment()?;
     let connection = crate::macos_worker::backend_transport::NativeConnection::connect()
-        .with_context(|| format!("account {} is enrolled; log into it, open GlassMcp.app for its permission checklist, then switch back without logging it out", account.name))?;
+        .with_context(|| format!("account {} is enrolled, but its private worker connection failed; run glass-mcp setup --account {} to check its registration", account.name, account.name))?;
     let mut backend = crate::remote_backend::backend(connection)?;
     let input = backend.platform.input_capabilities();
     backend.platform.stop_app_by(Deadline::from_millis(8000))?;
@@ -602,7 +654,7 @@ pub(crate) fn checks() -> Vec<glass_core::Check> {
             match crate::macos_worker::check_endpoint(account.owner_uid) {
                 Ok(()) => Check::new("worker endpoint", CheckStatus::Ok, "registered; readiness is checked without a desktop fallback at glass_start"),
                 Err(error) => Check::new("worker endpoint", CheckStatus::Fail, error.to_string())
-                    .with_remedy("log into the enrolled account, open GlassMcp.app for its permission checklist, then switch back without logging it out"),
+                    .with_remedy(format!("run glass-mcp setup --account {} to check registration and restore worker socket access", account.name)),
             },
         ],
         Ok(_) => vec![Check::new("private account", CheckStatus::Fail, "registration disabled or belongs to another owner")],
@@ -640,10 +692,71 @@ mod tests {
         assert_eq!(job["RunAtLoad"].as_boolean(), Some(false));
         let sockets = job["Sockets"].as_dictionary().unwrap();
         let socket = sockets["Worker"].as_dictionary().unwrap();
-        assert_eq!(socket["SockPathOwner"].as_unsigned_integer(), Some(501));
+        assert!(!socket.contains_key("SockPathOwner"));
         assert_eq!(socket["SockPathMode"].as_unsigned_integer(), Some(0o600));
         assert!(!job.contains_key("UserName"));
         assert!(!job.contains_key("EnvironmentVariables"));
+    }
+
+    fn socket_directory() -> (tempfile::TempDir, File, std::os::unix::net::UnixListener) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("worker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        (root, parent, listener)
+    }
+
+    #[test]
+    fn owner_socket_normalization_is_idempotent_and_preserves_its_inode() {
+        let (root, parent, _listener) = socket_directory();
+        let path = root.path().join("worker.sock");
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        normalize_socket(&parent, owner, owner + 1).unwrap();
+        normalize_socket(&parent, owner, owner + 1).unwrap();
+        let after = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(after.uid(), owner);
+        assert_eq!(after.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn socket_normalization_refuses_broader_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, parent, _listener) = socket_directory();
+        let path = root.path().join("worker.sock");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert!(normalize_socket(&parent, owner, owner + 1).is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o777,
+            0o666
+        );
+    }
+
+    #[test]
+    fn socket_normalization_leaves_a_regular_file_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("worker.sock");
+        std::fs::write(&path, b"unrelated").unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert!(normalize_socket(&parent, owner, owner + 1).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn socket_normalization_does_not_follow_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("unrelated");
+        std::fs::write(&target, b"preserved").unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("worker.sock")).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert!(normalize_socket(&parent, owner, owner + 1).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), b"preserved");
     }
 
     #[test]

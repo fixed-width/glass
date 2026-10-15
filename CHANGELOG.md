@@ -42,6 +42,8 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- macOS account setup now gives the normal account access to launchd's worker socket after creation, avoiding registrations that load successfully but cannot accept connections. Worker connection errors no longer incorrectly prescribe another privacy-permission visit.
+- macOS doctor retains its accessibility section for enrolled development accounts and explains that their reader is checked in the private worker.
 - macOS account setup now accepts protected directories with existing permission entries instead of mistaking the end of their ACL for an I/O error.
 - macOS build output is captured in application logs instead of reaching the MCP transport; build failures include bounded diagnostic output.
 - Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.

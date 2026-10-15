@@ -34,7 +34,9 @@ needed.
    Accept a requested restart. Switch back to your normal account **without logging the development
    account out**. Fast User Switching changes the account you are viewing while keeping both logged in.
 5. Run the same setup command again to verify readiness. A healthy existing registration is reused
-   without another administrator request. Register the bundle binary with your stdio MCP client, or
+   without another administrator request. After logging the development account out and back in,
+   run setup again; restoring access to its recreated worker socket may require administrator
+   authentication. Register the bundle binary with your stdio MCP client, or
    use `--launchagent` instead for the existing HTTP/menu-bar integration.
 
 Routine launches and rebuilds require no account switching or extra display in your VNC view. If
