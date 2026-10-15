@@ -43,6 +43,7 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 - macOS account setup now gives the normal account access to launchd's worker socket after creation, avoiding registrations that load successfully but cannot accept connections. Worker connection errors no longer incorrectly prescribe another privacy-permission visit.
+- Reenrolling a macOS development account clears its disabled registration before starting the worker, allowing it to create the socket setup waits for.
 - macOS doctor retains its accessibility section for enrolled development accounts and explains that their reader is checked in the private worker.
 - macOS account setup now accepts protected directories with existing permission entries instead of mistaking the end of their ACL for an I/O error.
 - macOS build output is captured in application logs instead of reaching the MCP transport; build failures include bounded diagnostic output.

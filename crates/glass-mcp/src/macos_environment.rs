@@ -268,6 +268,23 @@ fn wait_for_socket(parent: &File, owner: u32, worker: u32) -> anyhow::Result<()>
     }
 }
 
+fn enable_worker(
+    root: &File,
+    account: &Enrollment,
+    register: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    // The worker must pass enrollment checks before checking in to create its socket.
+    match rustix::fs::unlinkat(root, "disabled", rustix::fs::AtFlags::empty()) {
+        Ok(()) => root.sync_all()?,
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(error.into()),
+    }
+    if register()? {
+        wait_for_socket(root, account.owner_uid, account.uid)?;
+    }
+    Ok(())
+}
+
 fn create_file(parent: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let temporary = format!(".setup-{:032x}", rand::random::<u128>());
     let mut file = File::from(openat(
@@ -384,34 +401,28 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{LABEL}");
-    let mut registered = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .output()?
-        .status
-        .success();
-    if !registered {
-        // A real login loads this persistent agent too; absence is a pending setup step.
-        let result = Command::new("/bin/launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(account.home.join("Library/LaunchAgents").join(JOB))
-            .output()?;
-        if !result.status.success() {
-            eprintln!(
-                "glass: registration saved; log into the selected account once to load its worker"
-            );
+    enable_worker(&root, &account, || {
+        let mut registered = Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .output()?
+            .status
+            .success();
+        if !registered {
+            // A real login loads this persistent agent too; absence is a pending setup step.
+            let result = Command::new("/bin/launchctl")
+                .arg("bootstrap")
+                .arg(&domain)
+                .arg(account.home.join("Library/LaunchAgents").join(JOB))
+                .output()?;
+            if !result.status.success() {
+                eprintln!(
+                    "glass: registration saved; log into the selected account once to load its worker"
+                );
+            }
+            registered = result.status.success();
         }
-        registered = result.status.success();
-    }
-    if registered {
-        // launchd cannot create this cross-account socket with an explicit foreign owner.
-        wait_for_socket(&root, account.owner_uid, account.uid)?;
-    }
-    match rustix::fs::unlinkat(&root, "disabled", rustix::fs::AtFlags::empty()) {
-        Ok(()) => root.sync_all()?,
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(error) => return Err(error.into()),
-    }
+        Ok(registered)
+    })?;
     println!(
         "glass: enrolled {}; account, home and login credentials remain yours",
         account.name
@@ -706,6 +717,56 @@ mod tests {
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         let parent = File::open(root.path()).unwrap();
         (root, parent, listener)
+    }
+
+    #[test]
+    fn reenrollment_allows_worker_checkin_before_waiting_for_its_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let disabled = root.path().join("disabled");
+        std::fs::write(&disabled, b"Glass account registration removed\n").unwrap();
+        let mut account = account();
+        account.owner_uid = rustix::process::getuid().as_raw();
+        let socket = root.path().join("worker.sock");
+        let mut listener = None;
+        enable_worker(&parent, &account, || {
+            ensure!(
+                !disabled.try_exists()?,
+                "worker refuses disabled enrollment"
+            );
+            listener = Some(std::os::unix::net::UnixListener::bind(&socket)?);
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(socket).unwrap().uid(),
+            account.owner_uid
+        );
+    }
+
+    #[test]
+    fn reenrollment_without_an_aqua_login_keeps_registration_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = File::open(root.path()).unwrap();
+        std::fs::write(root.path().join("disabled"), b"removed").unwrap();
+        enable_worker(&parent, &account(), || Ok(false)).unwrap();
+        assert!(!root.path().join("worker.sock").exists());
+    }
+
+    #[test]
+    fn reenrollment_refuses_an_unremovable_marker_before_activating_a_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = File::open(root.path()).unwrap();
+        std::fs::create_dir(root.path().join("disabled")).unwrap();
+        let mut activated = false;
+        let result = enable_worker(&parent, &account(), || {
+            activated = true;
+            Ok(false)
+        });
+        assert!(result.is_err());
+        assert!(!activated);
     }
 
     #[test]
