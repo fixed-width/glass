@@ -220,17 +220,48 @@ fn job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn validate_socket(info: &rustix::fs::Stat, owner: u32, worker: u32) -> anyhow::Result<()> {
+    ensure!(
+        rustix::fs::FileType::from_raw_mode(info.st_mode) == rustix::fs::FileType::Socket
+            && info.st_nlink == 1
+            && info.st_mode & 0o777 == 0o600
+            && [0, owner, worker].contains(&info.st_uid),
+        "private worker socket has unexpected identity or permissions"
+    );
+    Ok(())
+}
+
+fn remove_socket(parent: &File, owner: u32, worker: u32) -> anyhow::Result<()> {
+    use rustix::fs::{AtFlags, statat, unlinkat};
+
+    let info = match statat(parent, "worker.sock", AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(info) => info,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    validate_socket(&info, owner, worker)?;
+    match unlinkat(parent, "worker.sock", AtFlags::empty()) {
+        Ok(()) => parent.sync_all()?,
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn unregister_worker(
+    parent: &File,
+    account: &Enrollment,
+    unregister: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    unregister()?;
+    remove_socket(parent, account.owner_uid, account.uid)
+}
+
 fn normalize_socket(parent: &File, owner: u32, worker: u32) -> anyhow::Result<()> {
     use rustix::fs::{AtFlags, FileType, chownat, statat};
 
     let before = statat(parent, "worker.sock", AtFlags::SYMLINK_NOFOLLOW)?;
-    ensure!(
-        FileType::from_raw_mode(before.st_mode) == FileType::Socket
-            && before.st_nlink == 1
-            && before.st_mode & 0o777 == 0o600
-            && [0, owner, worker].contains(&before.st_uid),
-        "private worker socket has unexpected identity or permissions"
-    );
+    validate_socket(&before, owner, worker)?;
     if before.st_uid != owner {
         chownat(
             parent,
@@ -408,6 +439,8 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
             .status
             .success();
         if !registered {
+            // launchd leaves its socket node behind when a registration is removed.
+            remove_socket(&root, account.owner_uid, account.uid)?;
             // A real login loads this persistent agent too; absence is a pending setup step.
             let result = Command::new("/bin/launchctl")
                 .arg("bootstrap")
@@ -578,10 +611,6 @@ pub fn uninstall() -> anyhow::Result<()> {
         account.owner_uid == rustix::process::getuid().as_raw(),
         "macOS account registration belongs to another owner"
     );
-    let root = directory(Path::new(private_session::ROOT), 0, false)?;
-    if same_file(&root, "disabled", b"Glass account registration removed\n")? {
-        return Ok(());
-    }
     let lease = File::open(Path::new(private_session::ROOT).join(ACCOUNT))?;
     fs4::FileExt::try_lock(&lease)
         .context("stop active Glass application work before uninstalling")?;
@@ -638,17 +667,19 @@ pub fn unenroll() -> anyhow::Result<()> {
         registered_file || !loaded,
         "worker job is loaded but its registered file is missing; refusing unbound cleanup"
     );
-    if loaded {
-        checked(Command::new("/bin/launchctl").args(["bootout", &target]))?;
+    // A failed cleanup must leave clients on the disabled private route.
+    if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
+        create_file(&root, "disabled", b"Glass account registration removed\n")?;
     }
+    unregister_worker(&root, &account, || {
+        if loaded {
+            checked(Command::new("/bin/launchctl").args(["bootout", &target]))?;
+        }
+        Ok(())
+    })?;
     if registered_file {
         rustix::fs::unlinkat(&agents, JOB, rustix::fs::AtFlags::empty())?;
         agents.sync_all()?;
-    }
-    // Keep enrollment plus an explicit disabled marker: removing enrollment must not
-    // silently turn existing clients into shared-desktop controllers.
-    if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
-        create_file(&root, "disabled", b"Glass account registration removed\n")?;
     }
     println!(
         "glass: worker registration removed; account {}, its home and permissions retained",
@@ -818,6 +849,86 @@ mod tests {
         let owner = rustix::process::getuid().as_raw();
         assert!(normalize_socket(&parent, owner, owner + 1).is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn removed_listener_socket_can_be_cleaned_before_registering_again() {
+        let (root, parent, listener) = socket_directory();
+        let path = root.path().join("worker.sock");
+        drop(listener);
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
+        let owner = rustix::process::getuid().as_raw();
+        remove_socket(&parent, owner, owner + 1).unwrap();
+        let _new_listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    }
+
+    #[test]
+    fn failed_unregistration_preserves_socket_for_cleanup_retry() {
+        let (root, parent, listener) = socket_directory();
+        let socket = root.path().join("worker.sock");
+        let mut account = account();
+        account.owner_uid = rustix::process::getuid().as_raw();
+        let error = unregister_worker(&parent, &account, || anyhow::bail!("bootout refused"));
+        assert!(error.is_err());
+        assert!(socket.exists());
+        unregister_worker(&parent, &account, || {
+            drop(listener);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn socket_removal_accepts_an_already_absent_node() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        remove_socket(&parent, owner, owner + 1).unwrap();
+    }
+
+    #[test]
+    fn socket_removal_preserves_a_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("worker.sock");
+        std::fs::write(&path, b"unrelated").unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert!(remove_socket(&parent, owner, owner + 1).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn socket_removal_does_not_follow_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("unrelated");
+        std::fs::write(&target, b"preserved").unwrap();
+        let path = root.path().join("worker.sock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert!(remove_socket(&parent, owner, owner + 1).is_err());
+        assert!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn socket_removal_preserves_unexpected_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, parent, _listener) = socket_directory();
+        let path = root.path().join("worker.sock");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let owner = rustix::process::getuid().as_raw();
+        assert!(remove_socket(&parent, owner, owner + 1).is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o777,
+            0o666
+        );
     }
 
     #[test]
