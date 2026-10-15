@@ -35,8 +35,9 @@ needed.
    account out**. Fast User Switching changes the account you are viewing while keeping both logged in.
 5. Run the same setup command again to verify readiness. A healthy existing registration is reused
    without another administrator request. After logging the development account out and back in,
-   run setup again; restoring access to its recreated worker socket may require administrator
-   authentication. Register the bundle binary with your stdio MCP client, or
+   run setup again to check readiness. Restoring access to a recreated worker socket may require
+   administrator authentication; a connection refusal needs the recovery sequence below.
+   Register the bundle binary with your stdio MCP client, or
    use `--launchagent` instead for the existing HTTP/menu-bar integration.
 
 Routine launches and rebuilds require no account switching or extra display in your VNC view. If
@@ -57,11 +58,39 @@ in the owning MCP client to stop its app, or quit that client's Glass process. T
 in person, switch to the selected account: Glass refuses further private input while it is the console
 account. Return to your normal account before resuming agent work.
 
-This is a preview. The underlying development loop and automated desktop coexistence have been
-exercised on Apple Silicon; the supported installer and account lifecycle still need native end-to-end
-qualification. Physical concurrent input, unattended cold-boot login and monitor-free operation are
-not qualified. Keep the account logged in; after a restart, log into it again. This does not change
-Windows's shared-desktop behavior.
+This is a preview. Setup, worker re-registration, and changed-build development loops through both
+stdio and HTTP have been exercised on Apple Silicon with an existing initialized login. Physical
+concurrent input, unattended cold-boot login and monitor-free operation are not qualified.
+Keep the account logged in; after a restart, log into it again. This does not change Windows's
+shared-desktop behavior.
+
+### Recover a refused worker connection
+
+If setup reports `Connection refused` after logging the development account out and back in or
+changing its registration, stop active Glass work and run this from your normal account:
+
+```bash
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp uninstall
+```
+
+This removes Glass's worker registration and old socket, along with its normal-account HTTP/menu-bar
+LaunchAgent. It retains the development account, home, privacy grants and app data. Register again
+using your previous integration. For stdio:
+
+```bash
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp setup --account glassdev --no-launchagent
+```
+
+For HTTP/menu-bar integration:
+
+```bash
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp setup --account glassdev --launchagent
+```
+
+Replace `glassdev` with the enrolled account's short name. If HTTP used a custom address, include
+the same `--addr` value. These registration changes request administrator authentication.
+This preview cannot repair a loaded registration with a stale socket by rerunning setup alone.
+Keep the development account logged in during ordinary work.
 
 ## Shared-desktop setup
 

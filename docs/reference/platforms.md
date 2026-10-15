@@ -24,8 +24,12 @@ separate desktop, but the native backend cannot attest isolation from the VM hos
 
 macOS also has [separate-account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview)
 in preview, using a retained real login in the same OS. It routes the normal tools to that account,
-with no shared-desktop fallback when enrollment is configured. Installer/lifecycle qualification,
-physical concurrent input, cold-boot login and operation without a monitor remain open.
+with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
+development loops have been exercised with an existing initialized login. Physical concurrent input,
+cold-boot login and operation without a monitor remain open.
+After logout/relogin, a loaded registration with a stale socket requires the documented
+[uninstall/setup recovery](../how-to/setup-macos.md#recover-a-refused-worker-connection);
+rerunning setup alone does not repair that state.
 
 For the actual active session, use `glass_capabilities` with `scope: "session"`: each input operation
 reports its support and `desktop_interference: "none" | "possible" | "unknown"`. `none` describes
