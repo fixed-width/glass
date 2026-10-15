@@ -306,8 +306,7 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
             .args(["--verify", "--strict"])
             .arg(crate::setup::app_bundle_path(&binary)),
     )?;
-    directory(&account.home, account.uid, false)
-        .context("log into the selected account once to initialize its home, then switch back without logging it out")?;
+    directory(&account.home, account.uid, false).context("validating the selected account home")?;
     let root = directory(Path::new(private_session::ROOT), 0, true)?;
     let agents = directory(
         &account.home.join("Library/LaunchAgents"),

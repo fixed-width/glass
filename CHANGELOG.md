@@ -42,6 +42,7 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- macOS account setup now accepts protected directories with existing permission entries instead of mistaking the end of their ACL for an I/O error.
 - macOS build output is captured in application logs instead of reaching the MCP transport; build failures include bounded diagnostic output.
 - Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.
 - Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.

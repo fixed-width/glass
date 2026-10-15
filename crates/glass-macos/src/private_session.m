@@ -184,7 +184,8 @@ int glass_private_writes_protected(int fd, uint32_t owner) {
         }
         if (result) break;
     }
-    if (!result && next != 1) result = EIO;
+    // Darwin reports EINVAL when iteration reaches the end of a valid ACL.
+    if (!result && (next != -1 || errno != EINVAL)) result = errno ? errno : EIO;
     acl_free(acl);
     return result;
 }

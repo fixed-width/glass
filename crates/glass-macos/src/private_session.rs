@@ -282,3 +282,86 @@ impl ProcessIdentity {
         self.pid == pid
     }
 }
+
+#[cfg(test)]
+mod protection_tests {
+    use super::require_write_protected;
+    use std::fs::File;
+    use std::process::Command;
+
+    struct Directory {
+        temporary: tempfile::TempDir,
+        file: File,
+    }
+
+    impl Directory {
+        fn new() -> Self {
+            let temporary = tempfile::tempdir().unwrap();
+            let file = File::open(temporary.path()).unwrap();
+            Self { temporary, file }
+        }
+
+        fn entry(&self, index: u32, value: &str) {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a#", &index.to_string(), value])
+                    .arg(self.temporary.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        fn check(&self) -> std::io::Result<()> {
+            require_write_protected(&self.file, rustix::process::getuid().as_raw())
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(self.temporary.path())
+                .status();
+        }
+    }
+
+    #[test]
+    fn an_absent_acl_is_protected() {
+        let directory = Directory::new();
+        directory.check().unwrap();
+    }
+
+    #[test]
+    fn a_deny_entry_is_not_an_io_error() {
+        let directory = Directory::new();
+        directory.entry(0, "everyone deny delete");
+        directory.check().unwrap();
+    }
+
+    #[test]
+    fn foreign_read_access_after_a_deny_entry_is_protected() {
+        let directory = Directory::new();
+        directory.entry(0, "everyone deny delete");
+        directory.entry(1, "everyone allow readattr,readsecurity");
+        directory.check().unwrap();
+    }
+
+    #[test]
+    fn an_owner_write_entry_is_protected() {
+        let directory = Directory::new();
+        let owner = Command::new("/usr/bin/id").arg("-un").output().unwrap();
+        assert!(owner.status.success());
+        let name = String::from_utf8(owner.stdout).unwrap();
+        directory.entry(0, &format!("user:{} allow write", name.trim()));
+        directory.check().unwrap();
+    }
+
+    #[test]
+    fn a_later_foreign_write_entry_is_refused() {
+        let directory = Directory::new();
+        directory.entry(0, "everyone deny delete");
+        directory.entry(1, "everyone allow write");
+        assert_eq!(directory.check().unwrap_err().raw_os_error(), Some(1));
+    }
+}
