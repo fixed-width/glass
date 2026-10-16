@@ -2,10 +2,10 @@
 
 macOS gates screen capture and input injection behind its privacy system (TCC), and the way those
 grants are recorded shapes how glass is packaged and run on the Mac. Understanding this model explains
-*why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary — and why, once
-set up, it never asks again.
+*why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
+compatible updates can retain existing grants.
 
-glass needs two one-time grants in the account where its backend runs:
+glass needs two grants in the account where its backend runs:
 
 - **Screen Recording** — to capture the screen.
 - **Accessibility** — to manage windows and inject input.
@@ -42,7 +42,7 @@ responsible process, so each permission request attributes to the app and the gr
 both are granted, the app installs its own LaunchAgent. Building from source, you reproduce the same
 steps by hand — establish a stable signing identity, sign the app, install it as a LaunchAgent, and
 enable it in the two Privacy panes. Either way, because the grants are keyed to a stable identity,
-rebuilding, moving the app, or restarting the LaunchAgent never re-prompts.
+compatible rebuilds and fresh launches can reuse the app's existing grants.
 
 The step-by-step for each path is in the setup and build guides:
 [how-to/setup-macos.md](../how-to/setup-macos.md) and
@@ -51,8 +51,14 @@ The step-by-step for each path is in the setup and build guides:
 ## A separate development account
 
 With `setup --account ACCOUNT`, the grant-bearing worker runs as a LaunchAgent in that account's
-real Aqua login. Grant Glass the same two permissions there using the existing checklist. The MCP
-server in your ordinary account continues handling tools, audit records, traces and other backends;
+real Aqua login. After enrollment, switch to that account and double-click `/Applications/GlassMcp.app`
+in Finder. Its **glass permissions** window has **Request…** buttons for Accessibility and Screen
+Recording. Enable Glass in the corresponding macOS privacy settings, accept a requested app restart,
+then switch back without logging the development account out. The
+[account setup guide](../how-to/setup-macos.md#apps-off-your-desktop-preview) gives the full sequence,
+including verification and MCP-client configuration.
+
+The MCP server in your ordinary account continues handling tools, audit records, traces and other backends;
 its own TCC snapshot does not describe the private worker's permissions. Setup checks the worker,
 and `glass_capabilities` with `scope: "session"` reports actual input support and interference.
 

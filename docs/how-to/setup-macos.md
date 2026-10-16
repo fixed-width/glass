@@ -1,6 +1,6 @@
 # Set up glass on macOS
 
-On macOS, install a **notarized `.dmg`**. Glass uses a real Aqua login and two one-time macOS privacy
+On macOS, install a **notarized `.dmg`**. Glass uses a real Aqua login and two macOS privacy
 grants. The existing shared-desktop setup is below; separate-account setup is available as a preview. (Contributors and anyone
 running an unreleased checkout build from source instead — see
 [build-from-source.md](build-from-source.md).)
@@ -13,35 +13,96 @@ selected account; Android and iOS continue through their existing backends. Use 
 `glass_start`, capture, accessibility, input, logs and `glass_stop` tools. No second MCP server is
 needed.
 
+If Glass already has an application running, stop it with `glass_stop` before enrolling an account.
+
 1. Install the signed `GlassMcp.app` in `/Applications`. Account setup requires Glass's hardened
    runtime signature; a source build with debugging or library-validation exceptions cannot serve
    as the private worker. This requirement applies to Glass, not your development applications.
-2. In **System Settings → Users & Groups**, create a standard account for development, or select
-   an existing standard account dedicated to that work. You own its password, home and app data;
-   Glass does not create or delete the account or store its password. Log into it once to finish
-   macOS's first-login setup, then switch back without logging it out.
-3. From Terminal in your normal account, run the following, replacing `glassdev` with its short name:
+2. In **System Settings → Users & Groups**, create a **Standard** account with account name
+   `glassdev`, or select an existing standard account dedicated to development. This preview accepts
+   short names of 1–64 ASCII letters, digits or underscores; use an accepted name in the commands below.
+   You own its password, home and app data; Glass does not create or delete the account or store its
+   password. Enable
+   [Fast User Switching](https://support.apple.com/guide/mac-help/mchlp2439/mac) if the user-switching
+   menu is not visible. Use that menu to log into the development account, finish macOS's first-login
+   setup, then return to your normal account while leaving the development account logged in.
+   Switching accounts keeps both sessions running; **Log Out** ends the selected account's session.
+3. In your normal account, open Terminal (**Finder → Go → Utilities → Terminal**) and run the
+   following, replacing `glassdev` with the development account's short name:
 
    ```bash
    /Applications/GlassMcp.app/Contents/MacOS/glass-mcp setup --account glassdev --no-launchagent
    ```
 
-   Administrator authentication registers only Glass's worker. A pending-login or missing-grant
-   error means registration is saved and the next step remains; it does not mean the account must
-   be recreated. Authentication and setup have no test timer.
-4. Log into the selected account, complete macOS's first-login setup, and open `/Applications/GlassMcp.app`.
-   Use the existing checklist to enable **Accessibility** and **Screen Recording** for Glass there.
-   Accept a requested restart. Switch back to your normal account **without logging the development
-   account out**. Fast User Switching changes the account you are viewing while keeping both logged in.
-5. Run the same setup command again to verify readiness. A healthy existing registration is reused
-   without another administrator request. Earlier preview registrations migrate to the per-user
-   layout during setup, with administrator authentication. After logging the development account out and back in,
-   run setup again to check readiness. Restoring access to a recreated worker socket may require
-   administrator authentication; a connection refusal needs the recovery sequence below.
-   Register the bundle binary with your stdio MCP client, or
-   use `--launchagent` instead for the existing HTTP/menu-bar integration. Setup reloads that
-   LaunchAgent from the current executable and verifies that its HTTP server uses the enrolled
-   account. An unrelated process using the address causes setup to fail; stop it and rerun setup.
+   This Terminal form requires your normal account to have `sudo` authorisation; enter that account's
+   password locally if asked. If your normal account cannot use `sudo`, use the macOS authorisation
+   dialogue instead by redirecting stdin, and have an administrator authenticate there:
+
+   ```bash
+   /Applications/GlassMcp.app/Contents/MacOS/glass-mcp setup --account glassdev --no-launchagent < /dev/null
+   ```
+
+   Run either form from the normal account that will use Glass. This registers Glass's worker in the
+   development account; `--no-launchagent` leaves the normal account's HTTP/menu-bar integration
+   unchanged. If setup reports that enrollment is saved but the account's login or privacy grants
+   are missing, continue with the permission steps below. Resolve other errors before proceeding.
+   There is no setup timer to meet.
+4. Use Fast User Switching to go to the development account. In **Finder → Applications**,
+   double-click **GlassMcp.app**. Open the app itself from Finder so macOS attributes its requests
+   to Glass. If a grant is missing, Glass opens a window titled **glass permissions**, with
+   **Accessibility** and **Screen Recording** rows, **Request…** buttons, and **Re-check** at the bottom.
+   A ✓ marks an existing grant; complete the next two steps only for missing permissions.
+5. If Accessibility is missing, click **Request…** beside **Accessibility**. In the macOS alert,
+   choose **Open System Settings**, or open System Settings yourself. Enable Glass under
+   **Privacy & Security → Accessibility**.
+   Authenticate with an administrator account if macOS asks. Apple's
+   [Accessibility instructions](https://support.apple.com/guide/mac-help/mh43185/mac) describe the
+   controls. Complete this permission before requesting the next one.
+6. If Screen Recording is missing, return to **glass permissions** and click **Request…** beside
+   **Screen Recording**. Follow the macOS prompt, or open System Settings yourself, and enable Glass
+   under **Privacy & Security → Screen Recording**. Newer macOS
+   versions call this pane **Screen & System Audio Recording**; see Apple's
+   [screen-recording instructions](https://support.apple.com/guide/mac-help/mchld6aa7d23/mac).
+   If Glass is missing from either permission list, use that list's **+** button to add
+   `/Applications/GlassMcp.app`, then enable it. These grants are for Glass in the development account.
+7. After enabling the missing permissions, choose **Quit & Reopen** if macOS offers it. If the Glass
+   window still shows a missing grant, click its **Re-check** button to relaunch Glass and read the grants
+   again. Reopen **GlassMcp.app** from Finder if needed. On that fresh launch, Glass closes the
+   permission flow when both grants are held; its window does not need to stay open. If both grants
+   were already present, no permission window is needed. The next step verifies readiness.
+8. Use Fast User Switching to return to your normal account, **leaving the development account
+   logged in**. In Terminal in your normal account, run the same command again:
+
+   ```bash
+   /Applications/GlassMcp.app/Contents/MacOS/glass-mcp setup --account glassdev --no-launchagent
+   ```
+
+   Use the `< /dev/null` form again if administrator authorisation must come from the macOS dialogue.
+   Success reports that the account is ready and apps use its private desktop. A healthy existing
+   registration is reused without another administrator request. Earlier preview registrations
+   migrate to the per-user layout with administrator authentication. A refused connection needs
+   the [worker recovery sequence](#recover-a-refused-worker-connection).
+9. In your normal account, configure your MCP client to launch
+   `/Applications/GlassMcp.app/Contents/MacOS/glass-mcp` over stdio. For clients using `mcpServers` JSON:
+
+   ```json
+   {
+     "mcpServers": {
+       "glass": {
+         "command": "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"
+       }
+     }
+   }
+   ```
+
+   See [Connect glass to your agent](connect-an-agent.md#over-stdio) for client-specific registration.
+   Restart an existing Glass MCP connection after enrollment. The agent can then build and launch
+   your application with the normal Glass tools while you stay in your normal account.
+
+For HTTP/menu-bar integration, use `--launchagent` instead of `--no-launchagent` in the setup commands
+and [connect the client over HTTP](connect-an-agent.md#over-http). Setup reloads that LaunchAgent from
+the current executable and verifies its enrolled route. An unrelated process using the address
+causes setup to fail; stop it and rerun setup. Keep the same `--addr` value when using a custom address.
 
 Routine launches and rebuilds require no account switching or extra display in your VNC view. If
 login, permissions or attachment are unavailable, the macOS backend refuses work; it does not launch
