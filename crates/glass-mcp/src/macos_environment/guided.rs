@@ -4,7 +4,76 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::*;
+use crate::macos_setup::pending::{self, Identity, Pending};
 use crate::macos_setup::{Coordinator, Decision, Phase, Progress};
+
+fn saved_root(create: bool) -> anyhow::Result<Option<File>> {
+    let path = crate::permission_journal::PermissionJournal::root()?;
+    if !create {
+        match std::fs::symlink_metadata(path.join(pending::FILE)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+    }
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let owner = rustix::process::getuid().as_raw();
+    ensure!(
+        owner >= 501 && rustix::process::geteuid().as_raw() == owner,
+        "open application setup from your normal account"
+    );
+    Ok(Some(crate::permission_journal::private_root(&path, owner)?))
+}
+
+pub(super) fn saved() -> anyhow::Result<Option<Pending>> {
+    let Some(root) = saved_root(false)? else {
+        return Ok(None);
+    };
+    pending::read(&root, rustix::process::getuid().as_raw())
+}
+
+pub(super) fn forget(id: &str) -> anyhow::Result<()> {
+    if let Some(root) = saved_root(false)? {
+        pending::forget(&root, rustix::process::getuid().as_raw(), id)?;
+    }
+    Ok(())
+}
+
+pub(super) fn forget_saved() -> anyhow::Result<()> {
+    if let Some(root) = saved_root(false)? {
+        pending::discard(&root, rustix::process::getuid().as_raw())?;
+    }
+    Ok(())
+}
+
+pub(super) fn can_resume(saved: &Pending) -> anyhow::Result<bool> {
+    if !private_session::is_owner() {
+        return Ok(false);
+    }
+    let account = read_enrollment()?;
+    if account.owner_uid != saved.owner || account.name != saved.name {
+        return Ok(false);
+    }
+    let created = if saved.identity.is_none() && saved.create {
+        account_creation::completed_identity(saved.owner, &saved.name)?
+    } else {
+        None
+    };
+    Ok(saved.may_resume(
+        account.owner_uid,
+        &account.name,
+        &Identity {
+            uid: account.uid,
+            uuid: account.record_uuid,
+        },
+        true,
+        created.as_ref(),
+    ))
+}
 
 #[derive(Debug)]
 pub(super) struct AccountCreationIncomplete;
@@ -17,7 +86,7 @@ impl std::fmt::Display for AccountCreationIncomplete {
 impl std::error::Error for AccountCreationIncomplete {}
 
 pub(super) fn phase() -> anyhow::Result<Phase> {
-    read_enrollment()?;
+    let account = read_enrollment()?;
     ensure!(
         private_session::is_owner(),
         "account registration is disabled or invalid"
@@ -30,14 +99,28 @@ pub(super) fn phase() -> anyhow::Result<Phase> {
     }
     if let Err(error) = std::fs::symlink_metadata(owner_root()?.join("worker.sock")) {
         if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(Phase::LoginRequired);
+            return Ok(unavailable_worker(
+                account.uid,
+                true,
+                "the worker activation socket is missing".into(),
+            ));
         }
         return Err(error.into());
     }
     match crate::macos_worker::backend_transport::readiness_with_lease(lease) {
         Ok(readiness) => Ok(readiness.phase()),
-        Err(error) => Ok(Phase::RepairRequired(error.to_string())),
+        Err(error) => Ok(unavailable_worker(account.uid, false, error.to_string())),
     }
+}
+
+fn unavailable_worker(uid: u32, socket_missing: bool, reason: String) -> Phase {
+    Phase::unavailable_worker(
+        socket_missing,
+        private_session::login_observation(uid)
+            .map(|login| login == private_session::LoginObservation::Complete)
+            .map_err(|error| error.to_string()),
+        reason,
+    )
 }
 
 pub(super) fn diagnostic_phase() -> anyhow::Result<Phase> {
@@ -64,6 +147,8 @@ pub(super) struct Options<'a> {
     pub addr: Option<&'a str>,
     pub system_dialog: bool,
     pub cancelled: &'a AtomicBool,
+    pub resume: Option<Pending>,
+    pub previous: Option<String>,
 }
 
 pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> anyhow::Result<()> {
@@ -76,23 +161,83 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
         addr,
         system_dialog,
         cancelled,
+        resume,
+        previous,
     } = options;
     progress(Progress::applying(
         "Checking account registration. Complete or cancel macOS authentication locally; take your time.",
     ));
-    if let Some(password) = create {
+    ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "setup cancelled; completed account data retained"
+    );
+    if let Some(saved) = &resume {
         ensure!(
-            !non_interactive,
-            "create an account interactively in Glass application setup"
+            saved.name == name
+                && (if create.is_some() {
+                    saved.create
+                } else {
+                    can_resume(saved)?
+                }),
+            "saved setup no longer matches an enabled enrollment; retained without re-enabling it"
         );
-        progress(Progress::applying(
-            "Creating the standard development account. Complete or cancel macOS authentication locally; take your time. Your password is not saved by Glass.",
-        ));
-        account_creation::create(name, &password, system_dialog)
-            .context(AccountCreationIncomplete)?;
-    } else {
-        register_setup(name, non_interactive, system_dialog)?;
+        if !self::saved()?.is_some_and(|current| current.id == saved.id) {
+            return Err(pending::Superseded.into());
+        }
     }
+    let identity = if create.is_some() {
+        account_creation::completed_identity(rustix::process::getuid().as_raw(), name)?
+    } else {
+        let account = account_record(name, rustix::process::getuid().as_raw(), false)?;
+        Some(Identity {
+            uid: account.uid,
+            uuid: account.record_uuid,
+        })
+    };
+    let saved = Pending::new(
+        rustix::process::getuid().as_raw(),
+        name,
+        identity,
+        create.is_some(),
+        launchagent,
+        addr.unwrap_or("127.0.0.1:7300"),
+    )?;
+    let root = saved_root(true)?.context("saved setup storage is unavailable")?;
+    pending::remember(
+        &root,
+        &saved,
+        resume
+            .as_ref()
+            .map(|saved| saved.id.as_str())
+            .or(previous.as_deref()),
+    )?;
+    let mut checkpoint = Progress::applying(
+        "Setup progress saved. Complete or cancel macOS authentication locally; take your time.",
+    );
+    checkpoint.pending_id = Some(saved.id.clone());
+    progress(checkpoint);
+    let remembered = saved.id;
+    ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "setup cancelled; completed account data retained"
+    );
+    let registered = (|| -> anyhow::Result<()> {
+        if let Some(password) = create {
+            ensure!(
+                !non_interactive,
+                "create an account interactively in Glass application setup"
+            );
+            progress(Progress::applying(
+                "Creating the standard development account. Complete or cancel macOS authentication locally; take your time. Your password is not saved by Glass.",
+            ));
+            account_creation::create(name, &password, system_dialog)
+                .context(AccountCreationIncomplete)?;
+        } else if resume.is_none() {
+            register_setup(name, non_interactive, system_dialog)?;
+        }
+        Ok(())
+    })();
+    registered?;
     let mut coordinator = Coordinator::new(!non_interactive);
     let mut previous = None;
     loop {
@@ -111,7 +256,12 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
                 progress(Progress::applying(
                     "Verifying workspace recovery and MCP integration…",
                 ));
+                ensure!(
+                    !cancelled.load(Ordering::Relaxed),
+                    "setup cancelled; completed registration and grants retained"
+                );
                 finish_setup(launchagent, addr)?;
+                forget(&remembered)?;
                 progress(Progress::waiting(Phase::Ready.message(name)));
                 return Ok(());
             }
@@ -120,21 +270,45 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
                     !cancelled_now,
                     "setup cancelled; completed registration and grants retained"
                 );
+                ensure!(
+                    current != Phase::WorkerStarting,
+                    "the development account is logged in, but Glass's worker did not create its activation socket after registration repair; completed account data and grants were retained"
+                );
                 bail!("{}", current.message(name));
             }
             Decision::OpenPermissions => {
+                progress(Progress::applying(
+                    "Opening the Glass permission window in the development account…",
+                ));
+                ensure!(
+                    !cancelled.load(Ordering::Relaxed),
+                    "setup cancelled; completed registration and grants retained"
+                );
                 // The helper is registered and parented by launchd in the development login.
                 crate::macos_worker::backend_transport::open_onboarding()?;
+                progress(Progress::waiting(
+                    "Permission window requested. Checking the development account…",
+                ));
+                previous = None;
             }
             Decision::Repair => {
                 progress(Progress::applying(
                     "Repairing the registered worker. Complete or cancel macOS authentication locally; take your time.",
                 ));
+                ensure!(
+                    !cancelled.load(Ordering::Relaxed),
+                    "setup cancelled; completed registration and grants retained"
+                );
                 elevate_using(
                     &["macos-enroll", name, "--onboarding", "--repair"],
                     false,
                     system_dialog,
                 )?;
+                coordinator.repair_completed();
+                progress(Progress::waiting(
+                    "Worker registration checked. Waiting for the development account's worker…",
+                ));
+                previous = None;
             }
             Decision::Wait => {}
         }

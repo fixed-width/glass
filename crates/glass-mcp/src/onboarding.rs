@@ -22,6 +22,9 @@ use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
 pub fn run(addr: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
+        if !matches!(crate::macos_environment::has_pending_setup(), Ok(false)) {
+            return crate::macos_environment::show_setup(addr);
+        }
         if !matches!(glass_macos::private_session::configured(), Ok(false)) {
             return crate::macos_environment::show_setup(addr);
         }

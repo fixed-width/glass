@@ -49,7 +49,9 @@ Stop any current Glass application with `glass_stop` before changing its environ
    and verifies the actual worker's readiness before reporting **Ready**. Registration repair may
    request administrator authentication. A failed repair stops with its cause and retains completed
    registration and grants; **Set up** retries the outstanding work. **Cancel setup** stops waiting and
-   retains completed setup steps. While native registration, repair or disable is in progress, finish
+   retains completed setup steps. If the account is already logged in but its worker is missing,
+   Glass checks startup and attempts one registration repair before reporting the failure. Time
+   spent approving administrator authentication does not count against worker startup. While native registration, repair or disable is in progress, finish
    or cancel the macOS authentication dialogue before closing Glass; its cleanup completes as one step.
 6. Connect the agent to the normal Glass endpoint, normally `http://127.0.0.1:7300/`; see
    [Connect glass to your agent](connect-an-agent.md#over-http). Existing menu-bar integration keeps
@@ -114,6 +116,14 @@ record whose identity Glass saved before creation. Supply the original chosen pa
 already set. Glass keeps created accounts and homes after a failure; it refuses a different account,
 changed identity or preexisting home instead of overwriting them. A deleted completed account is not
 recreated from its old receipt; select a new name or an existing account.
+If Glass exits during setup, reopening the app or its menu-bar server opens the same setup window.
+For the same enabled enrollment, Glass continues worker and permission checks automatically with
+the saved integration and address. An unfinished account creation reopens the secure password
+dialog for the same account; enter the original chosen password. Glass stores only setup metadata,
+never that password. Missing, disabled or changed enrollment pauses for explicit action instead
+of being enabled automatically. Closing or cancelling setup clears its pending request while
+retaining accounts, files and grants; **Disable isolation** also clears that request.
+
 Reopening setup restores the creating user's last saved name and progress. If a rejected attempt only
 reserved a name belonging to a different existing account, **Set up** can retire that user's unused
 reservation after administrator authentication without changing the existing account or its password.
@@ -320,6 +330,13 @@ Keep other Glass setup, unenrollment and uninstall operations stopped during thi
            "$glass_enrollment_root/worker.requirement" "$glass_enrollment_root/disabled" &&
        sudo rm "$glass_enrollment_root/account.plist" &&
        /bin/sync
+   ```
+
+   Clear this normal user's pending setup request, if present, so reopening Glass does not offer
+   to continue it. This removes only setup metadata; keep the permission-recovery journal:
+
+   ```bash
+   rm -f "$HOME/Library/Application Support/glass/macos/permission-recovery/pending-setup.json"
    ```
 
    Leave `/Library/Application Support/Glass`, its `accounts` directory, lock files and other users'

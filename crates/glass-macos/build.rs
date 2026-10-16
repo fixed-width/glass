@@ -26,6 +26,7 @@ fn main() {
         "OpenDirectory",
         "ApplicationServices",
         "Security",
+        "SystemConfiguration",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }

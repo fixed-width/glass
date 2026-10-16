@@ -271,6 +271,77 @@ pub fn session_exists(session: u32, worker: u32) -> std::io::Result<bool> {
     }
 }
 
+/// Read-only login hints; these never establish worker identity, grants or readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginObservation {
+    NotObserved,
+    Incomplete,
+    Complete,
+}
+
+/// Inspect the dynamic store, requiring a complete owner login as a positive control.
+pub fn login_observation(worker: u32) -> std::io::Result<LoginObservation> {
+    unsafe extern "C" {
+        fn glass_private_login_observation(worker: u32) -> i32;
+    }
+    // SAFETY: the native helper reads session metadata and returns only a scalar classification.
+    match unsafe { glass_private_login_observation(worker) } {
+        0 => Ok(LoginObservation::NotObserved),
+        1 => Ok(LoginObservation::Incomplete),
+        2 => Ok(LoginObservation::Complete),
+        code => Err(std::io::Error::from_raw_os_error(-code)),
+    }
+}
+
+#[test]
+fn login_observation_rejects_incomplete_or_ambiguous_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("session-readonly-tests");
+    let mut compiler = std::process::Command::new("/usr/bin/clang");
+    compiler
+        .args(["-fobjc-arc", "-std=c11", "-DGLASS_PRIVATE_SESSION_TEST"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/private_session.m"))
+        .args(["-lbsm", "-o"])
+        .arg(&executable);
+    for framework in [
+        "Foundation",
+        "OpenDirectory",
+        "ApplicationServices",
+        "Security",
+        "SystemConfiguration",
+    ] {
+        compiler.args(["-framework", framework]);
+    }
+    let built = compiler.output().unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let checked = std::process::Command::new(executable).output().unwrap();
+    assert!(
+        checked.status.success(),
+        "native parser check returned {}: {}",
+        checked.status,
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("\"login_observation_cases\":8"));
+}
+
+#[test]
+#[ignore = "requires a normal GUI owner with an enrolled, logged-in development account; read-only"]
+fn login_observation_includes_a_background_development_login() {
+    assert!(is_owner());
+    assert_eq!(
+        login_observation(rustix::process::getuid().as_raw()).unwrap(),
+        LoginObservation::Complete
+    );
+    assert_eq!(
+        login_observation(worker_uid()).unwrap(),
+        LoginObservation::Complete
+    );
+}
+
 pub fn current_process() -> std::io::Result<ProcessIdentity> {
     account_processes(rustix::process::getuid().as_raw())?
         .into_iter()

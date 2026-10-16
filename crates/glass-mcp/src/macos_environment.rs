@@ -1154,6 +1154,8 @@ pub fn setup(
             addr,
             system_dialog: false,
             cancelled: &std::sync::atomic::AtomicBool::new(false),
+            resume: None,
+            previous: None,
         },
         |progress| println!("glass: {}", progress.message),
     )
@@ -1173,12 +1175,28 @@ pub(crate) fn resume_setup(
     setup(&name, non_interactive, launchagent, addr)
 }
 
+pub(crate) fn has_pending_setup() -> anyhow::Result<bool> {
+    guided::saved().map(|saved| saved.is_some())
+}
+
 /// The app and CLI use the same enrollment, consent and readiness coordinator.
 pub fn show_setup(addr: &str) -> anyhow::Result<()> {
-    use glass_macos::setup_window::{SetupActions, SetupProgress};
+    use glass_macos::setup_window::{ResumeCreation, SetupActions, SetupProgress};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+    };
+    let (saved, mut saved_error) = match guided::saved() {
+        Ok(saved) => (saved, None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
+    let automatic = match saved.as_ref().map(guided::can_resume).transpose() {
+        Ok(Some(true)) => saved.clone(),
+        Ok(_) => None,
+        Err(error) => {
+            saved_error = Some(format!("{error:#}"));
+            None
+        }
     };
     let existing = match owner_root().and_then(|root| root.try_exists().map_err(Into::into)) {
         Ok(true) => Some(read_enrollment()),
@@ -1190,10 +1208,32 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     } else {
         Ok(None)
     };
+    let resume_creation = if existing.is_none() && automatic.is_none() && saved_error.is_none() {
+        if let Some(saved) = &saved
+            && saved.create
+        {
+            match account_creation::completed_identity(saved.owner, &saved.name) {
+                Ok(None) => Some(ResumeCreation {
+                    name: saved.name.clone(),
+                    attempt: saved.id.clone(),
+                }),
+                Ok(Some(_)) => None,
+                Err(error) => {
+                    saved_error = Some(format!("{error:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let account = existing
         .as_ref()
         .and_then(|result| result.as_ref().ok())
         .map(|account| account.name.clone())
+        .or_else(|| saved.as_ref().map(|saved| saved.name.clone()))
         .or_else(|| {
             creation
                 .as_ref()
@@ -1206,6 +1246,24 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         format!(
             "Existing setup needs attention: {error:#}. Enter the development account name to check it. Glass will preserve unverified registration files."
         )
+    } else if let Some(error) = saved_error {
+        format!(
+            "Saved setup needs attention: {error}. Choose Set up or Create account… to begin a new explicit attempt; completed account data are retained."
+        )
+    } else if let Some(saved) = &saved
+        && automatic.is_none()
+    {
+        if resume_creation.is_some() {
+            format!(
+                "Account preparation for {} was interrupted. Enter the original chosen password in the secure dialog to continue; Glass did not save that password.",
+                saved.name
+            )
+        } else {
+            format!(
+                "Saved setup for {} is paused because its original enrollment is not enabled or no longer matches. Choose Set up to continue explicitly, or Close to cancel the saved setup. Accounts and files are retained.",
+                saved.name
+            )
+        }
     } else if let Err(error) = &creation {
         format!(
             "Saved account preparation needs attention: {error:#}. Existing records are retained."
@@ -1235,15 +1293,21 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         can_cancel: true,
     }));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let pending_id = Arc::new(Mutex::new(None::<String>));
     let begin_state = state.clone();
     let begin_cancelled = cancelled.clone();
+    let begin_pending = pending_id.clone();
+    let displayed_id = saved.as_ref().map(|saved| saved.id.clone());
     let addr = addr.to_owned();
     #[cfg(feature = "network")]
     let disable_addr = addr.clone();
     let disable_state = state.clone();
     let close_state = state.clone();
+    let close_cancelled = cancelled.clone();
     let begin = Arc::new(
-        move |name: String, create: Option<crate::macos_account::Password>| {
+        move |name: String,
+              create: Option<crate::macos_account::Password>,
+              resume: Option<crate::macos_setup::pending::Pending>| {
             let mut state = match begin_state.lock() {
                 Ok(state) => state,
                 Err(_) => return,
@@ -1253,25 +1317,45 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             }
             state.running = true;
             state.can_cancel = false;
+            let previous = begin_pending
+                .lock()
+                .ok()
+                .and_then(|id| id.clone())
+                .or_else(|| displayed_id.clone());
             state.message =
                 "Checking setup. Complete any macOS authentication locally; take your time.".into();
             drop(state);
             let state = begin_state.clone();
             let cancelled = begin_cancelled.clone();
-            let addr = addr.clone();
+            let pending_id = begin_pending.clone();
+            let addr = resume
+                .as_ref()
+                .map(|saved| saved.addr.clone())
+                .unwrap_or_else(|| addr.clone());
+            let launchagent = resume
+                .as_ref()
+                .map(|saved| saved.launchagent)
+                .unwrap_or(cfg!(feature = "network"));
             std::thread::spawn(move || {
                 let result = guided::run(
                     guided::Options {
                         name: &name,
                         create,
                         non_interactive: false,
-                        launchagent: cfg!(feature = "network"),
+                        launchagent,
                         addr: Some(&addr),
                         system_dialog: true,
                         cancelled: &cancelled,
+                        resume,
+                        previous,
                     },
                     |progress| {
                         if let Ok(mut state) = state.lock() {
+                            if let Some(id) = progress.pending_id
+                                && let Ok(mut pending) = pending_id.lock()
+                            {
+                                *pending = Some(id);
+                            }
                             state.message = progress.message;
                             state.can_cancel = progress.can_cancel;
                         }
@@ -1282,6 +1366,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.can_cancel = true;
                     state.message = match result {
                         Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
+                        Err(error) if error.is::<crate::macos_setup::pending::Superseded>() => "This saved setup was cancelled or replaced. This window did not restart it. Close this window; begin a new setup explicitly if needed.".into(),
                         Err(error) if error.is::<guided::AccountCreationIncomplete>() => format!("{error:#}. Completed account data and grants are retained. Choose Create account… with the same name and original chosen password to resume."),
                         Err(error) => format!("{error:#}. Completed registration and grants are retained. Fix the reported cause, then choose Set up."),
                     };
@@ -1291,12 +1376,47 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     );
     let create = begin.clone();
     let create_state = state.clone();
+    let create_saved = saved.clone();
+    let create_pending = pending_id.clone();
+    let resume_begin = begin.clone();
     let actions = SetupActions {
         account,
-        on_begin: Box::new(move |name| begin(name, None)),
+        resume_creation,
+        on_resume: automatic.map(|saved| {
+            Box::new(move || resume_begin(saved.name.clone(), None, Some(saved)))
+                as Box<dyn FnOnce()>
+        }),
+        on_begin: Box::new(move |name| begin(name, None, None)),
         on_create: Box::new(move |request| {
             match crate::macos_account::Password::from_text(request.password) {
-                Ok(password) => create(request.name, Some(password)),
+                Ok(password) => {
+                    let resume = (|| -> anyhow::Result<_> {
+                        let owned = create_pending
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("setup state is unavailable"))?
+                            .clone();
+                        let current = guided::saved()?;
+                        crate::macos_setup::pending::Pending::creation_retry(
+                            create_saved.as_ref(),
+                            owned.as_deref(),
+                            current.as_ref(),
+                            &request.name,
+                            request.previous_attempt.as_deref(),
+                        )
+                    })();
+                    let resume = match resume {
+                        Ok(resume) => resume,
+                        Err(error) => {
+                            if let Ok(mut state) = create_state.lock() {
+                                state.message = format!(
+                                    "{error:#}. Close this window and open setup again before starting another attempt."
+                                );
+                            }
+                            return;
+                        }
+                    };
+                    create(request.name, Some(password), resume);
+                }
                 Err(error) => {
                     if let Ok(mut state) = create_state.lock() {
                         state.message = error.to_string();
@@ -1349,12 +1469,32 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         can_close: Box::new(move || {
             close_state
                 .lock()
-                .map(|state| !state.running || state.can_cancel)
+                .map(|state| {
+                    let allowed = !state.running || state.can_cancel;
+                    if allowed {
+                        close_cancelled.store(true, Ordering::Relaxed);
+                    }
+                    allowed
+                })
                 .unwrap_or(true)
         }),
     };
     let result = glass_macos::setup_window::run_setup(actions).map_err(anyhow::Error::msg);
     cancelled.store(true, Ordering::Relaxed);
+    let owned_id = pending_id.lock().ok().and_then(|id| id.clone());
+    if let Some(id) = owned_id {
+        guided::forget(&id)?;
+    } else if let Some(saved) = saved {
+        match guided::environment_lease(crate::macos_setup::LeaseKind::Application) {
+            Ok(_setup) => guided::forget(&saved.id)?,
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<fs4::TryLockError>(),
+                    Some(fs4::TryLockError::WouldBlock)
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
     result
 }
 
@@ -1586,6 +1726,7 @@ pub fn leave_account(non_interactive: bool) -> anyhow::Result<()> {
 
 fn leave_account_using(non_interactive: bool, system_dialog: bool) -> anyhow::Result<()> {
     let _setup = guided::lock_setup()?;
+    guided::forget_saved()?;
     if !owner_root()?.try_exists()? {
         let owner = rustix::process::geteuid().as_raw();
         let retired = private_session::root_for(owner)

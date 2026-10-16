@@ -24,6 +24,8 @@ pub struct SetupProgress {
 
 pub struct SetupActions {
     pub account: String,
+    pub on_resume: Option<Box<dyn FnOnce()>>,
+    pub resume_creation: Option<ResumeCreation>,
     pub on_begin: Box<dyn Fn(String)>,
     pub on_disable: Box<dyn Fn()>,
     pub on_create: Box<dyn Fn(NewAccount)>,
@@ -34,13 +36,36 @@ pub struct SetupActions {
 pub struct NewAccount {
     pub name: String,
     pub password: Zeroizing<String>,
+    pub previous_attempt: Option<String>,
 }
 
-fn create_account_dialog(mtm: MainThreadMarker, default_name: &str) -> Option<NewAccount> {
+pub struct ResumeCreation {
+    pub name: String,
+    pub attempt: String,
+}
+
+fn create_account_dialog(
+    mtm: MainThreadMarker,
+    default_name: &str,
+    resume: Option<&ResumeCreation>,
+) -> Option<NewAccount> {
+    let resuming = resume.is_some();
     let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str("Create a development account"));
-    alert.setInformativeText(&NSString::from_str("Glass creates a standard macOS account. Choose its short name and password; you will use them for its first login. Glass does not save the password. The account and its files remain yours when isolation is disabled."));
-    alert.addButtonWithTitle(&NSString::from_str("Create account"));
+    alert.setMessageText(&NSString::from_str(if resuming {
+        "Continue development account setup"
+    } else {
+        "Create a development account"
+    }));
+    alert.setInformativeText(&NSString::from_str(if resuming {
+        "Enter the password you originally chose. Glass did not save it. Glass checks the retained account identity and completes unfinished preparation without resetting existing credentials."
+    } else {
+        "Glass creates a standard macOS account. Choose its short name and password; you will use them for its first login. Glass does not save the password. The account and its files remain yours when isolation is disabled."
+    }));
+    alert.addButtonWithTitle(&NSString::from_str(if resuming {
+        "Continue setup"
+    } else {
+        "Create account"
+    }));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 360.0, 118.0));
     let name = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(0.0, 82.0, 360.0, 26.0));
@@ -50,6 +75,7 @@ fn create_account_dialog(mtm: MainThreadMarker, default_name: &str) -> Option<Ne
     } else {
         default_name
     }));
+    name.setEnabled(!resuming);
     let password = NSSecureTextField::initWithFrame(
         NSSecureTextField::alloc(mtm),
         rect(0.0, 43.0, 360.0, 26.0),
@@ -85,6 +111,7 @@ fn create_account_dialog(mtm: MainThreadMarker, default_name: &str) -> Option<Ne
             break Some(NewAccount {
                 name,
                 password: password_text,
+                previous_attempt: resume.map(|saved| saved.attempt.clone()),
             });
         }
         alert.setInformativeText(&NSString::from_str("Start the name with an ASCII letter and use at most 64 letters, digits or underscores. Enter matching, nonempty passwords (at most 1024 UTF-8 bytes). macOS also checks this Mac's password policy."));
@@ -218,15 +245,27 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     );
     view.addSubview(&begin);
     let create_field = account.clone();
+    let resume_creation = actions.resume_creation;
+    let automatic_creation = resume_creation.is_some();
+    let create_action: Rc<dyn Fn() -> bool> = Rc::new(move || {
+        let name = create_field.stringValue().to_string();
+        if let Some(request) = create_account_dialog(
+            mtm,
+            &name,
+            resume_creation.as_ref().filter(|saved| saved.name == name),
+        ) {
+            create_field.setStringValue(&NSString::from_str(&request.name));
+            (actions.on_create)(request);
+            true
+        } else {
+            false
+        }
+    });
+    let click_create = create_action.clone();
     let create_target = ButtonTarget::new(
         mtm,
         Box::new(move || {
-            if let Some(request) =
-                create_account_dialog(mtm, &create_field.stringValue().to_string())
-            {
-                create_field.setStringValue(&NSString::from_str(&request.name));
-                (actions.on_create)(request);
-            }
+            click_create();
         }),
     );
     let create = button(
@@ -290,7 +329,17 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
-    app.runModalForWindow(&window);
+    let continue_setup = if let Some(resume) = actions.on_resume {
+        resume();
+        true
+    } else if automatic_creation {
+        create_action()
+    } else {
+        true
+    };
+    if continue_setup {
+        app.runModalForWindow(&window);
+    }
     window.orderOut(None);
     drop((
         timer,

@@ -109,6 +109,11 @@ Plain `setup` resumes an existing enrollment. The menu's **Application setup…*
 flow and provides disable. Active macOS application work blocks environment changes. Without an
 enrollment, setup retains the shared-desktop flow.
 
+An interrupted account setup saves its account and integration choices without credentials.
+Reopening Glass resumes checks only for the same enabled enrollment; incomplete account creation
+asks for the original chosen password again. Cancelling setup or running `unenroll` clears that
+pending request and retains completed account data and grants.
+
 - `--launchagent` — install the ordinary user's HTTP/menu-bar server.
 - `--no-launchagent` — use your MCP client's normal stdio server.
 - `--non-interactive` — require existing authorization and report pending steps without prompting.

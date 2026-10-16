@@ -367,6 +367,31 @@ pub(super) fn last_created(owner: u32) -> anyhow::Result<Option<Receipt>> {
     Ok(latest.map(|(_, receipt)| receipt))
 }
 
+pub(super) fn completed_identity(
+    owner: u32,
+    name: &str,
+) -> anyhow::Result<Option<crate::macos_setup::pending::Identity>> {
+    validate_name(name)?;
+    let path = Path::new(private_session::ROOT).join("account-creation");
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let root = directory(&path, 0, false)?;
+    let Some(bytes) = stored_file(&root, &format!("{name}.plist"))? else {
+        return Ok(None);
+    };
+    let receipt: Receipt = plist::from_bytes(&bytes)?;
+    receipt.validate(owner, name)?;
+    Ok(
+        (receipt.created && receipt.password_set).then_some(
+            crate::macos_setup::pending::Identity {
+                uid: receipt.uid,
+                uuid: receipt.uuid,
+            },
+        ),
+    )
+}
+
 fn uid_in_use(uid: u32) -> anyhow::Result<bool> {
     if !private_session::account_processes(uid)?.is_empty() {
         return Ok(true);

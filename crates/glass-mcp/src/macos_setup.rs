@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+pub(crate) mod pending;
+
 #[cfg(all(test, unix))]
 pub(crate) fn lock_at(root: &std::fs::File, owner: u32) -> anyhow::Result<Lease> {
     lock_for(root, owner, LeaseKind::Setup)
@@ -82,6 +85,7 @@ pub(crate) struct Readiness {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     LoginRequired,
+    WorkerStarting,
     PermissionsRequired {
         accessibility: bool,
         screen_recording: bool,
@@ -113,10 +117,28 @@ impl Readiness {
 }
 
 impl Phase {
+    pub(crate) fn unavailable_worker(
+        socket_missing: bool,
+        login_complete: Result<bool, String>,
+        reason: String,
+    ) -> Self {
+        match login_complete {
+            Ok(false) => Self::LoginRequired,
+            Ok(true) if socket_missing => Self::WorkerStarting,
+            Ok(true) => Self::RepairRequired(reason),
+            Err(error) => Self::RepairRequired(format!(
+                "{reason}; macOS login state could not be verified: {error}"
+            )),
+        }
+    }
+
     pub(crate) fn message(&self, account: &str) -> String {
         match self {
             Self::LoginRequired => format!(
                 "Log into {account} using Fast User Switching and finish macOS login. Glass will continue automatically. Keep this account logged in."
+            ),
+            Self::WorkerStarting => format!(
+                "{account} is logged in. Waiting for its Glass worker to start; registration will be checked automatically if it does not appear."
             ),
             Self::PermissionsRequired { accessibility, screen_recording, .. } => {
                 let permissions = match (accessibility, screen_recording) {
@@ -151,12 +173,14 @@ pub(crate) struct Coordinator {
     interactive: bool,
     permission_retried: bool,
     repaired: bool,
+    worker_wait: Option<std::time::Instant>,
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) struct Progress {
     pub message: String,
     pub can_cancel: bool,
+    pub pending_id: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -165,12 +189,14 @@ impl Progress {
         Self {
             message: message.into(),
             can_cancel: false,
+            pending_id: None,
         }
     }
     pub(crate) fn waiting(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             can_cancel: true,
+            pending_id: None,
         }
     }
 }
@@ -181,17 +207,40 @@ impl Coordinator {
             interactive,
             permission_retried: false,
             repaired: false,
+            worker_wait: None,
         }
     }
 
     pub(crate) fn next(&mut self, phase: &Phase, cancelled: bool) -> Decision {
+        self.next_at(phase, cancelled, std::time::Instant::now())
+    }
+
+    pub(crate) fn repair_completed(&mut self) {
+        self.worker_wait = None;
+    }
+
+    fn next_at(&mut self, phase: &Phase, cancelled: bool, now: std::time::Instant) -> Decision {
         if cancelled {
             return Decision::Stop;
+        }
+        if !matches!(phase, Phase::WorkerStarting) {
+            self.worker_wait = None;
         }
         match phase {
             Phase::Ready => Decision::Finish,
             Phase::Busy => Decision::Stop,
             _ if !self.interactive => Decision::Stop,
+            Phase::WorkerStarting => {
+                let started = self.worker_wait.get_or_insert(now);
+                if now.saturating_duration_since(*started) < std::time::Duration::from_secs(10) {
+                    Decision::Wait
+                } else if !self.repaired {
+                    self.repaired = true;
+                    Decision::Repair
+                } else {
+                    Decision::Stop
+                }
+            }
             Phase::PermissionsRequired {
                 helper_running: false,
                 ..
@@ -220,6 +269,109 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logged_in_account_with_a_missing_worker_is_not_told_to_log_in_again() {
+        let phase = Phase::unavailable_worker(true, Ok(true), "activation socket missing".into());
+        assert_eq!(phase, Phase::WorkerStarting);
+    }
+
+    #[test]
+    fn an_unknown_login_does_not_become_a_login_instruction_or_ready_claim() {
+        let phase = Phase::unavailable_worker(
+            true,
+            Err("unreadable session metadata".into()),
+            "activation socket missing".into(),
+        );
+        assert!(
+            matches!(phase, Phase::RepairRequired(reason) if reason.contains("unreadable session metadata"))
+        );
+    }
+
+    #[test]
+    fn a_failed_connection_after_logout_waits_for_login_without_repairing_registration() {
+        let mut setup = Coordinator::new(true);
+        let phase = Phase::unavailable_worker(false, Ok(false), "connection refused".into());
+        assert_eq!(setup.next(&phase, false), Decision::Wait);
+    }
+
+    #[test]
+    fn worker_startup_gets_a_grace_period_then_one_repair_and_a_bounded_failure() {
+        let mut setup = Coordinator::new(true);
+        let now = std::time::Instant::now();
+        assert_eq!(
+            setup.next_at(&Phase::WorkerStarting, false, now),
+            Decision::Wait
+        );
+        assert_eq!(
+            setup.next_at(
+                &Phase::WorkerStarting,
+                false,
+                now + std::time::Duration::from_secs(9)
+            ),
+            Decision::Wait
+        );
+        assert_eq!(
+            setup.next_at(
+                &Phase::WorkerStarting,
+                false,
+                now + std::time::Duration::from_secs(10)
+            ),
+            Decision::Repair
+        );
+        // Time spent authenticating the repair is outside the worker's startup budget.
+        setup.repair_completed();
+        assert_eq!(
+            setup.next_at(
+                &Phase::WorkerStarting,
+                false,
+                now + std::time::Duration::from_secs(3600)
+            ),
+            Decision::Wait
+        );
+        assert_eq!(
+            setup.next_at(
+                &Phase::WorkerStarting,
+                false,
+                now + std::time::Duration::from_secs(3609)
+            ),
+            Decision::Wait
+        );
+        assert_eq!(
+            setup.next_at(
+                &Phase::WorkerStarting,
+                false,
+                now + std::time::Duration::from_secs(3610)
+            ),
+            Decision::Stop
+        );
+    }
+
+    #[test]
+    fn login_and_consent_waits_do_not_inherit_the_machine_startup_deadline() {
+        let mut setup = Coordinator::new(true);
+        let now = std::time::Instant::now();
+        assert_eq!(
+            setup.next_at(&Phase::LoginRequired, false, now),
+            Decision::Wait
+        );
+        assert_eq!(
+            setup.next_at(
+                &Phase::LoginRequired,
+                false,
+                now + std::time::Duration::from_secs(3600)
+            ),
+            Decision::Wait
+        );
+        assert_eq!(
+            setup.next_at(
+                &Phase::WorkerStarting,
+                false,
+                now + std::time::Duration::from_secs(3601)
+            ),
+            Decision::Wait
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

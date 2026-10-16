@@ -4,6 +4,7 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <Security/AuthSession.h>
 #include <Security/Security.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <bsm/libbsm.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -129,6 +130,62 @@ static bool boolean(CFTypeRef v, bool *out) {
     *out = CFBooleanGetValue(v);
     return true;
 }
+
+static int login_observation(CFPropertyListRef value, uint32_t owner, uint32_t target) {
+    if (!value || CFGetTypeID(value) != CFDictionaryGetTypeID()) return -EPROTO;
+    CFTypeRef sessions = CFDictionaryGetValue(value, CFSTR("SessionInfo"));
+    if (!sessions || CFGetTypeID(sessions) != CFArrayGetTypeID()) return -EPROTO;
+    CFIndex count = CFArrayGetCount(sessions);
+    if (!count || count > 1024) return -EPROTO;
+    unsigned controls = 0, matches = 0;
+    bool completed = false;
+    for (CFIndex i = 0; i < count; i++) {
+        CFTypeRef session = CFArrayGetValueAtIndex(sessions, i);
+        if (!session || CFGetTypeID(session) != CFDictionaryGetTypeID()) return -EPROTO;
+        CFTypeRef number = item(session, CFSTR("kCGSSessionUserIDKey"), CFSTR("kCGSessionUserIDKey"));
+        int64_t uid = -1;
+        bool done = false;
+        if (!number || CFGetTypeID(number) != CFNumberGetTypeID() || CFNumberIsFloatType(number) ||
+            !CFNumberGetValue(number, kCFNumberSInt64Type, &uid) || uid < 0 || uid > UINT32_MAX ||
+            !boolean(item(session, CFSTR("kCGSessionLoginDoneKey"), CFSTR("kCGSSessionLoginDoneKey")), &done))
+            return -EPROTO;
+        if ((uint32_t)uid == owner && done) controls++;
+        if ((uint32_t)uid == target) { matches++; completed = done; }
+    }
+    if (controls != 1 || matches > 1) return -EAGAIN;
+    return matches ? (completed ? 2 : 1) : 0;
+}
+
+// A setup hint only; authenticated worker facts still decide whether Glass is ready.
+int glass_private_login_observation(uint32_t target) {
+    if (target < 501 || getuid() < 501 || getuid() != geteuid()) return -EINVAL;
+    SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("Glass account setup"), NULL, NULL);
+    if (!store) return -EIO;
+    CFPropertyListRef value = SCDynamicStoreCopyValue(store, CFSTR("State:/Users/ConsoleUser"));
+    int result = login_observation(value, getuid(), target);
+    if (value) CFRelease(value);
+    CFRelease(store);
+    return result;
+}
+
+#ifdef GLASS_PRIVATE_SESSION_TEST
+static int login_observation_test(void) {
+    @autoreleasepool {
+        NSDictionary *owner = @{@"kCGSSessionUserIDKey":@501, @"kCGSessionLoginDoneKey":@YES};
+        NSDictionary *complete = @{@"kCGSSessionUserIDKey":@502, @"kCGSessionLoginDoneKey":@YES};
+        NSDictionary *starting = @{@"kCGSSessionUserIDKey":@502, @"kCGSessionLoginDoneKey":@NO};
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[owner,complete]},501,502) != 2) return 1;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[owner,starting]},501,502) != 1) return 2;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[owner]},501,502) != 0) return 3;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[complete]},501,502) >= 0) return 4;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[owner,complete,complete]},501,502) >= 0) return 5;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[owner,@{}]},501,502) >= 0) return 6;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[]},501,502) >= 0) return 7;
+        if (login_observation((__bridge CFPropertyListRef)@{@"SessionInfo":@[owner,@{@"kCGSSessionUserIDKey":@502,@"kCGSessionLoginDoneKey":@1}]},501,502) >= 0) return 8;
+        return 0;
+    }
+}
+#endif
 
 static Context read_context(void) {
     Context c = {0};
@@ -379,7 +436,8 @@ int main(void) {
         integer(@4294967296LL, &n) || integer(@"1", &n) || !integer(@1, &n) || n != 1) return 6;
     if (!owner_bound(501, 501, 502) || owner_bound(503, 501, 502) ||
         !owner_bound(501, 0, 501) || owner_bound(502, 0, 501)) return 7;
-    puts("{\"completed\":true,\"context_refusal_cases\":11,\"integer_type_cases\":7,\"ssh_attachment_refused\":true,\"gui_started\":false}");
+    if (login_observation_test()) return 8;
+    puts("{\"completed\":true,\"context_refusal_cases\":11,\"integer_type_cases\":7,\"login_observation_cases\":8,\"ssh_attachment_refused\":true,\"gui_started\":false}");
     return 0;
 }
 #endif
