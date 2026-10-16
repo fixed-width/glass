@@ -706,6 +706,12 @@ fn publish_registration(parent: &File, name: &str, staged: &str) -> anyhow::Resu
     Ok(())
 }
 
+fn registration_permissions(root: &File) -> anyhow::Result<()> {
+    rustix::fs::fchmod(root, Mode::from_raw_mode(0o755))?;
+    root.sync_all()?;
+    Ok(())
+}
+
 fn stage_registration(
     parent: &File,
     owner: &str,
@@ -720,7 +726,7 @@ fn stage_registration(
         Mode::empty(),
     )?);
     let prepared = prepare(&root).and_then(|()| {
-        root.sync_all()?;
+        registration_permissions(&root)?;
         publish_registration(parent, owner, &staged)
     });
     if let Err(primary) = prepared {
@@ -748,6 +754,7 @@ fn prepare_registration(
                 && same_file(&root, "worker.requirement", requirement)?,
             "existing account registration is incomplete"
         );
+        registration_permissions(&root)?;
         return Ok(root);
     }
     let parent = directory(
@@ -1268,6 +1275,40 @@ mod tests {
         assert!(result.is_err());
         assert!(!registry.path().join("501").exists());
         assert_eq!(std::fs::read_dir(registry.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn published_registration_remains_readable_after_restrictive_creation() {
+        let registry = tempfile::tempdir().unwrap();
+        let parent = File::open(registry.path()).unwrap();
+        let root = stage_registration(&parent, "501", |root| {
+            // A caller with umask 077 creates the staging directory this way.
+            rustix::fs::fchmod(root, Mode::from_raw_mode(0o700))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(root.metadata().unwrap().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::metadata(registry.path().join("501"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn registration_permissions_repair_an_inaccessible_existing_registration() {
+        let registry = tempfile::tempdir().unwrap();
+        let root = File::open(registry.path()).unwrap();
+        rustix::fs::fchmod(&root, Mode::from_raw_mode(0o700)).unwrap();
+        std::fs::write(registry.path().join(ACCOUNT), b"retained account").unwrap();
+        registration_permissions(&root).unwrap();
+        assert_eq!(root.metadata().unwrap().mode() & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read(registry.path().join(ACCOUNT)).unwrap(),
+            b"retained account"
+        );
     }
 
     #[test]
