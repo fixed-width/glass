@@ -128,9 +128,9 @@ int glass_account_prepare(const char *name_bytes, const char *uuid_bytes, uint32
         NSError *error = nil;
         if (!admin || [admin isMemberRecord:record error:&error] || error) return 7;
         if (record_only) return 0;
-        // Borrow the caller's zeroizing UTF-8 buffer. Foundation/OD may make internal copies.
-        NSString *password = [[NSString alloc] initWithBytesNoCopy:(void *)password_bytes
-            length:password_length encoding:NSUTF8StringEncoding freeWhenDone:NO];
+        // OD may retain its NSString argument; it must not borrow the caller's temporary bytes.
+        NSString *password = [[NSString alloc] initWithBytes:password_bytes
+            length:password_length encoding:NSUTF8StringEncoding];
         if (!password) return 1;
         NSDictionary *details = [record recordDetailsForAttributes:@[kODAttributeTypeAuthenticationAuthority] error:NULL];
         if (!details) return 3;
