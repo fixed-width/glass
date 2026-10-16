@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 4;
+const PROTOCOL: u32 = 5;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -80,12 +80,13 @@ impl Bootstrap {
         Ok(())
     }
 
-    fn child_command(&self, binary: &std::path::Path) -> Command {
+    fn child_command(&self, binary: &std::path::Path, owner: u32) -> Command {
         let mut command = Command::new(binary);
         command
             .current_dir(&self.cwd)
             .envs(&self.env)
-            .arg("native-backend");
+            .arg("native-backend")
+            .arg(owner.to_string());
         command
     }
 }
@@ -272,18 +273,16 @@ mod native {
     use std::os::unix::fs::MetadataExt;
     use tokio::net::UnixStream;
 
-    pub(super) const ROOT: &str = "/Library/Application Support/Glass";
-    pub(super) const SOCKET: &str = "/Library/Application Support/Glass/worker.sock";
-
     pub(super) fn protected_endpoint(owner: u32) -> anyhow::Result<()> {
-        for parent in ["/", "/Library", "/Library/Application Support", ROOT] {
+        let root = glass_macos::private_session::root_for(owner);
+        for parent in root.ancestors() {
             let metadata = std::fs::symlink_metadata(parent)?;
             ensure!(
                 metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
                 "private worker setup directory is not protected"
             );
         }
-        let metadata = std::fs::symlink_metadata(SOCKET)?;
+        let metadata = std::fs::symlink_metadata(root.join("worker.sock"))?;
         use std::os::unix::fs::FileTypeExt;
         ensure!(
             metadata.file_type().is_socket()
@@ -294,8 +293,8 @@ mod native {
         Ok(())
     }
 
-    pub async fn worker() -> anyhow::Result<()> {
-        glass_macos::private_session::attach(false)?;
+    pub async fn worker(owner: u32) -> anyhow::Result<()> {
+        glass_macos::private_session::attach_for(owner, false)?;
         let listener = glass_macos::worker_socket::activate_listener()?;
         listener.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(listener)?;
@@ -328,7 +327,7 @@ mod native {
         let bootstrap: Bootstrap = serde_json::from_slice(&data)?;
         bootstrap.validate()?;
         glass_macos::private_session::require_private()?;
-        let command = bootstrap.child_command(&std::env::current_exe()?);
+        let command = bootstrap.child_command(&std::env::current_exe()?, owner);
         match broker(stream, command).await {
             Ok(receipt) if receipt.clean_worker_exit && receipt.connection_valid => Ok(()),
             Ok(_) => bail!("private worker cleanup is unconfirmed after forced or abnormal exit"),

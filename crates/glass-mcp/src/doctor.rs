@@ -199,8 +199,7 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
         // Mirrors the Linux/Windows "sandbox" section: Seatbelt containment posture.
         sections.push(Section::new("sandbox", None, glass_sandbox_macos::checks()));
-        let accessibility = if std::fs::symlink_metadata(glass_macos::private_session::ROOT).is_ok()
-        {
+        let accessibility = if !matches!(glass_macos::private_session::configured(), Ok(false)) {
             private_macos_a11y_checks()
         } else {
             macos_a11y_checks(
@@ -412,7 +411,7 @@ fn macos_checks_from(
 /// [`macos_checks_from`].
 #[cfg(target_os = "macos")]
 fn macos_checks(resolved_backend: &str) -> Vec<Check> {
-    if std::fs::symlink_metadata(glass_macos::private_session::ROOT).is_ok() {
+    if !matches!(glass_macos::private_session::configured(), Ok(false)) {
         return crate::macos_environment::checks();
     }
     macos_checks_from(

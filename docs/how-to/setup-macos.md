@@ -34,7 +34,8 @@ needed.
    Accept a requested restart. Switch back to your normal account **without logging the development
    account out**. Fast User Switching changes the account you are viewing while keeping both logged in.
 5. Run the same setup command again to verify readiness. A healthy existing registration is reused
-   without another administrator request. After logging the development account out and back in,
+   without another administrator request. Earlier preview registrations migrate to the per-user
+   layout during setup, with administrator authentication. After logging the development account out and back in,
    run setup again to check readiness. Restoring access to a recreated worker socket may require
    administrator authentication; a connection refusal needs the recovery sequence below.
    Register the bundle binary with your stdio MCP client, or
@@ -44,8 +45,10 @@ needed.
 
 Routine launches and rebuilds require no account switching or extra display in your VNC view. If
 login, permissions or attachment are unavailable, the macOS backend refuses work; it does not launch
-on your normal desktop. Only one Glass macOS backend can use the enrolled environment at a time. This preview has one
-owner/account registration per Mac and does not support changing the selected account.
+on your normal desktop. Only one Glass macOS backend can use the enrolled environment at a time.
+Enrollment applies to the normal macOS user who ran setup; other users retain their shared-desktop
+workflow. Each development account belongs to one enrollment. To select another development account,
+unenroll the current one first.
 
 The requested workspace is shared read/write for the run. Existing executable search paths and
 existing file/directory arguments receive read access; unrelated environment values are not treated
@@ -67,17 +70,34 @@ after a reboot have not been tested.
 Keep the account logged in; after a restart, log into it again. This does not change Windows's
 shared-desktop behavior.
 
+### Return to shared-desktop use
+
+Stop active application work with `glass_stop`, then run this from your normal account:
+
+```bash
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp unenroll
+```
+
+Administrator authentication removes your worker registration after checking that owned work and
+permission recovery have completed. The app, development account, home, privacy grants and normal
+HTTP/menu-bar startup integration remain. Restart existing Glass MCP servers before starting
+shared-desktop work. The normal account needs its usual Accessibility and Screen Recording grants.
+`--non-interactive` requires existing administrator authorization and fails instead of prompting.
+
+A failure before worker and permission cleanup completes retains your enrollment and reports the
+problem. Glass does not silently move work onto your desktop. Another user's enrollment is unaffected.
+
 ### Recover a refused worker connection
 
 If setup reports `Connection refused` after logging the development account out and back in or
 changing its registration, stop active Glass work and run this from your normal account:
 
 ```bash
-/Applications/GlassMcp.app/Contents/MacOS/glass-mcp uninstall
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp unenroll
 ```
 
-This removes Glass's worker registration and old socket, along with its normal-account HTTP/menu-bar
-LaunchAgent. It retains the development account, home, privacy grants and app data. Register again
+This removes your worker registration and old socket while retaining the normal-account HTTP/menu-bar
+integration, development account, home, privacy grants and app data. Register again
 using your previous integration. For stdio:
 
 ```bash
@@ -168,8 +188,8 @@ From the **`glass ●`** menu bar, click **Uninstall glass…** (it confirms fir
 also quits glass). Or from a terminal, `glass-mcp uninstall`. Stop active application work first.
 For an enrolled account, uninstall restores recoverable workspace permissions and requests administrator
 authentication to remove its worker registration. It retains the account, home, permissions and app
-data. A disabled registration marker prevents clients from silently returning to shared-desktop
-control; rerun `setup --account ACCOUNT` to enroll again.
+data. Your enrollment is removed. To return to shared-desktop use while keeping Glass's startup
+integration, use `glass-mcp unenroll` instead.
 
 Either path also removes
 `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` and boots out the running job, so glass stops

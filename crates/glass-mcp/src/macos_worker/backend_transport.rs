@@ -184,19 +184,23 @@ impl NativeConnection {
     pub(crate) fn connect() -> Result<Self> {
         let owner = rustix::process::geteuid().as_raw();
         native::protected_endpoint(owner).map_err(error)?;
-        let lease = File::open(PathBuf::from(native::ROOT).join("account.plist")).map_err(error)?;
+        let lease = File::open(glass_macos::private_session::root_for(owner).join("account.plist"))
+            .map_err(error)?;
         fs4::FileExt::try_lock(&lease)
             .map_err(|_| error("the private macOS environment is already in use"))?;
         use sha2::Digest;
         let account = sha2::Sha256::digest(
-            std::fs::read(PathBuf::from(native::ROOT).join("account.plist")).map_err(error)?,
+            std::fs::read(glass_macos::private_session::root_for(owner).join("account.plist"))
+                .map_err(error)?,
         )
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
         let callback = super::callback::Callback::new(owner)?;
         let requirement = super::callback::broker_requirement()?;
-        let mut activation = UnixStream::connect(native::SOCKET).map_err(error)?;
+        let mut activation =
+            UnixStream::connect(glass_macos::private_session::root_for(owner).join("worker.sock"))
+                .map_err(error)?;
         activation.set_nonblocking(true).map_err(error)?;
         if glass_macos::worker_socket::peer_uid(&activation).map_err(error)? != 0 {
             return Err(error("activation socket was not created by launchd"));
@@ -294,7 +298,10 @@ impl NativeConnection {
                 bootstrap.cwd.clone(),
                 home,
                 bootstrap.env.get("PATH").cloned(),
-                vec![PathBuf::from(native::ROOT), journal_root],
+                vec![
+                    PathBuf::from(glass_macos::private_session::ROOT),
+                    journal_root,
+                ],
                 self.journal.clone(),
             )
             .map_err(error)?,

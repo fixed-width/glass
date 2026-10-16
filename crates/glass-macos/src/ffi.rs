@@ -114,6 +114,11 @@ pub fn init_main_thread() {
     app_kit_init();
 }
 
+/// Whether the process initialized AppKit before starting platform threads.
+pub fn main_thread_initialized() -> bool {
+    APP_KIT_INIT.is_completed()
+}
+
 /// Classify a `null` async ScreenCaptureKit result's paired `NSError`:
 /// [`GlassError::PermissionDenied`] for a Screen Recording TCC decline (domain
 /// `SCStreamErrorDomain`, code `-3801`, and/or a "declined" description — observed together,

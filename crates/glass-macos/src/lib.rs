@@ -70,7 +70,7 @@ pub mod workspace_access;
 #[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;
 #[cfg(target_os = "macos")]
-pub use ffi::init_main_thread;
+pub use ffi::{init_main_thread, main_thread_initialized};
 
 /// This backend's capability map. Every cell but `accessibility` is code-constant; the
 /// `accessibility` cell is live — gated on the macOS Accessibility TCC grant

@@ -11,12 +11,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     #[cfg(target_os = "macos")]
     match cli.command {
-        Some(Command::MacosWorker) => return glass_mcp::macos_worker::worker().await,
-        Some(Command::NativeBackend) => return glass_mcp::native_backend::run(),
+        Some(Command::MacosWorker { owner }) => {
+            return glass_mcp::macos_worker::worker(owner).await;
+        }
+        Some(Command::NativeBackend { owner }) => return glass_mcp::native_backend::run(owner),
         Some(Command::MacosEnroll { account }) => {
             return glass_mcp::macos_environment::enroll(&account);
         }
-        Some(Command::MacosUnenroll) => return glass_mcp::macos_environment::unenroll(),
+        Some(Command::MacosUnenroll) => return glass_mcp::macos_environment::remove_registration(),
         _ => {}
     }
     // AppKit setup precedes platform workers; offline evidence commands need none.
@@ -24,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     if !matches!(
         cli.command,
         Some(Command::Tools { .. } | Command::Trace { .. })
-    ) && (!glass_macos::private_session::is_owner()
+    ) && (matches!(glass_macos::private_session::configured(), Ok(false))
         || matches!(cli.command, Some(Command::Serve { menubar: true, .. })))
     {
         glass_macos::init_main_thread();
@@ -40,8 +42,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         #[cfg(target_os = "macos")]
         Some(
-            Command::MacosWorker
-            | Command::NativeBackend
+            Command::MacosWorker { .. }
+            | Command::NativeBackend { .. }
             | Command::MacosEnroll { .. }
             | Command::MacosUnenroll,
         ) => {
@@ -203,6 +205,10 @@ async fn main() -> anyhow::Result<()> {
             json,
             color,
         }) => glass_mcp::run_update(check, yes, skip_attestation, json, color).await,
+        #[cfg(target_os = "macos")]
+        Some(Command::Unenroll { non_interactive }) => {
+            glass_mcp::macos_environment::leave_account(non_interactive)
+        }
         Some(Command::Uninstall) => run_uninstall(),
         Some(Command::DebugGrants) => run_debug_grants(),
         Some(Command::DebugChecklist) => run_debug_checklist(),

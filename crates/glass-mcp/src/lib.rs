@@ -72,6 +72,14 @@ compile_error!(
      mirroring the linux/windows/macos backends) plus its make_platform + doctor arms"
 );
 
+#[cfg(target_os = "macos")]
+fn shared_desktop_restart_required() -> GlassError {
+    GlassError::Backend(
+        "shared-desktop use requires restarting this Glass MCP server after unenrollment".into(),
+    )
+    .before_dispatch()
+}
+
 /// Construct a backend by name. The only place that knows the concrete backends;
 /// passed to `Glass` as a factory so the backend is built per `glass_start`.
 pub fn make_platform(
@@ -86,6 +94,10 @@ pub fn make_platform(
         return remote_backend::backend(
             macos_worker::backend_transport::NativeConnection::connect()?,
         );
+    }
+    #[cfg(target_os = "macos")]
+    if backend == "macos" && !glass_macos::main_thread_initialized() {
+        return Err(shared_desktop_restart_required());
     }
     #[cfg(target_os = "macos")]
     if backend == "ios" {
@@ -388,7 +400,12 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     // actually drive `xcrun simctl`. `#[cfg]` on a closure's captured argument isn't
     // stable, so the closure itself is defined once per branch instead.
     #[cfg(target_os = "macos")]
+    let started_enrolled = !matches!(glass_macos::private_session::configured(), Ok(false));
+    #[cfg(target_os = "macos")]
     let platform_factory: glass_core::PlatformFactory = Box::new(move |b| {
+        if b == "macos" && started_enrolled && !glass_macos::private_session::configured()? {
+            return Err(shared_desktop_restart_required());
+        }
         make_platform(
             b,
             &reg_factory,

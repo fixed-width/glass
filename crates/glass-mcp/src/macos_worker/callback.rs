@@ -132,7 +132,8 @@ impl Drop for Callback {
 pub(crate) fn broker_requirement() -> Result<Vec<u8>> {
     let file = File::from(
         open(
-            Path::new(glass_macos::private_session::ROOT).join("worker.requirement"),
+            glass_macos::private_session::root_for(rustix::process::geteuid().as_raw())
+                .join("worker.requirement"),
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )

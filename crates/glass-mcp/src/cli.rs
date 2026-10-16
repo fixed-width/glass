@@ -41,10 +41,10 @@ pub struct Cli {
 pub enum Command {
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
-    MacosWorker,
+    MacosWorker { owner: u32 },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
-    NativeBackend,
+    NativeBackend { owner: u32 },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     MacosEnroll { account: String },
@@ -150,6 +150,13 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t, value_name = "WHEN")]
         color: crate::color::ColorChoice,
     },
+    /// Stop using an enrolled macOS account and return to shared-desktop operation.
+    #[cfg(target_os = "macos")]
+    Unenroll {
+        /// Fail instead of prompting for administrator authentication.
+        #[arg(long)]
+        non_interactive: bool,
+    },
     /// Remove the login LaunchAgent so glass stops starting at login (macOS). Then drag
     /// GlassMcp.app to the Trash to remove the app itself.
     Uninstall,
@@ -183,6 +190,20 @@ pub enum TraceCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unenroll_is_public_and_worker_roles_require_an_owner() {
+        let cli = Cli::try_parse_from(["glass-mcp", "unenroll", "--non-interactive"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Unenroll {
+                non_interactive: true
+            })
+        ));
+        assert!(Cli::try_parse_from(["glass-mcp", "macos-worker"]).is_err());
+        assert!(Cli::try_parse_from(["glass-mcp", "native-backend"]).is_err());
+    }
 
     #[test]
     fn tool_profile_defaults_and_global_placement() {

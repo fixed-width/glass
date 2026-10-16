@@ -6,8 +6,8 @@ use glass_core::{Deadline, GlassError, Result};
 
 use crate::backend_worker::{Dispatcher, Properties, Request, Response, VERSION};
 
-pub fn run() -> anyhow::Result<()> {
-    glass_macos::private_session::attach(false)?;
+pub fn run(owner: u32) -> anyhow::Result<()> {
+    glass_macos::private_session::attach_for(owner, false)?;
     glass_macos::init_main_thread();
     let (requests, incoming) = std::sync::mpsc::channel::<Request>();
     let (outgoing, responses) = std::sync::mpsc::channel::<Response>();

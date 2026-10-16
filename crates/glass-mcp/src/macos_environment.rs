@@ -161,8 +161,29 @@ fn directory(path: &Path, owner: u32, create: bool) -> anyhow::Result<File> {
     Ok(fd)
 }
 
+fn owner_root() -> anyhow::Result<PathBuf> {
+    let owner = if rustix::process::geteuid().is_root() {
+        root_owner()?
+    } else {
+        rustix::process::geteuid().as_raw()
+    };
+    let root = private_session::root_for(owner);
+    if root.try_exists()? {
+        return Ok(root);
+    }
+    let legacy = Path::new(private_session::ROOT);
+    if legacy.join(ACCOUNT).try_exists()? && private_session::legacy_owner()? == owner {
+        return Ok(legacy.to_path_buf());
+    }
+    Ok(root)
+}
+
 fn read_enrollment() -> anyhow::Result<Enrollment> {
-    let root = directory(Path::new(private_session::ROOT), 0, false)?;
+    read_enrollment_at(&owner_root()?)
+}
+
+fn read_enrollment_at(path: &Path) -> anyhow::Result<Enrollment> {
+    let root = directory(path, 0, false)?;
     let file = File::from(openat(
         &root,
         ACCOUNT,
@@ -195,6 +216,7 @@ fn job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
         plist::Value::Array(vec![
             binary.to_string_lossy().into_owned().into(),
             "macos-worker".into(),
+            account.owner_uid.to_string().into(),
         ]),
     );
     value.insert(
@@ -209,7 +231,11 @@ fn job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
     let mut worker = plist::Dictionary::new();
     worker.insert(
         "SockPathName".into(),
-        format!("{}/worker.sock", private_session::ROOT).into(),
+        private_session::root_for(account.owner_uid)
+            .join("worker.sock")
+            .to_string_lossy()
+            .into_owned()
+            .into(),
     );
     worker.insert("SockPathMode".into(), 0o600.into());
     let mut sockets = plist::Dictionary::new();
@@ -345,17 +371,16 @@ fn create_file(parent: &File, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
     result
 }
 
-fn same_file(parent: &File, name: &str, bytes: &[u8]) -> anyhow::Result<bool> {
-    let fd = match openat(
+fn stored_file(parent: &File, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let file = match openat(
         parent,
         name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
-        Err(rustix::io::Errno::NOENT) => return Ok(false),
-        result => result?,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        result => File::from(result?),
     };
-    let file = File::from(fd);
     let info = file.metadata()?;
     ensure!(
         info.is_file()
@@ -366,8 +391,16 @@ fn same_file(parent: &File, name: &str, bytes: &[u8]) -> anyhow::Result<bool> {
         "setup file was replaced or is unprotected"
     );
     private_session::require_write_protected(&file, 0)?;
-    let mut actual = Vec::new();
-    file.take(65537).read_to_end(&mut actual)?;
+    let mut bytes = Vec::new();
+    file.take(65537).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 65536, "setup file grew while reading");
+    Ok(Some(bytes))
+}
+
+fn same_file(parent: &File, name: &str, bytes: &[u8]) -> anyhow::Result<bool> {
+    let Some(actual) = stored_file(parent, name)? else {
+        return Ok(false);
+    };
     ensure!(
         actual == bytes,
         "existing Glass setup differs; refusing to replace its registered files"
@@ -387,10 +420,354 @@ fn root_owner() -> anyhow::Result<u32> {
     Ok(owner)
 }
 
+fn stop_registered_worker(target: &str, account: &Enrollment) -> anyhow::Result<()> {
+    let job = Command::new("/bin/launchctl")
+        .args(["print", target])
+        .output()?;
+    if !job.status.success() {
+        return Ok(());
+    }
+    let broker = match crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&job.stdout)) {
+        Some(pid) => private_session::account_processes(account.uid)?
+            .into_iter()
+            .find(|process| process.matches_pid(pid)),
+        None => None,
+    };
+    checked(Command::new("/bin/launchctl").args(["bootout", target]))?;
+    let deadline = Deadline::from_millis(8000);
+    while let Some(process) = broker {
+        if !private_session::account_processes(account.uid)?.contains(&process) {
+            break;
+        }
+        ensure!(
+            !deadline.has_passed(),
+            "private worker has not exited; registration retained"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    ensure!(
+        !Command::new("/bin/launchctl")
+            .args(["print", target])
+            .output()?
+            .status
+            .success(),
+        "private worker registration remains loaded"
+    );
+    Ok(())
+}
+
+fn legacy_job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut value: plist::Dictionary = plist::from_bytes(&job(account, binary)?)?;
+    value.insert(
+        "ProgramArguments".into(),
+        plist::Value::Array(vec![
+            binary.to_string_lossy().into_owned().into(),
+            "macos-worker".into(),
+        ]),
+    );
+    let mut socket = plist::Dictionary::new();
+    socket.insert(
+        "SockPathName".into(),
+        Path::new(private_session::ROOT)
+            .join("worker.sock")
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+    );
+    socket.insert("SockPathMode".into(), 0o600.into());
+    let mut sockets = plist::Dictionary::new();
+    sockets.insert("Worker".into(), socket.into());
+    value.insert("Sockets".into(), sockets.into());
+    let mut bytes = Vec::new();
+    plist::to_writer_xml(&mut bytes, &value)?;
+    Ok(bytes)
+}
+
+fn migrate_legacy(account: &Enrollment, binary: &Path) -> anyhow::Result<()> {
+    let legacy_path = Path::new(private_session::ROOT);
+    if !legacy_path.join(ACCOUNT).try_exists()? {
+        return Ok(());
+    }
+    let existing = read_enrollment_at(legacy_path)?;
+    // Other owners keep their legacy registration until they choose to migrate it.
+    if existing.owner_uid != account.owner_uid {
+        return Ok(());
+    }
+    ensure!(
+        existing == *account,
+        "legacy enrollment names another development account"
+    );
+    let legacy = directory(legacy_path, 0, false)?;
+    fs4::FileExt::try_lock(&legacy).context("legacy registration is already changing")?;
+    let lease = File::from(openat(
+        &legacy,
+        ACCOUNT,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    fs4::FileExt::try_lock(&lease).context("stop active Glass work before migrating enrollment")?;
+    let agents = directory(
+        &account.home.join("Library/LaunchAgents"),
+        account.uid,
+        false,
+    )?;
+    let old = legacy_job(account, binary)?;
+    let registered_file = same_file(&agents, JOB, &old)?;
+    let target = format!("gui/{}/{LABEL}", account.uid);
+    let loaded = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()?
+        .status
+        .success();
+    ensure!(
+        registered_file || !loaded,
+        "legacy job cannot be attributed; registration retained"
+    );
+    let bytes = stored_file(&legacy, ACCOUNT)?.context("legacy account record missing")?;
+    let requirement =
+        stored_file(&legacy, "worker.requirement")?.context("legacy worker requirement missing")?;
+    let _new_root = prepare_registration(account, &bytes, &requirement)?;
+    if !same_file(&legacy, "disabled", b"Glass account registration removed\n")? {
+        create_file(&legacy, "disabled", b"Glass account registration removed\n")?;
+    }
+    unregister_worker(&legacy, account, || {
+        if loaded {
+            stop_registered_worker(&target, account)?;
+        }
+        Ok(())
+    })?;
+    if registered_file {
+        rustix::fs::unlinkat(&agents, JOB, rustix::fs::AtFlags::empty())?;
+        agents.sync_all()?;
+    }
+    for name in [ACCOUNT, "worker.requirement", "disabled"] {
+        rustix::fs::unlinkat(&legacy, name, rustix::fs::AtFlags::empty())?;
+    }
+    legacy.sync_all()?;
+    Ok(())
+}
+
+fn setup_suffix(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn staged_names(parent: &File, owner: u32) -> anyhow::Result<Vec<String>> {
+    let prefix = format!(".setup-{owner}-");
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(parent)? {
+        let entry = entry?;
+        if let Ok(name) = entry.file_name().to_str()
+            && setup_suffix(name, &prefix)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+fn registration_files(root: &File) -> anyhow::Result<Vec<String>> {
+    use rustix::fs::{AtFlags, Dir, FileType};
+    let mut names = Vec::new();
+    for entry in Dir::read_from(root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let info = rustix::fs::statat(root, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)?;
+        ensure!(
+            ([ACCOUNT, "worker.requirement", "disabled"].contains(&name.as_ref())
+                || setup_suffix(&name, ".setup-"))
+                && FileType::from_raw_mode(info.st_mode) == FileType::RegularFile
+                && info.st_uid == root.metadata()?.uid()
+                && info.st_nlink == 1
+                && info.st_mode & 0o133 == 0
+                && info.st_size <= 65536,
+            "unexpected enrollment contents; disabled registration retained"
+        );
+        names.push(name.into_owned());
+    }
+    Ok(names)
+}
+
+fn cleanup_retired(parent: &File, name: &str) -> anyhow::Result<()> {
+    use rustix::fs::AtFlags;
+    let root = match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        result => File::from(result?),
+    };
+    ensure!(
+        root.metadata()?.uid() == parent.metadata()?.uid(),
+        "retired registration owner changed"
+    );
+    fs4::FileExt::try_lock(&root).context("registration cleanup is already running")?;
+    for file in registration_files(&root)? {
+        rustix::fs::unlinkat(&root, file.as_str(), AtFlags::empty())?;
+    }
+    root.sync_all()?;
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+fn retire_registration(parent: &File, name: &str, root: &File) -> anyhow::Result<()> {
+    registration_files(root)?;
+    let retired = format!(".unenroll-{name}");
+    cleanup_retired(parent, &retired)?;
+    let current = rustix::fs::statat(parent, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+    let expected = root.metadata()?;
+    ensure!(
+        current.st_dev as u64 == expected.dev() && current.st_ino == expected.ino(),
+        "registration identity changed before removal"
+    );
+    rustix::fs::renameat_with(
+        parent,
+        name,
+        parent,
+        retired.as_str(),
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
+    parent.sync_all()?;
+    // The runtime and permission cleanup is complete before this explicit route transition.
+    // Reuse the held descriptor's lock through cleanup; a separate open would conflict with it.
+    for file in registration_files(root)? {
+        rustix::fs::unlinkat(root, file.as_str(), rustix::fs::AtFlags::empty())?;
+    }
+    root.sync_all()?;
+    rustix::fs::unlinkat(parent, retired.as_str(), rustix::fs::AtFlags::REMOVEDIR)?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+fn finish_removal(path: &Path, root: &File) -> anyhow::Result<()> {
+    let parent = directory(
+        path.parent().context("registration parent unavailable")?,
+        0,
+        false,
+    )?;
+    retire_registration(
+        &parent,
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .context("registration owner unavailable")?,
+        root,
+    )
+    .context("removing account registration; inspect status if retired metadata cleanup failed")
+}
+
+fn mutation_lock(kind: &str, identity: u32) -> anyhow::Result<File> {
+    let parent = directory(&Path::new(private_session::ROOT).join("accounts"), 0, true)?;
+    let lock = File::from(openat(
+        &parent,
+        format!(".{kind}-{identity}.lock").as_str(),
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?);
+    let info = lock.metadata()?;
+    ensure!(
+        info.is_file() && info.uid() == 0 && info.nlink() == 1 && info.mode() & 0o077 == 0,
+        "registration lock is not protected"
+    );
+    private_session::require_write_protected(&lock, 0)?;
+    fs4::FileExt::try_lock(&lock).context("account registration is already changing")?;
+    Ok(lock)
+}
+
+fn accepts_job(parent: &File, current: &[u8], legacy: &[u8]) -> anyhow::Result<bool> {
+    let Some(actual) = stored_file(parent, JOB)? else {
+        return Ok(false);
+    };
+    ensure!(
+        actual == current || actual == legacy,
+        "development account is already enrolled by another user or installation"
+    );
+    Ok(true)
+}
+
+fn publish_registration(parent: &File, name: &str, staged: &str) -> anyhow::Result<()> {
+    rustix::fs::renameat_with(
+        parent,
+        staged,
+        parent,
+        name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+fn stage_registration(
+    parent: &File,
+    owner: &str,
+    prepare: impl FnOnce(&File) -> anyhow::Result<()>,
+) -> anyhow::Result<File> {
+    let staged = format!(".setup-{owner}-{:032x}", rand::random::<u128>());
+    rustix::fs::mkdirat(parent, staged.as_str(), Mode::from_raw_mode(0o755))?;
+    let root = File::from(openat(
+        parent,
+        staged.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let prepared = prepare(&root).and_then(|()| {
+        root.sync_all()?;
+        publish_registration(parent, owner, &staged)
+    });
+    if let Err(primary) = prepared {
+        let cleanup = cleanup_retired(parent, &staged);
+        return match cleanup {
+            Ok(()) => Err(primary),
+            Err(cleanup) => {
+                Err(primary.context(format!("staged registration cleanup: {cleanup:#}")))
+            }
+        };
+    }
+    Ok(root)
+}
+
+fn prepare_registration(
+    account: &Enrollment,
+    bytes: &[u8],
+    requirement: &[u8],
+) -> anyhow::Result<File> {
+    let path = private_session::root_for(account.owner_uid);
+    if path.try_exists()? {
+        let root = directory(&path, 0, false)?;
+        ensure!(
+            same_file(&root, ACCOUNT, bytes)?
+                && same_file(&root, "worker.requirement", requirement)?,
+            "existing account registration is incomplete"
+        );
+        return Ok(root);
+    }
+    let parent = directory(
+        path.parent().context("registration parent unavailable")?,
+        0,
+        true,
+    )?;
+    stage_registration(&parent, &account.owner_uid.to_string(), |root| {
+        create_file(root, "disabled", b"Glass account registration removed\n")?;
+        create_file(root, "worker.requirement", requirement)?;
+        create_file(root, ACCOUNT, bytes)
+    })
+}
+
 /// Authenticated installer entry; never creates/deletes accounts or changes their credentials.
 pub fn enroll(name: &str) -> anyhow::Result<()> {
     let owner = root_owner()?;
     let account = account_record(name, owner, true)?;
+    let _owner_lock = mutation_lock("owner", owner)?;
+    let _worker_lock = mutation_lock("worker", account.uid)?;
     let binary = std::env::current_exe()?.canonicalize()?;
     ensure!(
         crate::setup::is_inside_app_bundle(&binary),
@@ -402,22 +779,44 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
             .arg(crate::setup::app_bundle_path(&binary)),
     )?;
     directory(&account.home, account.uid, false).context("validating the selected account home")?;
-    let root = directory(Path::new(private_session::ROOT), 0, true)?;
+    if Path::new(private_session::ROOT)
+        .join(ACCOUNT)
+        .try_exists()?
+        && let Ok(legacy) = read_enrollment_at(Path::new(private_session::ROOT))
+    {
+        ensure!(
+            legacy.uid != account.uid || legacy.owner_uid == owner,
+            "the development account is already enrolled by another user"
+        );
+    }
     let agents = directory(
         &account.home.join("Library/LaunchAgents"),
         account.uid,
         true,
     )?;
+    accepts_job(
+        &agents,
+        &job(&account, &binary)?,
+        &legacy_job(&account, &binary)?,
+    )?;
+    migrate_legacy(&account, &binary)?;
+    let path = private_session::root_for(owner);
+    let bytes = if path.try_exists()? {
+        let bytes = stored_file(&directory(&path, 0, false)?, ACCOUNT)?
+            .context("account record unavailable")?;
+        ensure!(
+            plist::from_bytes::<Enrollment>(&bytes)? == account,
+            "account identity changed"
+        );
+        bytes
+    } else {
+        let mut bytes = Vec::new();
+        plist::to_writer_xml(&mut bytes, &account)?;
+        bytes
+    };
     let requirement = private_session::signing_requirement()?;
-    if !same_file(&root, "worker.requirement", &requirement)? {
-        create_file(&root, "worker.requirement", &requirement)?;
-    }
-
-    let mut bytes = Vec::new();
-    plist::to_writer_xml(&mut bytes, &account)?;
-    if !same_file(&root, ACCOUNT, &bytes)? {
-        create_file(&root, ACCOUNT, &bytes)?;
-    }
+    let root = prepare_registration(&account, &bytes, &requirement)?;
+    fs4::FileExt::try_lock(&root).context("account setup is already changing")?;
     let lease = File::from(openat(
         &root,
         ACCOUNT,
@@ -576,7 +975,7 @@ pub fn verify() -> anyhow::Result<()> {
 }
 
 pub fn status() -> anyhow::Result<()> {
-    if !Path::new(private_session::ROOT).exists() {
+    if !owner_root()?.try_exists()? {
         return Ok(());
     }
     let account = read_enrollment()?;
@@ -584,7 +983,7 @@ pub fn status() -> anyhow::Result<()> {
         account.owner_uid == rustix::process::getuid().as_raw(),
         "macOS account registration belongs to another owner"
     );
-    let lease = File::open(Path::new(private_session::ROOT).join(ACCOUNT))?;
+    let lease = File::open(owner_root()?.join(ACCOUNT))?;
     let busy = fs4::FileExt::try_lock(&lease).is_err();
     println!(
         "macOS account: {} ({})",
@@ -604,7 +1003,31 @@ pub fn status() -> anyhow::Result<()> {
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
-    if !Path::new(private_session::ROOT).exists() {
+    leave_account(false)
+}
+
+/// Restore this user's shared-desktop route while preserving the normal MCP integration.
+pub fn leave_account(non_interactive: bool) -> anyhow::Result<()> {
+    if !owner_root()?.try_exists()? {
+        let owner = rustix::process::geteuid().as_raw();
+        let retired = private_session::root_for(owner)
+            .parent()
+            .context("registration parent unavailable")?
+            .join(format!(".unenroll-{owner}"));
+        let parent = retired
+            .parent()
+            .context("registration parent unavailable")?;
+        let staged = if parent.try_exists()? {
+            !staged_names(&File::open(parent)?, owner)?.is_empty()
+        } else {
+            false
+        };
+        if retired.try_exists()? || staged {
+            elevate(&["macos-unenroll"], non_interactive)?;
+        }
+        println!(
+            "glass: no separate-account enrollment for this user; shared-desktop use is available"
+        );
         return Ok(());
     }
     let account = read_enrollment()?;
@@ -612,16 +1035,14 @@ pub fn uninstall() -> anyhow::Result<()> {
         account.owner_uid == rustix::process::getuid().as_raw(),
         "macOS account registration belongs to another owner"
     );
-    let lease = File::open(Path::new(private_session::ROOT).join(ACCOUNT))?;
+    let lease = File::open(owner_root()?.join(ACCOUNT))?;
     fs4::FileExt::try_lock(&lease)
-        .context("stop active Glass application work before uninstalling")?;
+        .context("stop active Glass application work before unenrolling")?;
     use sha2::Digest;
-    let binding = sha2::Sha256::digest(std::fs::read(
-        Path::new(private_session::ROOT).join(ACCOUNT),
-    )?)
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect();
+    let binding = sha2::Sha256::digest(std::fs::read(owner_root()?.join(ACCOUNT))?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let mut journal = crate::permission_journal::PermissionJournal::open(
         &crate::permission_journal::PermissionJournal::root()?,
         account.uid,
@@ -632,61 +1053,131 @@ pub fn uninstall() -> anyhow::Result<()> {
     journal.finish(Deadline::from_millis(8000))?;
     drop(journal);
     drop(lease);
-    elevate(&["macos-unenroll"], false)
+    elevate(&["macos-unenroll"], non_interactive)?;
+    ensure!(
+        !private_session::configured()?,
+        "macOS account enrollment remains active"
+    );
+    println!(
+        "glass: shared-desktop use restored; the app, account, grants and MCP startup integration were retained"
+    );
+    println!("glass: restart existing Glass MCP servers before starting shared-desktop work");
+    Ok(())
 }
 
 /// Remove only the registered agent; retain the user's account, home, grants and app data.
-pub fn unenroll() -> anyhow::Result<()> {
+pub fn remove_registration() -> anyhow::Result<()> {
     let owner = root_owner()?;
-    let account = read_enrollment()?;
-    ensure!(
-        account.owner_uid == owner,
-        "account setup belongs to another user"
-    );
-    let root = directory(Path::new(private_session::ROOT), 0, false)?;
-    let lease = File::from(openat(
-        &root,
-        ACCOUNT,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?);
-    fs4::FileExt::try_lock(&lease).context("Glass application work is active; nothing removed")?;
-    let agents = directory(
-        &account.home.join("Library/LaunchAgents"),
-        account.uid,
-        false,
-    )?;
-    let expected = job(&account, &std::env::current_exe()?.canonicalize()?)?;
-    let registered_file = same_file(&agents, JOB, &expected)?;
-    let target = format!("gui/{}/{LABEL}", account.uid);
-    let loaded = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .output()?
-        .status
-        .success();
-    ensure!(
-        registered_file || !loaded,
-        "worker job is loaded but its registered file is missing; refusing unbound cleanup"
-    );
-    // A failed cleanup must leave clients on the disabled private route.
-    if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
-        create_file(&root, "disabled", b"Glass account registration removed\n")?;
-    }
-    unregister_worker(&root, &account, || {
-        if loaded {
-            checked(Command::new("/bin/launchctl").args(["bootout", &target]))?;
+    let _owner_lock = mutation_lock("owner", owner)?;
+    let legacy_path = Path::new(private_session::ROOT).join(ACCOUNT);
+    let mut legacy_lease = if legacy_path.try_exists()? && private_session::legacy_owner()? == owner
+    {
+        let file = File::open(&legacy_path)?;
+        fs4::FileExt::try_lock(&file)
+            .context("stop active legacy Glass work before unenrolling")?;
+        Some(file)
+    } else {
+        None
+    };
+    loop {
+        if !owner_root()?.try_exists()? {
+            let parent_path = private_session::root_for(owner)
+                .parent()
+                .context("registration parent unavailable")?
+                .to_path_buf();
+            if parent_path.try_exists()? {
+                let parent = directory(&parent_path, 0, false)?;
+                cleanup_retired(&parent, &format!(".unenroll-{owner}"))?;
+                for staged in staged_names(&parent, owner)? {
+                    cleanup_retired(&parent, &staged)?;
+                }
+            }
+            return Ok(());
         }
-        Ok(())
-    })?;
-    if registered_file {
-        rustix::fs::unlinkat(&agents, JOB, rustix::fs::AtFlags::empty())?;
-        agents.sync_all()?;
+        let account = read_enrollment()?;
+        let _worker_lock = mutation_lock("worker", account.uid)?;
+        ensure!(
+            account.owner_uid == owner,
+            "account setup belongs to another user"
+        );
+        let root_path = owner_root()?;
+        let root = directory(&root_path, 0, false)?;
+        fs4::FileExt::try_lock(&root).context("account setup is already changing")?;
+        let lease = if root_path == Path::new(private_session::ROOT) {
+            legacy_lease
+                .take()
+                .context("legacy registration lease unavailable")?
+        } else {
+            let file = File::from(openat(
+                &root,
+                ACCOUNT,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?);
+            fs4::FileExt::try_lock(&file)
+                .context("Glass application work is active; nothing removed")?;
+            file
+        };
+        let _lease = lease;
+        let agents = directory(
+            &account.home.join("Library/LaunchAgents"),
+            account.uid,
+            false,
+        )?;
+        let binary = std::env::current_exe()?.canonicalize()?;
+        let legacy_owned = Path::new(private_session::ROOT)
+            .join(ACCOUNT)
+            .try_exists()?
+            && private_session::legacy_owner()? == owner;
+        let expected = job(&account, &binary)?;
+        let legacy = if legacy_owned {
+            legacy_job(&account, &binary)?
+        } else {
+            expected.clone()
+        };
+        let registered_file = accepts_job(&agents, &expected, &legacy)?;
+        let target = format!("gui/{}/{LABEL}", account.uid);
+        let loaded = Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .output()?
+            .status
+            .success();
+        ensure!(
+            registered_file || !loaded,
+            "worker job is loaded but its registered file is missing; refusing unbound cleanup"
+        );
+        // A failed cleanup must leave clients on the disabled private route.
+        if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
+            create_file(&root, "disabled", b"Glass account registration removed\n")?;
+        }
+        unregister_worker(&root, &account, || {
+            if loaded {
+                stop_registered_worker(&target, &account)?;
+            }
+            Ok(())
+        })?;
+        if registered_file {
+            rustix::fs::unlinkat(&agents, JOB, rustix::fs::AtFlags::empty())?;
+            agents.sync_all()?;
+        }
+        if root_path == Path::new(private_session::ROOT) {
+            for name in ["worker.requirement", "disabled"] {
+                match rustix::fs::unlinkat(&root, name, rustix::fs::AtFlags::empty()) {
+                    Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            root.sync_all()?;
+            rustix::fs::unlinkat(&root, ACCOUNT, rustix::fs::AtFlags::empty())?;
+            root.sync_all()?;
+        } else {
+            finish_removal(&root_path, &root)?;
+        }
+        println!(
+            "glass: worker registration removed; account {}, its home and permissions retained",
+            account.name
+        );
     }
-    println!(
-        "glass: worker registration removed; account {}, its home and permissions retained",
-        account.name
-    );
-    Ok(())
 }
 
 pub(crate) fn checks() -> Vec<glass_core::Check> {
@@ -722,6 +1213,194 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_marker_write_does_not_permanently_block_unenrollment() {
+        let registry = tempfile::tempdir().unwrap();
+        let owner = registry.path().join("501");
+        std::fs::create_dir(&owner).unwrap();
+        std::fs::write(owner.join(ACCOUNT), "complete registration").unwrap();
+        std::fs::write(
+            owner.join(format!(".setup-{}", "01".repeat(16))),
+            "interrupted marker",
+        )
+        .unwrap();
+        retire_registration(
+            &File::open(registry.path()).unwrap(),
+            "501",
+            &File::open(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(!owner.exists());
+        assert!(!registry.path().join(".unenroll-501").exists());
+    }
+
+    #[test]
+    fn setup_recovery_names_are_canonical_and_bound_to_the_owner() {
+        let registry = tempfile::tempdir().unwrap();
+        let ours = format!(".setup-501-{}", "ab".repeat(16));
+        for name in [
+            &ours,
+            &format!(".setup-502-{}", "ab".repeat(16)),
+            ".setup-501-unknown",
+        ] {
+            std::fs::create_dir(registry.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            staged_names(&File::open(registry.path()).unwrap(), 501).unwrap(),
+            vec![ours]
+        );
+        assert!(!setup_suffix(".setup-../unrelated", ".setup-"));
+    }
+
+    #[test]
+    fn failed_registration_preparation_never_publishes_an_incomplete_owner_route() {
+        let registry = tempfile::tempdir().unwrap();
+        let parent = File::open(registry.path()).unwrap();
+        let result = stage_registration(&parent, "501", |root| {
+            let mut file = File::from(openat(
+                root,
+                ACCOUNT,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o600),
+            )?);
+            file.write_all(b"partial record")?;
+            bail!("injected preparation failure")
+        });
+        assert!(result.is_err());
+        assert!(!registry.path().join("501").exists());
+        assert_eq!(std::fs::read_dir(registry.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn complete_registration_is_published_without_replacing_an_existing_route() {
+        let registry = tempfile::tempdir().unwrap();
+        let parent = File::open(registry.path()).unwrap();
+        let staged = stage_registration(&parent, "501", |root| {
+            let mut file = File::from(openat(
+                root,
+                ACCOUNT,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o600),
+            )?);
+            file.write_all(b"complete record")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(registry.path().join("501").join(ACCOUNT)).unwrap(),
+            b"complete record"
+        );
+        assert!(stage_registration(&parent, "501", |_| Ok(())).is_err());
+        assert_eq!(
+            std::fs::read(registry.path().join("501").join(ACCOUNT)).unwrap(),
+            b"complete record"
+        );
+        drop(staged);
+    }
+
+    #[test]
+    fn public_removal_restores_only_the_selected_owner_and_preserves_startup_files() {
+        let registry = tempfile::tempdir().unwrap();
+        let owner = registry.path().join("501");
+        let other = registry.path().join("502");
+        let startup = registry.path().join("owner-http.plist");
+        std::fs::create_dir(&owner).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(&startup, "retained HTTP configuration").unwrap();
+        for name in [ACCOUNT, "worker.requirement", "disabled"] {
+            std::fs::write(owner.join(name), "owned registration metadata").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(owner.join(name), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        retire_registration(
+            &File::open(registry.path()).unwrap(),
+            "501",
+            &File::open(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(!owner.exists());
+        assert!(other.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(startup).unwrap(),
+            "retained HTTP configuration"
+        );
+        assert!(!registry.path().join(".unenroll-501").exists());
+    }
+
+    #[test]
+    fn unexpected_enrollment_contents_keep_the_owners_route_closed() {
+        let registry = tempfile::tempdir().unwrap();
+        let owner = registry.path().join("501");
+        std::fs::create_dir(&owner).unwrap();
+        std::fs::write(owner.join("unrelated"), "do not delete").unwrap();
+        assert!(
+            retire_registration(
+                &File::open(registry.path()).unwrap(),
+                "501",
+                &File::open(&owner).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(owner.join("unrelated")).unwrap(),
+            "do not delete"
+        );
+    }
+
+    #[test]
+    fn completed_route_transition_metadata_cleanup_is_retryable() {
+        let registry = tempfile::tempdir().unwrap();
+        let retired = registry.path().join(".unenroll-501");
+        std::fs::create_dir(&retired).unwrap();
+        std::fs::write(retired.join(ACCOUNT), "remaining owned metadata").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            retired.join(ACCOUNT),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let parent = File::open(registry.path()).unwrap();
+        cleanup_retired(&parent, ".unenroll-501").unwrap();
+        cleanup_retired(&parent, ".unenroll-501").unwrap();
+        assert!(!retired.exists());
+    }
+
+    #[test]
+    fn worker_jobs_bind_the_owner_namespace_and_command_argument() {
+        let account = Enrollment {
+            version: 1,
+            uid: 502,
+            gid: 20,
+            record_uuid: "test-record".into(),
+            name: "test-worker".into(),
+            home: PathBuf::from("/Users/test-worker"),
+            owner_uid: 501,
+        };
+        let value: plist::Value = plist::from_bytes(
+            &job(
+                &account,
+                Path::new("/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            value.as_dictionary().unwrap()["ProgramArguments"]
+                .as_array()
+                .unwrap()[2]
+                .as_string(),
+            Some("501")
+        );
+        let sockets = value.as_dictionary().unwrap()["Sockets"]
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            sockets["Worker"].as_dictionary().unwrap()["SockPathName"].as_string(),
+            Some("/Library/Application Support/Glass/accounts/501/worker.sock")
+        );
+    }
+
+    #[test]
     fn worker_job_uses_only_the_native_backend_service() {
         let bytes = job(
             &account(),
@@ -730,7 +1409,7 @@ mod tests {
         .unwrap();
         let job: plist::Dictionary = plist::from_bytes(&bytes).unwrap();
         let args = job["ProgramArguments"].as_array().unwrap();
-        assert_eq!(args.len(), 2);
+        assert_eq!(args.len(), 3);
         assert_eq!(args[1].as_string(), Some("macos-worker"));
         assert_eq!(job["RunAtLoad"].as_boolean(), Some(false));
         let sockets = job["Sockets"].as_dictionary().unwrap();

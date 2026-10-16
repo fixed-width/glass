@@ -27,6 +27,8 @@
 #include <sys/user.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <stdio.h>
 
 typedef struct {
     uint64_t device, inode, birth_seconds, birth_nanoseconds;
@@ -103,6 +105,7 @@ int glass_private_processes(uint32_t uid, GlassProcessIdentity *out, int capacit
 static atomic_uint pinned_asid;
 static atomic_uint pinned_uid;
 static atomic_uint pinned_owner;
+static atomic_uint registration_owner;
 
 typedef struct {
     bool user, dictionary_owner, console_known, on_console, login_known, login_done;
@@ -196,10 +199,13 @@ static bool protected_directory(int fd) {
         !(s.st_mode & 0022) && glass_private_writes_protected(fd, 0) == 0;
 }
 
-static NSDictionary *enrollment(void) {
+static NSDictionary *enrollment_at(bool legacy, bool allow_disabled) {
     int fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    const char *parents[] = {"Library", "Application Support", "Glass"};
-    for (unsigned i = 0; i < 3; i++) {
+    char owner[16];
+    uint32_t selected = atomic_load(&registration_owner);
+    snprintf(owner, sizeof(owner), "%u", selected ? selected : getuid());
+    const char *parents[] = {"Library", "Application Support", "Glass", "accounts", owner};
+    for (unsigned i = 0; i < (legacy ? 3u : 5u); i++) {
         if (!protected_directory(fd)) { if (fd >= 0) close(fd); return nil; }
         int next = openat(fd, parents[i], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         close(fd);
@@ -207,7 +213,7 @@ static NSDictionary *enrollment(void) {
     }
     if (!protected_directory(fd)) { if (fd >= 0) close(fd); return nil; }
     struct stat disabled;
-    if (fstatat(fd, "disabled", &disabled, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+    if (!allow_disabled && (fstatat(fd, "disabled", &disabled, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)) {
         close(fd); return nil;
     }
     int file = openat(fd, "account.plist", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
@@ -240,14 +246,20 @@ static bool integer(id n, uint32_t *out) {
     return true;
 }
 
+static bool owner_bound(uint32_t recorded, uint32_t selected, uint32_t caller) {
+    return recorded == (selected ? selected : caller);
+}
+
 static bool account_matches(bool worker) {
-    NSDictionary *p = enrollment();
+    NSDictionary *p = enrollment_at(false, false);
     NSSet *keys = [NSSet setWithArray:@[@"version", @"uid", @"gid", @"record_uuid", @"name", @"home", @"owner_uid"]];
     if (!p || ![[NSSet setWithArray:p.allKeys] isEqual:keys]) return false;
     uint32_t version, uid, gid, owner;
     if (!integer(p[@"version"], &version) || version != 1 || !integer(p[@"uid"], &uid) ||
         !integer(p[@"gid"], &gid) || !integer(p[@"owner_uid"], &owner) || owner == uid || getuid() != geteuid() ||
         (worker ? (uid != getuid() || gid != getgid() || getgid() != getegid()) : owner != getuid())) return false;
+    uint32_t selected = atomic_load(&registration_owner);
+    if (!owner_bound(owner, selected, getuid())) return false;
     for (NSString *key in @[@"record_uuid", @"name", @"home"])
         if (![p[key] isKindOfClass:[NSString class]] || ![p[key] length]) return false;
     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:p[@"record_uuid"]];
@@ -279,6 +291,21 @@ static bool account_matches(bool worker) {
     return true;
 }
 
+uint32_t glass_private_legacy_owner(void) {
+    @autoreleasepool {
+        NSDictionary *p = enrollment_at(true, true);
+        uint32_t version, owner;
+        return p && p.count == 7 && integer(p[@"version"], &version) && version == 1 &&
+            integer(p[@"owner_uid"], &owner) && owner >= 501 ? owner : 0;
+    }
+}
+
+int glass_private_set_owner(uint32_t owner) {
+    if (owner < 501 || atomic_load(&pinned_asid)) return 77;
+    uint32_t previous = 0;
+    return atomic_compare_exchange_strong(&registration_owner, &previous, owner) || previous == owner ? 0 : 77;
+}
+
 int glass_private_is_owner(void) {
     @autoreleasepool {
         if (!getuid() || getuid() != geteuid()) return 0;
@@ -294,7 +321,7 @@ int glass_private_attached(void) {
 
 uint32_t glass_private_worker_uid(void) {
     @autoreleasepool {
-        NSDictionary *p = enrollment();
+        NSDictionary *p = enrollment_at(false, false);
         uint32_t version, owner, uid;
         if (!p || p.count != 7 || !integer(p[@"version"], &version) || version != 1 ||
             !integer(p[@"owner_uid"], &owner) || !integer(p[@"uid"], &uid) ||
@@ -345,6 +372,8 @@ int main(void) {
     uint32_t n;
     if (integer(@YES, &n) || integer(@0, &n) || integer(@(-1), &n) || integer(@1.5, &n) ||
         integer(@4294967296LL, &n) || integer(@"1", &n) || !integer(@1, &n) || n != 1) return 6;
+    if (!owner_bound(501, 501, 502) || owner_bound(503, 501, 502) ||
+        !owner_bound(501, 0, 501) || owner_bound(502, 0, 501)) return 7;
     puts("{\"completed\":true,\"context_refusal_cases\":11,\"integer_type_cases\":7,\"ssh_attachment_refused\":true,\"gui_started\":false}");
     return 0;
 }
@@ -359,7 +388,33 @@ int glass_private_owns_pid(int pid) {
 }
 
 int glass_private_is_worker(void) {
-    @autoreleasepool { return account_matches(true) ? 1 : 0; }
+    @autoreleasepool {
+        if (atomic_load(&registration_owner)) return account_matches(true) ? 1 : 0;
+        DIR *entries = opendir("/Library/Application Support/Glass/accounts");
+        if (!entries) return 0;
+        uint32_t found = 0;
+        unsigned count = 0;
+        struct dirent *entry;
+        bool ambiguous = false;
+        while ((entry = readdir(entries))) {
+            if (++count > 1024) { ambiguous = true; break; }
+            char *end = NULL;
+            errno = 0;
+            unsigned long value = strtoul(entry->d_name, &end, 10);
+            if (errno || !*entry->d_name || *end || value < 501 || value > UINT32_MAX) continue;
+            char canonical[16]; snprintf(canonical, sizeof(canonical), "%u", (uint32_t)value);
+            if (strcmp(canonical, entry->d_name)) continue;
+            atomic_store(&registration_owner, (uint32_t)value);
+            if (account_matches(true)) {
+                if (found) { ambiguous = true; break; }
+                found = (uint32_t)value;
+            }
+        }
+        closedir(entries);
+        atomic_store(&registration_owner, ambiguous ? 0 : found);
+        if (ambiguous || !found) { atomic_store(&pinned_owner, 0); return 0; }
+        return 1;
+    }
 }
 
 uint32_t glass_private_session_id(void) { return atomic_load(&pinned_asid); }

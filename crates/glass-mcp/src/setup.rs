@@ -452,7 +452,7 @@ pub(crate) fn verify_private_launch_agent(addr: &str) -> Result<()> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn loaded_agent_pid(output: &str) -> Option<u32> {
+pub(crate) fn loaded_agent_pid(output: &str) -> Option<u32> {
     let mut depth = 0_usize;
     let mut pid = None;
     for line in output.lines().map(str::trim) {

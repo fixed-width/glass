@@ -100,7 +100,8 @@ List every `GLASS_*` variable with its purpose, default, and current value (see
 Guided macOS setup. `--account ACCOUNT` enrolls an existing standard account for off-desktop apps
 (preview); administrator authentication registers an on-demand native backend worker. Complete its
 real login and the existing permission checklist once, then keep it logged in. Existing healthy
-registration is reused. Without enrollment, setup retains the shared-desktop flow.
+registration is reused. Enrollment applies to the normal user who runs setup. Without that user's
+enrollment, setup retains the shared-desktop flow.
 
 - `--launchagent` — install the ordinary user's HTTP/menu-bar server.
 - `--no-launchagent` — use your MCP client's normal stdio server.
@@ -176,10 +177,21 @@ plain error message with no JSON.) Its fields:
 If a `glass-mcp serve --http` process is already running, it keeps serving the previous build in
 memory until it is restarted — `update` replaces the file on disk, not the running process.
 
+## `unenroll` (macOS)
+
+Remove your separate-account enrollment and restore shared-desktop operation. Stop application work
+first. Administrator authentication removes the registered worker after permission recovery; the
+app, development account, home, grants and normal HTTP/menu-bar startup integration remain. Restart
+existing Glass MCP servers before shared-desktop work. Other users' enrollments are unaffected.
+
+- `--non-interactive` — require existing administrator authorization instead of prompting.
+
+See [returning to shared-desktop use](../how-to/setup-macos.md#return-to-shared-desktop-use).
+
 ## `uninstall`
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. For account setup, stop active work first: uninstall restores recoverable
 workspace permissions and removes only Glass’s worker registration with administrator authentication.
-The account, home and app data remain. A disabled enrollment prevents an automatic shared-desktop
-fallback. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
+The account, home and app data remain. Use `unenroll` to keep the ordinary startup integration while
+returning to shared-desktop operation. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).

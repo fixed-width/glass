@@ -23,13 +23,14 @@ a virtual monitor alone does not isolate input. Running Glass and its target ins
 separate desktop, but the native backend cannot attest isolation from the VM host.
 
 macOS also has [separate-account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview)
-in preview, using a retained real login in the same OS. It routes the normal tools to that account,
+in preview, using a retained real login in the same OS. Enrollment applies per normal user and
+`glass-mcp unenroll` restores that user's shared-desktop route. It routes the normal tools to the account,
 with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
 development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
 using an existing initialized login. Simultaneous physical keyboard/mouse use and unattended startup
 after a reboot have not been tested.
 After logout/relogin, a loaded registration with a stale socket requires the documented
-[uninstall/setup recovery](../how-to/setup-macos.md#recover-a-refused-worker-connection);
+[unenroll/setup recovery](../how-to/setup-macos.md#recover-a-refused-worker-connection);
 rerunning setup alone does not repair that state.
 
 For the actual active session, use `glass_capabilities` with `scope: "session"`: each input operation

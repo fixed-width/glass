@@ -113,16 +113,61 @@ pub fn account_processes(uid: u32) -> std::io::Result<Vec<ProcessIdentity>> {
 /// Installed enrollment directory; this is service state, never application eligibility.
 pub const ROOT: &str = "/Library/Application Support/Glass";
 
+/// Root-owned registration for one normal account; another user's registration has no effect.
+pub fn root_for(owner: u32) -> std::path::PathBuf {
+    std::path::Path::new(ROOT)
+        .join("accounts")
+        .join(owner.to_string())
+}
+
 /// Resolve explicit enrollment without silently returning to the shared desktop.
 pub fn configured() -> Result<bool> {
-    match std::fs::symlink_metadata(ROOT) {
+    let owner = rustix::process::geteuid().as_raw();
+    let root = root_for(owner);
+    if std::fs::symlink_metadata(&root)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        && std::fs::symlink_metadata(std::path::Path::new(ROOT).join("account.plist")).is_ok()
+        && legacy_owner()? == owner
+    {
+        return Err(GlassError::Backend("legacy macOS enrollment requires migration; run glass-mcp setup --account ACCOUNT or glass-mcp unenroll".into()));
+    }
+    configured_at(&root, is_owner)
+}
+
+fn configured_at(root: &std::path::Path, verify: impl FnOnce() -> bool) -> Result<bool> {
+    match std::fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
-        Ok(_) if is_owner() => Ok(true),
+        Ok(_) if verify() => Ok(true),
         Ok(_) => Err(GlassError::Backend(
-            "macOS account enrollment is incomplete, invalid, or belongs to another user; run glass-mcp setup".into(),
+            "macOS account enrollment is incomplete or invalid; run glass-mcp setup --account ACCOUNT or glass-mcp unenroll".into(),
         )),
     }
+}
+
+/// Owner of an older preview registration, read without requiring its live login.
+pub fn legacy_owner() -> Result<u32> {
+    unsafe extern "C" {
+        fn glass_private_legacy_owner() -> u32;
+    }
+    // SAFETY: this reader validates root-owned metadata and returns no pointers.
+    let owner = unsafe { glass_private_legacy_owner() };
+    if owner < 501 {
+        return Err(GlassError::Backend(
+            "legacy macOS enrollment owner cannot be verified".into(),
+        ));
+    }
+    Ok(owner)
+}
+
+/// Bind a worker to the normal owner's registration before reading session metadata.
+pub fn attach_for(owner: u32, onboarding: bool) -> Result<()> {
+    unsafe extern "C" {
+        fn glass_private_set_owner(owner: u32) -> i32;
+    }
+    // SAFETY: this setter accepts only an ordinary numeric UID and refuses a changed attachment.
+    check(unsafe { glass_private_set_owner(owner) })?;
+    attach(onboarding)
 }
 
 pub fn require_if_attached() -> Result<()> {
@@ -363,5 +408,49 @@ mod protection_tests {
         directory.entry(0, "everyone deny delete");
         directory.entry(1, "everyone allow write");
         assert_eq!(directory.check().unwrap_err().raw_os_error(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn another_users_incomplete_registration_does_not_select_or_validate_our_route() {
+        let registry = tempfile::tempdir().unwrap();
+        let other = registry.path().join("501");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("account.plist"), "incomplete").unwrap();
+        assert!(
+            !configured_at(&registry.path().join("502"), || panic!(
+                "another user's registration must not be validated"
+            ))
+            .unwrap()
+        );
+        assert!(configured_at(&other, || false).is_err());
+    }
+
+    #[test]
+    fn existing_owner_registration_never_silently_falls_back_when_verification_fails() {
+        let registry = tempfile::tempdir().unwrap();
+        assert!(configured_at(registry.path(), || false).is_err());
+    }
+
+    #[test]
+    fn removing_only_our_registration_restores_shared_use_and_leaves_the_other_user_enrolled() {
+        let registry = tempfile::tempdir().unwrap();
+        let ours = registry.path().join("501");
+        let other = registry.path().join("502");
+        std::fs::create_dir(&ours).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        assert!(configured_at(&ours, || true).unwrap());
+        std::fs::remove_dir(&ours).unwrap();
+        assert!(
+            !configured_at(&ours, || panic!(
+                "unenrolled owner must use the normal route"
+            ))
+            .unwrap()
+        );
+        assert!(configured_at(&other, || true).unwrap());
     }
 }

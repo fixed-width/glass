@@ -26,8 +26,9 @@ internal refactors, CI, or test-only changes.
   its login and grants, verifies worker access and managed HTTP routing during setup, and supports
   protected trace directories inside workspaces. It releases per-app workers and temporary workspace
   permissions on stop and recovers recorded permission changes after an interrupted client.
-  `status` and `doctor` recognize enrollment; uninstall removes Glass's registration while retaining
-  the account, home and app data.
+  Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
+  restores shared-desktop use while keeping the app, development account and MCP startup integration.
+  Uninstall also removes startup integration while retaining the account, home and app data.
 
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
