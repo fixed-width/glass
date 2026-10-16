@@ -124,6 +124,10 @@ in the owning MCP client to stop its app, or quit that client's Glass process. T
 in person, switch to the selected account: Glass refuses further private input while it is the console
 account. Return to your normal account before resuming agent work.
 
+First-time account creation and permission onboarding have not been tested end to end through the
+production app. Setup currently requires manual account preparation and permission actions; it does
+not coordinate that flow or resume it automatically.
+
 This is a preview. Setup, worker re-registration, and changed-build development loops through both
 stdio and HTTP have been tested on an Apple Silicon Mac mini without a physical monitor connected,
 using an existing initialized login. Simultaneous physical keyboard/mouse use and unattended startup
