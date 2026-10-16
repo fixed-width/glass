@@ -26,6 +26,9 @@ async fn main() -> anyhow::Result<()> {
             return onboarding::run_registered_worker(owner, check);
         }
         Some(Command::MacosUnenroll) => return glass_mcp::macos_environment::remove_registration(),
+        Some(Command::MacosPrepareAccount { account, endpoint }) => {
+            return glass_mcp::macos_environment::prepare_account(&account, &endpoint);
+        }
         _ => {}
     }
     // AppKit setup precedes platform workers; offline evidence commands need none.
@@ -53,7 +56,8 @@ async fn main() -> anyhow::Result<()> {
             | Command::NativeBackend { .. }
             | Command::MacosEnroll { .. }
             | Command::MacosOnboarding { .. }
-            | Command::MacosUnenroll,
+            | Command::MacosUnenroll
+            | Command::MacosPrepareAccount { .. },
         ) => {
             anyhow::bail!("internal macOS command was not dispatched before AppKit initialization")
         }

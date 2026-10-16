@@ -5,11 +5,13 @@ use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
-    NSModalPanelRunLoopMode, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSModalPanelRunLoopMode, NSSecureTextField, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSNotification, NSRunLoop, NSString};
 use std::rc::Rc;
+use zeroize::Zeroizing;
 
 use crate::onboarding_window::{ButtonTarget, PollTimer};
 
@@ -24,9 +26,72 @@ pub struct SetupActions {
     pub account: String,
     pub on_begin: Box<dyn Fn(String)>,
     pub on_disable: Box<dyn Fn()>,
-    pub on_accounts: Box<dyn Fn()>,
+    pub on_create: Box<dyn Fn(NewAccount)>,
     pub poll: Box<dyn Fn() -> SetupProgress>,
     pub can_close: Box<dyn Fn() -> bool>,
+}
+
+pub struct NewAccount {
+    pub name: String,
+    pub password: Zeroizing<String>,
+}
+
+fn create_account_dialog(mtm: MainThreadMarker, default_name: &str) -> Option<NewAccount> {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Create a development account"));
+    alert.setInformativeText(&NSString::from_str("Glass creates a standard macOS account. Choose its short name and password; you will use them for its first login. Glass does not save the password. The account and its files remain yours when isolation is disabled."));
+    alert.addButtonWithTitle(&NSString::from_str("Create account"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 360.0, 118.0));
+    let name = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(0.0, 82.0, 360.0, 26.0));
+    name.setPlaceholderString(Some(&NSString::from_str("Account short name")));
+    name.setStringValue(&NSString::from_str(if default_name.is_empty() {
+        "glassdev"
+    } else {
+        default_name
+    }));
+    let password = NSSecureTextField::initWithFrame(
+        NSSecureTextField::alloc(mtm),
+        rect(0.0, 43.0, 360.0, 26.0),
+    );
+    password.setPlaceholderString(Some(&NSString::from_str("New account password")));
+    let confirm = NSSecureTextField::initWithFrame(
+        NSSecureTextField::alloc(mtm),
+        rect(0.0, 4.0, 360.0, 26.0),
+    );
+    confirm.setPlaceholderString(Some(&NSString::from_str("Confirm password")));
+    view.addSubview(&name);
+    view.addSubview(&password);
+    view.addSubview(&confirm);
+    alert.setAccessoryView(Some(&view));
+    let result = loop {
+        if alert.runModal() != 1000 {
+            break None;
+        }
+        let name = name.stringValue().to_string();
+        let password_text = Zeroizing::new(password.stringValue().to_string());
+        let confirmation = Zeroizing::new(confirm.stringValue().to_string());
+        let valid_name = name.len() <= 64
+            && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if valid_name
+            && !password_text.is_empty()
+            && password_text.len() <= 1024
+            && !password_text.contains('\0')
+            && *password_text == *confirmation
+        {
+            break Some(NewAccount {
+                name,
+                password: password_text,
+            });
+        }
+        alert.setInformativeText(&NSString::from_str("Start the name with an ASCII letter and use at most 64 letters, digits or underscores. Enter matching, nonempty passwords (at most 1024 UTF-8 bytes). macOS also checks this Mac's password policy."));
+    };
+    password.setStringValue(&NSString::from_str(""));
+    confirm.setStringValue(&NSString::from_str(""));
+    result
 }
 
 pub enum SetupChoice {
@@ -133,7 +198,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     view.addSubview(&account);
     let status = NSTextField::wrappingLabelWithString(
         &NSString::from_str(
-            "Select an existing standard development account. If you need one, open Accounts to create it. Your credentials stay in macOS.",
+            "Create a development account here, or enter the short name of an existing standard account. Your credentials stay on this Mac.",
         ),
         mtm,
     );
@@ -152,19 +217,30 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         &begin_target,
     );
     view.addSubview(&begin);
-    let accounts_target = ButtonTarget::new(mtm, actions.on_accounts);
-    let accounts = button(
+    let create_field = account.clone();
+    let create_target = ButtonTarget::new(
         mtm,
-        "Accounts…",
-        rect(24.0, 24.0, 130.0, 32.0),
-        &accounts_target,
+        Box::new(move || {
+            if let Some(request) =
+                create_account_dialog(mtm, &create_field.stringValue().to_string())
+            {
+                create_field.setStringValue(&NSString::from_str(&request.name));
+                (actions.on_create)(request);
+            }
+        }),
     );
-    view.addSubview(&accounts);
+    let create = button(
+        mtm,
+        "Create account…",
+        rect(24.0, 24.0, 154.0, 32.0),
+        &create_target,
+    );
+    view.addSubview(&create);
     let disable_target = ButtonTarget::new(mtm, actions.on_disable);
     let disable = button(
         mtm,
         "Disable isolation",
-        rect(163.0, 24.0, 166.0, 32.0),
+        rect(187.0, 24.0, 166.0, 32.0),
         &disable_target,
     );
     view.addSubview(&disable);
@@ -188,6 +264,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
             let progress = (actions.poll)();
             status.setStringValue(&NSString::from_str(&progress.message));
             begin.setEnabled(!progress.running);
+            create.setEnabled(!progress.running);
             disable.setEnabled(!progress.running);
             account.setEnabled(!progress.running);
             close.setEnabled(!progress.running || progress.can_cancel);
@@ -218,7 +295,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     drop((
         timer,
         begin_target,
-        accounts_target,
+        create_target,
         disable_target,
         close_target,
         delegate,

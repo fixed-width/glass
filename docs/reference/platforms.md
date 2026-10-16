@@ -24,7 +24,7 @@ separate desktop, but the native backend cannot attest isolation from the VM hos
 
 macOS also has [separate-account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview)
 in preview, using a retained real login in the same OS. The app's **Application setup…** window guides
-enrollment and permissions from one Glass installation. Enrollment applies per normal user and
+account creation, enrollment and permissions from one Glass installation. Enrollment applies per normal user and
 `glass-mcp unenroll` restores that user's shared-desktop route. It routes the normal tools to the account,
 with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
 development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,

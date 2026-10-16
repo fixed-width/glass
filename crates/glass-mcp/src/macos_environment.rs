@@ -93,6 +93,13 @@ fn account_record(name: &str, owner: u32, enrollment: bool) -> anyhow::Result<En
         "account home must be absolute"
     );
     if enrollment {
+        account_creation::check_created_account(&account, true)?;
+        glass_macos::account_setup::verify_identity(
+            &account.name,
+            &account.record_uuid,
+            account.uid,
+        )
+        .map_err(anyhow::Error::msg)?;
         let authorities = attributes
             .get("dsAttrTypeStandard:AuthenticationAuthority")
             .and_then(plist::Value::as_array)
@@ -1149,7 +1156,13 @@ fn elevate_using(
     Ok(())
 }
 
+mod account_creation;
 mod guided;
+
+/// Internal, authenticated root role; credentials arrive through its verified local connection.
+pub fn prepare_account(name: &str, endpoint: &Path) -> anyhow::Result<()> {
+    account_creation::prepare(name, endpoint)
+}
 
 pub(crate) fn application_lease() -> anyhow::Result<crate::macos_setup::Lease> {
     guided::environment_lease(crate::macos_setup::LeaseKind::Application)
@@ -1164,6 +1177,7 @@ pub fn setup(
     guided::run(
         guided::Options {
             name,
+            create: None,
             non_interactive,
             launchagent,
             addr,
@@ -1200,17 +1214,45 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         Ok(false) => None,
         Err(error) => Some(Err(error)),
     };
+    let creation = if existing.is_none() {
+        account_creation::last_created(rustix::process::getuid().as_raw())
+    } else {
+        Ok(None)
+    };
     let account = existing
         .as_ref()
         .and_then(|result| result.as_ref().ok())
         .map(|account| account.name.clone())
+        .or_else(|| {
+            creation
+                .as_ref()
+                .ok()
+                .and_then(|value| value.as_ref())
+                .map(|receipt| receipt.name.clone())
+        })
         .unwrap_or_default();
     let message = if let Some(Err(error)) = existing {
         format!(
             "Existing setup needs attention: {error:#}. Enter the development account name to check it. Glass will preserve unverified registration files."
         )
+    } else if let Err(error) = &creation {
+        format!(
+            "Saved account preparation needs attention: {error:#}. Existing records are retained."
+        )
+    } else if let Ok(Some(receipt)) = &creation {
+        if receipt.created && receipt.password_set {
+            format!(
+                "{} was created and retained. Set up checks registration and resumes the remaining login/permission steps.",
+                receipt.name
+            )
+        } else {
+            format!(
+                "Account creation for {} is unfinished. Choose Create account… with the same name and original chosen password to resume.",
+                receipt.name
+            )
+        }
     } else if account.is_empty() {
-        "Select a standard development account. Accounts… opens macOS account settings if you need to create one. Glass handles registration and permission checks.".into()
+        "Create a standard development account here, or enter the short name of an existing one. Glass handles registration and permission checks.".into()
     } else {
         format!(
             "{account} is enrolled. Set up checks its live worker and resumes any pending setup. Disable isolation returns this user to shared-desktop use."
@@ -1229,9 +1271,8 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     let disable_addr = addr.clone();
     let disable_state = state.clone();
     let close_state = state.clone();
-    let actions = SetupActions {
-        account,
-        on_begin: Box::new(move |name| {
+    let begin = Arc::new(
+        move |name: String, create: Option<crate::macos_account::Password>| {
             let mut state = match begin_state.lock() {
                 Ok(state) => state,
                 Err(_) => return,
@@ -1251,6 +1292,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 let result = guided::run(
                     guided::Options {
                         name: &name,
+                        create,
                         non_interactive: false,
                         launchagent: cfg!(feature = "network"),
                         addr: Some(&addr),
@@ -1269,10 +1311,27 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.can_cancel = true;
                     state.message = match result {
                         Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
+                        Err(error) if error.is::<guided::AccountCreationIncomplete>() => format!("{error:#}. Completed account data and grants are retained. Choose Create account… with the same name and original chosen password to resume."),
                         Err(error) => format!("{error:#}. Completed registration and grants are retained. Fix the reported cause, then choose Set up."),
                     };
                 }
             });
+        },
+    );
+    let create = begin.clone();
+    let create_state = state.clone();
+    let actions = SetupActions {
+        account,
+        on_begin: Box::new(move |name| begin(name, None)),
+        on_create: Box::new(move |request| {
+            match crate::macos_account::Password::from_text(request.password) {
+                Ok(password) => create(request.name, Some(password)),
+                Err(error) => {
+                    if let Ok(mut state) = create_state.lock() {
+                        state.message = error.to_string();
+                    }
+                }
+            }
         }),
         on_disable: Box::new(move || {
             let mut state = match disable_state.lock() {
@@ -1311,14 +1370,6 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 }
             });
         }),
-        on_accounts: Box::new(|| {
-            if let Err(error) = Command::new("/usr/bin/open")
-                .arg("x-apple.systempreferences:com.apple.Users-Groups-Settings.extension")
-                .spawn()
-            {
-                eprintln!("glass: could not open account settings: {error}");
-            }
-        }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
             message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true,
@@ -1341,8 +1392,9 @@ fn register_setup(name: &str, non_interactive: bool, system_dialog: bool) -> any
         !rustix::process::geteuid().is_root(),
         "run glass-mcp setup from your normal account; it requests elevation for registration only"
     );
-    account_record(name, rustix::process::getuid().as_raw(), false)
+    let account = account_record(name, rustix::process::getuid().as_raw(), false)
         .context("select an existing development account in Glass application setup")?;
+    let unused_creation = account_creation::check_created_account(&account, false)?;
     if let Ok(existing) = read_enrollment() {
         ensure!(
             existing.owner_uid == rustix::process::getuid().as_raw(),
@@ -1365,7 +1417,7 @@ fn register_setup(name: &str, non_interactive: bool, system_dialog: bool) -> any
         false
     };
     let onboarding_installed = reusable && owner_root()?.join(ONBOARD_JOB).try_exists()?;
-    if !reusable || (!non_interactive && !onboarding_installed) {
+    if !reusable || unused_creation || (!non_interactive && !onboarding_installed) {
         let mut arguments = vec!["macos-enroll", name];
         if !reusable && private_session::is_owner() {
             arguments.push("--repair");

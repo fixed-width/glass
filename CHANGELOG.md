@@ -33,6 +33,9 @@ internal refactors, CI, or test-only changes.
   worker checks, fresh-process grant updates, standard-home preparation and bounded registration
   repair. Doctor checks live worker readiness. Active macOS application sessions block setup or
   disable; the menu provides setup and disable without a second Glass installation.
+  Create a standard development account in that window with a local password, retained only in
+  memory during authenticated setup. Interrupted creation resumes its recorded account identity;
+  existing accounts and passwords are preserved. First login and privacy consent remain user actions.
 
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile

@@ -124,6 +124,7 @@ serde = { version = "1", features = ["derive"] }
 # feature set) out of the build entirely. Each list was derived and verified empirically
 # on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
+zeroize = "1"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
@@ -168,6 +169,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSWindow",
     "NSGraphics",
     "NSTextField",
+    "NSSecureTextField",
     # `CGFloat` — the status-item length type: `NSStatusBar::statusItemWithLength:` and the
     # `NSVariableStatusItemLength` constant are both `cfg`-gated on app-kit's own
     # `objc2-core-foundation` feature (which pulls the `CGFloat` alias in).

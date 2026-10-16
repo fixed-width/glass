@@ -6,6 +6,16 @@ use std::time::Duration;
 use super::*;
 use crate::macos_setup::{Coordinator, Decision, Phase, Progress};
 
+#[derive(Debug)]
+pub(super) struct AccountCreationIncomplete;
+
+impl std::fmt::Display for AccountCreationIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("account creation needs attention")
+    }
+}
+impl std::error::Error for AccountCreationIncomplete {}
+
 pub(super) fn phase() -> anyhow::Result<Phase> {
     read_enrollment()?;
     ensure!(
@@ -48,6 +58,7 @@ pub(super) fn diagnostic_phase() -> anyhow::Result<Phase> {
 
 pub(super) struct Options<'a> {
     pub name: &'a str,
+    pub create: Option<crate::macos_account::Password>,
     pub non_interactive: bool,
     pub launchagent: bool,
     pub addr: Option<&'a str>,
@@ -59,6 +70,7 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
     let _setup = lock_setup()?;
     let Options {
         name,
+        create,
         non_interactive,
         launchagent,
         addr,
@@ -68,7 +80,19 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
     progress(Progress::applying(
         "Checking account registration. Complete or cancel macOS authentication locally; take your time.",
     ));
-    register_setup(name, non_interactive, system_dialog)?;
+    if let Some(password) = create {
+        ensure!(
+            !non_interactive,
+            "create an account interactively in Glass application setup"
+        );
+        progress(Progress::applying(
+            "Creating the standard development account. Complete or cancel macOS authentication locally; take your time. Your password is not saved by Glass.",
+        ));
+        account_creation::create(name, &password, system_dialog)
+            .context(AccountCreationIncomplete)?;
+    } else {
+        register_setup(name, non_interactive, system_dialog)?;
+    }
     let mut coordinator = Coordinator::new(!non_interactive);
     let mut previous = None;
     loop {

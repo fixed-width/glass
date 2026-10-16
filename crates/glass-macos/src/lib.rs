@@ -36,6 +36,8 @@ pub mod window_directed;
 mod window_resolve; // pure active-window deadline policy — cross-platform, host-tested
 
 #[cfg(target_os = "macos")]
+pub mod account_setup;
+#[cfg(target_os = "macos")]
 mod axwindow;
 #[cfg(target_os = "macos")]
 mod backend;

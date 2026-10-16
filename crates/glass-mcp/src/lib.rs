@@ -901,6 +901,8 @@ mod remote_backend;
 #[cfg(target_os = "macos")]
 mod workspace_permissions;
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_account;
 #[cfg(target_os = "macos")]
 pub mod macos_environment;
 #[cfg(any(target_os = "macos", test))]

@@ -18,11 +18,16 @@ Stop any current Glass application with `glass_stop` before changing its environ
 1. Install the signed, hardened `GlassMcp.app` in `/Applications`. Use that one app for both your
    normal account and the development account. This signing requirement applies to Glass.
 2. Open Glass. On first run, choose **Off your desktop…**; if the menu-bar app is already running,
-   choose **glass → Application setup…**. Enter the short name of a dedicated **Standard** account.
-   **Accounts…** opens macOS account settings if you need to create one. This preview accepts account
-   names of 1–64 ASCII letters, digits or underscores. You control the account's password and files.
-3. Click **Set up**. Authenticate locally if macOS asks for administrator approval. Glass registers its
-   worker and permission helper from the same installed app. If the account's standard `/Users/NAME`
+   choose **glass → Application setup…**. Choose **Create account…** to create a dedicated **Standard**
+   account: enter its short name and a new password twice. The default name is `glassdev`; new names
+   start with an ASCII letter and use at most 64 letters, digits or underscores. Glass does not save
+   the password. You will use it for the account's first login; its display name is
+   **Glass development (NAME)**, with your chosen short name in parentheses.
+   To reuse an existing standard account, enter its short name and click **Set up** instead. Existing
+   names may contain 1–64 ASCII letters, digits or underscores. Glass never resets an existing account's password.
+3. Authenticate locally when macOS asks for administrator approval. This is separate from the new
+   account password. Glass creates the account if requested, then registers its worker and permission
+   helper from the same installed app. If the account's standard `/Users/NAME`
    home is missing, Glass asks macOS to initialise that selected home. Existing homes are retained;
    custom home locations must already be prepared.
 4. When Glass asks, use [Fast User Switching](https://support.apple.com/guide/mac-help/mchlp2439/mac)
@@ -86,6 +91,8 @@ on your normal desktop. Only one Glass macOS backend can use the enrolled enviro
 Enrollment applies to the normal macOS user who ran setup; other users retain their shared-desktop
 workflow. Each development account belongs to one enrollment. To select another development account,
 unenroll the current one first.
+An account created through Glass remains assigned to the normal user who created it, including after
+unenrollment; another normal user's setup cannot claim that creation record.
 
 The requested workspace is shared read/write for the run. Existing executable search paths and
 existing file/directory arguments receive read access; unrelated environment values are not treated
@@ -100,9 +107,16 @@ in the owning MCP client to stop its app, or quit that client's Glass process. T
 in person, switch to the selected account: Glass refuses further private input while it is the console
 account. Return to your normal account before resuming agent work.
 
-The guided account/permission flow is under development and has not yet been tested end to end
-through the production app. Account creation and initial macOS login still require user action;
-further automation of those steps remains under investigation.
+The guided account/permission flow and account creation are under development and have not yet been
+tested end to end through the production app. Initial macOS login and privacy consent still require
+user action. If creation is interrupted, **Create account…** with the same name resumes only the
+record whose identity Glass saved before creation. Supply the original chosen password if it was
+already set. Glass keeps created accounts and homes after a failure; it refuses a different account,
+changed identity or preexisting home instead of overwriting them. A deleted completed account is not
+recreated from its old receipt; select a new name or an existing account.
+Reopening setup restores the creating user's last saved name and progress. If a rejected attempt only
+reserved a name belonging to a different existing account, **Set up** can retire that user's unused
+reservation after administrator authentication without changing the existing account or its password.
 
 This is a preview. Setup, worker re-registration, and changed-build development loops through both
 stdio and HTTP have been tested on an Apple Silicon Mac mini without a physical monitor connected,

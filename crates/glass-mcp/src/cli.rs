@@ -64,6 +64,12 @@ pub enum Command {
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     MacosUnenroll,
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosPrepareAccount {
+        account: String,
+        endpoint: std::path::PathBuf,
+    },
 
     /// Inspect or export a stopped session trace without starting a backend.
     Trace {

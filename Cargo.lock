@@ -1381,6 +1381,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -1428,6 +1429,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "windows",
+ "zeroize",
  "zip",
 ]
 

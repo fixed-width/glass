@@ -26,7 +26,8 @@ apps off your desktop, alongside its existing shared-desktop setup. `glass_capab
 
 The [macOS account setup](docs/how-to/setup-macos.md#apps-off-your-desktop-preview) uses the normal
 MCP tools and one Glass installation. **Application setup…** guides enrollment, permission handoff and
-live readiness checks. It needs a real login and Glass privacy grants in a separate standard account,
+live readiness checks, including creating a standard development account with a locally chosen
+password. It needs a real login and Glass privacy grants in that account,
 retained between runs. Enrollment applies to your macOS user; `glass-mcp unenroll` returns to
 shared-desktop use while retaining the app, development account and MCP startup integration.
 Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.

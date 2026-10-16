@@ -102,6 +102,11 @@ int glass_private_processes(uint32_t uid, GlassProcessIdentity *out, int capacit
     return count;
 }
 
+int glass_private_uid_empty(uint32_t uid) {
+    GlassProcessIdentity sample[16];
+    return glass_private_processes(uid, sample, 16) == 0;
+}
+
 static atomic_uint pinned_asid;
 static atomic_uint pinned_uid;
 static atomic_uint pinned_owner;
@@ -505,14 +510,17 @@ int glass_private_copy_requirement(uint8_t **out, size_t *length) {
     return status;
 }
 
-int glass_private_authenticate_peer(int fd, const uint8_t *required, size_t length,
-                                   uint32_t expected_uid, uint32_t *pid, uint32_t *session) {
+static int authenticate_peer(int fd, const uint8_t *required, size_t length,
+                            uint32_t expected_uid, uint32_t audit_uid, bool privileged,
+                            uint32_t *pid, uint32_t *session) {
     @autoreleasepool {
         audit_token_t token = {0};
         socklen_t size = sizeof(token);
         if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &size) || size != sizeof(token))
             return errno ? errno : EIO;
-        if (audit_token_to_euid(token) != expected_uid || audit_token_to_auid(token) != expected_uid)
+        uint32_t audit = audit_token_to_auid(token);
+        if (audit_token_to_euid(token) != expected_uid ||
+            (audit != audit_uid && !(privileged && audit == 0)))
             return EACCES;
         SecCodeRef code = NULL;
         SecRequirementRef requirement = NULL;
@@ -535,4 +543,15 @@ int glass_private_authenticate_peer(int fd, const uint8_t *required, size_t leng
         if (bytes) CFRelease(bytes);
         return status;
     }
+}
+
+int glass_private_authenticate_peer(int fd, const uint8_t *required, size_t length,
+                                   uint32_t expected_uid, uint32_t *pid, uint32_t *session) {
+    return authenticate_peer(fd, required, length, expected_uid, expected_uid, false, pid, session);
+}
+
+int glass_setup_authenticate_root(int fd, const uint8_t *required, size_t length,
+                                 uint32_t owner, uint32_t *pid, uint32_t *session) {
+    if (owner < 501) return EINVAL;
+    return authenticate_peer(fd, required, length, 0, owner, true, pid, session);
 }

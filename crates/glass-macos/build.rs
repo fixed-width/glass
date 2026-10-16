@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/private_session.m");
+    println!("cargo:rerun-if-changed=src/account_setup.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -15,6 +16,7 @@ fn main() {
             std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "14.0".into()),
         )
         .file("src/private_session.m")
+        .file("src/account_setup.m")
         .flag("-fobjc-arc")
         .flag("-std=c11")
         .warnings_into_errors(true)

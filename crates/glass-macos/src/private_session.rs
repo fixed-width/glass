@@ -352,6 +352,45 @@ impl ProcessIdentity {
     }
 }
 
+/// Authenticate the transient privileged setup role without relaxing worker authentication.
+pub fn authenticate_setup_root(
+    stream: &std::os::unix::net::UnixStream,
+    requirement: &[u8],
+    owner: u32,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn glass_setup_authenticate_root(
+            fd: i32,
+            bytes: *const u8,
+            length: usize,
+            owner: u32,
+            pid: *mut u32,
+            session: *mut u32,
+        ) -> i32;
+    }
+    let mut pid = 0;
+    let mut session = 0;
+    // SAFETY: the socket/requirement stay live and the helper initializes both scalar outputs.
+    let code = unsafe {
+        glass_setup_authenticate_root(
+            stream.as_raw_fd(),
+            requirement.as_ptr(),
+            requirement.len(),
+            owner,
+            &mut pid,
+            &mut session,
+        )
+    };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(GlassError::Backend(format!(
+            "privileged Glass setup authentication failed: {code}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod protection_tests {
     use super::require_write_protected;
