@@ -72,6 +72,8 @@ const REQUEST_EPSILON_PX: i32 = 2;
 
 /// macOS backend, driving the target app with ScreenCaptureKit + CGEvent + AXUIElement.
 pub struct MacosPlatform {
+    /// Keeps environment changes out of an active MCP application session.
+    _environment_lease: Option<Box<dyn Send>>,
     /// Logs drained by `drain_logs`, filled by `process::spawn`'s per-stream reader threads —
     /// `Arc<Mutex<_>>` because those threads push while `drain_logs` reads. Empty until
     /// `start_app` launches a child.
@@ -147,6 +149,7 @@ impl MacosPlatform {
     pub fn new() -> Result<Self> {
         permissions::preflight()?;
         Ok(Self {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -159,27 +162,10 @@ impl MacosPlatform {
         })
     }
 
-    /// Run the optional `spec.build` shell step in `spec.cwd`, mirroring the X11/Windows
-    /// backends' `sh -c`/`cmd /C` build step. A nonzero exit maps to
-    /// `GlassError::AppNotStarted` — no launch is attempted if the build failed.
-    fn run_build(spec: &AppSpec) -> Result<()> {
-        let Some(build) = &spec.build else {
-            return Ok(());
-        };
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(build);
-        if let Some(dir) = &spec.cwd {
-            cmd.current_dir(dir);
-        }
-        let status = cmd
-            .status()
-            .map_err(|e| GlassError::AppNotStarted(format!("build command: {e}")))?;
-        if !status.success() {
-            return Err(GlassError::AppNotStarted(format!(
-                "build command failed with status {status}"
-            )));
-        }
-        Ok(())
+    /// Retain the controller's environment lease until this backend stops and is dropped.
+    pub fn with_environment_lease(mut self, lease: impl Send + 'static) -> Self {
+        self._environment_lease = Some(Box::new(lease));
+        self
     }
 
     /// Poll for `child`'s window, alternating a single
@@ -439,6 +425,11 @@ impl MacosPlatform {
         crate::bundle::handoff_gate(spec.sandbox)?;
         let id = crate::bundle::bundle_identifier(bundle)?;
         let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
+            Some(_) if crate::private_session::attached() => {
+                return Err(GlassError::AppNotStarted(
+                    "this bundle is already running in the development account; close that instance before starting a new Glass session".into(),
+                ));
+            }
             Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
             // `ffi::launch_bundle` blocks this thread on a channel until `NSWorkspace`'s
             // completion handler fires — on the true main thread, that handler could need a
@@ -454,6 +445,10 @@ impl MacosPlatform {
                 // `None` just found above means any instance running now is one we
                 // spawned, so best-effort reclaim it before propagating the error.
                 Err(e) => {
+                    if crate::private_session::attached() {
+                        return Err(GlassError::cleanup_failed("launching a private bundle", e,
+                            GlassError::Backend("LaunchServices returned no owned process; unverified instances were left untouched".into())));
+                    }
                     if let Some(pid) = crate::ffi::running_pid_for_bundle_id(&id)
                         && !crate::ffi::terminate_app(pid)
                     {
@@ -661,13 +656,38 @@ fn session_input_support(
 }
 
 impl Platform for MacosPlatform {
+    fn input_route(&self) -> glass_core::InputRoute {
+        if crate::private_session::attached() {
+            glass_core::InputRoute::Isolated
+        } else {
+            glass_core::InputRoute::SharedDesktop
+        }
+    }
+
     fn input_capabilities(&self) -> glass_core::InputCapabilities {
+        if crate::private_session::attached() && crate::private_session::require_private().is_err()
+        {
+            return glass_core::InputCapabilities::uniform(
+                glass_core::CapabilityStatus::requires_setup(
+                    "the enrolled account must retain its off-console Aqua login",
+                ),
+                glass_core::DesktopInterference::Unknown,
+            );
+        }
         glass_core::InputCapabilities::uniform(
             session_input_support(
                 crate::permissions::screen_recording_granted(),
                 crate::permissions::accessibility_granted(),
             ),
-            glass_core::DesktopInterference::Possible,
+            if crate::private_session::attached() {
+                if crate::private_session::require_private().is_ok() {
+                    glass_core::DesktopInterference::None
+                } else {
+                    glass_core::DesktopInterference::Unknown
+                }
+            } else {
+                glass_core::DesktopInterference::Possible
+            },
         )
     }
 
@@ -692,7 +712,12 @@ impl Platform for MacosPlatform {
     /// (`bundle::is_app_bundle`), this delegates to [`Self::start_bundle`]; every other
     /// `run[0]` takes the plain-exec path below.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
-        Self::run_build(spec)?;
+        crate::private_session::require_if_attached()?;
+        self.logs
+            .lock()
+            .map_err(|_| GlassError::Backend("build log sink poisoned".into()))?
+            .extend(crate::build::run(spec)?);
+        crate::private_session::require_if_attached()?;
         let run0 = spec
             .run
             .first()
@@ -742,6 +767,32 @@ impl Platform for MacosPlatform {
         };
         // Activate the launched app so its window registers with the AX API (best-effort — see
         // `activate_launched`); the launch itself already succeeded above.
+        if crate::private_session::attached()
+            && self
+                .app_pid
+                .is_some_and(|pid| !crate::private_session::owns_pid(pid))
+        {
+            let primary = GlassError::Backend(
+                "launched application is outside the private account; activation refused".into(),
+            )
+            .after_dispatch();
+            let unverified_handoff = self.adopted.take().is_some();
+            if let Some(mut child) = self.child.take() {
+                process::terminate(&mut child);
+            }
+            self.app_pid = None;
+            self.active_window = None;
+            self.taps.clear();
+            release_clip(self.clip.as_ref());
+            self.clip = None;
+            self.clipboard_route = ClipboardRoute::Unsupported;
+            return if unverified_handoff {
+                Err(GlassError::cleanup_failed("rejecting an unverified LaunchServices process", primary,
+                    GlassError::Backend("unverified process left untouched; its launch/cleanup could not be attributed".into())))
+            } else {
+                Err(primary)
+            };
+        }
         activate_launched(self.app_pid);
         Ok(geometry)
     }
@@ -1111,14 +1162,14 @@ mod tests {
             let support = session_input_support(false, accessibility);
             assert_eq!(support.status, glass_core::Support::RequiresSetup);
             assert_eq!(
-                support.note,
+                support.note.as_deref(),
                 Some(crate::permissions::screen_recording_remedy())
             );
         }
         let support = session_input_support(true, false);
         assert_eq!(support.status, glass_core::Support::RequiresSetup);
         assert_eq!(
-            support.note,
+            support.note.as_deref(),
             Some(crate::permissions::accessibility_remedy())
         );
         let support = session_input_support(true, true);
@@ -1128,6 +1179,7 @@ mod tests {
 
     fn test_platform() -> MacosPlatform {
         MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1168,6 +1220,7 @@ mod tests {
         // Build without preflight (which would require grants) by constructing the struct
         // directly — `new()` is exercised in the Mac-gated suite.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(vec![(Stream::Stdout, "hi".into())])),
             app_pid: Some(42),
             child: None,
@@ -1185,6 +1238,7 @@ mod tests {
     #[test]
     fn app_pid_returns_the_constructed_value() {
         let p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1204,6 +1258,7 @@ mod tests {
         // handle) and must succeed — this path never touches AppKit, so it's exercisable
         // off the Mac-gated suite's main-thread test.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1225,6 +1280,7 @@ mod tests {
         // later start_app on the same MacosPlatform never leaks a stale CGWindowID from a
         // previous session into resolve_active_window.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1246,6 +1302,7 @@ mod tests {
         // get_clipboard/set_clipboard to a pasteboard no longer in play. `clip` is None here,
         // so no pasteboard is touched.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1266,6 +1323,7 @@ mod tests {
         // inherits a previous one's private pasteboard name. With `clip` set, this also runs
         // the `release_named` path for the content + `.ready` boards.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1289,6 +1347,7 @@ mod tests {
         // reap + full state reset without a real process, needing no TCC grant or main
         // thread. Every per-session field must clear so a later `start_app` decides fresh.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(999_999),
             child: None,
@@ -1314,6 +1373,7 @@ mod tests {
         // A `PreExisting` adoptee is left running (glass only raised it), but the adopted
         // record and the rest of the per-session state must still clear on `stop_app`.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(999_999),
             child: None,
@@ -1339,6 +1399,7 @@ mod tests {
         // structured `AppNotStarted`, before any FFI/main-thread work — construct the struct
         // directly (as the other tests here do) to bypass `new()`'s TCC preflight.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1389,6 +1450,7 @@ mod tests {
         // `Unsupported` route below returns before either clipboard method touches any
         // pasteboard, so this exercises the routing grant-free.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1413,6 +1475,7 @@ mod tests {
         // own test-module discipline of never mutating the shared system pasteboard from an
         // automated test — this only proves the route reaches the real implementation.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,

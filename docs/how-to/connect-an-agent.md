@@ -91,7 +91,7 @@ tunnel setup.
 
 ## The macOS exception
 
-On macOS, prefer the HTTP endpoint that the menu-bar LaunchAgent already serves (see
+For shared-desktop operation on macOS, prefer the HTTP endpoint that the menu-bar LaunchAgent serves (see
 [setup-macos.md](setup-macos.md)). You *can* register the app's bundled binary over stdio:
 
 ```bash
@@ -102,3 +102,8 @@ claude mcp add glass --scope user -- \
 — but a stdio server is launched by, and attributed to, your MCP client, so the macOS permission
 grants must attach to *that* process. The LaunchAgent model exists precisely so glass holds its own
 grants; see [the permission model](../explanation/macos-permissions.md) for why.
+
+With the [separate-account preview](setup-macos.md#apps-off-your-desktop-preview), the grant-bearing
+worker is already a Glass LaunchAgent in the development account. Your ordinary MCP server can use
+stdio; its parent's privacy grants do not determine the private worker's permissions. Run the MCP
+client in your normal account and keep the enrolled development account logged in.

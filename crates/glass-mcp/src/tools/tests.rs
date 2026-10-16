@@ -138,6 +138,41 @@ fn start_hands_the_requested_env_to_the_backend() {
 }
 
 #[test]
+fn failed_build_output_is_an_untrusted_sibling_of_the_error() {
+    let root = tempfile::tempdir().unwrap();
+    let mut glass = Glass::new(
+        Box::new(|_| {
+            Err(glass_core::GlassError::BuildFailed {
+                status: "exit status: 23".into(),
+                stdout: "project stdout".into(),
+                stderr: "project stderr".into(),
+            }
+            .after_dispatch())
+        }),
+        "fake".into(),
+        glass_core::BaselineStore::new(root.path()),
+        100,
+    );
+    let mut args = start_args();
+    args.a11y = Some(false);
+    let output = start(&mut glass, &args).unwrap_err();
+    let [OutContent::Text(status), OutContent::Text(diagnostics)] = output.0.as_slice() else {
+        panic!("expected status and diagnostic");
+    };
+    assert_eq!(status.trust, crate::output::TextTrust::Trusted);
+    assert!(status.body.contains("exit status: 23"));
+    assert!(!status.body.contains("project"));
+    assert_eq!(
+        diagnostics.trust,
+        crate::output::TextTrust::UntrustedApplication
+    );
+    let rendered = output.render_text_blocks();
+    assert!(rendered[1].contains("project stdout"));
+    assert!(rendered[1].contains("project stderr"));
+    assert!(rendered[1].starts_with(crate::untrusted::NOTE));
+}
+
+#[test]
 fn start_rejects_empty_run() {
     let mut g = glass_with(FakePlatform::new(10, 10));
     let mut a = start_args();
@@ -154,7 +189,8 @@ fn start_rejects_unknown_sandbox() {
     let mut a = start_args();
     a.sandbox = Some("bogus".into());
     let err = start(&mut g, &a).unwrap_err();
-    assert!(err.contains("unknown sandbox level"), "got: {err}");
+    let message = err.render_text_blocks().join("\n");
+    assert!(message.contains("unknown sandbox level"), "got: {message}");
 }
 
 #[test]

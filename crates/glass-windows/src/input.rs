@@ -570,13 +570,13 @@ impl glass_core::ScrollSink for WindowsScrollSink {
             .dy
             .checked_mul(-WHEEL_DELTA)
             .ok_or(GlassError::InvalidPointerInput(
-                "vertical scroll delta overflowed",
+                "vertical scroll delta overflowed".into(),
             ))?;
         let horizontal =
             self.dx
                 .checked_mul(WHEEL_DELTA)
                 .ok_or(GlassError::InvalidPointerInput(
-                    "horizontal scroll delta overflowed",
+                    "horizontal scroll delta overflowed".into(),
                 ))?;
         send(&[
             mouse(self.nx, self.ny, MOUSEEVENTF_MOVE | ABS),
@@ -682,7 +682,7 @@ pub(crate) fn send_pointer_by(
                     .ok()
                     .and_then(|count| count.checked_mul(2))
                     .ok_or_else(|| {
-                        GlassError::InvalidPointerInput("click event count overflowed")
+                        GlassError::InvalidPointerInput("click event count overflowed".into())
                             .before_dispatch()
                     })?;
                 let capacity = modifiers
@@ -691,7 +691,7 @@ pub(crate) fn send_pointer_by(
                     .and_then(|count| count.checked_add(1))
                     .and_then(|count| count.checked_add(click_events))
                     .ok_or_else(|| {
-                        GlassError::InvalidPointerInput("click event count overflowed")
+                        GlassError::InvalidPointerInput("click event count overflowed".into())
                             .before_dispatch()
                     })?;
                 let mut inputs = Vec::with_capacity(capacity);

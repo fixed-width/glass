@@ -21,6 +21,29 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Preview macOS account setup with `glass-mcp setup --account ACCOUNT`: enroll an existing standard
+  account for off-desktop development using the normal MCP tools over stdio or HTTP. Glass reuses
+  its login and grants, verifies worker access and managed HTTP routing during setup, and supports
+  protected trace directories inside workspaces. It releases per-app workers and temporary workspace
+  permissions on stop and recovers recorded permission changes after an interrupted client.
+  Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
+  restores shared-desktop use while keeping the app, development account and MCP startup integration.
+  Uninstall also removes startup integration while retaining the account, home and app data.
+  The app's Application setup window and CLI share a resumable permission flow with automatic
+  worker checks, fresh-process grant updates, standard-home preparation and bounded registration
+  repair. Registration changes wait for the original process and launchd job to stop, and setup
+  displays native authorization and repair failures. Doctor checks live worker readiness. Active macOS application sessions block setup or
+  disable; the menu provides setup and disable without a second Glass installation.
+  Create a standard development account in that window with a local password, retained only in
+  memory during native administrator-authenticated setup. Refused setup connections are recorded
+  in the app log. New account IDs are checked against existing login domains without creating
+  domains during allocation; unavailable inventories return an error. Interrupted creation resumes its recorded account identity;
+  existing accounts and passwords are preserved. First login and privacy consent remain user actions.
+  Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
+  disable clear that pending request; stale windows cannot restart it. A logged-in account whose
+  worker is missing gets a startup check and one repair, rather than another login instruction;
+  administrator approval does not consume the worker's startup time.
+
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
   isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
@@ -36,6 +59,10 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- macOS build output is captured in application logs instead of reaching the MCP transport; build failures return bounded compiler diagnostics as untrusted application output, separately from the error status.
+- Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.
+- Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.
+- macOS contained launches inspect relative executable paths in the requested working directory, so eligible rebuilt apps retain clipboard support. Bare commands use the launch PATH rather than a same-named file in Glass's directory.
 - macOS accessibility actions can recover a target whose tree position changed when one complete bounded search finds the same role and name at its original bounds. Ambiguous matches, unreadable searches and moved targets still refuse the action.
 - macOS double and triple clicks now send the full sequence of paired mouse events, allowing Qt controls to recognize word selection correctly. Multi-click deadlines still release a pressed button before stopping.
 - macOS typing now sends Unicode characters, including accented text, CJK and emoji, through keyboard events while preserving ASCII keys and keyboard chords.

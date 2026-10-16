@@ -16,12 +16,16 @@ use glass_core::capability::{CapabilityMap, CapabilityStatus};
 pub mod adoption_log; // pure window-adoption diagnostic rendering — cross-platform, host-tested
 #[cfg(any(target_os = "macos", test))]
 mod ax_timeout; // pure AX messaging-timeout orchestration — cross-platform, host-tested
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod build;
 pub mod bundle; // pure .app-bundle logic — cross-platform, host-tested
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
 pub mod coords; // pure window-relative <-> global math — cross-platform, host-tested
 #[cfg(any(target_os = "macos", test))]
 mod input_deadline; // pure post-focus/input deadline sequencing — cross-platform, host-tested
 pub mod keymap; // pure ASCII -> (keycode, shift) US map — cross-platform, host-tested
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod launch_program;
 pub mod settle; // settle policy + poll loop over successive readings — cross-platform, host-tested
 #[cfg(any(target_os = "macos", test))]
 mod shareable_receive; // pure completion-channel receive classification — cross-platform, host-tested
@@ -31,6 +35,8 @@ pub mod window_directed;
 #[cfg(any(target_os = "macos", test))]
 mod window_resolve; // pure active-window deadline policy — cross-platform, host-tested
 
+#[cfg(target_os = "macos")]
+pub mod account_setup;
 #[cfg(target_os = "macos")]
 mod axwindow;
 #[cfg(target_os = "macos")]
@@ -62,9 +68,13 @@ mod scwindow;
 #[cfg(target_os = "macos")]
 mod session;
 #[cfg(target_os = "macos")]
+pub mod setup_window;
+#[cfg(target_os = "macos")]
+pub mod workspace_access;
+#[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;
 #[cfg(target_os = "macos")]
-pub use ffi::init_main_thread;
+pub use ffi::{init_main_thread, main_thread_initialized};
 
 /// This backend's capability map. Every cell but `accessibility` is code-constant; the
 /// `accessibility` cell is live — gated on the macOS Accessibility TCC grant
@@ -177,7 +187,7 @@ mod capability_tests {
         let msg = glass_core::GlassError::unsupported(
             "multi_touch",
             crate::BACKEND,
-            crate::MULTI_TOUCH.note,
+            crate::MULTI_TOUCH.note.as_deref(),
         )
         .to_string();
         assert!(msg.contains("macos backend"), "{msg}");
@@ -185,3 +195,8 @@ mod capability_tests {
         assert!(!msg.contains("android"), "{msg}");
     }
 }
+
+#[cfg(target_os = "macos")]
+pub mod private_session;
+#[cfg(target_os = "macos")]
+pub mod worker_socket;

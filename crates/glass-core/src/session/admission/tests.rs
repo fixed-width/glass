@@ -449,7 +449,7 @@ fn targeted_capability_reporting_agrees_with_admission_for_partial_or_interferin
             DesktopInterference::Possible,
             DesktopInterference::Unknown,
         ] {
-            let mut report = InputCapabilities::uniform(support, interference);
+            let mut report = InputCapabilities::uniform(support.clone(), interference);
             report.restrict_window_targeted();
             let admitted = super::require_targeted_support(report.click.clone(), "click").is_ok();
             assert_eq!(
@@ -458,7 +458,7 @@ fn targeted_capability_reporting_agrees_with_admission_for_partial_or_interferin
             );
             if support.status == Support::RequiresSetup {
                 assert_eq!(report.click.support.status, Support::RequiresSetup);
-                assert_eq!(report.click.support.note, Some("setup"));
+                assert_eq!(report.click.support.note.as_deref(), Some("setup"));
             } else if !admitted {
                 assert_eq!(report.click.support.status, Support::Unsupported);
             }

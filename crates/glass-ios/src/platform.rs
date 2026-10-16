@@ -724,7 +724,7 @@ impl Platform for IosPlatform {
             WindowOp::Resize { .. } | WindowOp::Move { .. } => Err(GlassError::unsupported(
                 "window_move_resize",
                 crate::BACKEND,
-                crate::capabilities().window_move_resize.note,
+                crate::capabilities().window_move_resize.note.as_deref(),
             )),
         };
         if deadline.has_passed() {

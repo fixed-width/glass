@@ -52,6 +52,8 @@ pub struct MenuBarActions {
     /// puts any "finish in the Finder" guidance in that confirmation; this crate only invokes
     /// the callback.
     pub on_uninstall: Box<dyn Fn()>,
+    /// Open application environment setup without stopping the MCP server.
+    pub on_setup: Box<dyn Fn()>,
 }
 
 /// The boxed callbacks, stored in [`MenuTarget`]'s instance variables. Not `Send`/`Sync`, and
@@ -61,6 +63,7 @@ struct Ivars {
     on_copy: Box<dyn Fn()>,
     on_restart: Box<dyn Fn()>,
     on_uninstall: Box<dyn Fn()>,
+    on_setup: Box<dyn Fn()>,
     on_quit: Option<Box<dyn Fn()>>,
 }
 
@@ -78,6 +81,10 @@ define_class!(
     struct MenuTarget;
 
     impl MenuTarget {
+        #[unsafe(method(applicationSetup:))]
+        fn application_setup(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_setup)();
+        }
         #[unsafe(method(copyEndpoint:))]
         fn copy_endpoint(&self, _sender: Option<&AnyObject>) {
             (self.ivars().on_copy)();
@@ -180,6 +187,7 @@ pub fn run_with_quit(actions: MenuBarActions, on_quit: Option<Box<dyn Fn()>>) ->
             on_copy: actions.on_copy,
             on_restart: actions.on_restart,
             on_uninstall: actions.on_uninstall,
+            on_setup: actions.on_setup,
             on_quit,
         },
     );
@@ -203,6 +211,13 @@ pub fn run_with_quit(actions: MenuBarActions, on_quit: Option<Box<dyn Fn()>>) ->
     menu.addItem(&copy_item);
     let restart_item = action_item(mtm, "Restart", sel!(restart:), "", Some(&target));
     menu.addItem(&restart_item);
+    menu.addItem(&action_item(
+        mtm,
+        "Application setup…",
+        sel!(applicationSetup:),
+        "",
+        Some(&target),
+    ));
 
     let sep2 = NSMenuItem::separatorItem(mtm);
     menu.addItem(&sep2);

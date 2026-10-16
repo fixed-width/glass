@@ -35,7 +35,7 @@ use objc2_app_kit::{
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSNotification, NSString};
+use objc2_foundation::{NSNotification, NSString, NSTimer};
 
 /// One permission's row: the human label, its current grant snapshot (drives the status
 /// glyph), and the action that requests the permission's grant (macOS then shows its own
@@ -70,7 +70,7 @@ pub struct ChecklistActions {
 /// `Send`/`Sync`, and it needn't be: `ButtonTarget` is `MainThreadOnly`, so the object —
 /// and thus this closure — only ever runs on the main thread (button actions dispatch on
 /// the main run loop).
-struct ButtonIvars {
+pub(crate) struct ButtonIvars {
     on_fire: Box<dyn Fn()>,
 }
 
@@ -85,7 +85,7 @@ define_class!(
     #[thread_kind = MainThreadOnly]
     #[name = "GlassOnboardingButtonTarget"]
     #[ivars = ButtonIvars]
-    struct ButtonTarget;
+    pub(crate) struct ButtonTarget;
 
     impl ButtonTarget {
         #[unsafe(method(fire:))]
@@ -98,11 +98,49 @@ define_class!(
 );
 
 impl ButtonTarget {
-    fn new(mtm: MainThreadMarker, on_fire: Box<dyn Fn()>) -> Retained<Self> {
+    pub(crate) fn new(mtm: MainThreadMarker, on_fire: Box<dyn Fn()>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ButtonIvars { on_fire });
         // SAFETY: `NSObject`'s `init` takes no arguments and returns the initialized
         // instance; `this` is a freshly-allocated `ButtonTarget` with its ivar set.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Fresh permission facts supplied by the host without blocking the AppKit thread.
+pub struct ChecklistUpdate {
+    pub granted: [bool; 2],
+    pub message: String,
+    pub finished: bool,
+}
+
+pub(crate) struct PollTimer {
+    pub(crate) timer: Retained<NSTimer>,
+    _target: Retained<ButtonTarget>,
+}
+
+impl PollTimer {
+    pub(crate) fn new(mtm: MainThreadMarker, on_tick: Box<dyn Fn()>) -> Self {
+        let target = ButtonTarget::new(mtm, on_tick);
+        // SAFETY: target implements fire:, remains retained, and the timer stays on this main run loop.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                1.0,
+                &target,
+                sel!(fire:),
+                None,
+                true,
+            )
+        };
+        Self {
+            timer,
+            _target: target,
+        }
+    }
+}
+
+impl Drop for PollTimer {
+    fn drop(&mut self) {
+        self.timer.invalidate();
     }
 }
 
@@ -147,7 +185,7 @@ impl WindowDelegate {
 const WIDTH: f64 = 480.0;
 const H_MARGIN: f64 = 24.0;
 const V_MARGIN: f64 = 20.0;
-const INSTRUCTION_H: f64 = 40.0;
+const INSTRUCTION_H: f64 = 72.0;
 const SECTION_GAP: f64 = 16.0;
 const ROW_H: f64 = 28.0;
 const ROW_GAP: f64 = 10.0;
@@ -204,6 +242,14 @@ fn rect(content_h: f64, x: f64, top: f64, w: f64, h: f64) -> CGRect {
 /// Returns `Err` only for the one precondition this crate can enforce off a real AppKit run
 /// loop: being called off the main thread.
 pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
+    run_checklist_with_poll(actions, None)
+}
+
+/// Run the checklist with optional fresh-process permission updates.
+pub fn run_checklist_with_poll(
+    actions: ChecklistActions,
+    poll: Option<Box<dyn Fn() -> Option<ChecklistUpdate>>>,
+) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         "the onboarding checklist window must start on the main thread".to_string()
     })?;
@@ -274,6 +320,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     // Every per-button target lives here for the whole run loop (`fire:` targets are weak
     // references — see the module doc).
     let mut button_targets: Vec<Retained<ButtonTarget>> = Vec::with_capacity(rows.len() + 1);
+    let mut row_controls = Vec::new();
 
     if rows.is_empty() {
         // Defensive: the host only opens this window when a permission is missing, so an empty
@@ -316,6 +363,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
             };
             button.setFrame(rect(content_h, button_x, row_top, BUTTON_W, ROW_H));
             container.addSubview(&button);
+            row_controls.push((glyph_label, button));
             button_targets.push(target);
         }
     }
@@ -362,6 +410,30 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     app.activateIgnoringOtherApps(true);
     window.orderFrontRegardless();
 
+    let timer = poll.map(|poll| {
+        let instruction = instruction.clone();
+        let window = window.clone();
+        PollTimer::new(
+            mtm,
+            Box::new(move || {
+                if let Some(update) = poll() {
+                    instruction.setStringValue(&NSString::from_str(&update.message));
+                    for ((glyph, button), granted) in row_controls.iter().zip(update.granted) {
+                        glyph.setStringValue(&NSString::from_str(if granted {
+                            "✓"
+                        } else {
+                            "○"
+                        }));
+                        button.setEnabled(!granted);
+                    }
+                    if update.finished {
+                        window.close();
+                    }
+                }
+            }),
+        )
+    });
+
     // Block the main thread on the AppKit event loop. `window`, `container`, `delegate`, and
     // every `ButtonTarget` must outlive this call (`setTarget:`/`setDelegate:` hold only weak
     // references), so they stay bound until after `run` returns.
@@ -369,6 +441,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     // None of the rendering is checkable off a real WindowServer/AppKit run loop — the darwin
     // build only proves it compiles.
     app.run();
+    drop(timer);
 
     // Reached only if the run loop stops without the process exiting. Keep the AppKit
     // objects alive right up to here.

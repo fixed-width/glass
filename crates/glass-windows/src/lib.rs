@@ -161,7 +161,7 @@ const MULTI_TOUCH: CapabilityStatus = CapabilityStatus::unsupported(None);
 // non-test off-target build sees this as dead (mirrors jobcfg.rs/doctor.rs in this crate).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
-    glass_core::GlassError::unsupported("multi_touch", BACKEND, MULTI_TOUCH.note)
+    glass_core::GlassError::unsupported("multi_touch", BACKEND, MULTI_TOUCH.note.as_deref())
 }
 
 #[cfg(windows)]

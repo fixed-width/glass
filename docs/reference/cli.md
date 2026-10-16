@@ -31,8 +31,8 @@ Serve MCP over the network (Streamable HTTP) instead of stdio.
 - `--http` — use the HTTP transport.
 - `--addr <host:port>` — bind address, e.g. `0.0.0.0:7300`. A non-loopback bind requires a token.
 - `--token-file <path>` — read the bearer token from this file (alternative: `GLASS_TOKEN`).
-- `--menubar` — run as the visible **`glass ●`** menu-bar app (macOS); without it the server stays
-  headless (no menu bar, MCP served silently).
+- `--menubar` — run as the visible **`glass ●`** menu-bar app (macOS); otherwise the server has
+  no menu bar. This does not itself isolate the application desktop.
 - `--audit-log <path>` — as above.
 - `--tool-profile full|lean` — as above, including menu-bar mode.
 - `--trace-dir` and `--trace-max-bytes` — as above, including menu-bar mode.
@@ -81,6 +81,10 @@ containment runtime, and external tool paths — and print how to fix anything m
 if the default backend can't run (CI-friendly). The agent can run the same checks via the
 `glass_doctor` tool.
 
+For an enrolled macOS account, this includes an authenticated worker login/permission probe without
+launching a development app or sharing a workspace. An environment in use is reported as busy and
+the probe is skipped; setup and ordinary application work are left undisturbed.
+
 - `--deep` — additionally spawn and tear down the display to prove it starts.
 - `--json` — machine-readable output.
 - `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
@@ -95,10 +99,34 @@ List every `GLASS_*` variable with its purpose, default, and current value (see
 - `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
   Ignored with `--json`. A non-empty `NO_COLOR`, or `TERM=dumb`, suppresses `auto`.
 
+## `setup`
+
+Guided macOS setup. `--account ACCOUNT` enrolls an existing standard account for off-desktop apps
+(preview); administrator authentication registers the backend and permission helper from the same
+Glass app. Setup waits for initial login, privacy consent and the return to the normal account,
+then checks live worker readiness and workspace recovery. Completed registration/grants are reused.
+Plain `setup` resumes an existing enrollment. The menu's **Application setup…** window uses the same
+flow and provides disable. Active macOS application work blocks environment changes. Without an
+enrollment, setup retains the shared-desktop flow.
+
+An interrupted account setup saves its account and integration choices without credentials.
+Reopening Glass resumes checks only for the same enabled enrollment; incomplete account creation
+asks for the original chosen password again. Cancelling setup or running `unenroll` clears that
+pending request and retains completed account data and grants.
+
+- `--launchagent` — install the ordinary user's HTTP/menu-bar server.
+- `--no-launchagent` — use your MCP client's normal stdio server.
+- `--non-interactive` — require existing authorization and report pending steps without prompting.
+- `--addr ADDR` — the HTTP server's address.
+
+See [macOS account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview) for prerequisites,
+workspace access, recovery and qualification limits.
+
 ## `status`
 
 Report whether glass is running and at what endpoint (reads `/healthz`). Primarily used with the
-macOS menu-bar LaunchAgent — see [how-to/setup-macos.md](../how-to/setup-macos.md).
+macOS menu-bar LaunchAgent. An enrolled macOS account also reports whether it is idle, in use or
+disabled, without starting a worker — see [how-to/setup-macos.md](../how-to/setup-macos.md).
 
 ## `update`
 
@@ -160,7 +188,23 @@ plain error message with no JSON.) Its fields:
 If a `glass-mcp serve --http` process is already running, it keeps serving the previous build in
 memory until it is restarted — `update` replaces the file on disk, not the running process.
 
+## `unenroll` (macOS)
+
+Remove your separate-account enrollment and restore shared-desktop operation. Stop application work
+first. Administrator authentication removes the registered worker after permission recovery; the
+app, development account, home, grants and normal HTTP/menu-bar startup integration remain. Restart
+existing Glass MCP servers before shared-desktop work. Other users' enrollments are unaffected.
+
+- `--non-interactive` — require existing administrator authorization instead of prompting.
+
+See [returning to shared-desktop use](../how-to/setup-macos.md#return-to-shared-desktop-use).
+If the app bundle has already been removed, see
+[unenrolling by hand](../how-to/setup-macos.md#unenroll-by-hand).
+
 ## `uninstall`
 
 Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
-not remove the app bundle. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
+not remove the app bundle. For account setup, stop active work first: uninstall restores recoverable
+workspace permissions and removes only Glass’s worker registration with administrator authentication.
+The account, home and app data remain. Use `unenroll` to keep the ordinary startup integration while
+returning to shared-desktop operation. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).

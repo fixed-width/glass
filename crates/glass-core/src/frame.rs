@@ -12,7 +12,7 @@ pub struct Frame {
 /// A window-relative sub-rectangle to crop a captured frame to. Top-left
 /// origin; same field shape as [`crate::BBox`] so a diff result's bbox can be
 /// fed back directly as a capture region.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Region {
     pub x: u32,
     pub y: u32,

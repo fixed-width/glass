@@ -1364,6 +1364,7 @@ name = "glass-macos"
 version = "0.0.0"
 dependencies = [
  "block2",
+ "cc",
  "glass-a11y-macos",
  "glass-core",
  "glass-pipe-unix",
@@ -1377,7 +1378,10 @@ dependencies = [
  "objc2-screen-capture-kit",
  "plist",
  "rustix",
+ "serde",
+ "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -1409,6 +1413,7 @@ dependencies = [
  "glass-windows",
  "glass-x11",
  "image",
+ "plist",
  "proptest",
  "rand 0.10.3",
  "reqwest",
@@ -1424,6 +1429,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "windows",
+ "zeroize",
  "zip",
 ]
 

@@ -290,17 +290,24 @@ fn spawn_for(
         let cwd_canon: Option<PathBuf> = effective_cwd
             .as_ref()
             .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()));
-        // Resolve to an absolute path: `build_profile`'s guard needs one to reason about home
-        // exposure.
+        let path = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"));
         let program =
-            std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
+            crate::launch_program::resolve(&spec.run[0], effective_cwd.as_deref(), path.as_deref());
 
         // Decide injection before building the profile: `allow_pasteboard` depends on it.
         // `dylib_path` is resolved once and reused below (rather than a second
         // `shim_dylib_path()` call) so a transient filesystem hiccup between the two checks
         // can't make `injectable` and the later `.expect` disagree.
         let dylib_path = session_launch.then(shim_dylib_path).flatten();
-        let injectable = session_launch && target_is_injectable(&program) && dylib_path.is_some();
+        let injectable = session_launch
+            && program.as_deref().is_some_and(target_is_injectable)
+            && dylib_path.is_some();
         let allow_pasteboard = injectable;
         // The shim dylib FILE, re-allowed for read in the profile below when injecting (`None`
         // — no re-allow — otherwise, matching unchanged pre-injection behavior).
@@ -368,7 +375,7 @@ fn spawn_for(
             // `/` here is inert (`is_safe_reallow("/")` is false) — it only matters when
             // `effective_cwd` was unset (a `current_dir()` failure, logged above).
             cwd: cwd_canon.unwrap_or_else(|| PathBuf::from("/")),
-            program,
+            program: program.unwrap_or_else(|| PathBuf::from(&spec.run[0])),
             ro_binds: reallows.ro_binds,
             ro_files,
             rw_binds: vec![],
