@@ -23,9 +23,11 @@ internal refactors, CI, or test-only changes.
 
 - Preview macOS account setup with `glass-mcp setup --account ACCOUNT`: enroll an existing standard
   account for off-desktop development using the normal MCP tools over stdio or HTTP. Glass reuses
-  its login and grants, releases per-app workers and temporary workspace permissions on stop, and
-  recovers recorded permission changes after an interrupted client. `status` reports account use;
-  uninstall removes Glass's registration while retaining the account, home and app data.
+  its login and grants, verifies worker access and managed HTTP routing during setup, and supports
+  protected trace directories inside workspaces. It releases per-app workers and temporary workspace
+  permissions on stop and recovers recorded permission changes after an interrupted client.
+  `status` and `doctor` recognize enrollment; uninstall removes Glass's registration while retaining
+  the account, home and app data.
 
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
@@ -42,14 +44,6 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
-- macOS account setup reloads and verifies its managed HTTP server, preventing an older shared-desktop server from being reported ready after enrollment.
-- Failed macOS worker startup now closes its permission lease after verifying shutdown, so an empty abandoned journal does not block later sessions.
-- macOS account sessions can use a trace directory inside the project while retaining evidence protection and restoring temporary workspace permissions on stop.
-- macOS account setup now gives the normal account access to launchd's worker socket after creation, avoiding registrations that load successfully but cannot accept connections. Worker connection errors no longer incorrectly prescribe another privacy-permission visit.
-- Reenrolling a macOS development account clears its disabled registration before starting the worker, allowing it to create the socket setup waits for.
-- macOS registration changes remove the old worker socket safely, preventing setup from reusing a stale socket that refuses connections.
-- macOS doctor retains its accessibility section for enrolled development accounts and explains that their reader is checked in the private worker.
-- macOS account setup now accepts protected directories with existing permission entries instead of mistaking the end of their ACL for an I/O error.
 - macOS build output is captured in application logs instead of reaching the MCP transport; build failures return bounded compiler diagnostics as untrusted application output, separately from the error status.
 - Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.
 - Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.
