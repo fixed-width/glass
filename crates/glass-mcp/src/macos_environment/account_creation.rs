@@ -120,13 +120,19 @@ pub(super) fn create(name: &str, password: &Password, system_dialog: bool) -> an
         let authorization = scope
             .spawn(|| elevate_using(&["macos-prepare-account", name, path], false, system_dialog));
         // Authentication is untimed; the child connects only after local macOS approval.
+        let mut reported_refusal = false;
         let mut stream = loop {
             match endpoint.listener.accept() {
                 Ok((stream, _)) => {
-                    if private_session::authenticate_setup_root(&stream, &requirement, owner)
-                        .is_ok()
-                    {
-                        break stream;
+                    match private_session::authenticate_setup_root(&stream, &requirement, owner) {
+                        Ok(()) => break stream,
+                        Err(error) if !reported_refusal => {
+                            eprintln!(
+                                "glass: refused privileged account setup connection: {error}"
+                            );
+                            reported_refusal = true;
+                        }
+                        Err(_) => {}
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

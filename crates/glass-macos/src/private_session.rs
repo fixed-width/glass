@@ -463,6 +463,64 @@ pub fn authenticate_setup_root(
 }
 
 #[cfg(test)]
+mod peer_credentials_tests {
+    fn allowed(expected: u32, owner: u32, privileged: bool, effective: u32, audit: u32) -> bool {
+        unsafe extern "C" {
+            fn glass_private_peer_credentials_match(
+                expected_uid: u32,
+                audit_uid: u32,
+                privileged: bool,
+                effective: u32,
+                audit: u32,
+            ) -> bool;
+        }
+        // SAFETY: this native predicate accepts only scalar values and retains no state.
+        unsafe {
+            glass_private_peer_credentials_match(expected, owner, privileged, effective, audit)
+        }
+    }
+
+    #[test]
+    fn privileged_setup_accepts_an_unset_system_audit_user() {
+        assert!(allowed(0, 501, true, 0, u32::MAX));
+    }
+
+    #[test]
+    fn privileged_setup_accepts_root_and_the_requesting_audit_user() {
+        for audit in [0, 501] {
+            assert!(allowed(0, 501, true, 0, audit));
+        }
+    }
+
+    #[test]
+    fn privileged_setup_rejects_other_audit_users() {
+        for audit in [502, 600] {
+            assert!(!allowed(0, 501, true, 0, audit));
+        }
+    }
+
+    #[test]
+    fn privileged_setup_still_requires_an_effective_root_user() {
+        for audit in [0, 501, u32::MAX] {
+            assert!(!allowed(0, 501, true, 501, audit));
+        }
+    }
+
+    #[test]
+    fn workers_require_matching_effective_and_audit_users() {
+        assert!(allowed(600, 600, false, 600, 600));
+        for (effective, audit) in [(600, 0), (600, 501), (600, u32::MAX), (601, 600)] {
+            assert!(!allowed(600, 600, false, effective, audit));
+        }
+    }
+
+    #[test]
+    fn privileged_flag_cannot_relax_a_non_root_role() {
+        assert!(!allowed(600, 501, true, 600, u32::MAX));
+    }
+}
+
+#[cfg(test)]
 mod protection_tests {
     use super::require_write_protected;
     use std::fs::File;

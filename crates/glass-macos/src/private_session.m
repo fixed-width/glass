@@ -568,6 +568,13 @@ int glass_private_copy_requirement(uint8_t **out, size_t *length) {
     return status;
 }
 
+bool glass_private_peer_credentials_match(uint32_t expected_uid, uint32_t audit_uid,
+                                         bool privileged, uint32_t effective, uint32_t audit) {
+    // System-authorized root helpers can have no audit user; code authentication still follows.
+    return effective == expected_uid && (audit == audit_uid ||
+        (privileged && expected_uid == 0 && (audit == 0 || audit == AU_DEFAUDITID)));
+}
+
 static int authenticate_peer(int fd, const uint8_t *required, size_t length,
                             uint32_t expected_uid, uint32_t audit_uid, bool privileged,
                             uint32_t *pid, uint32_t *session) {
@@ -577,8 +584,8 @@ static int authenticate_peer(int fd, const uint8_t *required, size_t length,
         if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &size) || size != sizeof(token))
             return errno ? errno : EIO;
         uint32_t audit = audit_token_to_auid(token);
-        if (audit_token_to_euid(token) != expected_uid ||
-            (audit != audit_uid && !(privileged && audit == 0)))
+        if (!glass_private_peer_credentials_match(expected_uid, audit_uid, privileged,
+                                                 audit_token_to_euid(token), audit))
             return EACCES;
         SecCodeRef code = NULL;
         SecRequirementRef requirement = NULL;
