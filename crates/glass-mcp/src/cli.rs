@@ -47,7 +47,20 @@ pub enum Command {
     NativeBackend { owner: u32 },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
-    MacosEnroll { account: String },
+    MacosEnroll {
+        account: String,
+        #[arg(long)]
+        onboarding: bool,
+        #[arg(long)]
+        repair: bool,
+    },
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacosOnboarding {
+        owner: u32,
+        #[arg(long)]
+        check: bool,
+    },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     MacosUnenroll,

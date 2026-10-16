@@ -51,16 +51,22 @@ The step-by-step for each path is in the setup and build guides:
 ## A separate development account
 
 With `setup --account ACCOUNT`, the grant-bearing worker runs as a LaunchAgent in that account's
-real Aqua login. After enrollment, switch to that account and double-click `/Applications/GlassMcp.app`
-in Finder. Its **glass permissions** window has **Request…** buttons for Accessibility and Screen
-Recording. Enable Glass in the corresponding macOS privacy settings, accept a requested app restart,
-then switch back without logging the development account out. The
+real Aqua login. The app's **Application setup…** window and CLI share the same coordinator. Enrollment
+registers a permission helper from that one Glass bundle; it opens **glass permissions** in the
+development account and reads grant changes in fresh Glass processes. The coordinator waits for
+consent and the user's return without a user deadline, then checks live worker readiness and any
+pending workspace recovery. The
 [account setup guide](../how-to/setup-macos.md#apps-off-your-desktop-preview) gives the full sequence,
 including verification and MCP-client configuration.
 
 The MCP server in your ordinary account continues handling tools, audit records, traces and other backends;
 its own TCC snapshot does not describe the private worker's permissions. Setup checks the worker,
 and `glass_capabilities` with `scope: "session"` reports actual input support and interference.
+
+A readiness probe authenticates the worker's kernel identity, signature and login without launching
+an application or sharing a workspace. Application sessions retain an environment lease so setup
+and disable cannot change their route while they still accept input. Doctor reports busy state
+without interrupting those sessions.
 
 Enrollment records Glass's signing identity in protected service state. Before sharing a workspace,
 the owner authenticates the running worker through its kernel connection identity and code signature.

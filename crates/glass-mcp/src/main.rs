@@ -15,8 +15,15 @@ async fn main() -> anyhow::Result<()> {
             return glass_mcp::macos_worker::worker(owner).await;
         }
         Some(Command::NativeBackend { owner }) => return glass_mcp::native_backend::run(owner),
-        Some(Command::MacosEnroll { account }) => {
-            return glass_mcp::macos_environment::enroll(&account);
+        Some(Command::MacosEnroll {
+            account,
+            onboarding,
+            repair,
+        }) => {
+            return glass_mcp::macos_environment::enroll_with_options(&account, onboarding, repair);
+        }
+        Some(Command::MacosOnboarding { owner, check }) => {
+            return onboarding::run_registered_worker(owner, check);
         }
         Some(Command::MacosUnenroll) => return glass_mcp::macos_environment::remove_registration(),
         _ => {}
@@ -45,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
             Command::MacosWorker { .. }
             | Command::NativeBackend { .. }
             | Command::MacosEnroll { .. }
+            | Command::MacosOnboarding { .. }
             | Command::MacosUnenroll,
         ) => {
             anyhow::bail!("internal macOS command was not dispatched before AppKit initialization")

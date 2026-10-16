@@ -162,12 +162,36 @@ pub fn legacy_owner() -> Result<u32> {
 
 /// Bind a worker to the normal owner's registration before reading session metadata.
 pub fn attach_for(owner: u32, onboarding: bool) -> Result<()> {
+    select_owner(owner)?;
+    attach(onboarding)
+}
+
+fn select_owner(owner: u32) -> Result<()> {
     unsafe extern "C" {
         fn glass_private_set_owner(owner: u32) -> i32;
     }
     // SAFETY: this setter accepts only an ordinary numeric UID and refuses a changed attachment.
-    check(unsafe { glass_private_set_owner(owner) })?;
-    attach(onboarding)
+    check(unsafe { glass_private_set_owner(owner) })
+}
+
+/// Waitable onboarding attachment; an unfinished first login is pending, not a failed grant.
+pub fn try_attach_for_onboarding(owner: u32) -> Result<bool> {
+    select_owner(owner)?;
+    if !is_worker() {
+        return Err(GlassError::Backend(
+            "permission onboarding has no matching account enrollment".into(),
+        ));
+    }
+    // SAFETY: the helper reads this process's session and pins only a valid attachment.
+    let code = unsafe { glass_private_attach(1) };
+    match code {
+        0 => Ok(true),
+        77 => Ok(false),
+        _ => {
+            check(code)?;
+            Ok(false)
+        }
+    }
 }
 
 pub fn require_if_attached() -> Result<()> {

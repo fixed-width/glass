@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 5;
+const PROTOCOL: u32 = 6;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -22,6 +22,9 @@ const EXIT: u8 = 5;
 const FAILED: u8 = 6;
 const GREETING: u8 = 7;
 const ACTIVATE: u8 = 8;
+const PROBE: u8 = 9;
+const READINESS: u8 = 10;
+const OPEN_ONBOARDING: u8 = 11;
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(60);
 const SETUP_WAIT: Duration = Duration::from_secs(10);
 const EXIT_WAIT: Duration = Duration::from_secs(4);
@@ -113,6 +116,7 @@ struct Greeting {
     worker: u32,
     session: u32,
     process: glass_macos::private_session::ProcessIdentity,
+    private_session: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -294,7 +298,8 @@ mod native {
     }
 
     pub async fn worker(owner: u32) -> anyhow::Result<()> {
-        glass_macos::private_session::attach_for(owner, false)?;
+        // Setup may inspect this login on the console. Backend activation still requires privacy.
+        glass_macos::private_session::attach_for(owner, true)?;
         let listener = glass_macos::worker_socket::activate_listener()?;
         listener.set_nonblocking(true)?;
         let listener = tokio::net::UnixListener::from_std(listener)?;
@@ -320,9 +325,34 @@ mod native {
             worker: rustix::process::getuid().as_raw(),
             session: glass_macos::private_session::session_id()?,
             process: glass_macos::private_session::current_process()?,
+            private_session: glass_macos::private_session::require_private().is_ok(),
         };
         tokio::time::timeout(SETUP_WAIT, send_json(&mut stream, GREETING, &greeting)).await??;
         let (kind, data) = tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await??;
+        if kind == PROBE || kind == OPEN_ONBOARDING {
+            ensure!(data.is_empty(), "readiness probe must have no payload");
+            if kind == OPEN_ONBOARDING
+                && let Err(error) = crate::macos_environment::request_onboarding(owner)
+            {
+                send_json(&mut stream, FAILED, &format!("{error:#}")).await?;
+                return Err(error);
+            }
+            let onboarding_running = match crate::macos_environment::onboarding_running(owner) {
+                Ok(running) => running,
+                Err(error) => {
+                    send_json(&mut stream, FAILED, &format!("{error:#}")).await?;
+                    return Err(error);
+                }
+            };
+            let readiness = crate::macos_setup::Readiness {
+                private_session: glass_macos::private_session::require_private().is_ok(),
+                accessibility: glass_macos::accessibility_granted(),
+                screen_recording: glass_macos::screen_recording_granted(),
+                onboarding_running,
+            };
+            send_json(&mut stream, READINESS, &readiness).await?;
+            return Ok(());
+        }
         ensure!(kind == HELLO, "private worker bootstrap missing");
         let bootstrap: Bootstrap = serde_json::from_slice(&data)?;
         bootstrap.validate()?;

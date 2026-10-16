@@ -24,11 +24,14 @@ separate from your desktop. Windows shares it; macOS adds a preview of separate-
 apps off your desktop, alongside its existing shared-desktop setup. `glass_capabilities` with
 `scope: "session"` reports click, scroll and text support and whether each can affect your desktop.
 
-The [macOS account setup](docs/how-to/setup-macos.md#apps-off-your-desktop-preview) reuses the normal
-MCP tools and permissions. It needs a real login in a separate standard account, retained between
-runs. Enrollment applies to your macOS user; `glass-mcp unenroll` returns to shared-desktop use
-while retaining the app, development account and MCP startup integration. Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.
-Unattended startup after a reboot has not been tested.
+The [macOS account setup](docs/how-to/setup-macos.md#apps-off-your-desktop-preview) uses the normal
+MCP tools and one Glass installation. **Application setup…** guides enrollment, permission handoff and
+live readiness checks. It needs a real login and Glass privacy grants in a separate standard account,
+retained between runs. Enrollment applies to your macOS user; `glass-mcp unenroll` returns to
+shared-desktop use while retaining the app, development account and MCP startup integration.
+Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.
+These runtime checks reused an initialized login; guided first-time production-app onboarding remains
+under validation. Unattended startup after a reboot has not been tested.
 
 ## See it
 

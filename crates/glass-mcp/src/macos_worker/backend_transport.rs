@@ -64,6 +64,7 @@ fn exit_and_cleanup(receipt: Result<()>, cleanup: Result<()>) -> Result<()> {
 }
 
 pub(crate) struct NativeConnection {
+    _environment_lease: crate::macos_setup::Lease,
     stream: UnixStream,
     lease: File,
     prepare: Option<NativePrepare>,
@@ -180,14 +181,128 @@ fn receive(
     Ok((header[0], bytes))
 }
 
-impl NativeConnection {
-    pub(crate) fn connect() -> Result<Self> {
-        let owner = rustix::process::geteuid().as_raw();
-        native::protected_endpoint(owner).map_err(error)?;
-        let lease = File::open(glass_macos::private_session::root_for(owner).join("account.plist"))
+struct BrokerConnection {
+    stream: UnixStream,
+    lease: File,
+    greeting: Greeting,
+}
+
+fn connect_broker(lease: Option<File>) -> Result<BrokerConnection> {
+    let owner = rustix::process::geteuid().as_raw();
+    native::protected_endpoint(owner).map_err(error)?;
+    let lease = match lease {
+        Some(lease) => lease,
+        None => {
+            let lease =
+                File::open(glass_macos::private_session::root_for(owner).join("account.plist"))
+                    .map_err(error)?;
+            fs4::FileExt::try_lock(&lease)
+                .map_err(|_| error("the private macOS environment is already in use"))?;
+            lease
+        }
+    };
+    let callback = super::callback::Callback::new(owner)?;
+    let requirement = super::callback::broker_requirement()?;
+    let mut activation =
+        UnixStream::connect(glass_macos::private_session::root_for(owner).join("worker.sock"))
             .map_err(error)?;
-        fs4::FileExt::try_lock(&lease)
-            .map_err(|_| error("the private macOS environment is already in use"))?;
+    activation.set_nonblocking(true).map_err(error)?;
+    if glass_macos::worker_socket::peer_uid(&activation).map_err(error)? != 0 {
+        return Err(error("activation socket was not created by launchd"));
+    }
+    send(
+        &mut activation,
+        ACTIVATE,
+        &serde_json::to_vec(&Activation {
+            version: PROTOCOL,
+            endpoint: callback.path(),
+        })
+        .map_err(error)?,
+        Deadline::from_millis(10_000),
+        None,
+    )?;
+    let worker = glass_macos::private_session::worker_uid();
+    let (mut stream, authenticated_pid, authenticated_session) =
+        callback.accept(worker, &requirement, Deadline::from_millis(10_000))?;
+    drop(activation);
+    drop(callback);
+    let (kind, bytes) = receive(&mut stream, Deadline::from_millis(10_000), None)?;
+    let greeting: Greeting = serde_json::from_slice(&bytes).map_err(error)?;
+    if kind != GREETING
+        || greeting.version != PROTOCOL
+        || greeting.worker != worker
+        || greeting.session != authenticated_session
+        || !greeting.process.matches_pid(authenticated_pid)
+        || !glass_macos::private_session::account_processes(worker)
+            .map_err(error)?
+            .contains(&greeting.process)
+    {
+        return Err(error(
+            "worker did not bind a live private session before workspace preparation",
+        ));
+    }
+    Ok(BrokerConnection {
+        stream,
+        lease,
+        greeting,
+    })
+}
+
+pub(crate) fn readiness() -> Result<crate::macos_setup::Readiness> {
+    probe(None, PROBE)
+}
+
+pub(crate) fn readiness_with_lease(lease: File) -> Result<crate::macos_setup::Readiness> {
+    probe(Some(lease), PROBE)
+}
+
+pub(crate) fn open_onboarding() -> Result<crate::macos_setup::Readiness> {
+    probe(None, OPEN_ONBOARDING)
+}
+
+fn probe(lease: Option<File>, request: u8) -> Result<crate::macos_setup::Readiness> {
+    let mut connection = connect_broker(lease)?;
+    let deadline = Deadline::from_millis(10_000);
+    send(&mut connection.stream, request, &[], deadline, None)?;
+    let (kind, bytes) = receive(&mut connection.stream, deadline, None)?;
+    if kind != READINESS {
+        if kind == FAILED {
+            let reason: String = serde_json::from_slice(&bytes).map_err(error)?;
+            return Err(error(reason));
+        }
+        return Err(error("private worker did not return readiness facts"));
+    }
+    let readiness = serde_json::from_slice(&bytes).map_err(error)?;
+    drop(connection.stream);
+    let worker = glass_macos::private_session::worker_uid();
+    let deadline = Deadline::from_millis(8000);
+    while glass_macos::private_session::account_processes(worker)
+        .map_err(error)?
+        .contains(&connection.greeting.process)
+    {
+        if deadline.has_passed() {
+            return Err(error(
+                "readiness worker has not exited; setup state is unconfirmed",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(readiness)
+}
+
+impl NativeConnection {
+    pub(crate) fn connect(environment_lease: crate::macos_setup::Lease) -> Result<Self> {
+        let owner = rustix::process::geteuid().as_raw();
+        let BrokerConnection {
+            stream,
+            lease,
+            greeting,
+        } = connect_broker(None)?;
+        if !greeting.private_session {
+            return Err(error(
+                "switch back to your normal account before starting private application work",
+            ));
+        }
         use sha2::Digest;
         let account = sha2::Sha256::digest(
             std::fs::read(glass_macos::private_session::root_for(owner).join("account.plist"))
@@ -196,46 +311,6 @@ impl NativeConnection {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-        let callback = super::callback::Callback::new(owner)?;
-        let requirement = super::callback::broker_requirement()?;
-        let mut activation =
-            UnixStream::connect(glass_macos::private_session::root_for(owner).join("worker.sock"))
-                .map_err(error)?;
-        activation.set_nonblocking(true).map_err(error)?;
-        if glass_macos::worker_socket::peer_uid(&activation).map_err(error)? != 0 {
-            return Err(error("activation socket was not created by launchd"));
-        }
-        send(
-            &mut activation,
-            ACTIVATE,
-            &serde_json::to_vec(&Activation {
-                version: PROTOCOL,
-                endpoint: callback.path(),
-            })
-            .map_err(error)?,
-            Deadline::from_millis(10_000),
-            None,
-        )?;
-        let worker = glass_macos::private_session::worker_uid();
-        let (mut stream, authenticated_pid, authenticated_session) =
-            callback.accept(worker, &requirement, Deadline::from_millis(10_000))?;
-        drop(activation);
-        drop(callback);
-        let (kind, bytes) = receive(&mut stream, Deadline::from_millis(10_000), None)?;
-        let greeting: Greeting = serde_json::from_slice(&bytes).map_err(error)?;
-        if kind != GREETING
-            || greeting.version != PROTOCOL
-            || greeting.worker != worker
-            || greeting.session != authenticated_session
-            || !greeting.process.matches_pid(authenticated_pid)
-            || !glass_macos::private_session::account_processes(worker)
-                .map_err(error)?
-                .contains(&greeting.process)
-        {
-            return Err(error(
-                "worker did not bind a live private session before workspace preparation",
-            ));
-        }
         let journal = Arc::new(Mutex::new(
             crate::permission_journal::PermissionJournal::open(
                 &crate::permission_journal::PermissionJournal::root().map_err(error)?,
@@ -247,6 +322,7 @@ impl NativeConnection {
             .map_err(error)?,
         ));
         let mut connection = Self {
+            _environment_lease: environment_lease,
             stream,
             lease,
             prepare: None,
@@ -587,6 +663,7 @@ mod tests {
         assert!(fs4::FileExt::try_lock(&observed_lease).is_err());
         let (stream, mut peer) = UnixStream::pair().unwrap();
         let connection = NativeConnection {
+            _environment_lease: crate::macos_setup::Lease::new(tempfile::tempfile().unwrap()),
             stream,
             lease,
             prepare: None,

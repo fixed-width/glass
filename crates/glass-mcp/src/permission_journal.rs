@@ -53,7 +53,7 @@ pub(crate) struct PermissionJournal {
     admission: Option<ProcessIdentity>,
 }
 
-fn private_root(path: &Path, owner: u32) -> io::Result<File> {
+pub(crate) fn private_root(path: &Path, owner: u32) -> io::Result<File> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = std::fs::DirBuilder::new();
     builder

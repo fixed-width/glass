@@ -56,7 +56,7 @@ mod untrusted;
 pub(crate) mod update;
 
 use anyhow::Context;
-use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};
+use glass_core::{Backend, BaselineStore, Glass, GlassError, Result};
 #[cfg(target_os = "linux")]
 use glass_wayland::WaylandPlatform;
 #[cfg(target_os = "linux")]
@@ -90,14 +90,21 @@ pub fn make_platform(
     #[cfg(target_os = "macos")] sim_registry: &glass_ios::SimulatorRegistry,
 ) -> Result<Backend> {
     #[cfg(target_os = "macos")]
-    if backend == "macos" && glass_macos::private_session::configured()? {
-        return remote_backend::backend(
-            macos_worker::backend_transport::NativeConnection::connect()?,
-        );
-    }
-    #[cfg(target_os = "macos")]
-    if backend == "macos" && !glass_macos::main_thread_initialized() {
-        return Err(shared_desktop_restart_required());
+    if backend == "macos" {
+        let lease = macos_environment::application_lease()
+            .map_err(|error| GlassError::Backend(error.to_string()).before_dispatch())?;
+        if glass_macos::private_session::configured()? {
+            return remote_backend::backend(
+                macos_worker::backend_transport::NativeConnection::connect(lease)?,
+            );
+        }
+        if !glass_macos::main_thread_initialized() {
+            return Err(shared_desktop_restart_required());
+        }
+        return Ok(Backend {
+            platform: Box::new(glass_macos::MacosPlatform::new()?.with_environment_lease(lease)),
+            accessibility: Some(Box::new(glass_a11y_macos::MacosA11y::new())),
+        });
     }
     #[cfg(target_os = "macos")]
     if backend == "ios" {
@@ -126,45 +133,43 @@ pub fn make_platform(
             accessibility: Some(accessibility),
         });
     }
-    let platform: Box<dyn Platform + Send> = match backend {
-        #[cfg(target_os = "linux")]
-        "wayland" => Box::new(WaylandPlatform::new()?),
-        #[cfg(target_os = "linux")]
-        "x11" => Box::new(X11Platform::from_env()?),
-        #[cfg(windows)]
-        "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
-        #[cfg(target_os = "macos")]
-        "macos" => Box::new(glass_macos::MacosPlatform::new()?),
-        other => {
-            #[cfg(target_os = "linux")]
-            let valid = "\"x11\", \"wayland\", or \"android\"";
-            #[cfg(windows)]
-            let valid = "\"windows\" or \"android\"";
-            #[cfg(target_os = "macos")]
-            let valid = "\"macos\", \"android\", or \"ios\"";
-            return Err(GlassError::Backend(format!(
-                "unknown backend {other:?}; use {valid}"
-            )));
-        }
-    };
-    // Accessibility is per-OS: AT-SPI on Linux (serving both display backends), UI Automation
-    // on Windows, AXUIElement on macOS. Each reader is attached unconditionally, with no
-    // silent fallback — a reader-specific failure (an unreachable AT-SPI bus, a missing macOS
-    // Accessibility grant) surfaces as `AccessibilityUnavailable` or `PermissionDenied` at
-    // call time, not here.
-    #[cfg(windows)]
-    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-        Some(Box::new(glass_a11y_windows::WindowsA11y::new()));
-    #[cfg(target_os = "linux")]
-    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-        Some(Box::new(glass_a11y_linux::LinuxA11y::new()));
     #[cfg(target_os = "macos")]
-    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-        Some(Box::new(glass_a11y_macos::MacosA11y::new()));
-    Ok(Backend {
-        platform,
-        accessibility,
-    })
+    {
+        Err(GlassError::Backend(format!(
+            "unknown backend {backend:?}; use \"macos\", \"android\", or \"ios\""
+        )))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let platform: Box<dyn glass_core::Platform + Send> = match backend {
+            #[cfg(target_os = "linux")]
+            "wayland" => Box::new(WaylandPlatform::new()?),
+            #[cfg(target_os = "linux")]
+            "x11" => Box::new(X11Platform::from_env()?),
+            #[cfg(windows)]
+            "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
+            other => {
+                #[cfg(target_os = "linux")]
+                let valid = "\"x11\", \"wayland\", or \"android\"";
+                #[cfg(windows)]
+                let valid = "\"windows\" or \"android\"";
+                return Err(GlassError::Backend(format!(
+                    "unknown backend {other:?}; use {valid}"
+                )));
+            }
+        };
+        // Each reader attaches unconditionally; unavailable accessibility surfaces at call time.
+        #[cfg(windows)]
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(glass_a11y_windows::WindowsA11y::new()));
+        #[cfg(target_os = "linux")]
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(glass_a11y_linux::LinuxA11y::new()));
+        Ok(Backend {
+            platform,
+            accessibility,
+        })
+    }
 }
 
 /// The canonical list of backend names glass accepts. Single source of truth: the
@@ -898,3 +903,5 @@ mod workspace_permissions;
 
 #[cfg(target_os = "macos")]
 pub mod macos_environment;
+#[cfg(any(target_os = "macos", test))]
+mod macos_setup;

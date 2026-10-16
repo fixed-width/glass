@@ -88,6 +88,7 @@ mod macos {
         serve::check_exposure(&cfg)?;
 
         let endpoint = format!("http://{}/", cfg.addr);
+        let setup_addr = cfg.addr.to_string();
 
         // Bind synchronously with `std::net` (no async context needed for the bind itself),
         // then hand the socket to tokio. `AddrInUse` is surfaced *in the menu* rather than
@@ -179,6 +180,11 @@ mod macos {
                     // `KeepAlive=false` launchd would never bring it back.
                     if let Err(e) = crate::setup::restart_launch_agent() {
                         eprintln!("glass: menu 'Restart' failed: {e}");
+                    }
+                }),
+                on_setup: Box::new(move || {
+                    if let Err(error) = crate::macos_environment::show_setup(&setup_addr) {
+                        eprintln!("glass: application setup failed: {error:#}");
                     }
                 }),
                 on_uninstall: Box::new(|| {

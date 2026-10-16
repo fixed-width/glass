@@ -81,6 +81,10 @@ containment runtime, and external tool paths — and print how to fix anything m
 if the default backend can't run (CI-friendly). The agent can run the same checks via the
 `glass_doctor` tool.
 
+For an enrolled macOS account, this includes an authenticated worker login/permission probe without
+launching a development app or sharing a workspace. An environment in use is reported as busy and
+the probe is skipped; setup and ordinary application work are left undisturbed.
+
 - `--deep` — additionally spawn and tear down the display to prove it starts.
 - `--json` — machine-readable output.
 - `--color <when>` — `auto` (default; color only when writing to a terminal), `always`, or `never`.
@@ -98,9 +102,11 @@ List every `GLASS_*` variable with its purpose, default, and current value (see
 ## `setup`
 
 Guided macOS setup. `--account ACCOUNT` enrolls an existing standard account for off-desktop apps
-(preview); administrator authentication registers an on-demand native backend worker. Complete its
-real login and the existing permission checklist once, then keep it logged in. Existing healthy
-registration is reused. Enrollment applies to the normal user who runs setup. Without that user's
+(preview); administrator authentication registers the backend and permission helper from the same
+Glass app. Setup waits for initial login, privacy consent and the return to the normal account,
+then checks live worker readiness and workspace recovery. Completed registration/grants are reused.
+Plain `setup` resumes an existing enrollment. The menu's **Application setup…** window uses the same
+flow and provides disable. Active macOS application work blocks environment changes. Without an
 enrollment, setup retains the shared-desktop flow.
 
 - `--launchagent` — install the ordinary user's HTTP/menu-bar server.

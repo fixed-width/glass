@@ -72,6 +72,8 @@ const REQUEST_EPSILON_PX: i32 = 2;
 
 /// macOS backend, driving the target app with ScreenCaptureKit + CGEvent + AXUIElement.
 pub struct MacosPlatform {
+    /// Keeps environment changes out of an active MCP application session.
+    _environment_lease: Option<Box<dyn Send>>,
     /// Logs drained by `drain_logs`, filled by `process::spawn`'s per-stream reader threads —
     /// `Arc<Mutex<_>>` because those threads push while `drain_logs` reads. Empty until
     /// `start_app` launches a child.
@@ -147,6 +149,7 @@ impl MacosPlatform {
     pub fn new() -> Result<Self> {
         permissions::preflight()?;
         Ok(Self {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -157,6 +160,12 @@ impl MacosPlatform {
             adopted: None,
             protected_host_paths: Vec::new(),
         })
+    }
+
+    /// Retain the controller's environment lease until this backend stops and is dropped.
+    pub fn with_environment_lease(mut self, lease: impl Send + 'static) -> Self {
+        self._environment_lease = Some(Box::new(lease));
+        self
     }
 
     /// Poll for `child`'s window, alternating a single
@@ -1170,6 +1179,7 @@ mod tests {
 
     fn test_platform() -> MacosPlatform {
         MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1210,6 +1220,7 @@ mod tests {
         // Build without preflight (which would require grants) by constructing the struct
         // directly — `new()` is exercised in the Mac-gated suite.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(vec![(Stream::Stdout, "hi".into())])),
             app_pid: Some(42),
             child: None,
@@ -1227,6 +1238,7 @@ mod tests {
     #[test]
     fn app_pid_returns_the_constructed_value() {
         let p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1246,6 +1258,7 @@ mod tests {
         // handle) and must succeed — this path never touches AppKit, so it's exercisable
         // off the Mac-gated suite's main-thread test.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1267,6 +1280,7 @@ mod tests {
         // later start_app on the same MacosPlatform never leaks a stale CGWindowID from a
         // previous session into resolve_active_window.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1288,6 +1302,7 @@ mod tests {
         // get_clipboard/set_clipboard to a pasteboard no longer in play. `clip` is None here,
         // so no pasteboard is touched.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1308,6 +1323,7 @@ mod tests {
         // inherits a previous one's private pasteboard name. With `clip` set, this also runs
         // the `release_named` path for the content + `.ready` boards.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(42),
             child: None,
@@ -1331,6 +1347,7 @@ mod tests {
         // reap + full state reset without a real process, needing no TCC grant or main
         // thread. Every per-session field must clear so a later `start_app` decides fresh.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(999_999),
             child: None,
@@ -1356,6 +1373,7 @@ mod tests {
         // A `PreExisting` adoptee is left running (glass only raised it), but the adopted
         // record and the rest of the per-session state must still clear on `stop_app`.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: Some(999_999),
             child: None,
@@ -1381,6 +1399,7 @@ mod tests {
         // structured `AppNotStarted`, before any FFI/main-thread work — construct the struct
         // directly (as the other tests here do) to bypass `new()`'s TCC preflight.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1431,6 +1450,7 @@ mod tests {
         // `Unsupported` route below returns before either clipboard method touches any
         // pasteboard, so this exercises the routing grant-free.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,
@@ -1455,6 +1475,7 @@ mod tests {
         // own test-module discipline of never mutating the shared system pasteboard from an
         // automated test — this only proves the route reaches the real implementation.
         let mut p = MacosPlatform {
+            _environment_lease: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app_pid: None,
             child: None,

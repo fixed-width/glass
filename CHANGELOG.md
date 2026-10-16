@@ -29,6 +29,10 @@ internal refactors, CI, or test-only changes.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
   restores shared-desktop use while keeping the app, development account and MCP startup integration.
   Uninstall also removes startup integration while retaining the account, home and app data.
+  The app's Application setup window and CLI share a resumable permission flow with automatic
+  worker checks, fresh-process grant updates, standard-home preparation and bounded registration
+  repair. Doctor checks live worker readiness. Active macOS application sessions block setup or
+  disable; the menu provides setup and disable without a second Glass installation.
 
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile

@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 const LABEL: &str = "tech.fixedwidth.glass.worker";
 const ACCOUNT: &str = "account.plist";
 const JOB: &str = "tech.fixedwidth.glass.worker.plist";
+const ONBOARD_LABEL: &str = "tech.fixedwidth.glass.onboarding";
+const ONBOARD_JOB: &str = "tech.fixedwidth.glass.onboarding.plist";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +248,140 @@ fn job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn onboarding_job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut value = plist::Dictionary::new();
+    value.insert("Label".into(), ONBOARD_LABEL.into());
+    value.insert(
+        "ProgramArguments".into(),
+        plist::Value::Array(vec![
+            binary.to_string_lossy().into_owned().into(),
+            "macos-onboarding".into(),
+            account.owner_uid.to_string().into(),
+        ]),
+    );
+    value.insert(
+        "WorkingDirectory".into(),
+        account.home.to_string_lossy().into_owned().into(),
+    );
+    value.insert("LimitLoadToSessionType".into(), "Aqua".into());
+    value.insert("ProcessType".into(), "Interactive".into());
+    value.insert("RunAtLoad".into(), true.into());
+    value.insert("KeepAlive".into(), false.into());
+    let mut bytes = Vec::new();
+    plist::to_writer_xml(&mut bytes, &value)?;
+    Ok(bytes)
+}
+
+fn install_onboarding(
+    account: &Enrollment,
+    binary: &Path,
+    root: &File,
+    agents: &File,
+) -> anyhow::Result<()> {
+    let bytes = onboarding_job(account, binary)?;
+    if !same_file(agents, ONBOARD_JOB, &bytes)? {
+        create_file(agents, ONBOARD_JOB, &bytes)?;
+    }
+    if !same_file(root, ONBOARD_JOB, &bytes)? {
+        create_file(root, ONBOARD_JOB, &bytes)?;
+    }
+    let domain = format!("gui/{}", account.uid);
+    let target = format!("{domain}/{ONBOARD_LABEL}");
+    let loaded = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()?;
+    if loaded.status.success() {
+        ensure!(
+            loaded_job_matches(
+                &String::from_utf8_lossy(&loaded.stdout),
+                &[
+                    &binary.to_string_lossy(),
+                    "macos-onboarding",
+                    &account.owner_uid.to_string()
+                ]
+            ),
+            "loaded permission helper belongs to another installation"
+        );
+        if crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout)).is_none() {
+            checked(Command::new("/bin/launchctl").args(["kickstart", &target]))?;
+        }
+    } else {
+        // A real login loads the persistent job if this graphical domain is not available yet.
+        let result = Command::new("/bin/launchctl")
+            .arg("bootstrap")
+            .arg(domain)
+            .arg(account.home.join("Library/LaunchAgents").join(ONBOARD_JOB))
+            .output()?;
+        if !result.status.success() {
+            eprintln!(
+                "glass: permission onboarding will open when the development account logs in"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn onboarding_state(owner: u32) -> anyhow::Result<Option<(String, bool)>> {
+    ensure!(
+        private_session::owner_uid() == owner,
+        "permission request has no attached owner"
+    );
+    let root_path = private_session::root_for(owner);
+    let account = read_enrollment_at(&root_path)?;
+    ensure!(
+        account.uid == rustix::process::getuid().as_raw(),
+        "permission request is not in the enrolled account"
+    );
+    let root = directory(&root_path, 0, false)?;
+    if stored_file(&root, ONBOARD_JOB)?.is_none() {
+        return Ok(None);
+    }
+    let agents = directory(
+        &account.home.join("Library/LaunchAgents"),
+        account.uid,
+        false,
+    )?;
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let expected = onboarding_job(&account, &binary)?;
+    ensure!(
+        same_file(&root, ONBOARD_JOB, &expected)? && same_file(&agents, ONBOARD_JOB, &expected)?,
+        "permission helper is not registered; open Glass application setup to repair it"
+    );
+    let target = format!("gui/{}/{ONBOARD_LABEL}", account.uid);
+    let loaded = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()?;
+    ensure!(
+        loaded.status.success()
+            && loaded_job_matches(
+                &String::from_utf8_lossy(&loaded.stdout),
+                &[
+                    &binary.to_string_lossy(),
+                    "macos-onboarding",
+                    &owner.to_string()
+                ]
+            ),
+        "permission helper is not bound to this installation"
+    );
+    let running =
+        crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout)).is_some();
+    Ok(Some((target, running)))
+}
+
+pub(crate) fn onboarding_running(owner: u32) -> anyhow::Result<bool> {
+    Ok(onboarding_state(owner)?.is_some_and(|(_, running)| running))
+}
+
+pub(crate) fn request_onboarding(owner: u32) -> anyhow::Result<()> {
+    let (target, running) = onboarding_state(owner)?.context(
+        "permission helper is not registered; open Glass application setup to repair it",
+    )?;
+    if !running {
+        checked(Command::new("/bin/launchctl").args(["kickstart", &target]))?;
+    }
+    Ok(())
+}
+
 fn validate_socket(info: &rustix::fs::Stat, owner: u32, worker: u32) -> anyhow::Result<()> {
     ensure!(
         rustix::fs::FileType::from_raw_mode(info.st_mode) == rustix::fs::FileType::Socket
@@ -420,6 +556,45 @@ fn root_owner() -> anyhow::Result<u32> {
     Ok(owner)
 }
 
+fn loaded_job_matches(output: &str, expected: &[&str]) -> bool {
+    let mut depth = 0usize;
+    let mut program = None;
+    let mut arguments = None;
+    let mut collecting = false;
+    for line in output.lines().map(str::trim) {
+        if line == "}" {
+            if depth == 2 {
+                collecting = false;
+            }
+            let Some(next) = depth.checked_sub(1) else {
+                return false;
+            };
+            depth = next;
+        } else if depth == 1 {
+            if let Some(value) = line.strip_prefix("program = ")
+                && program.replace(value).is_some()
+            {
+                return false;
+            }
+            if line == "arguments = {" {
+                if arguments.replace(Vec::new()).is_some() {
+                    return false;
+                }
+                collecting = true;
+            }
+        } else if depth == 2
+            && collecting
+            && let Some(arguments) = &mut arguments
+        {
+            arguments.push(line);
+        }
+        if line.ends_with(" = {") || line.ends_with(" => {") {
+            depth += 1;
+        }
+    }
+    depth == 0 && program == expected.first().copied() && arguments.as_deref() == Some(expected)
+}
+
 fn stop_registered_worker(target: &str, account: &Enrollment) -> anyhow::Result<()> {
     let job = Command::new("/bin/launchctl")
         .args(["print", target])
@@ -581,7 +756,7 @@ fn registration_files(root: &File) -> anyhow::Result<Vec<String>> {
         }
         let info = rustix::fs::statat(root, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)?;
         ensure!(
-            ([ACCOUNT, "worker.requirement", "disabled"].contains(&name.as_ref())
+            ([ACCOUNT, "worker.requirement", "disabled", ONBOARD_JOB].contains(&name.as_ref())
                 || setup_suffix(&name, ".setup-"))
                 && FileType::from_raw_mode(info.st_mode) == FileType::RegularFile
                 && info.st_uid == root.metadata()?.uid()
@@ -769,8 +944,43 @@ fn prepare_registration(
     })
 }
 
+fn prepare_home(account: &Enrollment) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(&account.home) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure!(
+                account.home == Path::new("/Users").join(&account.name),
+                "automatic home preparation supports the standard /Users account location; prepare this account's custom home first"
+            );
+            directory(Path::new("/Users"), 0, false)?;
+            checked(Command::new("/usr/sbin/createhomedir").args([
+                "-c",
+                "-l",
+                "-u",
+                &account.name,
+            ]))?;
+            ensure!(
+                *account == account_record(&account.name, account.owner_uid, true)?,
+                "account identity changed during home preparation"
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let home = directory(&account.home, account.uid, false)
+        .context("validating the selected account home")?;
+    ensure!(
+        home.metadata()?.uid() == account.uid,
+        "the selected account does not own its home"
+    );
+    Ok(())
+}
+
 /// Authenticated installer entry; never creates/deletes accounts or changes their credentials.
 pub fn enroll(name: &str) -> anyhow::Result<()> {
+    enroll_with_options(name, false, false)
+}
+
+pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow::Result<()> {
     let owner = root_owner()?;
     let account = account_record(name, owner, true)?;
     let _owner_lock = mutation_lock("owner", owner)?;
@@ -785,7 +995,7 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
             .args(["--verify", "--strict"])
             .arg(crate::setup::app_bundle_path(&binary)),
     )?;
-    directory(&account.home, account.uid, false).context("validating the selected account home")?;
+    prepare_home(&account)?;
     if Path::new(private_session::ROOT)
         .join(ACCOUNT)
         .try_exists()?
@@ -838,6 +1048,30 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{LABEL}");
+    if repair {
+        let loaded = Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .output()?;
+        if loaded.status.success() {
+            ensure!(
+                loaded_job_matches(
+                    &String::from_utf8_lossy(&loaded.stdout),
+                    &[
+                        &binary.to_string_lossy(),
+                        "macos-worker",
+                        &account.owner_uid.to_string()
+                    ]
+                ),
+                "loaded worker belongs to another installation; registration retained"
+            );
+            ensure!(
+                crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout)).is_none(),
+                "the worker process is still running; its registration was retained"
+            );
+            stop_registered_worker(&target, &account)?;
+        }
+        remove_socket(&root, account.owner_uid, account.uid)?;
+    }
     enable_worker(&root, &account, || {
         let mut registered = Command::new("/bin/launchctl")
             .args(["print", &target])
@@ -862,6 +1096,9 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
         }
         Ok(registered)
     })?;
+    if onboarding {
+        install_onboarding(&account, &binary, &root, &agents)?;
+    }
     println!(
         "glass: enrolled {}; account, home and login credentials remain yours",
         account.name
@@ -869,9 +1106,13 @@ pub fn enroll(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn elevate(arguments: &[&str], non_interactive: bool) -> anyhow::Result<()> {
+fn elevate_using(
+    arguments: &[&str],
+    non_interactive: bool,
+    system_dialog: bool,
+) -> anyhow::Result<()> {
     use std::io::IsTerminal;
-    let status = if non_interactive || std::io::stdin().is_terminal() {
+    let status = if non_interactive || (!system_dialog && std::io::stdin().is_terminal()) {
         let mut command = Command::new("/usr/bin/sudo");
         if non_interactive {
             command.arg("-n");
@@ -908,16 +1149,200 @@ fn elevate(arguments: &[&str], non_interactive: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+mod guided;
+
+pub(crate) fn application_lease() -> anyhow::Result<crate::macos_setup::Lease> {
+    guided::environment_lease(crate::macos_setup::LeaseKind::Application)
+}
+
 pub fn setup(
     name: &str,
     non_interactive: bool,
     launchagent: bool,
     addr: Option<&str>,
 ) -> anyhow::Result<()> {
+    guided::run(
+        guided::Options {
+            name,
+            non_interactive,
+            launchagent,
+            addr,
+            system_dialog: false,
+            cancelled: &std::sync::atomic::AtomicBool::new(false),
+        },
+        |progress| println!("glass: {}", progress.message),
+    )
+}
+
+pub(crate) fn resume_setup(
+    non_interactive: bool,
+    integration: Option<crate::setup::RunMode>,
+    addr: Option<&str>,
+) -> anyhow::Result<()> {
+    let name = read_enrollment()?.name;
+    let launchagent = match integration {
+        Some(crate::setup::RunMode::Http) => true,
+        Some(crate::setup::RunMode::Stdio) => false,
+        None => crate::setup::launch_agent_plist_path(&std::env::var("HOME")?).try_exists()?,
+    };
+    setup(&name, non_interactive, launchagent, addr)
+}
+
+/// The app and CLI use the same enrollment, consent and readiness coordinator.
+pub fn show_setup(addr: &str) -> anyhow::Result<()> {
+    use glass_macos::setup_window::{SetupActions, SetupProgress};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    let existing = match owner_root().and_then(|root| root.try_exists().map_err(Into::into)) {
+        Ok(true) => Some(read_enrollment()),
+        Ok(false) => None,
+        Err(error) => Some(Err(error)),
+    };
+    let account = existing
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|account| account.name.clone())
+        .unwrap_or_default();
+    let message = if let Some(Err(error)) = existing {
+        format!(
+            "Existing setup needs attention: {error:#}. Enter the development account name to check it. Glass will preserve unverified registration files."
+        )
+    } else if account.is_empty() {
+        "Select a standard development account. Accounts… opens macOS account settings if you need to create one. Glass handles registration and permission checks.".into()
+    } else {
+        format!(
+            "{account} is enrolled. Set up checks its live worker and resumes any pending setup. Disable isolation returns this user to shared-desktop use."
+        )
+    };
+    let state = Arc::new(Mutex::new(SetupProgress {
+        message,
+        running: false,
+        can_cancel: true,
+    }));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let begin_state = state.clone();
+    let begin_cancelled = cancelled.clone();
+    let addr = addr.to_owned();
+    #[cfg(feature = "network")]
+    let disable_addr = addr.clone();
+    let disable_state = state.clone();
+    let close_state = state.clone();
+    let actions = SetupActions {
+        account,
+        on_begin: Box::new(move |name| {
+            let mut state = match begin_state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if state.running {
+                return;
+            }
+            state.running = true;
+            state.can_cancel = false;
+            state.message =
+                "Checking setup. Complete any macOS authentication locally; take your time.".into();
+            drop(state);
+            let state = begin_state.clone();
+            let cancelled = begin_cancelled.clone();
+            let addr = addr.clone();
+            std::thread::spawn(move || {
+                let result = guided::run(
+                    guided::Options {
+                        name: &name,
+                        non_interactive: false,
+                        launchagent: cfg!(feature = "network"),
+                        addr: Some(&addr),
+                        system_dialog: true,
+                        cancelled: &cancelled,
+                    },
+                    |progress| {
+                        if let Ok(mut state) = state.lock() {
+                            state.message = progress.message;
+                            state.can_cancel = progress.can_cancel;
+                        }
+                    },
+                );
+                if let Ok(mut state) = state.lock() {
+                    state.running = false;
+                    state.can_cancel = true;
+                    state.message = match result {
+                        Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
+                        Err(error) => format!("{error:#}. Completed registration and grants are retained. Fix the reported cause, then choose Set up."),
+                    };
+                }
+            });
+        }),
+        on_disable: Box::new(move || {
+            let mut state = match disable_state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if state.running {
+                return;
+            }
+            state.running = true;
+            state.can_cancel = false;
+            state.message = "Disabling isolation. Glass will restart its managed server; the account and its files will be kept. Authenticate locally if asked.".into();
+            drop(state);
+            let state = disable_state.clone();
+            #[cfg(feature = "network")]
+            let addr = disable_addr.clone();
+            std::thread::spawn(move || {
+                let result = leave_account_using(false, true);
+                #[cfg(feature = "network")]
+                let restart_error = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|()| restart_managed_after_disable(&addr).err());
+                #[cfg(not(feature = "network"))]
+                let restart_error: Option<anyhow::Error> = None;
+                if let Ok(mut state) = state.lock() {
+                    state.running = false;
+                    state.can_cancel = true;
+                    state.message = match result {
+                        Ok(()) => match restart_error {
+                            Some(error) => format!("Isolation disabled; the account and files were kept. Managed-server restart needs attention: {error:#}"),
+                            None => "Isolation disabled; the account, files and grants were kept. Reconnect client-spawned stdio servers before shared-desktop work.".into(),
+                        },
+                        Err(error) => format!("Could not disable isolation: {error:#}"),
+                    };
+                }
+            });
+        }),
+        on_accounts: Box::new(|| {
+            if let Err(error) = Command::new("/usr/bin/open")
+                .arg("x-apple.systempreferences:com.apple.Users-Groups-Settings.extension")
+                .spawn()
+            {
+                eprintln!("glass: could not open account settings: {error}");
+            }
+        }),
+        poll: Box::new(move || {
+            state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
+            message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true,
+        })
+        }),
+        can_close: Box::new(move || {
+            close_state
+                .lock()
+                .map(|state| !state.running || state.can_cancel)
+                .unwrap_or(true)
+        }),
+    };
+    let result = glass_macos::setup_window::run_setup(actions).map_err(anyhow::Error::msg);
+    cancelled.store(true, Ordering::Relaxed);
+    result
+}
+
+fn register_setup(name: &str, non_interactive: bool, system_dialog: bool) -> anyhow::Result<()> {
     ensure!(
         !rustix::process::geteuid().is_root(),
         "run glass-mcp setup from your normal account; it requests elevation for registration only"
     );
+    account_record(name, rustix::process::getuid().as_raw(), false)
+        .context("select an existing development account in Glass application setup")?;
     if let Ok(existing) = read_enrollment() {
         ensure!(
             existing.owner_uid == rustix::process::getuid().as_raw(),
@@ -939,21 +1364,94 @@ pub fn setup(
     } else {
         false
     };
-    if !reusable {
-        elevate(&["macos-enroll", name], non_interactive)?;
+    let onboarding_installed = reusable && owner_root()?.join(ONBOARD_JOB).try_exists()?;
+    if !reusable || (!non_interactive && !onboarding_installed) {
+        let mut arguments = vec!["macos-enroll", name];
+        if !reusable && private_session::is_owner() {
+            arguments.push("--repair");
+        }
+        if !non_interactive {
+            arguments.push("--onboarding");
+        }
+        elevate_using(&arguments, non_interactive, system_dialog)?;
     }
+    Ok(())
+}
 
+fn finish_setup(launchagent: bool, addr: Option<&str>) -> anyhow::Result<()> {
+    use sha2::Digest;
+    let account = read_enrollment()?;
+    let lease = File::open(owner_root()?.join(ACCOUNT))?;
+    fs4::FileExt::try_lock(&lease)
+        .context("Glass application work started while setup was finishing")?;
+    let binding = sha2::Sha256::digest(std::fs::read(owner_root()?.join(ACCOUNT))?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let mut journal = crate::permission_journal::PermissionJournal::open(
+        &crate::permission_journal::PermissionJournal::root()?,
+        account.uid,
+        binding,
+        None,
+        None,
+    )?;
+    journal
+        .finish(Deadline::from_millis(8000))
+        .context("previous workspace permission recovery has not finished")?;
+    drop(journal);
     let addr = addr.unwrap_or("127.0.0.1:7300");
     if launchagent {
         let exe = std::env::current_exe()?;
-        if let Some((label, pending)) =
-            crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
+        let target = crate::setup::launch_agent_target(rustix::process::getuid().as_raw());
+        let loaded = Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .output()?;
+        let running_here = loaded.status.success()
+            && crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout))
+                == Some(std::process::id());
+        if !running_here
+            && let Some((label, pending)) =
+                crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
         {
             bail!("{label}: {pending}");
         }
         crate::setup::verify_private_launch_agent(addr)?;
     }
-    verify()
+    let phase = crate::macos_worker::backend_transport::readiness_with_lease(lease)?.phase();
+    ensure!(
+        phase == crate::macos_setup::Phase::Ready,
+        "{}",
+        phase.message(&account.name)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "network")]
+fn restart_managed_after_disable(addr: &str) -> anyhow::Result<()> {
+    let target = crate::setup::launch_agent_target(rustix::process::getuid().as_raw());
+    let loaded = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()?;
+    if !loaded.status.success() {
+        return Ok(());
+    }
+    let binary = std::env::current_exe()?.canonicalize()?;
+    ensure!(
+        loaded_job_matches(
+            &String::from_utf8_lossy(&loaded.stdout),
+            &[
+                &binary.to_string_lossy(),
+                "serve",
+                "--http",
+                "--menubar",
+                "--addr",
+                addr
+            ]
+        ),
+        "isolation is disabled, but the managed server has different launch settings; restart that MCP connection"
+    );
+    crate::setup::restart_launch_agent()?;
+    Ok(())
 }
 
 /// Readiness uses the native worker's grants/session, never the calling terminal's TCC state.
@@ -963,21 +1461,68 @@ pub fn verify() -> anyhow::Result<()> {
         "no private macOS account enrolled"
     );
     let account = read_enrollment()?;
-    let connection = crate::macos_worker::backend_transport::NativeConnection::connect()
-        .with_context(|| format!("account {} is enrolled, but its private worker connection failed; run glass-mcp setup --account {} to check its registration", account.name, account.name))?;
-    let mut backend = crate::remote_backend::backend(connection)?;
-    let input = backend.platform.input_capabilities();
-    backend.platform.stop_app_by(Deadline::from_millis(8000))?;
+    let phase = crate::macos_worker::backend_transport::readiness()
+        .with_context(|| format!("account {} is enrolled, but its private worker connection failed; open Glass application setup to check its registration", account.name))?.phase();
     ensure!(
-        input.click.support.status == glass_core::Support::Supported
-            && input.text.support.status == glass_core::Support::Supported,
-        "enrollment saved; log into {}, open GlassMcp.app and enable its Accessibility and Screen Recording grants, then switch back without logging it out",
-        account.name
+        phase == crate::macos_setup::Phase::Ready,
+        "{}",
+        phase.message(&account.name)
     );
     println!(
         "glass: {} ready; apps use its private desktop through the normal MCP tools",
         account.name
     );
+    Ok(())
+}
+
+fn remove_onboarding(
+    account: &Enrollment,
+    binary: &Path,
+    root: &File,
+    agents: &File,
+) -> anyhow::Result<()> {
+    let recorded = stored_file(root, ONBOARD_JOB)?;
+    let installed = stored_file(agents, ONBOARD_JOB)?;
+    if recorded.is_none() && installed.is_none() {
+        return Ok(());
+    }
+    let expected = onboarding_job(account, binary)?;
+    ensure!(
+        recorded.as_ref().is_none_or(|bytes| *bytes == expected)
+            && installed.as_ref().is_none_or(|bytes| *bytes == expected),
+        "permission onboarding belongs to another installation; enrollment retained"
+    );
+    let target = format!("gui/{}/{ONBOARD_LABEL}", account.uid);
+    let loaded_job = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()?;
+    let loaded = loaded_job.status.success();
+    ensure!(
+        !loaded || installed.is_some(),
+        "permission onboarding file is missing; refusing unbound cleanup"
+    );
+    if loaded {
+        ensure!(
+            loaded_job_matches(
+                &String::from_utf8_lossy(&loaded_job.stdout),
+                &[
+                    &binary.to_string_lossy(),
+                    "macos-onboarding",
+                    &account.owner_uid.to_string()
+                ]
+            ),
+            "loaded permission helper changed; registration retained"
+        );
+        stop_registered_worker(&target, account)?;
+    }
+    if installed.is_some() {
+        rustix::fs::unlinkat(agents, ONBOARD_JOB, rustix::fs::AtFlags::empty())?;
+        agents.sync_all()?;
+    }
+    if recorded.is_some() {
+        rustix::fs::unlinkat(root, ONBOARD_JOB, rustix::fs::AtFlags::empty())?;
+        root.sync_all()?;
+    }
     Ok(())
 }
 
@@ -1015,6 +1560,11 @@ pub fn uninstall() -> anyhow::Result<()> {
 
 /// Restore this user's shared-desktop route while preserving the normal MCP integration.
 pub fn leave_account(non_interactive: bool) -> anyhow::Result<()> {
+    leave_account_using(non_interactive, false)
+}
+
+fn leave_account_using(non_interactive: bool, system_dialog: bool) -> anyhow::Result<()> {
+    let _setup = guided::lock_setup()?;
     if !owner_root()?.try_exists()? {
         let owner = rustix::process::geteuid().as_raw();
         let retired = private_session::root_for(owner)
@@ -1030,7 +1580,7 @@ pub fn leave_account(non_interactive: bool) -> anyhow::Result<()> {
             false
         };
         if retired.try_exists()? || staged {
-            elevate(&["macos-unenroll"], non_interactive)?;
+            elevate_using(&["macos-unenroll"], non_interactive, system_dialog)?;
         }
         println!(
             "glass: no separate-account enrollment for this user; shared-desktop use is available"
@@ -1060,7 +1610,7 @@ pub fn leave_account(non_interactive: bool) -> anyhow::Result<()> {
     journal.finish(Deadline::from_millis(8000))?;
     drop(journal);
     drop(lease);
-    elevate(&["macos-unenroll"], non_interactive)?;
+    elevate_using(&["macos-unenroll"], non_interactive, system_dialog)?;
     ensure!(
         !private_session::configured()?,
         "macOS account enrollment remains active"
@@ -1157,6 +1707,7 @@ pub fn remove_registration() -> anyhow::Result<()> {
         if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
             create_file(&root, "disabled", b"Glass account registration removed\n")?;
         }
+        remove_onboarding(&account, &binary, &root, &agents)?;
         unregister_worker(&root, &account, || {
             if loaded {
                 stop_registered_worker(&target, &account)?;
@@ -1197,6 +1748,12 @@ pub(crate) fn checks() -> Vec<glass_core::Check> {
                 Err(error) => Check::new("worker endpoint", CheckStatus::Fail, error.to_string())
                     .with_remedy(format!("run glass-mcp setup --account {} to check registration and restore worker socket access", account.name)),
             },
+            match guided::diagnostic_phase() {
+                Ok(crate::macos_setup::Phase::Ready) => Check::new("worker readiness", CheckStatus::Ok, "authenticated worker has a private graphical login, Accessibility and Screen Recording"),
+                Ok(crate::macos_setup::Phase::Busy) => Check::new("worker readiness", CheckStatus::Warn, "environment is in use; readiness probe skipped without interrupting it"),
+                Ok(phase) => Check::new("worker readiness", CheckStatus::Fail, phase.message(&account.name)).with_remedy("open Glass → Application setup… to resume setup or repair"),
+                Err(error) => Check::new("worker readiness", CheckStatus::Fail, error.to_string()).with_remedy("open Glass → Application setup…"),
+            },
         ],
         Ok(_) => vec![Check::new("private account", CheckStatus::Fail, "registration disabled or belongs to another owner")],
         Err(error) => vec![Check::new("private account", CheckStatus::Fail, error.to_string()).with_remedy("run glass-mcp setup --account ACCOUNT to repair registration")],
@@ -1206,6 +1763,94 @@ pub(crate) fn checks() -> Vec<glass_core::Check> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn loaded_job_binding_rejects_another_owner_program_or_argument_order() {
+        let output = "gui/502/example = {\n program = /Applications/Glass.app/Contents/MacOS/glass-mcp\n arguments = {\n /Applications/Glass.app/Contents/MacOS/glass-mcp\n macos-onboarding\n 501\n }\n environment = {\n pid = 900\n }\n}";
+        let expected = [
+            "/Applications/Glass.app/Contents/MacOS/glass-mcp",
+            "macos-onboarding",
+            "501",
+        ];
+        assert!(loaded_job_matches(output, &expected));
+        assert!(loaded_job_matches(
+            &output.replace(
+                " environment = {",
+                " environment = {\n \"reqs\" => {\n pid = 901\n }"
+            ),
+            &expected
+        ));
+        assert!(!loaded_job_matches(
+            &output.replace("\n 501\n", "\n 503\n"),
+            &expected
+        ));
+        assert!(!loaded_job_matches(
+            &output.replace(
+                "program = /Applications/Glass.app",
+                "program = /Applications/Other.app"
+            ),
+            &expected
+        ));
+        assert!(!loaded_job_matches(
+            &output.replace("macos-onboarding\n 501", "501\n macos-onboarding"),
+            &expected
+        ));
+        assert!(!loaded_job_matches(output.trim_end_matches('}'), &expected));
+        assert!(!loaded_job_matches(
+            &output.replace(" environment = {", " program = /other\n environment = {"),
+            &expected
+        ));
+    }
+
+    #[test]
+    fn permission_job_uses_the_same_glass_binary_and_an_explicit_owner_role() {
+        let account = Enrollment {
+            version: 1,
+            uid: 502,
+            gid: 20,
+            record_uuid: "test".into(),
+            name: "dev".into(),
+            home: "/Users/dev".into(),
+            owner_uid: 501,
+        };
+        let bytes = onboarding_job(
+            &account,
+            Path::new("/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"),
+        )
+        .unwrap();
+        let job: plist::Dictionary = plist::from_bytes(&bytes).unwrap();
+        let args = job["ProgramArguments"].as_array().unwrap();
+        assert_eq!(
+            args.iter()
+                .map(|value| value.as_string().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp",
+                "macos-onboarding",
+                "501"
+            ]
+        );
+        assert_eq!(job["RunAtLoad"].as_boolean(), Some(true));
+        assert_eq!(job["KeepAlive"].as_boolean(), Some(false));
+        assert_eq!(job["LimitLoadToSessionType"].as_string(), Some("Aqua"));
+        assert!(!job.contains_key("Sockets"));
+    }
+
+    #[test]
+    fn retired_registration_accepts_only_the_protected_permission_job_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = File::open(directory.path()).unwrap();
+        std::fs::write(directory.path().join(ONBOARD_JOB), b"job").unwrap();
+        std::fs::set_permissions(
+            directory.path().join(ONBOARD_JOB),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(registration_files(&root).unwrap(), [ONBOARD_JOB]);
+        std::fs::write(directory.path().join("unrelated.plist"), b"keep").unwrap();
+        assert!(registration_files(&root).is_err());
+    }
 
     fn account() -> Enrollment {
         Enrollment {

@@ -302,8 +302,12 @@ pub fn run(args: SetupArgs) -> Result<()> {
             .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
         }
         if glass_macos::private_session::configured()? {
-            return crate::macos_environment::verify()
-                .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
+            return crate::macos_environment::resume_setup(
+                non_interactive,
+                run_mode_from_flags(launchagent, no_launchagent),
+                addr.as_deref(),
+            )
+            .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
         }
         // Step 1: preconditions. Resolve the running binary's own path — used for the
         // signing-identity warning right below, and later as both the LaunchAgent's
@@ -466,7 +470,7 @@ pub(crate) fn loaded_agent_pid(output: &str) -> Option<u32> {
             }
             pid = Some(value.parse::<u32>().ok().filter(|&pid| pid != 0)?);
         }
-        if line.ends_with(" = {") {
+        if line.ends_with(" = {") || line.ends_with(" => {") {
             depth += 1;
         }
     }
@@ -1243,6 +1247,12 @@ mod tests {
         assert_eq!(
             loaded_agent_pid(
                 "gui/501/job = {\n state = running\n child = {\n pid = 9\n }\n pid = 42\n}\n"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            loaded_agent_pid(
+                "job = {\n environment = {\n \"reqs\" => {\n pid = 9\n }\n }\n pid = 42\n}"
             ),
             Some(42)
         );

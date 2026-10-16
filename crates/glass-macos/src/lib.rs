@@ -66,6 +66,8 @@ mod scwindow;
 #[cfg(target_os = "macos")]
 mod session;
 #[cfg(target_os = "macos")]
+pub mod setup_window;
+#[cfg(target_os = "macos")]
 pub mod workspace_access;
 #[cfg(target_os = "macos")]
 pub use backend::MacosPlatform;
