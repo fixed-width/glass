@@ -251,14 +251,7 @@ fn receipt(owner: u32, name: &str, root: &File) -> anyhow::Result<Receipt> {
         "new account home already exists; select an existing account or another name"
     );
     glass_macos::account_setup::require_unused_name(name).map_err(anyhow::Error::msg)?;
-    let mut minimum = 501;
-    let uid = loop {
-        let uid = glass_macos::account_setup::available_uid(minimum).map_err(anyhow::Error::msg)?;
-        if !uid_in_use(uid)? {
-            break uid;
-        }
-        minimum = uid + 1;
-    };
+    let uid = crate::account_uid::available()?;
     let random = format!("{:032x}", rand::random::<u128>());
     let uuid = format!(
         "{}-{}-4{}-8{}-{}",
@@ -398,38 +391,6 @@ pub(super) fn completed_identity(
     )
 }
 
-fn uid_in_use(uid: u32) -> anyhow::Result<bool> {
-    if !private_session::account_processes(uid)?.is_empty() {
-        return Ok(true);
-    }
-    for kind in ["user", "gui"] {
-        let result = Command::new("/bin/launchctl")
-            .args(["print", &format!("{kind}/{uid}")])
-            .env("LC_ALL", "C")
-            .stdout(std::process::Stdio::null())
-            .output()?;
-        if result.status.success() {
-            return Ok(true);
-        }
-        ensure!(
-            absent_domain(
-                kind,
-                uid,
-                result.status.code(),
-                &String::from_utf8_lossy(&result.stderr)
-            ),
-            "cannot verify that the selected account UID is unused"
-        );
-    }
-    Ok(false)
-}
-
-fn absent_domain(kind: &str, uid: u32, code: Option<i32>, stderr: &str) -> bool {
-    code == Some(112)
-        && stderr.lines().last()
-            == Some(format!("Could not find domain for user {kind}: {uid}").as_str())
-}
-
 pub(super) fn prepare(name: &str, endpoint: &Path) -> anyhow::Result<()> {
     let owner = root_owner()?;
     validate_name(name)?;
@@ -453,7 +414,7 @@ pub(super) fn prepare(name: &str, endpoint: &Path) -> anyhow::Result<()> {
         let mut receipt = receipt(owner, name, &root)?;
         if !receipt.created {
             ensure!(
-                !uid_in_use(receipt.uid)?,
+                !crate::account_uid::in_use(receipt.uid)?,
                 "the reserved UID has live processes or a login domain; creation retained without changing its identity"
             );
         }
@@ -533,21 +494,6 @@ mod tests {
                 .as_nanos()
         );
         assert!(glass_macos::account_setup::require_unused_name(&absent).is_ok());
-    }
-
-    #[test]
-    fn absent_domain_requires_the_observed_native_error_and_exact_numeric_target() {
-        let message = "Bad request.\nCould not find domain for user gui: 59999\n";
-        assert!(absent_domain("gui", 59999, Some(112), message));
-        assert!(!absent_domain("gui", 59998, Some(112), message));
-        assert!(!absent_domain("user", 59999, Some(112), message));
-        assert!(!absent_domain(
-            "gui",
-            59999,
-            Some(1),
-            "Could not print domain: 1: Operation not permitted\n"
-        ));
-        assert!(!absent_domain("gui", 59999, Some(113), message));
     }
 
     #[test]

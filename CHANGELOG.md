@@ -36,7 +36,8 @@ internal refactors, CI, or test-only changes.
   disable; the menu provides setup and disable without a second Glass installation.
   Create a standard development account in that window with a local password, retained only in
   memory during native administrator-authenticated setup. Refused setup connections are recorded
-  in the app log. Interrupted creation resumes its recorded account identity;
+  in the app log. New account IDs are checked against existing login domains without creating
+  domains during allocation; unavailable inventories return an error. Interrupted creation resumes its recorded account identity;
   existing accounts and passwords are preserved. First login and privacy consent remain user actions.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose
