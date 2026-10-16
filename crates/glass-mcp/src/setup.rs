@@ -770,14 +770,8 @@ mod macos_impl {
 
         let uid = self_uid();
         let target = super::launch_agent_target(uid);
-        // Idempotent (re)load. `bootstrap` fails with "already loaded" on a second run — which
-        // the flow itself asks for, since a Screen Recording grant only takes effect after a
-        // relaunch — and wouldn't pick up an `--addr` change. Unload first, ignoring the exit
-        // status (a harmless no-op when nothing is loaded), so every re-run converges.
-        let _ = Command::new("launchctl")
-            .arg("bootout")
-            .arg(&target)
-            .status();
+        crate::launchd::stop(&target, uid)
+            .map_err(|error| GlassError::Backend(format!("{error:#}")))?;
 
         let status = Command::new("launchctl")
             .arg("bootstrap")

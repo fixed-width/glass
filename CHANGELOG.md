@@ -31,7 +31,8 @@ internal refactors, CI, or test-only changes.
   Uninstall also removes startup integration while retaining the account, home and app data.
   The app's Application setup window and CLI share a resumable permission flow with automatic
   worker checks, fresh-process grant updates, standard-home preparation and bounded registration
-  repair. Doctor checks live worker readiness. Active macOS application sessions block setup or
+  repair. Registration changes wait for the original process and launchd job to stop, and setup
+  displays native authorization and repair failures. Doctor checks live worker readiness. Active macOS application sessions block setup or
   disable; the menu provides setup and disable without a second Glass installation.
   Create a standard development account in that window with a local password, retained only in
   memory during authenticated setup. Interrupted creation resumes its recorded account identity;

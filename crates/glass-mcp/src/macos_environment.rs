@@ -294,13 +294,10 @@ fn install_onboarding(
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{ONBOARD_LABEL}");
-    let loaded = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .output()?;
-    if loaded.status.success() {
+    if let Some(loaded) = crate::launchd::inspect(&target)? {
         ensure!(
             loaded_job_matches(
-                &String::from_utf8_lossy(&loaded.stdout),
+                &loaded,
                 &[
                     &binary.to_string_lossy(),
                     "macos-onboarding",
@@ -309,7 +306,7 @@ fn install_onboarding(
             ),
             "loaded permission helper belongs to another installation"
         );
-        if crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout)).is_none() {
+        if crate::setup::loaded_agent_pid(&loaded).is_none() {
             checked(Command::new("/bin/launchctl").args(["kickstart", &target]))?;
         }
     } else {
@@ -603,39 +600,7 @@ fn loaded_job_matches(output: &str, expected: &[&str]) -> bool {
 }
 
 fn stop_registered_worker(target: &str, account: &Enrollment) -> anyhow::Result<()> {
-    let job = Command::new("/bin/launchctl")
-        .args(["print", target])
-        .output()?;
-    if !job.status.success() {
-        return Ok(());
-    }
-    let broker = match crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&job.stdout)) {
-        Some(pid) => private_session::account_processes(account.uid)?
-            .into_iter()
-            .find(|process| process.matches_pid(pid)),
-        None => None,
-    };
-    checked(Command::new("/bin/launchctl").args(["bootout", target]))?;
-    let deadline = Deadline::from_millis(8000);
-    while let Some(process) = broker {
-        if !private_session::account_processes(account.uid)?.contains(&process) {
-            break;
-        }
-        ensure!(
-            !deadline.has_passed(),
-            "private worker has not exited; registration retained"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    ensure!(
-        !Command::new("/bin/launchctl")
-            .args(["print", target])
-            .output()?
-            .status
-            .success(),
-        "private worker registration remains loaded"
-    );
-    Ok(())
+    crate::launchd::stop(target, account.uid)
 }
 
 fn legacy_job(account: &Enrollment, binary: &Path) -> anyhow::Result<Vec<u8>> {
@@ -696,15 +661,18 @@ fn migrate_legacy(account: &Enrollment, binary: &Path) -> anyhow::Result<()> {
     let old = legacy_job(account, binary)?;
     let registered_file = same_file(&agents, JOB, &old)?;
     let target = format!("gui/{}/{LABEL}", account.uid);
-    let loaded = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .output()?
-        .status
-        .success();
+    let loaded_job = crate::launchd::inspect(&target)?;
+    let loaded = loaded_job.is_some();
     ensure!(
         registered_file || !loaded,
         "legacy job cannot be attributed; registration retained"
     );
+    if let Some(loaded_job) = loaded_job {
+        ensure!(
+            loaded_job_matches(&loaded_job, &[&binary.to_string_lossy(), "macos-worker"]),
+            "loaded legacy worker belongs to another installation; registration retained"
+        );
+    }
     let bytes = stored_file(&legacy, ACCOUNT)?.context("legacy account record missing")?;
     let requirement =
         stored_file(&legacy, "worker.requirement")?.context("legacy worker requirement missing")?;
@@ -1055,36 +1023,29 @@ pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{LABEL}");
+    if repair && let Some(loaded) = crate::launchd::inspect(&target)? {
+        ensure!(
+            loaded_job_matches(
+                &loaded,
+                &[
+                    &binary.to_string_lossy(),
+                    "macos-worker",
+                    &account.owner_uid.to_string()
+                ]
+            ),
+            "loaded worker belongs to another installation; registration retained"
+        );
+        ensure!(
+            crate::setup::loaded_agent_pid(&loaded).is_none(),
+            "the worker process is still running; its registration was retained"
+        );
+        stop_registered_worker(&target, &account)?;
+    }
     if repair {
-        let loaded = Command::new("/bin/launchctl")
-            .args(["print", &target])
-            .output()?;
-        if loaded.status.success() {
-            ensure!(
-                loaded_job_matches(
-                    &String::from_utf8_lossy(&loaded.stdout),
-                    &[
-                        &binary.to_string_lossy(),
-                        "macos-worker",
-                        &account.owner_uid.to_string()
-                    ]
-                ),
-                "loaded worker belongs to another installation; registration retained"
-            );
-            ensure!(
-                crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout)).is_none(),
-                "the worker process is still running; its registration was retained"
-            );
-            stop_registered_worker(&target, &account)?;
-        }
         remove_socket(&root, account.owner_uid, account.uid)?;
     }
     enable_worker(&root, &account, || {
-        let mut registered = Command::new("/bin/launchctl")
-            .args(["print", &target])
-            .output()?
-            .status
-            .success();
+        let mut registered = crate::launchd::inspect(&target)?.is_some();
         if !registered {
             // launchd leaves its socket node behind when a registration is removed.
             remove_socket(&root, account.owner_uid, account.uid)?;
@@ -1145,9 +1106,19 @@ fn elevate_using(
             "do shell script {} with administrator privileges",
             serde_json::to_string(&script)?
         );
-        Command::new("/usr/bin/osascript")
+        let output = Command::new("/usr/bin/osascript")
             .args(["-e", &expression])
-            .status()?
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "macOS account setup did not complete: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(8192)
+                .collect::<String>()
+        );
+        output.status
     };
     ensure!(
         status.success(),
@@ -1545,18 +1516,16 @@ fn remove_onboarding(
         "permission onboarding belongs to another installation; enrollment retained"
     );
     let target = format!("gui/{}/{ONBOARD_LABEL}", account.uid);
-    let loaded_job = Command::new("/bin/launchctl")
-        .args(["print", &target])
-        .output()?;
-    let loaded = loaded_job.status.success();
+    let loaded_job = crate::launchd::inspect(&target)?;
+    let loaded = loaded_job.is_some();
     ensure!(
         !loaded || installed.is_some(),
         "permission onboarding file is missing; refusing unbound cleanup"
     );
-    if loaded {
+    if let Some(loaded_job) = loaded_job {
         ensure!(
             loaded_job_matches(
-                &String::from_utf8_lossy(&loaded_job.stdout),
+                &loaded_job,
                 &[
                     &binary.to_string_lossy(),
                     "macos-onboarding",
@@ -1746,15 +1715,22 @@ pub fn remove_registration() -> anyhow::Result<()> {
         };
         let registered_file = accepts_job(&agents, &expected, &legacy)?;
         let target = format!("gui/{}/{LABEL}", account.uid);
-        let loaded = Command::new("/bin/launchctl")
-            .args(["print", &target])
-            .output()?
-            .status
-            .success();
+        let loaded_job = crate::launchd::inspect(&target)?;
+        let loaded = loaded_job.is_some();
         ensure!(
             registered_file || !loaded,
             "worker job is loaded but its registered file is missing; refusing unbound cleanup"
         );
+        if let Some(loaded_job) = loaded_job {
+            let binary = binary.to_string_lossy();
+            let owner = account.owner_uid.to_string();
+            ensure!(
+                loaded_job_matches(&loaded_job, &[&binary, "macos-worker", &owner])
+                    || (legacy_owned
+                        && loaded_job_matches(&loaded_job, &[&binary, "macos-worker"])),
+                "loaded worker belongs to another installation; registration retained"
+            );
+        }
         // A failed cleanup must leave clients on the disabled private route.
         if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
             create_file(&root, "disabled", b"Glass account registration removed\n")?;
