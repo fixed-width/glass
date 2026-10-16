@@ -61,8 +61,9 @@ in person, switch to the selected account: Glass refuses further private input w
 account. Return to your normal account before resuming agent work.
 
 This is a preview. Setup, worker re-registration, and changed-build development loops through both
-stdio and HTTP have been exercised on Apple Silicon with an existing initialized login. Physical
-concurrent input, unattended cold-boot login and monitor-free operation are not qualified.
+stdio and HTTP have been tested on an Apple Silicon Mac mini without a physical monitor connected,
+using an existing initialized login. Simultaneous physical keyboard/mouse use and unattended startup
+after a reboot have not been tested.
 Keep the account logged in; after a restart, log into it again. This does not change Windows's
 shared-desktop behavior.
 

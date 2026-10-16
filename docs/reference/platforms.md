@@ -25,8 +25,9 @@ separate desktop, but the native backend cannot attest isolation from the VM hos
 macOS also has [separate-account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview)
 in preview, using a retained real login in the same OS. It routes the normal tools to that account,
 with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
-development loops have been exercised with an existing initialized login. Physical concurrent input,
-cold-boot login and operation without a monitor remain open.
+development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
+using an existing initialized login. Simultaneous physical keyboard/mouse use and unattended startup
+after a reboot have not been tested.
 After logout/relogin, a loaded registration with a stale socket requires the documented
 [uninstall/setup recovery](../how-to/setup-macos.md#recover-a-refused-worker-connection);
 rerunning setup alone does not repair that state.
@@ -165,8 +166,9 @@ process are contained at `default`/`strict`, and `strict` additionally blocks ou
 containment the clipboard is isolated **and working** for an app not built with Apple's hardened
 runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. The opt-in
 [separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
-apps off your desktop using an existing initialized login. Physical concurrent input, cold-boot login
-and monitor-free operation remain unqualified. Containment details are in
+apps off your desktop using an existing initialized login. This has been tested on an Apple Silicon
+Mac mini without a physical monitor connected. Simultaneous physical keyboard/mouse use and
+unattended startup after a reboot have not been tested. Containment details are in
 [explanation/containment.md](../explanation/containment.md).
 
 ## Status
