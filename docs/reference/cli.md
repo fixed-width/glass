@@ -187,6 +187,8 @@ existing Glass MCP servers before shared-desktop work. Other users' enrollments 
 - `--non-interactive` — require existing administrator authorization instead of prompting.
 
 See [returning to shared-desktop use](../how-to/setup-macos.md#return-to-shared-desktop-use).
+If the app bundle has already been removed, see
+[unenrolling by hand](../how-to/setup-macos.md#unenroll-by-hand).
 
 ## `uninstall`
 
