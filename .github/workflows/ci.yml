@@ -193,31 +193,19 @@ jobs:
         run: ./scripts/test-macos-mcp.sh
 
   macos-account:
-    name: macOS account APIs (${{ matrix.image }})
+    name: macOS account APIs (${{ matrix.image }}, ${{ matrix.context }})
     runs-on: ${{ matrix.image }}
     timeout-minutes: 8
     strategy:
       fail-fast: false
       matrix:
         image: [macos-14, xcode-27]
+        context: [direct, system]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Test native account preparation on the disposable host
         timeout-minutes: 5
-        run: |
-          sw_vers
-          account_test_dir=$(mktemp -d)
-          trap 'rm -rf "$account_test_dir"' EXIT
-          xcrun clang -fobjc-arc -std=c11 \
-            crates/glass-macos/tests/account_creation.m \
-            crates/glass-macos/src/private_session.m \
-            -framework Foundation -framework OpenDirectory -framework ApplicationServices \
-            -framework Security -framework SystemConfiguration -lbsm \
-            -o "$account_test_dir/account-creation"
-          "$account_test_dir/account-creation" --contract
-          sudo -n /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-            GITHUB_ACTIONS="${GITHUB_ACTIONS:?}" RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT:?}" \
-            "$account_test_dir/account-creation" --disposable-ci
+        run: ./scripts/test-macos-account.sh '${{ matrix.context }}'
 
   windows:
     name: Windows (build · clippy · test)
