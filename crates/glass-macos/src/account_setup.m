@@ -83,6 +83,25 @@ static void capture_error(GlassAccountError *output, NSError *error) {
     output->code = error.code;
 }
 
+static int prepare_password(ODRecord *record, NSString *password, bool initial, GlassAccountError *diagnostic) {
+    NSError *error = nil;
+    NSDictionary *details = [record recordDetailsForAttributes:@[kODAttributeTypeAuthenticationAuthority] error:&error];
+    if (!details) { capture_error(diagnostic,error); return 3; }
+    NSArray *authority = details[kODAttributeTypeAuthenticationAuthority];
+    if (authority && ![authority isKindOfClass:NSArray.class]) return 3;
+    error = nil;
+    if (authority.count) {
+        // A resumed account already has credentials: verify, never reset them.
+        if (![record verifyPassword:password error:&error]) { capture_error(diagnostic,error); return 5; }
+    } else {
+        if (!initial) return 5;
+        if (![record changePassword:nil toPassword:password error:&error]) { capture_error(diagnostic,error); return 4; }
+        error = nil;
+        if (![record verifyPassword:password error:&error]) { capture_error(diagnostic,error); return 8; }
+    }
+    return 0;
+}
+
 extern int glass_private_uid_empty(uint32_t uid);
 
 static bool withdraw_new_record(ODRecord *record, NSDictionary *identity, NSString *name) {
@@ -153,18 +172,8 @@ int glass_account_prepare(const char *name_bytes, const char *uuid_bytes, uint32
         NSString *password = [[NSString alloc] initWithBytes:password_bytes
             length:password_length encoding:NSUTF8StringEncoding];
         if (!password) return 1;
-        NSDictionary *details = [record recordDetailsForAttributes:@[kODAttributeTypeAuthenticationAuthority] error:NULL];
-        if (!details) return 3;
-        NSArray *authority = details[kODAttributeTypeAuthenticationAuthority];
-        if (authority && ![authority isKindOfClass:NSArray.class]) return 3;
-        if (authority.count) {
-            // A resumed account already has credentials: verify, never reset them.
-            if (![record verifyPassword:password error:NULL]) return 5;
-        } else {
-            if (!initial) return 5;
-            if (![record changePassword:nil toPassword:password error:NULL]) return 4;
-            if (![record verifyPassword:password error:NULL]) return 8;
-        }
+        int password_status = prepare_password(record,password,initial,diagnostic);
+        if (password_status) return password_status;
         owners = records(node,kODAttributeTypeUniqueID,kODMatchEqualTo,[NSString stringWithFormat:@"%u",uid]);
         if (owners.count != 1 || !identity_matches(owners[0],identity)) return 11;
         return identity_matches(record, identity) ? 0 : 2;

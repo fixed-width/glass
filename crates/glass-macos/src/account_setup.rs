@@ -51,7 +51,7 @@ fn status(code: i32) -> Result<(), String> {
         0 => Ok(()),
         1 => Err("account creation requires administrator authorization and valid account details".into()),
         2 => Err("the account identity or UID is already in use or has changed; existing accounts were retained".into()),
-        4 => Err("macOS refused the initial password; choose a password meeting this Mac's policy and retry".into()),
+        4 => Err("macOS could not initialize the account password; the account was retained without enrollment".into()),
         5 => Err("this resumed account already has credentials; supply its original password or select it as an existing account".into()),
         7 => Err("the account could not be verified as a standard account; nothing was enrolled".into()),
         8 => Err("the new account password could not be verified; account retained for recovery".into()),
@@ -129,6 +129,21 @@ pub fn set_password(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initial_password_failures_preserve_native_errors_without_assuming_password_policy() {
+        let message = super::preparation_status(
+            4,
+            super::NativeError {
+                domain: 2,
+                code: 13,
+            },
+        )
+        .unwrap_err();
+        assert!(message.ends_with("(POSIX code 13)"));
+        assert!(message.contains("retained without enrollment"));
+        assert!(!message.contains("policy"));
+    }
+
     #[test]
     fn native_error_codes_are_reported_without_native_descriptions() {
         let error = super::preparation_status(

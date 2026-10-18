@@ -1,6 +1,62 @@
 // Account mutations run only on a disposable hosted CI machine; no home or GUI login is created.
 #include "../src/account_setup.m"
+#include <bsm/libbsm.h>
 #include <string.h>
+
+@interface PasswordRecordDouble : NSObject
+@property bool credentials;
+@property bool rejectChange;
+@property bool rejectVerification;
+@property NSUInteger changes;
+@property NSUInteger verifications;
+@property(strong) NSError *failure;
+@end
+
+@implementation PasswordRecordDouble
+- (NSDictionary *)recordDetailsForAttributes:(NSArray *)attributes error:(NSError **)error {
+    return @{kODAttributeTypeAuthenticationAuthority:self.credentials ? @[@"test-only"] : @[]};
+}
+- (BOOL)changePassword:(NSString *)oldPassword toPassword:(NSString *)newPassword error:(NSError **)error {
+    self.changes++;
+    if (self.rejectChange && error) *error = self.failure;
+    return !self.rejectChange;
+}
+- (BOOL)verifyPassword:(NSString *)password error:(NSError **)error {
+    self.verifications++;
+    if (self.rejectVerification && error) *error = self.failure;
+    return !self.rejectVerification;
+}
+@end
+
+static bool password_error_contract(void) {
+    NSError *failure = [NSError errorWithDomain:NSPOSIXErrorDomain code:EACCES
+        userInfo:@{NSLocalizedDescriptionKey:@"untrusted-description-must-not-be-reported"}];
+    PasswordRecordDouble *record = [PasswordRecordDouble new];
+    record.failure = failure; record.rejectChange = true;
+    GlassAccountError diagnostic = {0};
+    int status = prepare_password((ODRecord *)record,@"test-only",true,&diagnostic);
+    if (status != 4 || diagnostic.domain != 2 || diagnostic.code != EACCES ||
+        record.changes != 1 || record.verifications) return false;
+
+    record = [PasswordRecordDouble new];
+    record.credentials = true; record.rejectVerification = true; record.failure = failure;
+    diagnostic = (GlassAccountError){0};
+    status = prepare_password((ODRecord *)record,@"test-only",true,&diagnostic);
+    if (status != 5 || diagnostic.domain != 2 || diagnostic.code != EACCES ||
+        record.changes || record.verifications != 1) return false;
+
+    record = [PasswordRecordDouble new];
+    record.rejectVerification = true; record.failure = failure;
+    diagnostic = (GlassAccountError){0};
+    status = prepare_password((ODRecord *)record,@"test-only",true,&diagnostic);
+    if (status != 8 || diagnostic.domain != 2 || diagnostic.code != EACCES ||
+        record.changes != 1 || record.verifications != 1) return false;
+
+    record = [PasswordRecordDouble new];
+    diagnostic = (GlassAccountError){0};
+    status = prepare_password((ODRecord *)record,@"test-only",false,&diagnostic);
+    return status == 5 && !diagnostic.domain && !record.changes && !record.verifications;
+}
 
 static void erase_secret(void *buffer, size_t length) {
     volatile unsigned char *bytes = buffer;
@@ -67,16 +123,21 @@ static bool hosted_disposable_machine(void) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (argc == 2 && !strcmp(argv[1],"--contract")) return attributes_contract() ? 0 : 1;
+        if (argc == 2 && !strcmp(argv[1],"--contract")) return attributes_contract() && password_error_contract() ? 0 : 1;
         if (argc != 2 || strcmp(argv[1],"--disposable-ci") || !hosted_disposable_machine() || getuid() || geteuid()) {
             fputs("Account lifecycle test requires explicit disposable hosted CI execution as root.\n",stderr);
             return 77;
         }
-        if (!attributes_contract()) return 1;
+        if (!attributes_contract() || !password_error_contract()) return 1;
         ODNode *node = [ODNode nodeWithSession:[ODSession defaultSession] name:@"/Local/Default" error:NULL];
         if (!node) return 1;
         NSMutableArray *owned = [NSMutableArray array];
         NSMutableDictionary *result = [NSMutableDictionary dictionary];
+        auditinfo_addr_t audit = {0};
+        if (!getaudit_addr(&audit,sizeof(audit))) {
+            result[@"audit_uid"] = @(audit.ai_auid);
+            result[@"audit_session"] = @(audit.ai_asid);
+        }
         bool passed = false, cleaned = true;
         char secret[37] = {0}, wrong[37] = {0};
         @try {
@@ -101,6 +162,7 @@ int main(int argc, char **argv) {
             const char *name = [fixture[@"name"] UTF8String], *uuid = [fixture[@"uuid"] UTF8String];
             uint32_t uid = [fixture[@"uid"] unsignedIntValue];
             GlassAccountError diagnostic = {0};
+            fputs("{\"phase\":\"create_record\"}\n",stdout);fflush(stdout);
             int status = glass_account_prepare(name,uuid,uid,NULL,0,true,true,&diagnostic);
             result[@"record_status"] = @(status);
             result[@"record_error_domain"] = @(diagnostic.domain);
@@ -111,16 +173,24 @@ int main(int argc, char **argv) {
             memcpy(secret,"Aa1!",4);
             for (unsigned index=0;index<sizeof(random);index++) snprintf(secret+4+index*2,3,"%02x",random[index]);
             erase_secret(random,sizeof(random));
+            fputs("{\"phase\":\"initialize_password\"}\n",stdout);fflush(stdout);
             status = glass_account_prepare(name,uuid,uid,(const uint8_t *)secret,36,false,true,&diagnostic);
             result[@"initial_password_status"] = @(status);
+            result[@"initial_password_error_domain"] = @(diagnostic.domain);
+            result[@"initial_password_error_code"] = @(diagnostic.code);
             if (status) @throw [NSException exceptionWithName:@"InitialPasswordFailed" reason:nil userInfo:nil];
             status = glass_account_prepare(name,uuid,uid,(const uint8_t *)secret,36,false,false,&diagnostic);
             result[@"resume_password_status"] = @(status);
+            result[@"resume_password_error_domain"] = @(diagnostic.domain);
+            result[@"resume_password_error_code"] = @(diagnostic.code);
             if (status) @throw [NSException exceptionWithName:@"ResumePasswordFailed" reason:nil userInfo:nil];
             memcpy(wrong,secret,sizeof(secret));wrong[35] = wrong[35]=='0' ? '1' : '0';
             status = glass_account_prepare(name,uuid,uid,(const uint8_t *)wrong,36,false,false,&diagnostic);
             result[@"wrong_password_status"] = @(status);
+            result[@"wrong_password_error_domain"] = @(diagnostic.domain);
+            result[@"wrong_password_error_code"] = @(diagnostic.code);
             if (status != 5) @throw [NSException exceptionWithName:@"WrongPasswordAccepted" reason:nil userInfo:nil];
+            if (!diagnostic.domain) @throw [NSException exceptionWithName:@"WrongPasswordDiagnosticMissing" reason:nil userInfo:nil];
             status = glass_account_prepare(name,uuid,uid,(const uint8_t *)secret,36,false,false,&diagnostic);
             result[@"original_password_status"] = @(status);
             if (status) @throw [NSException exceptionWithName:@"OriginalPasswordChanged" reason:nil userInfo:nil];
