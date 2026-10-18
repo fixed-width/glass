@@ -31,8 +31,9 @@ password. It needs a real login and Glass privacy grants in that account,
 retained between runs. Enrollment applies to your macOS user; `glass-mcp unenroll` returns to
 shared-desktop use while retaining the app, development account and MCP startup integration.
 Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.
-These runtime checks reused an initialized login; guided first-time production-app onboarding remains
-under validation. Unattended startup after a reboot has not been tested.
+These runtime checks reused an initialized login; guided first-time production-app onboarding and
+simultaneous physical keyboard/mouse use remain unqualified. The current startup path requires
+logging into the development account again after a reboot; it does not provide unattended recovery.
 
 ## See it
 
