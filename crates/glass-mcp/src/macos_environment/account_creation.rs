@@ -95,6 +95,45 @@ fn receive(stream: &mut UnixStream, maximum: usize) -> anyhow::Result<Zeroizing<
     Ok(bytes)
 }
 
+fn exchange(
+    stream: &mut UnixStream,
+    password: &Password,
+    owner: u32,
+    name: &str,
+) -> anyhow::Result<()> {
+    // Darwin inherits the listener's nonblocking mode on accepted sockets.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let hello: (u32, String) = serde_json::from_slice(
+        &receive(stream, 1024).context("receiving the verified account helper's request")?,
+    )?;
+    ensure!(
+        hello == (owner, name.to_owned()),
+        "account preparation request does not match this setup"
+    );
+    send(stream, password.bytes())
+        .context("transferring credentials to the verified account helper")?;
+    // Native account operations can themselves wait for local OS authorization.
+    stream.set_read_timeout(None)?;
+    let result: Result<(), String> = serde_json::from_slice(
+        &receive(stream, 8192).context("receiving the account preparation result")?,
+    )?;
+    result.map_err(anyhow::Error::msg)
+}
+
+fn finish_exchange(
+    reply: anyhow::Result<()>,
+    authorization: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match (reply, authorization) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(reply), Err(authorization)) => Err(reply.context(format!(
+            "privileged account helper failed: {authorization:#}"
+        ))),
+    }
+}
+
 pub(super) fn create(name: &str, password: &Password, system_dialog: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     let owner = rustix::process::getuid().as_raw();
@@ -149,22 +188,13 @@ pub(super) fn create(name: &str, password: &Password, system_dialog: bool) -> an
                 Err(error) => return Err(error.into()),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        let hello: (u32, String) = serde_json::from_slice(&receive(&mut stream, 1024)?)?;
-        ensure!(
-            hello == (owner, name.to_owned()),
-            "account preparation request does not match this setup"
-        );
-        send(&mut stream, password.bytes())?;
-        // Native account operations can themselves wait for local OS authorization.
-        stream.set_read_timeout(None)?;
-        let result: Result<(), String> = serde_json::from_slice(&receive(&mut stream, 8192)?)?;
+        let result = exchange(&mut stream, password, owner, name);
+        drop(stream);
         let authorized = authorization
             .join()
-            .map_err(|_| anyhow::anyhow!("account authorization task stopped"))?;
-        result.map_err(anyhow::Error::msg)?;
-        authorized
+            .map_err(|_| anyhow::anyhow!("account authorization task stopped"))
+            .and_then(|result| result);
+        finish_exchange(result, authorized)
     })
 }
 
@@ -411,10 +441,12 @@ pub(super) fn prepare(name: &str, endpoint: &Path) -> anyhow::Result<()> {
             true,
         )?;
         let _homes = directory(Path::new("/Users"), 0, false)?;
-        let mut receipt = receipt(owner, name, &root)?;
+        let mut receipt =
+            receipt(owner, name, &root).context("saving account creation identity")?;
         if !receipt.created {
             ensure!(
-                !crate::account_uid::in_use(receipt.uid)?,
+                !crate::account_uid::in_use(receipt.uid)
+                    .context("checking the reserved account ID")?,
                 "the reserved UID has live processes or a login domain; creation retained without changing its identity"
             );
         }
@@ -424,9 +456,11 @@ pub(super) fn prepare(name: &str, endpoint: &Path) -> anyhow::Result<()> {
             receipt.uid,
             !receipt.created,
         )
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::msg)
+        .context("creating or verifying the development account record")?;
         receipt.created = true;
-        write_receipt(&root, &format!("{name}.plist"), &receipt)?;
+        write_receipt(&root, &format!("{name}.plist"), &receipt)
+            .context("saving the account record checkpoint")?;
         glass_macos::account_setup::set_password(
             name,
             &receipt.uuid,
@@ -434,11 +468,13 @@ pub(super) fn prepare(name: &str, endpoint: &Path) -> anyhow::Result<()> {
             password.bytes(),
             !receipt.password_set,
         )
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::msg)
+        .context("initializing or verifying the development account password")?;
         drop(password);
         receipt.password_set = true;
-        write_receipt(&root, &format!("{name}.plist"), &receipt)?;
-        enroll_with_options(name, true, false)
+        write_receipt(&root, &format!("{name}.plist"), &receipt)
+            .context("saving the password verification checkpoint")?;
+        enroll_with_options(name, true, false).context("enrolling the prepared development account")
     })();
     let reply = result
         .as_ref()
@@ -451,6 +487,150 @@ pub(super) fn prepare(name: &str, endpoint: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_setup_connection_waits_for_delayed_hello_and_reply() {
+        let owner = rustix::process::getuid().as_raw();
+        let endpoint = Endpoint::new(owner).unwrap();
+        let mut peer = UnixStream::connect(endpoint.socket()).unwrap();
+        let (mut stream, _) = endpoint.listener.accept().unwrap();
+        let password = Password::from_bytes(Zeroizing::new(b"test-only".to_vec())).unwrap();
+        std::thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                peer.set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+                send(
+                    &mut peer,
+                    &serde_json::to_vec(&(owner, "test_account")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(&*receive(&mut peer, 1024).unwrap(), b"test-only");
+                std::thread::sleep(Duration::from_millis(40));
+                send(
+                    &mut peer,
+                    &serde_json::to_vec(&Ok::<(), String>(())).unwrap(),
+                )
+                .unwrap();
+            });
+            let result = exchange(&mut stream, &password, owner, "test_account");
+            drop(stream);
+            let completed = helper.join();
+            result.unwrap();
+            completed.unwrap();
+        });
+    }
+
+    #[test]
+    fn accepted_setup_connection_waits_for_delayed_reply_after_password_transfer() {
+        let owner = rustix::process::getuid().as_raw();
+        let endpoint = Endpoint::new(owner).unwrap();
+        let mut peer = UnixStream::connect(endpoint.socket()).unwrap();
+        let (mut stream, _) = endpoint.listener.accept().unwrap();
+        let password = Password::from_bytes(Zeroizing::new(b"test-only".to_vec())).unwrap();
+        send(
+            &mut peer,
+            &serde_json::to_vec(&(owner, "test_account")).unwrap(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                assert_eq!(&*receive(&mut peer, 1024).unwrap(), b"test-only");
+                std::thread::sleep(Duration::from_millis(40));
+                send(
+                    &mut peer,
+                    &serde_json::to_vec(&Ok::<(), String>(())).unwrap(),
+                )
+                .unwrap();
+            });
+            let result = exchange(&mut stream, &password, owner, "test_account");
+            drop(stream);
+            let completed = helper.join();
+            result.unwrap();
+            completed.unwrap();
+        });
+    }
+
+    #[test]
+    fn mismatched_setup_hello_does_not_send_the_password() {
+        let owner = rustix::process::getuid().as_raw();
+        let endpoint = Endpoint::new(owner).unwrap();
+        let mut peer = UnixStream::connect(endpoint.socket()).unwrap();
+        let (mut stream, _) = endpoint.listener.accept().unwrap();
+        let password = Password::from_bytes(Zeroizing::new(b"test-only".to_vec())).unwrap();
+        send(
+            &mut peer,
+            &serde_json::to_vec(&(owner, "different_account")).unwrap(),
+        )
+        .unwrap();
+        let error = exchange(&mut stream, &password, owner, "test_account").unwrap_err();
+        assert!(error.to_string().contains("request does not match"));
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn delayed_setup_refusal_reaches_the_caller_without_password_data() {
+        let owner = rustix::process::getuid().as_raw();
+        let endpoint = Endpoint::new(owner).unwrap();
+        let mut peer = UnixStream::connect(endpoint.socket()).unwrap();
+        let (mut stream, _) = endpoint.listener.accept().unwrap();
+        let password = Password::from_bytes(Zeroizing::new(b"test-only".to_vec())).unwrap();
+        send(
+            &mut peer,
+            &serde_json::to_vec(&(owner, "test_account")).unwrap(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                assert_eq!(&*receive(&mut peer, 1024).unwrap(), b"test-only");
+                std::thread::sleep(Duration::from_millis(40));
+                send(
+                    &mut peer,
+                    &serde_json::to_vec(&Err::<(), _>("preparation refused")).unwrap(),
+                )
+                .unwrap();
+            });
+            let error = exchange(&mut stream, &password, owner, "test_account").unwrap_err();
+            drop(stream);
+            helper.join().unwrap();
+            assert_eq!(error.to_string(), "preparation refused");
+            assert!(!format!("{error:?}").contains("test-only"));
+        });
+    }
+
+    #[test]
+    fn incomplete_setup_reply_preserves_the_helpers_failure_and_transport_stage() {
+        let owner = rustix::process::getuid().as_raw();
+        let endpoint = Endpoint::new(owner).unwrap();
+        let mut peer = UnixStream::connect(endpoint.socket()).unwrap();
+        let (mut stream, _) = endpoint.listener.accept().unwrap();
+        let password = Password::from_bytes(Zeroizing::new(b"test-only".to_vec())).unwrap();
+        std::thread::scope(|scope| {
+            let helper = scope.spawn(move || -> anyhow::Result<()> {
+                peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+                send(&mut peer, &serde_json::to_vec(&(owner, "test_account"))?)?;
+                assert_eq!(&*receive(&mut peer, 1024)?, b"test-only");
+                peer.write_all(&100u32.to_be_bytes())?;
+                peer.write_all(b"{")?;
+                drop(peer);
+                bail!("native preparation stage failed")
+            });
+            let reply = exchange(&mut stream, &password, owner, "test_account");
+            drop(stream);
+            let error = finish_exchange(reply, helper.join().unwrap()).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("native preparation stage failed"));
+            assert!(message.contains("receiving the account preparation result"));
+            assert!(!message.contains("test-only"));
+        });
+    }
 
     #[test]
     fn directory_name_and_uid_queries_validate_the_current_local_account_without_mutation() {

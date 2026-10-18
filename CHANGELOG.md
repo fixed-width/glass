@@ -38,7 +38,8 @@ internal refactors, CI, or test-only changes.
   memory during native administrator-authenticated setup. Refused setup connections are recorded
   in the app log. New account IDs are checked against existing login domains without creating
   domains during allocation; unavailable inventories return an error. Interrupted creation resumes its recorded account identity;
-  existing accounts and passwords are preserved. First login and privacy consent remain user actions.
+  existing accounts and passwords are preserved. Native setup waits for its authenticated helper's
+  reply and reports failures by stage. First login and privacy consent remain user actions.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose
   worker is missing gets a startup check and one repair, rather than another login instruction;
