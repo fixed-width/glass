@@ -62,6 +62,27 @@ static bool identity_matches(ODRecord *record, NSDictionary *expected) {
     return true;
 }
 
+static NSDictionary *creation_attributes(NSDictionary *identity, NSString *name) {
+    NSMutableDictionary *attributes = [NSMutableDictionary dictionaryWithCapacity:7];
+    for (NSString *key in identity) attributes[key] = @[identity[key]];
+    attributes[kODAttributeTypeFullName] = @[[NSString stringWithFormat:@"Glass development (%@)",name]];
+    attributes[kODAttributeTypeUserShell] = @[@"/bin/zsh"];
+    attributes[kODAttributeTypePassword] = @[@"*"];
+    return attributes;
+}
+
+typedef struct { uint32_t domain; int64_t code; } GlassAccountError;
+
+static void capture_error(GlassAccountError *output, NSError *error) {
+    if (!output || !error) return;
+    if ([error.domain isEqualToString:@"com.apple.OpenDirectory"]) output->domain = 1;
+    else if ([error.domain isEqualToString:NSPOSIXErrorDomain]) output->domain = 2;
+    else if ([error.domain isEqualToString:NSCocoaErrorDomain]) output->domain = 3;
+    else if ([error.domain isEqualToString:NSOSStatusErrorDomain]) output->domain = 4;
+    else output->domain = 5;
+    output->code = error.code;
+}
+
 extern int glass_private_uid_empty(uint32_t uid);
 
 static bool withdraw_new_record(ODRecord *record, NSDictionary *identity, NSString *name) {
@@ -77,8 +98,10 @@ static bool withdraw_new_record(ODRecord *record, NSDictionary *identity, NSStri
 
 // Status codes deliberately exclude OpenDirectory's potentially sensitive error descriptions.
 int glass_account_prepare(const char *name_bytes, const char *uuid_bytes, uint32_t uid,
-                          const uint8_t *password_bytes, size_t password_length, bool record_only, bool initial) {
+                          const uint8_t *password_bytes, size_t password_length, bool record_only, bool initial,
+                          GlassAccountError *diagnostic) {
     @autoreleasepool {
+        if (diagnostic) *diagnostic = (GlassAccountError){0};
         if (getuid() || geteuid() || !name_bytes || !uuid_bytes || uid < 501 || uid >= 60000 ||
             (!record_only && (!password_bytes || password_length == 0 || password_length > 1024))) return 1;
         NSString *name = @(name_bytes), *uuid = @(uuid_bytes);
@@ -108,12 +131,10 @@ int glass_account_prepare(const char *name_bytes, const char *uuid_bytes, uint32
             errno = 0;
             if (getpwuid(uid)) return 2;
             if (errno) return 3;
-            NSMutableDictionary *attributes = [identity mutableCopy];
-            attributes[kODAttributeTypeFullName] = [NSString stringWithFormat:@"Glass development (%@)",name];
-            attributes[kODAttributeTypeUserShell] = @"/bin/zsh";
-            attributes[kODAttributeTypePassword] = @"*";
-            record = [node createRecordWithRecordType:kODRecordTypeUsers name:name attributes:attributes error:NULL];
-            if (!record) return 3;
+            NSError *error = nil;
+            record = [node createRecordWithRecordType:kODRecordTypeUsers name:name
+                attributes:creation_attributes(identity,name) error:&error];
+            if (!record) { capture_error(diagnostic,error); return 3; }
             created_here = true;
         }
         if (!identity_matches(record, identity)) return 2;

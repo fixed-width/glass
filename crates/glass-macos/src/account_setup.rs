@@ -2,6 +2,13 @@
 
 use std::ffi::CString;
 
+#[derive(Default)]
+#[repr(C)]
+struct NativeError {
+    domain: u32,
+    code: i64,
+}
+
 unsafe extern "C" {
     fn glass_account_name_unused(name: *const std::ffi::c_char) -> i32;
     fn glass_account_available_uid(minimum: u32, output: *mut u32) -> i32;
@@ -18,6 +25,7 @@ unsafe extern "C" {
         length: usize,
         record_only: bool,
         initial: bool,
+        diagnostic: *mut NativeError,
     ) -> i32;
 }
 
@@ -54,6 +62,20 @@ fn status(code: i32) -> Result<(), String> {
     }
 }
 
+fn preparation_status(code: i32, diagnostic: NativeError) -> Result<(), String> {
+    status(code).map_err(|message| {
+        let domain = match diagnostic.domain {
+            0 => return message,
+            1 => "Open Directory",
+            2 => "POSIX",
+            3 => "Cocoa",
+            4 => "OSStatus",
+            _ => "macOS",
+        };
+        format!("{message} ({domain} code {})", diagnostic.code)
+    })
+}
+
 pub fn available_uid(minimum: u32) -> Result<u32, String> {
     let mut uid = 0;
     // SAFETY: the helper only queries directory records and writes the scalar output.
@@ -74,8 +96,9 @@ fn prepare(
     if password.contains(&0) {
         return Err("account password contains a NUL character".into());
     }
-    // SAFETY: both strings and the password slice remain live for this synchronous native call.
-    status(unsafe {
+    let mut diagnostic = NativeError::default();
+    // SAFETY: the strings, password slice and writable scalar diagnostic remain live for the call.
+    let code = unsafe {
         glass_account_prepare(
             name.as_ptr(),
             uuid.as_ptr(),
@@ -84,8 +107,10 @@ fn prepare(
             password.len(),
             record_only,
             initial,
+            &mut diagnostic,
         )
-    })
+    };
+    preparation_status(code, diagnostic)
 }
 
 pub fn create_record(name: &str, uuid: &str, uid: u32, allow_creation: bool) -> Result<(), String> {
@@ -104,6 +129,33 @@ pub fn set_password(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_error_codes_are_reported_without_native_descriptions() {
+        let error = super::preparation_status(
+            3,
+            super::NativeError {
+                domain: 1,
+                code: 4001,
+            },
+        )
+        .unwrap_err();
+        assert!(error.ends_with("(Open Directory code 4001)"));
+        assert!(
+            super::preparation_status(
+                0,
+                super::NativeError {
+                    domain: 1,
+                    code: 4001
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            super::preparation_status(3, super::NativeError::default()),
+            super::status(3)
+        );
+    }
+
     #[test]
     fn numeric_process_guard_sees_the_current_user_and_an_unused_uid() {
         unsafe extern "C" {

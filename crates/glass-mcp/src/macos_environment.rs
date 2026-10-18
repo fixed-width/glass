@@ -1361,6 +1361,10 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                         }
                     },
                 );
+                if let Err(error) = &result {
+                    let details: String = format!("{error:#}").chars().take(8192).collect();
+                    eprintln!("glass: application setup failed: {details}");
+                }
                 if let Ok(mut state) = state.lock() {
                     state.running = false;
                     state.can_cancel = true;

@@ -170,6 +170,21 @@ jobs:
       # `--lib` rather than plain `--workspace`: it excludes the harness = false integration
       # targets, which need the TCC grants this runner lacks.
       - run: cargo test --workspace --lib --locked
+      - name: Test native account preparation on the disposable host
+        timeout-minutes: 5
+        run: |
+          account_test_dir=$(mktemp -d)
+          trap 'rm -rf "$account_test_dir"' EXIT
+          xcrun clang -fobjc-arc -std=c11 \
+            crates/glass-macos/tests/account_creation.m \
+            crates/glass-macos/src/private_session.m \
+            -framework Foundation -framework OpenDirectory -framework ApplicationServices \
+            -framework Security -framework SystemConfiguration -lbsm \
+            -o "$account_test_dir/account-creation"
+          "$account_test_dir/account-creation" --contract
+          sudo -n /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            GITHUB_ACTIONS="${GITHUB_ACTIONS:?}" RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT:?}" \
+            "$account_test_dir/account-creation" --disposable-ci
       # Builds the Swift fixture (crates/glass-macos/fixture/a11y_fixture.swift) — the one
       # thing `cargo build --workspace --all-targets` above doesn't reach — and re-links the
       # harness=false `a11y` integration test (crates/glass-macos/tests/a11y.rs) as a belt-
