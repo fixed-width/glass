@@ -44,6 +44,8 @@ internal refactors, CI, or test-only changes.
   Accounts that have not completed their first graphical login retain worker and permission-helper
   registration for that login instead of failing setup when their graphical launchd domain is unavailable.
   Interrupted registration continues with Set up and preserves an already prepared account password.
+  A fully closed permission-recovery journal can start a lease for a different development account;
+  unfinished or invalid recovery evidence is retained and still blocks that change.
   First login and privacy consent remain user actions.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose

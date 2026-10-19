@@ -226,8 +226,9 @@ impl PermissionJournal {
                         || (value.version == 1 && (value.boot.is_some() || value.session.is_some()))
                         || value.session.is_some_and(|id| id == 0 || id == u32::MAX)
                         || value.owner != self.header.owner
-                        || value.worker != self.header.worker
-                        || value.account != self.header.account
+                        || value.worker == 0
+                        || value.worker == value.owner
+                        || value.account.is_empty()
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -244,7 +245,12 @@ impl PermissionJournal {
                         .ok_or_else(|| io::Error::other("permission recovery sequence overflow"))?;
                 }
                 Event::Settled { id } if header.is_some() && id < self.next => {
-                    self.pending.remove(&id);
+                    if self.pending.remove(&id).is_none() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "permission settlement has no pending change",
+                        ));
+                    }
                 }
                 Event::Closed if header.is_some() && self.pending.is_empty() => {
                     self.closed = true;
@@ -257,12 +263,24 @@ impl PermissionJournal {
                 }
             }
         }
-        self.header = header.ok_or_else(|| {
+        let header = header.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "permission recovery header missing",
             )
         })?;
+        if (header.worker != self.header.worker || header.account != self.header.account)
+            && (!self.closed || end != bytes.len())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "permission recovery account binding changed",
+            ));
+        }
+        // A fully closed lease has no recovery work tying the next lease to its account.
+        if !self.closed {
+            self.header = header;
+        }
         self.loaded = true;
         // An incomplete final event was never followed by a successful write-ahead sync.
         self.file.set_len(end as u64)?;
@@ -505,6 +523,194 @@ mod tests {
         drop(first);
         let next = journal(root.path());
         assert!(!next.closed && next.pending.is_empty());
+    }
+
+    fn change() -> PermissionChange {
+        serde_json::from_value(serde_json::json!({
+            "identity": glass_macos::workspace_access::FileIdentity::default(),
+            "before": [],
+            "additions": [],
+        }))
+        .unwrap()
+    }
+
+    fn closed_journal(root: &Path) {
+        let mut journal = journal(root);
+        for _ in 0..3 {
+            let id = journal.prepared(&change()).unwrap();
+            journal.settled(id).unwrap();
+        }
+        journal.finish(Deadline::from_millis(1000)).unwrap();
+    }
+
+    fn assert_rebinding_refused(root: &Path) {
+        let path = root.join("pending.jsonl");
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            PermissionJournal::open(root, u32::MAX - 1, "another-account".into(), None, None)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn closed_history_can_start_a_different_account_lease() {
+        for (worker, account) in [
+            (u32::MAX, "another-account"),
+            (u32::MAX - 1, "test-account"),
+            (u32::MAX - 1, "another-account"),
+        ] {
+            let root = test_root();
+            closed_journal(root.path());
+            let next = PermissionJournal::open(root.path(), worker, account.into(), Some(42), None)
+                .unwrap();
+            assert_eq!(
+                (next.header.worker, next.header.account.as_str()),
+                (worker, account)
+            );
+            assert_eq!(next.header.session, Some(42));
+            assert!(!next.closed && next.pending.is_empty());
+            let bytes = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let Event::Header { value } = serde_json::from_slice(&bytes).unwrap() else {
+                panic!("fresh lease must retain its requested account header");
+            };
+            assert_eq!(value, next.header);
+        }
+    }
+
+    #[test]
+    fn unfinished_account_recovery_cannot_be_rebound() {
+        for settled in [false, true] {
+            let root = test_root();
+            let mut first = journal(root.path());
+            let id = first.prepared(&change()).unwrap();
+            if settled {
+                first.settled(id).unwrap();
+            }
+            drop(first);
+            let path = root.path().join("pending.jsonl");
+            let before = std::fs::read(&path).unwrap();
+            let error = PermissionJournal::open(
+                root.path(),
+                u32::MAX - 1,
+                "another-account".into(),
+                None,
+                None,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "permission recovery account binding changed"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn closed_legacy_history_can_start_a_new_account_lease() {
+        let root = test_root();
+        closed_journal(root.path());
+        let path = root.path().join("pending.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (first, rest) = text.split_once('\n').unwrap();
+        let Event::Header { mut value } = serde_json::from_str(first).unwrap() else {
+            panic!("expected the old lease header");
+        };
+        value.version = 1;
+        value.boot = None;
+        value.session = None;
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{rest}",
+                serde_json::to_string(&Event::Header { value }).unwrap()
+            ),
+        )
+        .unwrap();
+        let next = PermissionJournal::open(
+            root.path(),
+            u32::MAX - 1,
+            "another-account".into(),
+            Some(42),
+            None,
+        )
+        .unwrap();
+        assert_eq!(next.header.version, 2);
+        assert_eq!(next.header.worker, u32::MAX - 1);
+        assert_eq!(next.header.account, "another-account");
+        assert_eq!(next.header.session, Some(42));
+    }
+
+    #[test]
+    fn a_closed_marker_with_unsettled_changes_cannot_authorize_rebinding() {
+        let root = test_root();
+        let mut first = journal(root.path());
+        first.prepared(&change()).unwrap();
+        first.append(&Event::Closed).unwrap();
+        drop(first);
+        assert_rebinding_refused(root.path());
+    }
+
+    #[test]
+    fn orphan_or_duplicate_settlements_cannot_authorize_rebinding() {
+        for prepared in [false, true] {
+            let root = test_root();
+            let mut first = journal(root.path());
+            let id = if prepared {
+                let id = first.prepared(&change()).unwrap();
+                first.settled(id).unwrap();
+                id
+            } else {
+                0
+            };
+            first.append(&Event::Settled { id }).unwrap();
+            first.append(&Event::Closed).unwrap();
+            drop(first);
+            assert_rebinding_refused(root.path());
+        }
+    }
+
+    #[test]
+    fn records_after_a_closed_lease_cannot_authorize_rebinding() {
+        for tail in [
+            b"{\"kind\":\"Settled\",\"id\":1}\n".as_slice(),
+            b"{\"kind\":\"Prepared\",",
+        ] {
+            let root = test_root();
+            closed_journal(root.path());
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.path().join("pending.jsonl"))
+                .unwrap()
+                .write_all(tail)
+                .unwrap();
+            assert_rebinding_refused(root.path());
+        }
+    }
+
+    #[test]
+    fn invalid_closed_headers_cannot_authorize_rebinding() {
+        for field in ["owner", "worker", "account", "version", "boot", "session"] {
+            let root = test_root();
+            closed_journal(root.path());
+            let path = root.path().join("pending.jsonl");
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (first, rest) = text.split_once('\n').unwrap();
+            let mut row: serde_json::Value = serde_json::from_str(first).unwrap();
+            row["value"][field] = match field {
+                "owner" => serde_json::json!(rustix::process::getuid().as_raw() + 1),
+                "account" => serde_json::json!(""),
+                "boot" => serde_json::Value::Null,
+                _ => serde_json::json!(0),
+            };
+            std::fs::write(
+                &path,
+                format!("{}\n{rest}", serde_json::to_string(&row).unwrap()),
+            )
+            .unwrap();
+            assert_rebinding_refused(root.path());
+        }
     }
 
     #[test]
