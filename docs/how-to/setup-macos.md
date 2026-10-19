@@ -31,9 +31,11 @@ Stop any current Glass application with `glass_stop` before changing its environ
    home is missing, Glass asks macOS to initialise that selected home. Existing homes are retained;
    custom home locations must already be prepared.
 4. When Glass asks, use [Fast User Switching](https://support.apple.com/guide/mac-help/mchlp2439/mac)
-   to log into the development account and finish macOS's first-login setup. Glass's **glass permissions**
-   window opens automatically there. No Terminal command or second Glass installation is needed in
-   that account. Complete only the missing grants, in this order:
+   to log into the development account and finish macOS's first-login setup. Glass checks existing
+   permissions automatically and opens **glass permissions** if a grant is missing. Already allowed
+   permissions are reused; when both are allowed, the helper exits without opening that window.
+   No Terminal command or second Glass installation is needed in that account. Complete only the
+   missing grants, in this order:
 
    - Click **Request…** for **Accessibility**, then enable Glass in **System Settings → Privacy &
      Security → Accessibility**. [Apple's Accessibility instructions](https://support.apple.com/guide/mac-help/mh43185/mac).
@@ -45,7 +47,9 @@ Stop any current Glass application with `glass_stop` before changing its environ
    if macOS offers it. Glass checks grants in fresh processes automatically. These waits have no user
    deadline; the **Re-check** button remains available for a failed check.
 5. When the permission window says it is ready, switch back to your normal account, **leaving the
-   development account logged in**. Glass continues setup automatically, checks workspace recovery
+   development account logged in**. If no permission window appeared, return to your normal account
+   and check **Application setup…**; an absent window alone does not establish readiness.
+   Glass continues setup automatically, checks workspace recovery
    and verifies the actual worker's readiness before reporting **Ready**. Registration repair may
    request administrator authentication. A failed repair stops with its cause and retains completed
    registration and grants; **Set up** retries the outstanding work. **Cancel setup** stops waiting and
