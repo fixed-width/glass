@@ -223,7 +223,7 @@ fn connect_broker(lease: Option<File>) -> Result<BrokerConnection> {
     )?;
     let worker = glass_macos::private_session::worker_uid();
     let (mut stream, authenticated_pid, authenticated_session) =
-        callback.accept(worker, &requirement, Deadline::from_millis(10_000))?;
+        callback.accept(worker, &requirement, Deadline::UNBOUNDED)?;
     drop(activation);
     drop(callback);
     let (kind, bytes) = receive(&mut stream, Deadline::from_millis(10_000), None)?;
@@ -642,6 +642,22 @@ impl Drop for NativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs a signed, enrolled worker in a background graphical login"]
+    fn consecutive_readiness_checks_allow_launchd_to_relaunch_the_worker() {
+        assert!(glass_macos::private_session::configured().unwrap());
+        assert!(glass_macos::private_session::is_owner());
+        for index in 0..3 {
+            let started = std::time::Instant::now();
+            let facts = readiness().expect("authenticate a fresh worker after the previous probe");
+            eprintln!(
+                "readiness check {index} completed in {:?}",
+                started.elapsed()
+            );
+            assert!(facts.private_session && facts.accessibility && facts.screen_recording);
+        }
+    }
 
     #[test]
     fn failed_construction_closes_even_an_empty_journal_and_releases_the_account_lease() {

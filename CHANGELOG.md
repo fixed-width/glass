@@ -46,6 +46,8 @@ internal refactors, CI, or test-only changes.
   Interrupted registration continues with Set up and preserves an already prepared account password.
   A fully closed permission-recovery journal can start a lease for a different development account;
   unfinished or invalid recovery evidence is retained and still blocks that change.
+  Consecutive worker readiness checks allow for macOS's restart throttle instead of timing out at
+  its ten-second boundary. Worker activation remains bounded and keeps its authentication checks.
   First login and privacy consent remain user actions.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose

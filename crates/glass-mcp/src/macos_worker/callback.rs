@@ -5,9 +5,13 @@ use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use glass_core::{Deadline, GlassError, Result};
+use glass_core::{Deadline, GlassError, Result, Whose};
 use rustix::fs::{AtFlags, Mode, OFlags, open, unlinkat};
+
+// launchd can defer a rapid relaunch by its default ten-second throttle.
+const ACTIVATION_WAIT: Duration = Duration::from_secs(20);
 
 fn failure(error: impl std::fmt::Display) -> GlassError {
     GlassError::Backend(error.to_string())
@@ -77,22 +81,30 @@ impl Callback {
         requirement: &[u8],
         deadline: Deadline,
     ) -> Result<(UnixStream, u32, u32)> {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "private worker activation",
+            ));
+        }
+        let (until, whose) = deadline.resolve(Instant::now() + ACTIVATION_WAIT);
         loop {
-            let remaining = deadline
-                .remaining()
-                .map(rustix::event::Timespec::try_from)
-                .transpose()
-                .map_err(failure)?;
-            if deadline.has_passed() {
-                return Err(GlassError::deadline_not_started(
-                    "private worker authentication",
-                ));
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(match whose {
+                    Whose::Caller => {
+                        GlassError::caller_deadline_elapsed("waiting for private worker activation")
+                    }
+                    Whose::Callee => failure(
+                        "private worker activation timed out before an authenticated worker connected",
+                    ),
+                });
             }
+            let remaining = rustix::event::Timespec::try_from(remaining).map_err(failure)?;
             let mut poll = [rustix::event::PollFd::new(
                 &self.listener,
                 rustix::event::PollFlags::IN,
             )];
-            match rustix::event::poll(&mut poll, remaining.as_ref()) {
+            match rustix::event::poll(&mut poll, Some(&remaining)) {
                 Err(rustix::io::Errno::INTR) | Ok(0) => continue,
                 Err(error) => return Err(failure(error)),
                 Ok(_) => {}
@@ -110,6 +122,9 @@ impl Callback {
             else {
                 continue;
             };
+            if Instant::now() >= until {
+                continue;
+            }
             stream.set_nonblocking(true).map_err(failure)?;
             return Ok((stream, pid, session));
         }
@@ -194,6 +209,8 @@ pub(super) fn connect(path: &Path, owner: u32) -> anyhow::Result<tokio::net::Uni
 
 #[cfg(test)]
 mod tests {
+    use glass_core::{BoundDispatch, BoundKind};
+
     use super::*;
 
     #[test]
@@ -224,7 +241,52 @@ mod tests {
         let deadline = Deadline::from_millis(100);
         let error = callback.accept(owner + 1, &[], deadline).err().unwrap();
         assert!(deadline.has_passed());
-        assert!(error.to_string().contains("private worker authentication"));
+        assert!(matches!(
+            error,
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                ..
+            }
+        ));
         drop(sender.join().unwrap());
+    }
+
+    #[test]
+    fn waiting_for_a_missing_worker_is_not_reported_as_unstarted() {
+        let owner = rustix::process::getuid().as_raw();
+        let callback = Callback::new(owner).unwrap();
+        let error = callback
+            .accept(owner + 1, &[], Deadline::from_millis(100))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            GlassError::Bounded {
+                kind: BoundKind::TimedOut,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::MayHaveDispatched,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_spent_deadline_does_not_start_waiting_for_a_worker() {
+        let owner = rustix::process::getuid().as_raw();
+        let callback = Callback::new(owner).unwrap();
+        let error = callback
+            .accept(owner + 1, &[], Deadline::from_millis(0))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            GlassError::Bounded {
+                kind: BoundKind::NotStarted,
+                whose: Whose::Caller,
+                dispatch: BoundDispatch::NotDispatched,
+                ..
+            }
+        ));
     }
 }
