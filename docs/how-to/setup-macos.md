@@ -111,14 +111,18 @@ account. Return to your normal account before resuming agent work.
 
 The guided account/permission flow and account creation are under development and have not yet been
 tested end to end through the production app. Initial macOS login and privacy consent still require
-user action. If creation is interrupted, **Create account…** with the same name resumes only the
-record whose identity Glass saved before creation. Supply the original chosen password if it was
-already set. Glass keeps created accounts and homes after a failure; it refuses a different account,
+user action. If creation is interrupted before password preparation is confirmed, **Create account…**
+with the same name resumes only the record whose identity Glass saved before creation. Supply the
+original chosen password. Once Glass confirms that the account and password are prepared, choose
+**Set up** to finish registration without entering that development-account password again.
+Worker and permission-helper jobs are saved for the account's first graphical login.
+Glass keeps created accounts and homes after a failure; it refuses a different account,
 changed identity or preexisting home instead of overwriting them. A deleted completed account is not
 recreated from its old receipt; select a new name or an existing account.
 If Glass exits during setup, reopening the app or its menu-bar server opens the same setup window.
-For the same enabled enrollment, Glass continues worker and permission checks automatically with
-the saved integration and address. An unfinished account creation reopens the secure password
+For the same enabled enrollment with its permission-helper registration saved, Glass continues
+worker and permission checks automatically with the saved integration and address. Incomplete
+registration waits for **Set up** and any required administrator authentication. An unfinished account creation reopens the secure password
 dialog for the same account; enter the original chosen password. Glass stores only setup metadata,
 never that password. Missing, disabled or changed enrollment pauses for explicit action instead
 of being enabled automatically. Closing or cancelling setup clears its pending request while
