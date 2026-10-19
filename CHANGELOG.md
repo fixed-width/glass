@@ -41,6 +41,9 @@ internal refactors, CI, or test-only changes.
   existing accounts and passwords are preserved. Native setup waits for its authenticated helper's
   reply, reports record/password failures by stage and native error code, and records bounded failures
   in the app log. Initial password failures do not assume a password-policy rejection.
+  Accounts that have not completed their first graphical login retain worker and permission-helper
+  registration for that login instead of failing setup when their graphical launchd domain is unavailable.
+  Interrupted registration continues with Set up and preserves an already prepared account password.
   First login and privacy consent remain user actions.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose

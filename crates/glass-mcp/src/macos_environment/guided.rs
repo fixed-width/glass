@@ -68,11 +68,11 @@ pub(super) fn can_resume(saved: &Pending) -> anyhow::Result<bool> {
         &account.name,
         &Identity {
             uid: account.uid,
-            uuid: account.record_uuid,
+            uuid: account.record_uuid.clone(),
         },
         true,
         created.as_ref(),
-    ))
+    ) && permission_helper_registered(&account)?)
 }
 
 #[derive(Debug)]

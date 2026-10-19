@@ -5,14 +5,39 @@ use anyhow::Context;
 use anyhow::bail;
 use std::time::{Duration, Instant};
 
-fn missing(target: &str, code: Option<i32>, stderr: &str) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Inspection {
+    Loaded(String),
+    MissingJob,
+    MissingDomain,
+    GuiUnavailable,
+}
+
+impl Inspection {
+    fn into_job(self, target: &str) -> anyhow::Result<Option<String>> {
+        match self {
+            Self::Loaded(job) => Ok(Some(job)),
+            Self::MissingJob | Self::MissingDomain => Ok(None),
+            Self::GuiUnavailable => {
+                bail!("cannot inspect launchd job {target}: graphical domain is unavailable (125)")
+            }
+        }
+    }
+}
+
+fn target_parts(target: &str) -> Option<(&str, &str, &str)> {
     let mut parts = target.splitn(3, '/');
-    let (Some(domain), Some(uid), Some(label)) = (parts.next(), parts.next(), parts.next()) else {
+    let (domain, uid, label) = (parts.next()?, parts.next()?, parts.next()?);
+    if !matches!(domain, "gui" | "user") || uid.parse::<u32>().is_err() || label.is_empty() {
+        return None;
+    }
+    Some((domain, uid, label))
+}
+
+fn missing(target: &str, code: Option<i32>, stderr: &str) -> bool {
+    let Some((domain, uid, label)) = target_parts(target) else {
         return false;
     };
-    if !matches!(domain, "gui" | "user") || uid.parse::<u32>().is_err() || label.is_empty() {
-        return false;
-    }
     let expected = match code {
         Some(113) => {
             format!("Could not find service \"{label}\" in domain for user {domain}: {uid}")
@@ -23,25 +48,47 @@ fn missing(target: &str, code: Option<i32>, stderr: &str) -> bool {
     stderr.lines().last() == Some(expected.as_str())
 }
 
+fn interpret(
+    target: &str,
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> anyhow::Result<Inspection> {
+    if code == Some(0) {
+        return Ok(Inspection::Loaded(String::from_utf8(stdout)?));
+    }
+    let stderr = String::from_utf8_lossy(&stderr);
+    if missing(target, code, &stderr) {
+        return Ok(if code == Some(112) {
+            Inspection::MissingDomain
+        } else {
+            Inspection::MissingJob
+        });
+    }
+    if matches!(target_parts(target), Some(("gui", _, _)))
+        && code == Some(125)
+        && stdout.is_empty()
+        && stderr.trim_end_matches(['\r', '\n'])
+            == "Could not print domain: 125: Domain does not support specified action"
+    {
+        return Ok(Inspection::GuiUnavailable);
+    }
+    bail!("unrecognized launchd inspection result: {}", stderr.trim())
+}
+
 #[cfg(target_os = "macos")]
-pub(crate) fn inspect(target: &str) -> anyhow::Result<Option<String>> {
+pub(crate) fn inspect_for_setup(target: &str) -> anyhow::Result<Inspection> {
     let result = std::process::Command::new("/bin/launchctl")
         .args(["print", target])
         .env("LC_ALL", "C")
         .output()?;
-    if result.status.success() {
-        return Ok(Some(String::from_utf8(result.stdout)?));
-    }
-    let stderr = String::from_utf8_lossy(&result.stderr);
-    if missing(target, result.status.code(), &stderr) {
-        Ok(None)
-    } else {
-        bail!(
-            "cannot inspect launchd job {target}: {}: {}",
-            result.status,
-            stderr.trim()
-        )
-    }
+    interpret(target, result.status.code(), result.stdout, result.stderr)
+        .with_context(|| format!("cannot inspect launchd job {target}: {}", result.status))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn inspect(target: &str) -> anyhow::Result<Option<String>> {
+    inspect_for_setup(target)?.into_job(target)
 }
 
 fn wait_removed(
@@ -114,6 +161,103 @@ mod tests {
             Some(112),
             "Bad request.\nCould not find domain for user gui: 501\n"
         ));
+    }
+
+    #[test]
+    fn first_login_gui_unavailability_is_a_distinct_setup_state() {
+        let observed = b"Could not print domain: 125: Domain does not support specified action\n";
+        assert_eq!(
+            interpret(
+                "gui/501/dev.example.worker",
+                Some(125),
+                Vec::new(),
+                observed.to_vec()
+            )
+            .unwrap(),
+            Inspection::GuiUnavailable
+        );
+    }
+
+    #[test]
+    fn unavailable_gui_is_not_cleanup_confirmation() {
+        let target = "gui/501/dev.example.worker";
+        let observed = interpret(
+            target,
+            Some(125),
+            Vec::new(),
+            b"Could not print domain: 125: Domain does not support specified action\n".to_vec(),
+        )
+        .unwrap();
+        assert!(observed.into_job(target).is_err());
+    }
+
+    #[test]
+    fn setup_distinguishes_a_missing_service_from_a_missing_domain() {
+        let target = "gui/501/dev.example.worker";
+        assert_eq!(
+            interpret(
+                target,
+                Some(113),
+                Vec::new(),
+                b"Could not find service \"dev.example.worker\" in domain for user gui: 501\n"
+                    .to_vec()
+            )
+            .unwrap(),
+            Inspection::MissingJob
+        );
+        assert_eq!(
+            interpret(
+                target,
+                Some(112),
+                Vec::new(),
+                b"Could not find domain for user gui: 501\n".to_vec()
+            )
+            .unwrap(),
+            Inspection::MissingDomain
+        );
+    }
+
+    #[test]
+    fn prelogin_response_does_not_hide_other_domains_or_inspection_failures() {
+        let observed = "Could not print domain: 125: Domain does not support specified action\n";
+        for (target, code, stdout, stderr) in [
+            ("user/501/dev.example.worker", Some(125), "", observed),
+            ("system/dev.example.worker", Some(125), "", observed),
+            ("gui/not-a-uid/worker", Some(125), "", observed),
+            ("gui/501/", Some(125), "", observed),
+            ("gui/501/dev.example.worker", Some(1), "", observed),
+            ("gui/501/dev.example.worker", None, "", observed),
+            (
+                "gui/501/dev.example.worker",
+                Some(125),
+                "job data",
+                observed,
+            ),
+            (
+                "gui/501/dev.example.worker",
+                Some(125),
+                "",
+                "Operation not permitted\nCould not print domain: 125: Domain does not support specified action\n",
+            ),
+        ] {
+            assert!(
+                interpret(target, code, stdout.into(), stderr.into()).is_err(),
+                "unexpectedly accepted {target}, {code:?}, {stdout:?}, {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_job_output_is_preserved_and_invalid_utf8_is_refused() {
+        let target = "gui/501/dev.example.worker";
+        assert_eq!(
+            interpret(target, Some(0), b"loaded job\n".to_vec(), Vec::new())
+                .unwrap()
+                .into_job(target)
+                .unwrap(),
+            Some("loaded job\n".into())
+        );
+        assert!(interpret(target, Some(0), vec![0xff], Vec::new()).is_err());
     }
 
     #[test]

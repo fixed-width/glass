@@ -294,35 +294,44 @@ fn install_onboarding(
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{ONBOARD_LABEL}");
-    if let Some(loaded) = crate::launchd::inspect(&target)? {
-        ensure!(
-            loaded_job_matches(
-                &loaded,
-                &[
-                    &binary.to_string_lossy(),
-                    "macos-onboarding",
-                    &account.owner_uid.to_string()
-                ]
-            ),
-            "loaded permission helper belongs to another installation"
-        );
-        if crate::setup::loaded_agent_pid(&loaded).is_none() {
-            checked(Command::new("/bin/launchctl").args(["kickstart", &target]))?;
+    match crate::launchd::inspect_for_setup(&target)? {
+        crate::launchd::Inspection::Loaded(loaded) => {
+            ensure!(
+                loaded_job_matches(
+                    &loaded,
+                    &[
+                        &binary.to_string_lossy(),
+                        "macos-onboarding",
+                        &account.owner_uid.to_string()
+                    ]
+                ),
+                "loaded permission helper belongs to another installation"
+            );
+            if crate::setup::loaded_agent_pid(&loaded).is_none() {
+                checked(Command::new("/bin/launchctl").args(["kickstart", &target]))?;
+            }
         }
-    } else {
-        // A real login loads the persistent job if this graphical domain is not available yet.
-        let result = Command::new("/bin/launchctl")
-            .arg("bootstrap")
-            .arg(domain)
-            .arg(account.home.join("Library/LaunchAgents").join(ONBOARD_JOB))
-            .output()?;
-        if !result.status.success() {
+        crate::launchd::Inspection::MissingJob => {
+            checked(
+                Command::new("/bin/launchctl")
+                    .arg("bootstrap")
+                    .arg(domain)
+                    .arg(account.home.join("Library/LaunchAgents").join(ONBOARD_JOB)),
+            )?;
+        }
+        crate::launchd::Inspection::MissingDomain | crate::launchd::Inspection::GuiUnavailable => {
             eprintln!(
                 "glass: permission onboarding will open when the development account logs in"
             );
         }
     }
     Ok(())
+}
+
+fn permission_helper_registered(account: &Enrollment) -> anyhow::Result<bool> {
+    let root = directory(&private_session::root_for(account.owner_uid), 0, false)?;
+    let binary = std::env::current_exe()?.canonicalize()?;
+    same_file(&root, ONBOARD_JOB, &onboarding_job(account, &binary)?)
 }
 
 fn onboarding_state(owner: u32) -> anyhow::Result<Option<(String, bool)>> {
@@ -1023,7 +1032,10 @@ pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow
     }
     let domain = format!("gui/{}", account.uid);
     let target = format!("{domain}/{LABEL}");
-    if repair && let Some(loaded) = crate::launchd::inspect(&target)? {
+    if repair
+        && let crate::launchd::Inspection::Loaded(loaded) =
+            crate::launchd::inspect_for_setup(&target)?
+    {
         ensure!(
             loaded_job_matches(
                 &loaded,
@@ -1045,24 +1057,27 @@ pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow
         remove_socket(&root, account.owner_uid, account.uid)?;
     }
     enable_worker(&root, &account, || {
-        let mut registered = crate::launchd::inspect(&target)?.is_some();
-        if !registered {
-            // launchd leaves its socket node behind when a registration is removed.
-            remove_socket(&root, account.owner_uid, account.uid)?;
-            // A real login loads this persistent agent too; absence is a pending setup step.
-            let result = Command::new("/bin/launchctl")
-                .arg("bootstrap")
-                .arg(&domain)
-                .arg(account.home.join("Library/LaunchAgents").join(JOB))
-                .output()?;
-            if !result.status.success() {
+        match crate::launchd::inspect_for_setup(&target)? {
+            crate::launchd::Inspection::Loaded(_) => Ok(true),
+            crate::launchd::Inspection::MissingJob => {
+                // launchd leaves its socket node behind when a registration is removed.
+                remove_socket(&root, account.owner_uid, account.uid)?;
+                checked(
+                    Command::new("/bin/launchctl")
+                        .arg("bootstrap")
+                        .arg(&domain)
+                        .arg(account.home.join("Library/LaunchAgents").join(JOB)),
+                )?;
+                Ok(true)
+            }
+            crate::launchd::Inspection::MissingDomain
+            | crate::launchd::Inspection::GuiUnavailable => {
                 eprintln!(
                     "glass: registration saved; log into the selected account once to load its worker"
                 );
+                Ok(false)
             }
-            registered = result.status.success();
         }
-        Ok(registered)
     })?;
     if onboarding {
         install_onboarding(&account, &binary, &root, &agents)?;
@@ -1260,7 +1275,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             )
         } else {
             format!(
-                "Saved setup for {} is paused because its original enrollment is not enabled or no longer matches. Choose Set up to continue explicitly, or Close to cancel the saved setup. Accounts and files are retained.",
+                "Saved setup for {} is paused. Choose Set up to check registration and continue, or Close to cancel the saved setup. Accounts, passwords and files are retained.",
                 saved.name
             )
         }
@@ -1371,7 +1386,13 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.message = match result {
                         Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
                         Err(error) if error.is::<crate::macos_setup::pending::Superseded>() => "This saved setup was cancelled or replaced. This window did not restart it. Close this window; begin a new setup explicitly if needed.".into(),
-                        Err(error) if error.is::<guided::AccountCreationIncomplete>() => format!("{error:#}. Completed account data and grants are retained. Choose Create account… with the same name and original chosen password to resume."),
+                        Err(error) if error.is::<guided::AccountCreationIncomplete>() => {
+                            match account_creation::completed_identity(rustix::process::getuid().as_raw(), &name) {
+                                Ok(Some(_)) => format!("{error:#}. The account and password are prepared. Choose Set up to finish registration; you do not need to enter the development-account password again."),
+                                Ok(None) => format!("{error:#}. Completed account data and grants are retained. Choose Create account… with the same name and original chosen password to resume."),
+                                Err(check) => format!("{error:#}. The saved account checkpoint could not be verified: {check:#}. Existing account data are retained; close and reopen application setup to check it."),
+                            }
+                        }
                         Err(error) => format!("{error:#}. Completed registration and grants are retained. Fix the reported cause, then choose Set up."),
                     };
                 }
@@ -1531,7 +1552,7 @@ fn register_setup(name: &str, non_interactive: bool, system_dialog: bool) -> any
     } else {
         false
     };
-    let onboarding_installed = reusable && owner_root()?.join(ONBOARD_JOB).try_exists()?;
+    let onboarding_installed = reusable && permission_helper_registered(&account)?;
     if !reusable || unused_creation || (!non_interactive && !onboarding_installed) {
         let mut arguments = vec!["macos-enroll", name];
         if !reusable && private_session::is_owner() {
