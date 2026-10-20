@@ -416,6 +416,7 @@ int glass_private_still_private(void) {
 }
 
 #ifdef GLASS_PRIVATE_SESSION_TEST
+static bool platform_service_status(uint32_t status);
 int main(void) {
     Context good = {true,true,true,false,true,true,true,true,false,true,true,42};
     if (!context_allowed(good, false) || !context_allowed(good, true)) return 1;
@@ -437,7 +438,13 @@ int main(void) {
     if (!owner_bound(501, 501, 502) || owner_bound(503, 501, 502) ||
         !owner_bound(501, 0, 501) || owner_bound(502, 0, 501)) return 7;
     if (login_observation_test()) return 8;
-    puts("{\"completed\":true,\"context_refusal_cases\":11,\"integer_type_cases\":7,\"login_observation_cases\":8,\"ssh_attachment_refused\":true,\"gui_started\":false}");
+    uint32_t runtime = kSecCodeStatusValid | kSecCodeSignatureRuntime;
+    if (platform_service_status(runtime) ||
+        !platform_service_status(runtime | kSecCodeSignatureLibraryValidation) ||
+        !platform_service_status(runtime | 0x10) ||
+        platform_service_status(runtime | 0x10 | kSecCodeStatusDebugged) ||
+        platform_service_status((runtime | 0x10) & ~kSecCodeStatusValid)) return 9;
+    puts("{\"completed\":true,\"context_refusal_cases\":11,\"integer_type_cases\":7,\"login_observation_cases\":8,\"platform_status_cases\":5,\"ssh_attachment_refused\":true,\"gui_started\":false}");
     return 0;
 }
 #endif
@@ -510,7 +517,14 @@ int glass_private_session_exists(uint32_t asid, uint32_t uid) {
 
 #pragma clang diagnostic pop
 
-static OSStatus hardened_service(SecCodeRef code) {
+static bool platform_service_status(uint32_t status) {
+    // XNU cs_blobs.h exposes CS_FORCED_LV (0x10) through kSecCodeInfoStatus.
+    const uint32_t library_validation = kSecCodeSignatureLibraryValidation | 0x10;
+    return (status & kSecCodeStatusValid) && (status & kSecCodeSignatureRuntime) &&
+        (status & library_validation) && !(status & kSecCodeStatusDebugged);
+}
+
+static OSStatus hardened_service(SecCodeRef code, bool platform_runtime) {
     CFDictionaryRef info = NULL;
     OSStatus status = SecCodeCopySigningInformation(code,
         kSecCSSigningInformation | kSecCSDynamicInformation, &info);
@@ -522,8 +536,10 @@ static OSStatus hardened_service(SecCodeRef code) {
         CFGetTypeID(state) != CFNumberGetTypeID() ||
         !CFNumberGetValue(value, kCFNumberSInt32Type, &flags) ||
         !CFNumberGetValue(state, kCFNumberSInt32Type, &dynamic) ||
-        !(flags & kSecCodeSignatureRuntime) || !(dynamic & kSecCodeStatusValid) ||
+        !((flags | (platform_runtime ? dynamic : 0)) & kSecCodeSignatureRuntime) ||
+        !(dynamic & kSecCodeStatusValid) ||
         (dynamic & kSecCodeStatusDebugged)) status = errSecParam;
+    if (platform_runtime && !platform_service_status(dynamic)) status = errSecParam;
     CFTypeRef entitlements = CFDictionaryGetValue(info, kSecCodeInfoEntitlementsDict);
     if (entitlements) {
         if (CFGetTypeID(entitlements) != CFDictionaryGetTypeID()) status = errSecParam;
@@ -541,13 +557,88 @@ static OSStatus hardened_service(SecCodeRef code) {
     return status;
 }
 
+static bool process_matches(const GlassProcessIdentity *process, uint32_t uid) {
+    struct kinfo_proc info = {0};
+    size_t size = sizeof(info);
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)process->pid};
+    return sysctl(mib, 4, &info, &size, NULL, 0) == 0 && size == sizeof(info) &&
+        info.kp_eproc.e_ucred.cr_uid == uid &&
+        (uint64_t)info.kp_proc.p_starttime.tv_sec == process->seconds &&
+        (uint64_t)info.kp_proc.p_starttime.tv_usec == process->microseconds;
+}
+
+// This is an eligibility observation, not permission to ignore a process without its launchd job.
+int glass_private_idle_executable(const GlassProcessIdentity *process, uint32_t uid,
+                                 char *out, size_t capacity) {
+    @autoreleasepool {
+        uint32_t dirty = 0;
+        if (!process_matches(process, uid) || proc_get_dirty((int)process->pid, &dirty) ||
+            dirty != (PROC_DIRTY_TRACKED | PROC_DIRTY_ALLOWS_IDLE_EXIT)) return 0;
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath((int)process->pid, path, sizeof(path)) <= 0) return 0;
+        struct stat before = {0}, after = {0};
+        if (lstat(path, &before) || !S_ISREG(before.st_mode) || before.st_uid != 0 ||
+            (before.st_mode & 022)) return 0;
+        SecCodeRef code = NULL;
+        SecStaticCodeRef disk = NULL;
+        SecRequirementRef apple = NULL;
+        CFDictionaryRef live_info = NULL, disk_info = NULL;
+        NSDictionary *attributes = @{(__bridge NSString *)kSecGuestAttributePid: @(process->pid)};
+        NSURL *url = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:NO relativeToURL:nil];
+        OSStatus status = SecRequirementCreateWithString(CFSTR("anchor apple"), 0, &apple);
+        if (!status) status = SecCodeCopyGuestWithAttributes(NULL,
+            (__bridge CFDictionaryRef)attributes, 0, &code);
+        if (!status) status = SecCodeCheckValidity(code, kSecCSStrictValidate, apple);
+        // OS code can receive runtime enforcement from the kernel rather than its static flags.
+        if (!status) status = hardened_service(code, true);
+        if (!status) status = SecCodeCopySigningInformation(code,
+            kSecCSSigningInformation | kSecCSDynamicInformation, &live_info);
+        // Preserve the live architecture (including arm64e) when validating its on-disk code.
+        if (!status) status = SecCodeCopyStaticCode(code, 0, &disk);
+        if (!status) status = SecStaticCodeCheckValidity(disk, kSecCSStrictValidate, apple);
+        if (!status) status = SecCodeCopySigningInformation(disk, kSecCSSigningInformation, &disk_info);
+        bool eligible = false;
+        if (!status) {
+            NSDictionary *live = (__bridge NSDictionary *)live_info;
+            NSDictionary *stored = (__bridge NSDictionary *)disk_info;
+            id platform = live[(__bridge NSString *)kSecCodeInfoPlatformIdentifier];
+            id digest = live[(__bridge NSString *)kSecCodeInfoUnique];
+            NSURL *executable = live[(__bridge NSString *)kSecCodeInfoMainExecutable];
+            eligible = [platform isKindOfClass:NSNumber.class] && [platform unsignedIntValue] != 0 &&
+                [digest isKindOfClass:NSData.class] && [digest length] != 0 &&
+                [digest isEqual:stored[(__bridge NSString *)kSecCodeInfoUnique]] &&
+                [executable isKindOfClass:NSURL.class] && [executable.path isEqual:url.path];
+            NSDictionary *entitlements = live[(__bridge NSString *)kSecCodeInfoEntitlementsDict];
+            for (NSString *key in @[@"com.apple.security.cs.allow-jit",
+                    @"com.apple.security.cs.allow-unsigned-executable-memory",
+                    @"com.apple.private.security.clear-library-validation"]) {
+                id value = entitlements[key];
+                if (value && ![value isEqual:@NO]) eligible = false;
+            }
+        }
+        if (live_info) CFRelease(live_info);
+        if (disk_info) CFRelease(disk_info);
+        if (apple) CFRelease(apple);
+        if (disk) CFRelease(disk);
+        if (code) CFRelease(code);
+        if (!eligible || lstat(path, &after) || before.st_dev != after.st_dev ||
+            before.st_ino != after.st_ino || before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec ||
+            before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
+            !process_matches(process, uid) || proc_get_dirty((int)process->pid, &dirty) ||
+            dirty != (PROC_DIRTY_TRACKED | PROC_DIRTY_ALLOWS_IDLE_EXIT) ||
+            strlen(path) + 1 > capacity) return 0;
+        memcpy(out, path, strlen(path) + 1);
+        return 1;
+    }
+}
+
 int glass_private_copy_requirement(uint8_t **out, size_t *length) {
     SecCodeRef own = NULL;
     SecStaticCodeRef code = NULL;
     SecRequirementRef requirement = NULL;
     CFDataRef bytes = NULL;
     OSStatus status = SecCodeCopySelf(kSecCSDefaultFlags, &own);
-    if (!status) status = hardened_service(own);
+    if (!status) status = hardened_service(own, false);
     if (!status) status = SecCodeCopyStaticCode(own, kSecCSDefaultFlags, &code);
     if (!status) status = SecCodeCopyDesignatedRequirement(code, kSecCSDefaultFlags, &requirement);
     if (!status) status = SecRequirementCopyData(requirement, kSecCSDefaultFlags, &bytes);
@@ -596,7 +687,7 @@ static int authenticate_peer(int fd, const uint8_t *required, size_t length,
                                                        kSecCSDefaultFlags, &code);
         if (!status) status = SecRequirementCreateWithData(bytes, kSecCSDefaultFlags, &requirement);
         if (!status) status = SecCodeCheckValidity(code, kSecCSStrictValidate, requirement);
-        if (!status) status = hardened_service(code);
+        if (!status) status = hardened_service(code, false);
         if (!status) {
             pid_t process = audit_token_to_pid(token);
             au_asid_t asid = audit_token_to_asid(token);

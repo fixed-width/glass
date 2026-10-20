@@ -7,7 +7,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail, ensure};
-use glass_core::Deadline;
 use glass_macos::private_session;
 use rustix::fs::{Mode, OFlags, open, openat};
 use serde::{Deserialize, Serialize};
@@ -1576,17 +1575,12 @@ fn finish_setup(launchagent: bool, addr: Option<&str>) -> anyhow::Result<()> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let mut journal = crate::permission_journal::PermissionJournal::open(
-        &crate::permission_journal::PermissionJournal::root()?,
+    crate::macos_worker::backend_transport::finish_permission_recovery(
         account.uid,
         binding,
-        None,
-        None,
-    )?;
-    journal
-        .finish(Deadline::from_millis(8000))
-        .context("previous workspace permission recovery has not finished")?;
-    drop(journal);
+        &lease,
+    )
+    .context("previous workspace permission recovery has not finished")?;
     let addr = addr.unwrap_or("127.0.0.1:7300");
     if launchagent {
         let exe = std::env::current_exe()?;
@@ -1787,15 +1781,11 @@ fn leave_account_using(non_interactive: bool, system_dialog: bool) -> anyhow::Re
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let mut journal = crate::permission_journal::PermissionJournal::open(
-        &crate::permission_journal::PermissionJournal::root()?,
+    crate::macos_worker::backend_transport::finish_permission_recovery(
         account.uid,
         binding,
-        None,
-        None,
+        &lease,
     )?;
-    journal.finish(Deadline::from_millis(8000))?;
-    drop(journal);
     drop(lease);
     elevate_using(&["macos-unenroll"], non_interactive, system_dialog)?;
     ensure!(

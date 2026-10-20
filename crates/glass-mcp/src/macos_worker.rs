@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 6;
+const PROTOCOL: u32 = 7;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -25,6 +25,10 @@ const ACTIVATE: u8 = 8;
 const PROBE: u8 = 9;
 const READINESS: u8 = 10;
 const OPEN_ONBOARDING: u8 = 11;
+#[cfg(target_os = "macos")]
+const INSPECT_IDLE: u8 = 12;
+#[cfg(target_os = "macos")]
+const IDLE_SERVICES: u8 = 13;
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(60);
 const SETUP_WAIT: Duration = Duration::from_secs(10);
 const EXIT_WAIT: Duration = Duration::from_secs(4);
@@ -180,7 +184,12 @@ async fn finish_child(child: &mut Child) -> anyhow::Result<Receipt> {
     })
 }
 
-async fn broker<S>(mut stream: S, mut command: Command) -> anyhow::Result<Receipt>
+struct BrokerExit<S> {
+    receipt: Receipt,
+    stream: Option<S>,
+}
+
+async fn broker<S>(mut stream: S, mut command: Command) -> anyhow::Result<BrokerExit<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -215,16 +224,20 @@ where
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut inbound = tokio::spawn(async move {
         let mut stdin = stdin;
-        loop {
-            match read_frame(&mut reader).await {
-                Ok((DATA, data)) => stdin.write_all(&data).await?,
-                Ok((CLOSE, data)) if data.is_empty() => break,
-                Ok(_) => bail!("invalid private worker request"),
-                Err(error) => return Err(error),
+        let result = async {
+            loop {
+                match read_frame(&mut reader).await {
+                    Ok((DATA, data)) => stdin.write_all(&data).await?,
+                    Ok((CLOSE, data)) if data.is_empty() => break,
+                    Ok(_) => bail!("invalid private worker request"),
+                    Err(error) => return Err(error),
+                }
             }
+            stdin.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
         }
-        stdin.shutdown().await?;
-        Ok::<_, anyhow::Error>(())
+        .await;
+        (reader, result)
     });
     let outbound = tokio::spawn(async move {
         let mut buffer = [0; CHUNK];
@@ -237,28 +250,37 @@ where
         }
         Ok::<_, anyhow::Error>(writer)
     });
-    let (mut receipt, inbound_finished, inbound_valid) = tokio::select! {
-        result = &mut inbound => (finish_child(&mut child).await?, true, matches!(result, Ok(Ok(())))),
+    let (mut receipt, reader, inbound_valid) = tokio::select! {
+        biased;
+        result = &mut inbound => {
+            let (reader, result) = result?;
+            (finish_child(&mut child).await?, Some(reader), result.is_ok())
+        },
         status = child.wait() => {
             let status = status?;
-            (Receipt { worker_exit_code: status.code(), forced_termination: false, clean_worker_exit: status.success(), connection_valid: true }, false, true)
+            (Receipt { worker_exit_code: status.code(), forced_termination: false, clean_worker_exit: status.success(), connection_valid: true }, None, true)
         }
     };
     receipt.connection_valid = inbound_valid;
     inbound.abort();
-    if !inbound_finished {
+    if reader.is_none() {
         let _ = inbound.await;
     }
     let mut outbound = outbound;
     let drain = tokio::time::timeout(Duration::from_secs(1), &mut outbound).await;
-    match drain {
+    let stream = match drain {
         Ok(Ok(Ok(mut writer))) => {
             tokio::time::timeout(
                 Duration::from_secs(1),
                 send_json(&mut writer, EXIT, &receipt),
             )
             .await??;
-            writer.shutdown().await?;
+            if let Some(reader) = reader.filter(|_| inbound_valid) {
+                Some(reader.unsplit(writer))
+            } else {
+                writer.shutdown().await?;
+                None
+            }
         }
         Ok(Ok(Err(error))) => return Err(error),
         Ok(Err(error)) => return Err(error.into()),
@@ -267,8 +289,8 @@ where
             let _ = outbound.await;
             bail!("private worker output did not drain after exit");
         }
-    }
-    Ok(receipt)
+    };
+    Ok(BrokerExit { receipt, stream })
 }
 
 #[cfg(target_os = "macos")]
@@ -328,7 +350,14 @@ mod native {
             private_session: glass_macos::private_session::require_private().is_ok(),
         };
         tokio::time::timeout(SETUP_WAIT, send_json(&mut stream, GREETING, &greeting)).await??;
-        let (kind, data) = tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await??;
+        let (kind, data) = loop {
+            let (kind, data) =
+                tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await??;
+            if kind != INSPECT_IDLE {
+                break (kind, data);
+            }
+            inspect_idle(&mut stream, &data).await?;
+        };
         if kind == PROBE || kind == OPEN_ONBOARDING {
             ensure!(data.is_empty(), "readiness probe must have no payload");
             if kind == OPEN_ONBOARDING
@@ -358,10 +387,44 @@ mod native {
         bootstrap.validate()?;
         glass_macos::private_session::require_private()?;
         let command = bootstrap.child_command(&std::env::current_exe()?, owner);
-        match broker(stream, command).await {
-            Ok(receipt) if receipt.clean_worker_exit && receipt.connection_valid => Ok(()),
-            Ok(_) => bail!("private worker cleanup is unconfirmed after forced or abnormal exit"),
-            Err(error) => Err(error),
+        let exit = broker(stream, command).await?;
+        if let Some(mut stream) = exit.stream {
+            loop {
+                match tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await? {
+                    Ok((INSPECT_IDLE, data)) => inspect_idle(&mut stream, &data).await?,
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::UnexpectedEof
+                        }) =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                    _ => bail!("only idle-service inspection is allowed after backend exit"),
+                }
+            }
+        }
+        if exit.receipt.clean_worker_exit && exit.receipt.connection_valid {
+            Ok(())
+        } else {
+            bail!("private worker cleanup is unconfirmed after forced or abnormal exit")
+        }
+    }
+
+    async fn inspect_idle(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), super::idle_services::inspect(bytes))
+                .await;
+        match result {
+            Ok(Ok(services)) => send_json(stream, IDLE_SERVICES, &services).await,
+            _ => {
+                send_json(
+                    stream,
+                    FAILED,
+                    &"idle macOS service attribution was unavailable",
+                )
+                .await
+            }
         }
     }
 }
@@ -371,6 +434,9 @@ pub use native::worker;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod backend_transport;
+
+#[cfg(target_os = "macos")]
+mod idle_services;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn check_endpoint(owner: u32) -> anyhow::Result<()> {
@@ -426,6 +492,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_backend_exit_retains_a_duplex_inspection_channel_until_the_owner_closes() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut command = Command::new("/bin/cat");
+        command.arg("-u");
+        let handler = tokio::spawn(async move {
+            let exit = broker(server, command).await.unwrap();
+            assert!(exit.receipt.clean_worker_exit && exit.receipt.connection_valid);
+            let mut stream = exit.stream.unwrap();
+            assert_eq!(
+                read_frame(&mut stream).await.unwrap(),
+                (INSPECT_IDLE, b"[]".to_vec())
+            );
+            write_frame(&mut stream, IDLE_SERVICES, b"[]")
+                .await
+                .unwrap();
+            assert!(read_frame(&mut stream).await.is_err());
+        });
+        assert_eq!(read_frame(&mut client).await.unwrap().0, ACCEPTED);
+        write_frame(&mut client, CLOSE, b"").await.unwrap();
+        assert_eq!(read_frame(&mut client).await.unwrap().0, EXIT);
+        write_frame(&mut client, INSPECT_IDLE, b"[]").await.unwrap();
+        assert_eq!(
+            read_frame(&mut client).await.unwrap(),
+            (IDLE_SERVICES, b"[]".to_vec())
+        );
+        drop(client);
+        handler.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn broker_reports_unclean_close_without_replaying_input() {
         let (mut client, server) = tokio::io::duplex(4096);
         let mut command = Command::new("/bin/cat");
@@ -440,6 +536,8 @@ mod tests {
         let receipt: Receipt = serde_json::from_slice(&bytes).unwrap();
         assert!(receipt.clean_worker_exit);
         assert!(!receipt.connection_valid);
-        handler.await.unwrap().unwrap();
+        let exit = handler.await.unwrap().unwrap();
+        assert!(!exit.receipt.connection_valid);
+        assert!(exit.stream.is_none());
     }
 }

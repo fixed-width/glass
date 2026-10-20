@@ -48,6 +48,8 @@ internal refactors, CI, or test-only changes.
   unfinished or invalid recovery evidence is retained and still blocks that change.
   Consecutive worker readiness checks allow for macOS's restart throttle instead of timing out at
   its ten-second boundary. Worker activation remains bounded and keeps its authentication checks.
+  Workspace cleanup distinguishes verified idle macOS system services from unfinished application
+  work, restoring temporary permissions while retaining system-managed infrastructure.
   First login and privacy consent remain user actions.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose

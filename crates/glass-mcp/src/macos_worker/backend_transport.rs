@@ -16,6 +16,8 @@ use crate::remote_backend::Connection;
 use crate::workspace_permissions::{NativePrepare, PreparationError};
 
 const MAX_MESSAGE: usize = 128 * 1024 * 1024;
+// Child exit/drain, four bounded service observations, ACL restoration and broker exit share this cap.
+const CLEANUP_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CleanupPhase {
@@ -78,6 +80,7 @@ pub(crate) struct NativeConnection {
     receipt_failure: Option<String>,
     poisoned: bool,
     journal: Arc<Mutex<crate::permission_journal::PermissionJournal>>,
+    broker: Option<glass_macos::private_session::ProcessIdentity>,
 }
 
 fn error(error: impl std::fmt::Display) -> GlassError {
@@ -188,6 +191,10 @@ struct BrokerConnection {
 }
 
 fn connect_broker(lease: Option<File>) -> Result<BrokerConnection> {
+    connect_broker_until(lease, Deadline::UNBOUNDED)
+}
+
+fn connect_broker_until(lease: Option<File>, deadline: Deadline) -> Result<BrokerConnection> {
     let owner = rustix::process::geteuid().as_raw();
     native::protected_endpoint(owner).map_err(error)?;
     let lease = match lease {
@@ -218,15 +225,15 @@ fn connect_broker(lease: Option<File>) -> Result<BrokerConnection> {
             endpoint: callback.path(),
         })
         .map_err(error)?,
-        Deadline::from_millis(10_000),
-        None,
+        deadline,
+        Some(Duration::from_secs(10)),
     )?;
     let worker = glass_macos::private_session::worker_uid();
     let (mut stream, authenticated_pid, authenticated_session) =
-        callback.accept(worker, &requirement, Deadline::UNBOUNDED)?;
+        callback.accept(worker, &requirement, deadline)?;
     drop(activation);
     drop(callback);
-    let (kind, bytes) = receive(&mut stream, Deadline::from_millis(10_000), None)?;
+    let (kind, bytes) = receive(&mut stream, deadline, Some(Duration::from_secs(10)))?;
     let greeting: Greeting = serde_json::from_slice(&bytes).map_err(error)?;
     if kind != GREETING
         || greeting.version != PROTOCOL
@@ -290,11 +297,136 @@ fn probe(lease: Option<File>, request: u8) -> Result<crate::macos_setup::Readine
     Ok(readiness)
 }
 
+fn inspect_idle(
+    stream: &mut UnixStream,
+    processes: &[glass_macos::private_session::ProcessIdentity],
+    deadline: Deadline,
+) -> std::io::Result<Vec<glass_macos::private_session::ProcessIdentity>> {
+    let mut run = || -> Result<Vec<_>> {
+        if processes.len() > 64 {
+            return Err(error(
+                "too many processes for bounded macOS service inspection",
+            ));
+        }
+        send(
+            stream,
+            INSPECT_IDLE,
+            &serde_json::to_vec(processes).map_err(error)?,
+            deadline,
+            None,
+        )?;
+        let (kind, bytes) = receive(stream, deadline, Some(Duration::from_secs(4)))?;
+        if kind != IDLE_SERVICES {
+            return Err(error("idle macOS service attribution unavailable"));
+        }
+        let services: Vec<super::idle_services::IdleService> =
+            serde_json::from_slice(&bytes).map_err(error)?;
+        let worker = glass_macos::private_session::worker_uid();
+        let mut idle = Vec::new();
+        for service in services {
+            if !processes.contains(&service.process)
+                || idle.contains(&service.process)
+                || !super::idle_services::label_valid(&service.label)
+                || glass_macos::private_session::idle_system_executable(worker, &service.process)
+                    .is_none()
+            {
+                return Err(error("idle macOS service identity changed"));
+            }
+            eprintln!(
+                "glass: verified idle macOS system service {} (PID {})",
+                service.label,
+                service.process.pid()
+            );
+            idle.push(service.process);
+        }
+        Ok(idle)
+    };
+    run().map_err(std::io::Error::other)
+}
+
+fn close_broker(
+    stream: &UnixStream,
+    process: Option<glass_macos::private_session::ProcessIdentity>,
+    deadline: Deadline,
+) -> Result<()> {
+    let _ = stream.shutdown(Shutdown::Both);
+    if let Some(process) = process {
+        let worker = glass_macos::private_session::worker_uid();
+        while glass_macos::private_session::account_processes(worker)
+            .map_err(error)?
+            .contains(&process)
+        {
+            if deadline.has_passed() {
+                return Err(error("idle-inspection broker has not exited"));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &File) -> Result<()> {
+    let mut connection: Option<BrokerConnection> = None;
+    let result = (|| {
+        let mut inspect = |processes: &[glass_macos::private_session::ProcessIdentity],
+                           deadline| {
+            if connection.is_none() {
+                let broker = connect_broker_until(Some(lease.try_clone()?), deadline)
+                    .map_err(std::io::Error::other)?;
+                if broker.greeting.worker != worker {
+                    return Err(std::io::Error::other("recovery worker account changed"));
+                }
+                connection = Some(broker);
+            }
+            let broker = connection
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("recovery inspector unavailable"))?;
+            let candidates: Vec<_> = processes
+                .iter()
+                .copied()
+                .filter(|process| *process != broker.greeting.process)
+                .collect();
+            let mut idle = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                inspect_idle(&mut broker.stream, &candidates, deadline)?
+            };
+            if processes.contains(&broker.greeting.process)
+                && glass_macos::private_session::account_processes(worker)?
+                    .contains(&broker.greeting.process)
+            {
+                idle.push(broker.greeting.process);
+            }
+            Ok(idle)
+        };
+        let mut journal = crate::permission_journal::PermissionJournal::open_with(
+            &crate::permission_journal::PermissionJournal::root().map_err(error)?,
+            worker,
+            binding,
+            None,
+            None,
+            &mut inspect,
+        )
+        .map_err(error)?;
+        journal
+            .finish_with(Deadline::from_millis(8000), &mut inspect)
+            .map_err(error)
+    })();
+    let closed = connection.as_ref().map_or(Ok(()), |broker| {
+        close_broker(
+            &broker.stream,
+            Some(broker.greeting.process),
+            Deadline::from_millis(8000),
+        )
+    });
+    exit_and_cleanup(result, closed)
+}
+
 impl NativeConnection {
     pub(crate) fn connect(environment_lease: crate::macos_setup::Lease) -> Result<Self> {
         let owner = rustix::process::geteuid().as_raw();
         let BrokerConnection {
-            stream,
+            mut stream,
             lease,
             greeting,
         } = connect_broker(None)?;
@@ -312,12 +444,13 @@ impl NativeConnection {
         .map(|byte| format!("{byte:02x}"))
         .collect();
         let journal = Arc::new(Mutex::new(
-            crate::permission_journal::PermissionJournal::open(
+            crate::permission_journal::PermissionJournal::open_with(
                 &crate::permission_journal::PermissionJournal::root().map_err(error)?,
                 glass_macos::private_session::worker_uid(),
                 account,
                 Some(greeting.session),
                 Some(greeting.process),
+                &mut |processes, deadline| inspect_idle(&mut stream, processes, deadline),
             )
             .map_err(error)?,
         ));
@@ -336,6 +469,7 @@ impl NativeConnection {
             receipt_failure: None,
             poisoned: false,
             journal,
+            broker: Some(greeting.process),
         };
         let initialized = connection.initialize();
         connection.finish_connect(initialized)
@@ -435,6 +569,9 @@ impl NativeConnection {
         let journal = &self.journal;
         let prepare = &mut self.prepare;
         let lease = &self.lease;
+        let stream = &mut self.stream;
+        let broker = self.broker;
+        let stream = std::cell::RefCell::new(stream);
         self.cleanup.advance(
             || {
                 let journal = journal
@@ -443,7 +580,11 @@ impl NativeConnection {
                 if !self.established {
                     journal.wait_admission_exit(deadline).map_err(error)?;
                 }
-                journal.wait_idle(deadline).map_err(error)
+                journal
+                    .wait_idle_with(deadline, &mut |processes, deadline| {
+                        inspect_idle(&mut stream.borrow_mut(), processes, deadline)
+                    })
+                    .map_err(error)
             },
             || {
                 prepare
@@ -459,10 +600,15 @@ impl NativeConnection {
                 journal
                     .lock()
                     .map_err(|_| error("permission journal is poisoned"))?
-                    .finish(deadline)
+                    .finish_with(deadline, &mut |processes, deadline| {
+                        inspect_idle(&mut stream.borrow_mut(), processes, deadline)
+                    })
                     .map_err(error)
             },
-            || fs4::FileExt::unlock(lease).map_err(error),
+            || {
+                close_broker(&stream.borrow(), broker, deadline)?;
+                fs4::FileExt::unlock(lease).map_err(error)
+            },
         )
     }
 }
@@ -590,7 +736,7 @@ impl Connection for NativeConnection {
     }
 
     fn close(&mut self, deadline: Deadline) -> Result<()> {
-        let deadline = bounded(deadline, Some(Duration::from_secs(8)));
+        let deadline = bounded(deadline, Some(CLEANUP_WAIT));
         if self.cleanup == CleanupPhase::Complete {
             return self
                 .receipt_failure
@@ -603,7 +749,6 @@ impl Connection for NativeConnection {
                 .map_or(Ok(()), |failure| Err(error(failure)))
         } else {
             let _ = send(&mut self.stream, CLOSE, &[], deadline, None);
-            let _ = self.stream.shutdown(Shutdown::Write);
             (|| {
                 loop {
                     match receive(&mut self.stream, deadline, None)? {
@@ -642,6 +787,19 @@ impl Drop for NativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_cleanup_budget_preserves_an_earlier_caller_deadline() {
+        let start = std::time::Instant::now();
+        let caller = Deadline::at(start + Duration::from_secs(1));
+        assert!(bounded(caller, Some(CLEANUP_WAIT)).remaining().unwrap() <= Duration::from_secs(1));
+        assert!(
+            bounded(Deadline::UNBOUNDED, Some(CLEANUP_WAIT))
+                .remaining()
+                .unwrap()
+                >= EXIT_WAIT + Duration::from_secs(12) + Duration::from_secs(8)
+        );
+    }
 
     #[test]
     #[ignore = "needs a signed, enrolled worker in a background graphical login"]
@@ -693,6 +851,7 @@ mod tests {
             receipt_failure: None,
             poisoned: false,
             journal: Arc::new(Mutex::new(journal)),
+            broker: None,
         };
         let failed = connection.finish_connect(Err(error("native-backend spawn failed")));
         assert!(

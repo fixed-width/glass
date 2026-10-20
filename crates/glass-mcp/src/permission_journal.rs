@@ -16,6 +16,39 @@ use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
 
 const LIMIT: u64 = 64 * 1024 * 1024;
+type IdleInspector<'a> =
+    dyn FnMut(&[ProcessIdentity], Deadline) -> io::Result<Vec<ProcessIdentity>> + 'a;
+
+#[derive(Default)]
+struct IdleSamples {
+    previous: Option<Vec<ProcessIdentity>>,
+}
+
+impl IdleSamples {
+    fn observe(
+        &mut self,
+        current: &[ProcessIdentity],
+        unknown: &[ProcessIdentity],
+        idle: &[ProcessIdentity],
+    ) -> io::Result<bool> {
+        if idle
+            .iter()
+            .enumerate()
+            .any(|(index, process)| !unknown.contains(process) || idle[..index].contains(process))
+        {
+            return Err(io::Error::other(
+                "idle-service response included an unrequested or duplicate process",
+            ));
+        }
+        if unknown.iter().any(|process| !idle.contains(process)) {
+            self.previous = None;
+            return Ok(false);
+        }
+        let stable = self.previous.as_deref() == Some(current);
+        self.previous = Some(current.to_vec());
+        Ok(stable)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,12 +142,26 @@ impl PermissionJournal {
             .ok_or_else(|| io::Error::other("permission recovery directory is unavailable"))
     }
 
+    #[cfg(test)]
     pub(crate) fn open(
         root: &Path,
         worker: u32,
         account: String,
         session: Option<u32>,
         admission: Option<ProcessIdentity>,
+    ) -> io::Result<Self> {
+        Self::open_with(root, worker, account, session, admission, &mut |_, _| {
+            Ok(Vec::new())
+        })
+    }
+
+    pub(crate) fn open_with(
+        root: &Path,
+        worker: u32,
+        account: String,
+        session: Option<u32>,
+        admission: Option<ProcessIdentity>,
+        inspect: &mut IdleInspector<'_>,
     ) -> io::Result<Self> {
         let owner = rustix::process::geteuid().as_raw();
         if owner == 0
@@ -173,7 +220,8 @@ impl PermissionJournal {
         };
         result.read()?;
         if result.loaded && !result.closed {
-            result.recover(Deadline::from_millis(8000))?;
+            // A recovery inspector may need one launchd-throttled activation before observing idle.
+            result.recover_with(Deadline::from_millis(30_000), inspect)?;
         }
         result.header.version = 2;
         result.header.boot = Some(boot_identity()?);
@@ -394,22 +442,39 @@ impl PermissionJournal {
         Ok(())
     }
 
-    pub(crate) fn wait_idle(&self, deadline: Deadline) -> io::Result<()> {
-        let mut stable = 0;
+    pub(crate) fn wait_idle_with(
+        &self,
+        deadline: Deadline,
+        inspect: &mut IdleInspector<'_>,
+    ) -> io::Result<()> {
+        let mut samples = IdleSamples::default();
         loop {
-            let current = account_processes(self.header.worker)?;
-            if current.iter().all(|process| {
-                self.header.baseline.contains(process) || self.admission.as_ref() == Some(process)
-            }) {
-                stable += 1;
-                if stable == 2 {
-                    return Ok(());
-                }
+            if deadline.has_passed() {
+                return Err(io::Error::other("permission recovery deadline elapsed"));
+            }
+            let mut current = account_processes(self.header.worker)?;
+            current.sort_by_key(ProcessIdentity::pid);
+            let unknown: Vec<_> = current
+                .iter()
+                .copied()
+                .filter(|process| {
+                    !self.header.baseline.contains(process)
+                        && self.admission.as_ref() != Some(process)
+                })
+                .collect();
+            let idle = if unknown.is_empty() {
+                Vec::new()
             } else {
-                stable = 0;
                 if prior_work_gone(&self.header, boot_identity, session_exists)? {
                     return Ok(());
                 }
+                inspect(&unknown, deadline)?
+            };
+            if deadline.has_passed() {
+                return Err(io::Error::other("permission recovery deadline elapsed"));
+            }
+            if samples.observe(&current, &unknown, &idle)? {
+                return Ok(());
             }
             if deadline.has_passed() {
                 return Err(io::Error::other(
@@ -426,8 +491,12 @@ impl PermissionJournal {
         }
     }
 
-    pub(crate) fn recover(&mut self, deadline: Deadline) -> io::Result<()> {
-        self.wait_idle(deadline)?;
+    fn recover_with(
+        &mut self,
+        deadline: Deadline,
+        inspect: &mut IdleInspector<'_>,
+    ) -> io::Result<()> {
+        self.wait_idle_with(deadline, inspect)?;
         let ids: Vec<_> = self.pending.keys().copied().rev().collect();
         for id in ids {
             if deadline.has_passed() {
@@ -439,8 +508,17 @@ impl PermissionJournal {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(&mut self, deadline: Deadline) -> io::Result<()> {
-        self.recover(deadline)?;
+        self.finish_with(deadline, &mut |_, _| Ok(Vec::new()))
+    }
+
+    pub(crate) fn finish_with(
+        &mut self,
+        deadline: Deadline,
+        inspect: &mut IdleInspector<'_>,
+    ) -> io::Result<()> {
+        self.recover_with(deadline, inspect)?;
         self.append(&Event::Closed)?;
         self.closed = true;
         Ok(())
@@ -480,6 +558,55 @@ impl RecordChanges for PermissionJournal {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn process(pid: u32, birth: u64) -> ProcessIdentity {
+        serde_json::from_value(serde_json::json!({"pid":pid,"seconds":birth,"microseconds":0}))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_new_detached_child_blocks_cleanup_even_alongside_verified_idle_services() {
+        let service = process(100, 1);
+        let child = process(101, 2);
+        let mut samples = IdleSamples::default();
+        assert!(
+            !samples
+                .observe(&[service, child], &[service, child], &[service])
+                .unwrap()
+        );
+        assert!(
+            !samples
+                .observe(&[service, child], &[service, child], &[service])
+                .unwrap()
+        );
+        assert!(!samples.observe(&[service], &[service], &[service]).unwrap());
+        assert!(samples.observe(&[service], &[service], &[service]).unwrap());
+    }
+
+    #[test]
+    fn a_busy_or_reused_service_requires_two_new_clean_observations() {
+        let service = process(100, 1);
+        let reused = process(100, 2);
+        let mut samples = IdleSamples::default();
+        assert!(!samples.observe(&[service], &[service], &[service]).unwrap());
+        assert!(!samples.observe(&[service], &[service], &[]).unwrap());
+        assert!(!samples.observe(&[service], &[service], &[service]).unwrap());
+        assert!(!samples.observe(&[reused], &[reused], &[reused]).unwrap());
+        assert!(samples.observe(&[reused], &[reused], &[reused]).unwrap());
+    }
+
+    #[test]
+    fn unrequested_duplicate_and_stale_service_observations_are_refused() {
+        let service = process(100, 1);
+        let reused = process(100, 2);
+        for supplied in [vec![service, service], vec![reused]] {
+            assert!(
+                IdleSamples::default()
+                    .observe(&[service], &[service], &supplied)
+                    .is_err()
+            );
+        }
+    }
 
     fn test_root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();

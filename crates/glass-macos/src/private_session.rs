@@ -326,6 +326,7 @@ fn login_observation_rejects_incomplete_or_ambiguous_metadata() {
         String::from_utf8_lossy(&checked.stderr)
     );
     assert!(String::from_utf8_lossy(&checked.stdout).contains("\"login_observation_cases\":8"));
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("\"platform_status_cases\":5"));
 }
 
 #[test]
@@ -418,9 +419,38 @@ pub fn authenticate_peer(
 }
 
 impl ProcessIdentity {
+    /// Kernel PID; birth time remains part of the identity when comparing processes.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     pub fn matches_pid(&self, pid: u32) -> bool {
         self.pid == pid
     }
+}
+
+/// Observe idle Apple platform code; its protected launchd definition must also be verified.
+pub fn idle_system_executable(uid: u32, process: &ProcessIdentity) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn glass_private_idle_executable(
+            process: *const ProcessIdentity,
+            uid: u32,
+            out: *mut std::ffi::c_char,
+            capacity: usize,
+        ) -> i32;
+    }
+    let mut path = [0u8; 4096];
+    // SAFETY: the helper reads one repr(C) identity and writes a NUL-terminated path within capacity.
+    if unsafe { glass_private_idle_executable(process, uid, path.as_mut_ptr().cast(), path.len()) }
+        != 1
+    {
+        return None;
+    }
+    let end = path.iter().position(|&byte| byte == 0)?;
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &path[..end],
+    )))
 }
 
 /// Authenticate the transient privileged setup role without relaxing worker authentication.
