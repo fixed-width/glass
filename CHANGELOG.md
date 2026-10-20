@@ -49,7 +49,8 @@ internal refactors, CI, or test-only changes.
   Consecutive worker readiness checks allow for macOS's restart throttle instead of timing out at
   its ten-second boundary. Worker activation remains bounded and keeps its authentication checks.
   Workspace cleanup distinguishes verified idle macOS system services from unfinished application
-  work, restoring temporary permissions while retaining system-managed infrastructure.
+  work, restoring temporary permissions while retaining system-managed infrastructure, including
+  system jobs that declare their executable without an explicit argument list.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   First login and privacy consent remain user actions.

@@ -27,7 +27,7 @@ struct Definition {
     label: String,
     path: PathBuf,
     program: PathBuf,
-    arguments: Vec<String>,
+    arguments: Option<Vec<String>>,
     services: Vec<String>,
     source: Option<(ProtectedFile, Vec<u8>)>,
 }
@@ -129,23 +129,29 @@ impl Definition {
         if !label_valid(&label) || !value.get("EnablePressuredExit")?.as_boolean()? {
             return None;
         }
-        let arguments = value
-            .get("ProgramArguments")?
-            .as_array()?
-            .iter()
-            .map(|argument| argument.as_string().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()?;
-        if arguments.is_empty()
-            || arguments
-                .iter()
-                .any(|argument| argument.contains(['\n', '\r', '\0']))
-        {
-            return None;
-        }
-        let program = value
-            .get("Program")
-            .map_or(Some(arguments[0].as_str()), plist::Value::as_string)?;
-        if !Path::new(program).is_absolute() {
+        let arguments = match value.get("ProgramArguments") {
+            Some(arguments) => {
+                let arguments = arguments
+                    .as_array()?
+                    .iter()
+                    .map(|argument| argument.as_string().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()?;
+                if arguments.is_empty()
+                    || arguments
+                        .iter()
+                        .any(|argument| argument.contains(['\n', '\r', '\0']))
+                {
+                    return None;
+                }
+                Some(arguments)
+            }
+            None => None,
+        };
+        let program = match value.get("Program") {
+            Some(program) => program.as_string()?,
+            None => arguments.as_ref()?.first()?.as_str(),
+        };
+        if !Path::new(program).is_absolute() || program.contains(['\n', '\r', '\0']) {
             return None;
         }
         let services = value.get("MachServices")?.as_dictionary()?;
@@ -249,16 +255,16 @@ impl Definition {
         {
             return false;
         }
-        let Some(arguments) = block(&lines, "arguments") else {
-            return false;
-        };
-        if arguments
-            .iter()
-            .map(|line| line.strip_prefix("\t\t"))
-            .collect::<Option<Vec<_>>>()
-            != Some(self.arguments.iter().map(String::as_str).collect())
-        {
-            return false;
+        match (&self.arguments, block(&lines, "arguments")) {
+            (None, None) if !fields.contains_key("arguments") => {}
+            (Some(expected), Some(arguments))
+                if fields.get("arguments").copied() == Some("{")
+                    && arguments
+                        .iter()
+                        .map(|line| line.strip_prefix("\t\t"))
+                        .collect::<Option<Vec<_>>>()
+                        == Some(expected.iter().map(String::as_str).collect()) => {}
+            _ => return false,
         }
         let Some(endpoints) = block(&lines, "endpoints") else {
             return false;
@@ -399,6 +405,55 @@ mod tests {
 
     fn process() -> ProcessIdentity {
         serde_json::from_str(r#"{"pid":123,"seconds":1,"microseconds":2}"#).unwrap()
+    }
+
+    #[test]
+    fn program_only_system_job_requires_the_same_absent_argument_list() {
+        let mut value: plist::Dictionary = plist::from_bytes(
+            br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.apple.example</string>
+            <key>Program</key><string>/usr/libexec/example</string>
+            <key>EnablePressuredExit</key><true/>
+            <key>MachServices</key><dict><key>com.apple.example</key><true/></dict>
+            </dict></plist>"#,
+        )
+        .unwrap();
+        let program_only = Definition::parse(
+            format!("{ROOT}/com.apple.example.plist").into(),
+            value.clone(),
+        )
+        .unwrap();
+        let job_without_arguments =
+            job().replace("\targuments = {\n\t\t/usr/libexec/example\n\t}\n", "");
+        assert!(program_only.matches_job(502, 456, process(), &job_without_arguments));
+        assert!(!program_only.matches_job(502, 456, process(), &job()));
+        assert!(!definition().matches_job(502, 456, process(), &job_without_arguments));
+        for malformed in ["junk", "{"] {
+            let malformed_job = job_without_arguments.replace(
+                "\tstate = running",
+                &format!("\tstate = running\n\targuments = {malformed}"),
+            );
+            assert!(!program_only.matches_job(502, 456, process(), &malformed_job));
+        }
+        for malformed in [
+            plist::Value::Boolean(false),
+            plist::Value::Array(Vec::new()),
+            plist::Value::Array(vec![plist::Value::Integer(1.into())]),
+        ] {
+            value.insert("ProgramArguments".into(), malformed);
+            assert!(
+                Definition::parse(
+                    format!("{ROOT}/com.apple.example.plist").into(),
+                    value.clone()
+                )
+                .is_none()
+            );
+        }
+        value.remove("ProgramArguments");
+        value.remove("Program");
+        assert!(
+            Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value).is_none()
+        );
     }
 
     #[test]
