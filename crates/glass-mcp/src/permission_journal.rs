@@ -86,6 +86,15 @@ pub(crate) struct PermissionJournal {
     admission: Option<ProcessIdentity>,
 }
 
+impl Drop for PermissionJournal {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        if let Err(error) = fs4::FileExt::unlock(&self.file) {
+            eprintln!("glass: permission journal unlock failed: {error}");
+        }
+    }
+}
+
 pub(crate) fn private_root(path: &Path, owner: u32) -> io::Result<File> {
     use std::os::unix::fs::DirBuilderExt;
     let mut builder = std::fs::DirBuilder::new();
@@ -616,6 +625,26 @@ mod tests {
 
     fn journal(root: &Path) -> PermissionJournal {
         PermissionJournal::open(root, u32::MAX, "test-account".into(), None, None).unwrap()
+    }
+
+    #[test]
+    fn journal_release_does_not_wait_for_an_inherited_descriptor_to_close() {
+        let root = test_root();
+        let mut first = journal(root.path());
+        first.finish(Deadline::UNBOUNDED).unwrap();
+        let mut inherited = first.file.try_clone().unwrap();
+        let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+        assert!(
+            PermissionJournal::open(root.path(), u32::MAX, "test-account".into(), None, None)
+                .is_err()
+        );
+        drop(first);
+        let next = journal(root.path());
+        inherited.seek(SeekFrom::Start(0)).unwrap();
+        let mut retained = Vec::new();
+        inherited.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, before);
+        drop(next);
     }
 
     #[test]
