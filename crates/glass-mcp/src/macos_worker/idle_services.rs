@@ -136,14 +136,13 @@ impl Definition {
                     .iter()
                     .map(|argument| argument.as_string().map(str::to_owned))
                     .collect::<Option<Vec<_>>>()?;
-                if arguments.is_empty()
-                    || arguments
-                        .iter()
-                        .any(|argument| argument.contains(['\n', '\r', '\0']))
+                if arguments
+                    .iter()
+                    .any(|argument| argument.contains(['\n', '\r', '\0']))
                 {
                     return None;
                 }
-                Some(arguments)
+                (!arguments.is_empty()).then_some(arguments)
             }
             None => None,
         };
@@ -154,22 +153,27 @@ impl Definition {
         if !Path::new(program).is_absolute() || program.contains(['\n', '\r', '\0']) {
             return None;
         }
-        let services = value.get("MachServices")?.as_dictionary()?;
-        if services.is_empty()
-            || services.iter().any(|(name, enabled)| {
-                name.is_empty()
-                    || name.contains(['\n', '\r', '\0', '"'])
-                    || !(enabled.as_boolean() == Some(true) || enabled.as_dictionary().is_some())
-            })
-        {
-            return None;
-        }
+        let services = match value.get("MachServices") {
+            Some(services) => {
+                let services = services.as_dictionary()?;
+                if services.iter().any(|(name, enabled)| {
+                    name.is_empty()
+                        || name.contains(['\n', '\r', '\0', '"'])
+                        || !(enabled.as_boolean() == Some(true)
+                            || enabled.as_dictionary().is_some())
+                }) {
+                    return None;
+                }
+                services.keys().cloned().collect()
+            }
+            None => Vec::new(),
+        };
         Some(Self {
             label,
             path,
             program: program.into(),
             arguments,
-            services: services.keys().cloned().collect(),
+            services,
             source: None,
         })
     }
@@ -265,6 +269,9 @@ impl Definition {
                         .collect::<Option<Vec<_>>>()
                         == Some(expected.iter().map(String::as_str).collect()) => {}
             _ => return false,
+        }
+        if self.services.is_empty() {
+            return true;
         }
         let Some(endpoints) = block(&lines, "endpoints") else {
             return false;
@@ -380,19 +387,23 @@ mod tests {
         assert!(ProtectedFile::open(&link).is_none());
     }
 
-    fn definition() -> Definition {
-        Definition::parse(
-            format!("{ROOT}/com.apple.example.plist").into(),
-            plist::from_bytes(
-                br#"
+    fn definition_value() -> plist::Dictionary {
+        plist::from_bytes(
+            br#"
             <plist version="1.0"><dict>
             <key>Label</key><string>com.apple.example</string>
             <key>ProgramArguments</key><array><string>/usr/libexec/example</string></array>
             <key>EnablePressuredExit</key><true/>
             <key>MachServices</key><dict><key>com.apple.example</key><true/></dict>
             </dict></plist>"#,
-            )
-            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn definition() -> Definition {
+        Definition::parse(
+            format!("{ROOT}/com.apple.example.plist").into(),
+            definition_value(),
         )
         .unwrap()
     }
@@ -405,6 +416,101 @@ mod tests {
 
     fn process() -> ProcessIdentity {
         serde_json::from_str(r#"{"pid":123,"seconds":1,"microseconds":2}"#).unwrap()
+    }
+
+    #[test]
+    fn jobs_without_mach_services_still_require_loaded_system_provenance() {
+        let job = job().replace(
+            "\tendpoints = {\n\t\t\"com.apple.example\" = {\n\t\t\tactive = 1\n\t\t}\n\t}\n",
+            "",
+        );
+        assert!(!definition().matches_job(502, 456, process(), &job));
+        for services in [
+            None,
+            Some(plist::Value::Dictionary(plist::Dictionary::new())),
+        ] {
+            let mut value = definition_value();
+            value.remove("MachServices");
+            if let Some(services) = services {
+                value.insert("MachServices".into(), services);
+            }
+            let definition =
+                Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value).unwrap();
+            assert!(definition.matches_job(502, 456, process(), &job));
+            for (before, after) in [
+                (ROOT, "/Users/dev/Library/LaunchAgents"),
+                ("pid = 123", "pid = 124"),
+                ("asid = 456", "asid = 457"),
+                (
+                    "program = /usr/libexec/example",
+                    "program = /usr/libexec/other",
+                ),
+                (
+                    "\t\t/usr/libexec/example\n",
+                    "\t\t/usr/libexec/example\n\t\t--user-work\n",
+                ),
+                ("supports pressured exit", "other property"),
+                ("supports transactions", "other property"),
+                ("system service", "user service"),
+            ] {
+                assert!(
+                    !definition.matches_job(502, 456, process(), &job.replace(before, after)),
+                    "{before}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_mach_service_declarations_are_never_treated_as_absent() {
+        for services in [
+            plist::Value::Boolean(false),
+            plist::Value::Array(Vec::new()),
+            plist::Value::Dictionary(
+                [("com.apple.example".to_owned(), plist::Value::Boolean(false))]
+                    .into_iter()
+                    .collect(),
+            ),
+            plist::Value::Dictionary(
+                [("bad\nname".to_owned(), plist::Value::Boolean(true))]
+                    .into_iter()
+                    .collect(),
+            ),
+        ] {
+            let mut value = definition_value();
+            value.insert("MachServices".into(), services);
+            assert!(
+                Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_argument_arrays_require_an_explicit_program_and_absent_live_arguments() {
+        let mut value = definition_value();
+        value.insert("Program".into(), "/usr/libexec/example".into());
+        value.insert("ProgramArguments".into(), plist::Value::Array(Vec::new()));
+        let definition = Definition::parse(
+            format!("{ROOT}/com.apple.example.plist").into(),
+            value.clone(),
+        )
+        .unwrap();
+        let without_arguments =
+            job().replace("\targuments = {\n\t\t/usr/libexec/example\n\t}\n", "");
+        assert!(definition.matches_job(502, 456, process(), &without_arguments));
+        assert!(!definition.matches_job(502, 456, process(), &job()));
+        for present in ["junk", "{\n\t}"] {
+            let job = without_arguments.replace(
+                "\tstate = running",
+                &format!("\tstate = running\n\targuments = {present}"),
+            );
+            assert!(!definition.matches_job(502, 456, process(), &job));
+        }
+        value.remove("Program");
+        assert!(
+            Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value).is_none()
+        );
     }
 
     #[test]
@@ -437,7 +543,6 @@ mod tests {
         }
         for malformed in [
             plist::Value::Boolean(false),
-            plist::Value::Array(Vec::new()),
             plist::Value::Array(vec![plist::Value::Integer(1.into())]),
         ] {
             value.insert("ProgramArguments".into(), malformed);
