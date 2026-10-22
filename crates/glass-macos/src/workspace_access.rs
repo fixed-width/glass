@@ -167,6 +167,10 @@ pub trait RecordChanges: Send {
     fn prepared(&mut self, change: &PermissionChange) -> io::Result<u64>;
     /// Persist that the mutation no longer needs recovery.
     fn settled(&mut self, identity: u64) -> io::Result<()>;
+    /// Whether this record still needs restoration after another recovery path may have run.
+    fn is_pending(&self, _identity: u64) -> bool {
+        true
+    }
 }
 
 /// Shared recorder for independently rolled-back permission scopes.
@@ -198,6 +202,15 @@ impl PermissionChange {
     /// Recover the same filesystem object, including after a rename; never act on its replacement.
     /// An unlinked object with no pathname has no grant reachable by a later open.
     pub fn restore(&self, worker_uid: u32) -> io::Result<()> {
+        self.restore_for(worker_uid, false).map(|_| ())
+    }
+
+    /// Revoke an allow-only record; return false without changing a record containing denials.
+    pub fn revoke_access(&self, worker_uid: u32) -> io::Result<bool> {
+        self.restore_for(worker_uid, true)
+    }
+
+    fn restore_for(&self, worker_uid: u32, retain_denials: bool) -> io::Result<bool> {
         let sharing = Sharing::new(worker_uid)?;
         if self.additions.is_empty()
             || self.additions.iter().any(|entry| match entry.tag {
@@ -218,10 +231,13 @@ impl PermissionChange {
                 "permission recovery evidence is not owned",
             ));
         }
+        if retain_denials && self.additions.iter().any(|entry| entry.tag == Tag::Deny) {
+            return Ok(false);
+        }
         if let Some(file) = self.resolved_file()? {
             self.restore_file(&file)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn resolved_file(&self) -> io::Result<Option<File>> {
@@ -911,11 +927,13 @@ impl Sharing {
                             if !change.additions.iter().any(|entry| entry.tag == tag) {
                                 continue;
                             }
-                            change.restore_file(&node.file)?;
-                            recorder
+                            let mut recorder = recorder
                                 .lock()
-                                .map_err(|_| io::Error::other("permission recorder is poisoned"))?
-                                .settled(*record)?;
+                                .map_err(|_| io::Error::other("permission recorder is poisoned"))?;
+                            if recorder.is_pending(*record) {
+                                change.restore_file(&node.file)?;
+                                recorder.settled(*record)?;
+                            }
                             node.records.remove(index);
                         }
                     } else {
@@ -990,6 +1008,9 @@ mod tests {
     }
 
     impl RecordChanges for Recorded {
+        fn is_pending(&self, id: u64) -> bool {
+            !self.settled.contains(&id)
+        }
         fn prepared(&mut self, change: &PermissionChange) -> io::Result<u64> {
             let file = change
                 .resolved_file()?
@@ -1297,6 +1318,105 @@ mod tests {
         sharing.restore().unwrap();
         assert_eq!(entries(&file), before);
         assert_eq!(recorder.lock().unwrap().settled.len(), changes.len());
+    }
+
+    #[test]
+    fn mixed_records_wait_for_full_restore_without_partial_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = File::create(directory.path().join("workspace")).unwrap();
+        let sharing = Sharing::new(u32::MAX - 1).unwrap(); // Darwin's nobody account.
+        let before = entries(&file);
+        let allow = Entry {
+            tag: Tag::Allow,
+            principal: sharing.worker,
+            permissions: READ,
+            flags: 0,
+        };
+        let denial = Entry {
+            tag: Tag::Deny,
+            principal: sharing.worker,
+            permissions: DELETE,
+            flags: 0,
+        };
+        let change = PermissionChange {
+            identity: FileIdentity::read(&file).unwrap(),
+            before: before.clone(),
+            additions: vec![allow.clone(), denial.clone()],
+        };
+        let user_edit = Entry {
+            tag: Tag::Allow,
+            principal: sharing.owner,
+            permissions: EXECUTE,
+            flags: 0,
+        };
+        let mut acl = Acl::read(&file).unwrap();
+        for entry in [&allow, &denial, &user_edit] {
+            acl.append(entry).unwrap();
+        }
+        acl.write(&file).unwrap();
+
+        assert!(!change.revoke_access(sharing.worker_uid).unwrap());
+        assert!(entries(&file).contains(&allow));
+        assert!(entries(&file).contains(&denial));
+        assert!(entries(&file).contains(&user_edit));
+        let revoked = entries(&file);
+        assert!(!change.revoke_access(sharing.worker_uid).unwrap());
+        assert_eq!(entries(&file), revoked);
+
+        change.restore(sharing.worker_uid).unwrap();
+        let mut expected = before;
+        expected.push(user_edit);
+        assert_eq!(entries(&file), expected);
+    }
+
+    #[test]
+    fn an_allow_only_record_is_fully_settled_by_access_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = File::create(directory.path().join("workspace")).unwrap();
+        let sharing = Sharing::new(u32::MAX - 1).unwrap();
+        let before = entries(&file);
+        let allow = Entry {
+            tag: Tag::Allow,
+            principal: sharing.worker,
+            permissions: READ,
+            flags: 0,
+        };
+        let change = PermissionChange {
+            identity: FileIdentity::read(&file).unwrap(),
+            before: before.clone(),
+            additions: vec![allow.clone()],
+        };
+        let mut acl = Acl::read(&file).unwrap();
+        acl.append(&allow).unwrap();
+        acl.write(&file).unwrap();
+
+        assert!(change.revoke_access(sharing.worker_uid).unwrap());
+        assert_eq!(entries(&file), before);
+        assert!(change.revoke_access(sharing.worker_uid).unwrap());
+    }
+
+    #[test]
+    fn a_retained_scope_does_not_restore_an_already_settled_record_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source");
+        let file = File::create(&path).unwrap();
+        let before = entries(&file);
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let mut sharing = Sharing::recorded(u32::MAX - 1, recorded.clone()).unwrap();
+        sharing.path(&path, Access::Read).unwrap();
+        let change = recorded.lock().unwrap().changes[0].clone();
+        assert!(change.revoke_access(u32::MAX - 1).unwrap());
+        recorded.lock().unwrap().settled(1).unwrap();
+
+        let user_edit = change.additions[0].clone();
+        let mut acl = Acl::read(&file).unwrap();
+        acl.append(&user_edit).unwrap();
+        acl.write(&file).unwrap();
+        sharing.restore().unwrap();
+        let mut expected = before;
+        expected.push(user_edit);
+        assert_eq!(entries(&file), expected);
+        assert_eq!(recorded.lock().unwrap().settled, vec![1]);
     }
 
     #[test]

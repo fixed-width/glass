@@ -567,6 +567,13 @@ impl NativeConnection {
 
     fn restore_permissions(&mut self, deadline: Deadline) -> Result<()> {
         let journal = &self.journal;
+        if self.cleanup == CleanupPhase::WaitingForIdle {
+            journal
+                .lock()
+                .map_err(|_| error("permission journal is poisoned"))?
+                .revoke_access(deadline)
+                .map_err(error)?;
+        }
         let prepare = &mut self.prepare;
         let lease = &self.lease;
         let stream = &mut self.stream;
@@ -916,11 +923,11 @@ mod tests {
     }
 
     #[test]
-    fn live_work_prevents_acl_restore_and_preserves_the_receipt_error() {
+    fn live_work_prevents_full_guard_restore_and_preserves_the_receipt_error() {
         let mut phase = CleanupPhase::default();
         let cleanup = phase.advance(
             || Err(error("work still alive")),
-            || panic!("do not revoke"),
+            || panic!("retain protective denials"),
             || panic!("do not close journal"),
             || panic!("do not unlock"),
         );

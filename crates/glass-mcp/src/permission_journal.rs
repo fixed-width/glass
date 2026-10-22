@@ -500,11 +500,25 @@ impl PermissionJournal {
         }
     }
 
+    pub(crate) fn revoke_access(&mut self, deadline: Deadline) -> io::Result<()> {
+        let ids: Vec<_> = self.pending.keys().copied().rev().collect();
+        for id in ids {
+            if deadline.has_passed() {
+                return Err(io::Error::other("permission recovery deadline elapsed"));
+            }
+            if self.pending[&id].revoke_access(self.header.worker)? {
+                self.settled(id)?;
+            }
+        }
+        Ok(())
+    }
+
     fn recover_with(
         &mut self,
         deadline: Deadline,
         inspect: &mut IdleInspector<'_>,
     ) -> io::Result<()> {
+        self.revoke_access(deadline)?;
         self.wait_idle_with(deadline, inspect)?;
         let ids: Vec<_> = self.pending.keys().copied().rev().collect();
         for id in ids {
@@ -535,6 +549,9 @@ impl PermissionJournal {
 }
 
 impl RecordChanges for PermissionJournal {
+    fn is_pending(&self, id: u64) -> bool {
+        self.pending.contains_key(&id)
+    }
     fn prepared(&mut self, change: &PermissionChange) -> io::Result<u64> {
         if self.closed {
             return Err(io::Error::other("permission lease is already closed"));
@@ -625,6 +642,113 @@ mod tests {
 
     fn journal(root: &Path) -> PermissionJournal {
         PermissionJournal::open(root, u32::MAX, "test-account".into(), None, None).unwrap()
+    }
+
+    #[test]
+    fn revoking_access_settles_allows_but_preserves_guards_and_the_open_lease() {
+        use glass_macos::workspace_access::{Access, Recorder, Sharing};
+        use std::sync::{Arc, Mutex};
+
+        let root = test_root();
+        let project = root.path().join("project");
+        let evidence = project.join("evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        let source = project.join("source");
+        std::fs::write(&source, "source").unwrap();
+        let acl = |path: &Path| {
+            std::process::Command::new("/bin/ls")
+                .args(["-lde"])
+                .arg(path)
+                .output()
+                .unwrap()
+                .stdout
+        };
+        let source_before = acl(&source);
+        let store = root.path().join("journal");
+        let worker = u32::MAX - 1;
+        let journal = Arc::new(Mutex::new(
+            PermissionJournal::open(&store, worker, "test-account".into(), None, None).unwrap(),
+        ));
+        let recorder: Recorder = journal.clone();
+        let mut sharing = Sharing::recorded(worker, recorder).unwrap();
+        sharing
+            .path_excluding(&project, Access::ReadWrite, std::slice::from_ref(&evidence))
+            .unwrap();
+        assert_ne!(acl(&source), source_before);
+        let owner = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .unwrap()
+            .stdout;
+        let owner = String::from_utf8(owner).unwrap();
+        let owner_rule = format!("user:{} allow ", owner.trim());
+        let granted = String::from_utf8(acl(&project)).unwrap();
+        let same_allow = granted
+            .lines()
+            .find(|line| line.contains(&owner_rule))
+            .unwrap()
+            .trim()
+            .split_once(": ")
+            .unwrap()
+            .1
+            .to_owned();
+
+        {
+            let mut journal = journal.lock().unwrap();
+            let header = journal.header.clone();
+            journal.revoke_access(Deadline::UNBOUNDED).unwrap();
+            assert_eq!(acl(&source), source_before);
+            assert!(!journal.closed && !journal.pending.is_empty());
+            assert!(journal.pending.values().all(|change| {
+                serde_json::to_value(change).unwrap()["additions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry["tag"] == "Deny")
+            }));
+            assert_eq!(journal.header, header);
+            let history = std::fs::read_to_string(store.join("pending.jsonl")).unwrap();
+            assert!(history.contains("Settled") && !history.contains("Closed"));
+            journal.revoke_access(Deadline::UNBOUNDED).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(store.join("pending.jsonl")).unwrap(),
+                history
+            );
+        }
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args(["+a", &same_allow])
+                .arg(&project)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let allows = |path: &Path| {
+            String::from_utf8(acl(path))
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains(" allow "))
+                .map(|line| line.trim().split_once(": ").unwrap().1.to_owned())
+                .collect::<Vec<_>>()
+        };
+        let user_acl = allows(&project);
+        drop(sharing);
+        let path = store.join("pending.jsonl");
+        let prefix = std::fs::read(&path).unwrap();
+        let mut retained = File::open(&path).unwrap();
+        drop(journal);
+        let mut recovered =
+            PermissionJournal::open(&store, worker, "test-account".into(), None, None).unwrap();
+        assert_eq!(allows(&project), user_acl);
+        let mut history = Vec::new();
+        retained.read_to_end(&mut history).unwrap();
+        assert!(history.starts_with(&prefix));
+        let history = String::from_utf8(history).unwrap();
+        assert_eq!(
+            history.matches("Prepared").count(),
+            history.matches("Settled").count()
+        );
+        recovered.finish(Deadline::from_millis(2000)).unwrap();
     }
 
     #[test]

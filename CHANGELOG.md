@@ -51,6 +51,10 @@ internal refactors, CI, or test-only changes.
   Workspace cleanup distinguishes verified idle macOS system services from unfinished application
   work, restoring temporary permissions while retaining system-managed infrastructure, including
   system jobs without explicit argument lists or Mach endpoints.
+  If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
+  within the cleanup deadline. Protective denials and mixed allow/deny records remain until
+  process cleanup succeeds. Incomplete cleanup retains its recovery journal, reports an error
+  and blocks new private application work.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   First login and privacy consent remain user actions.
