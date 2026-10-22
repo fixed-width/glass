@@ -420,6 +420,13 @@ fn spawn_for(
         }
     })?;
 
+    if let Err(error) = crate::private_session::work::record(child.id()) {
+        terminate(&mut child);
+        release_named_boards(clip.as_ref());
+        return Err(GlassError::AppNotStarted(format!(
+            "recording application ownership: {error}"
+        )));
+    }
     if !session_launch {
         return Ok(Launch {
             child,

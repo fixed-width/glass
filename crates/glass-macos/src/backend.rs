@@ -123,9 +123,20 @@ struct Adopted {
     /// Whether glass started this instance (reap it) or merely re-found one already running
     /// (leave it alive) — see [`crate::bundle::Disposition`].
     disposition: crate::bundle::Disposition,
+    origin: Option<crate::private_session::work::ProcessOrigin>,
 }
 
 impl Adopted {
+    fn verify(&self) -> Result<()> {
+        match crate::private_session::work::matches_adopted(self.origin) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(GlassError::AppExited(None)),
+            Err(error) => Err(GlassError::Backend(format!(
+                "adopted process ownership could not be verified: {error}"
+            ))),
+        }
+    }
+
     /// Reap the adopted app iff glass started it
     /// ([`crate::bundle::Disposition::should_terminate`]). [`crate::ffi::terminate_app`] is
     /// graceful-only (`-[NSRunningApplication terminate]`, no `SIGKILL` escalation), so an app
@@ -133,6 +144,16 @@ impl Adopted {
     /// mid-edit. With no escalation to fall back to, a failed request is reported: otherwise
     /// `stop_app` returns success while an app glass launched is still on screen.
     fn reap(self) {
+        if self.disposition.should_terminate() {
+            match crate::private_session::work::matches_adopted(self.origin) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    eprintln!("glass: adopted process ownership could not be verified: {error}");
+                    return;
+                }
+            }
+        }
         if self.disposition.should_terminate() && !crate::ffi::terminate_app(self.pid) {
             eprintln!(
                 "glass: could not ask the app (pid {}) to quit — it is already gone, or no \
@@ -145,6 +166,13 @@ impl Adopted {
 }
 
 impl MacosPlatform {
+    fn active_pid(&self) -> Result<u32> {
+        if let Some(adopted) = &self.adopted {
+            adopted.verify()?;
+        }
+        self.app_pid.ok_or(GlassError::NoActiveSession)
+    }
+
     /// Construct the backend, failing fast if a required TCC grant is missing.
     pub fn new() -> Result<Self> {
         permissions::preflight()?;
@@ -215,14 +243,18 @@ impl MacosPlatform {
     /// dies before its window appears; this loop only re-queries
     /// `scwindow::query_once_with_candidates` until `timeout_ms` elapses. The returned match's
     /// `geometry` is the settled one.
-    fn discover_window_pid(pid: i32, timeout_ms: u64) -> Result<crate::scwindow::WindowMatch> {
+    fn discover_window_pid(app: &Adopted, timeout_ms: u64) -> Result<crate::scwindow::WindowMatch> {
         crate::ffi::app_kit_init();
+        let pid = app.pid;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         loop {
+            app.verify()?;
             if let Some((m, candidates)) = crate::scwindow::query_once_with_candidates(&[pid])? {
                 // Same adoption record as `discover_window` — see there (#263).
                 eprintln!("{}", adoption_line(pid, &candidates));
-                return Ok(Self::settle_window(pid, m));
+                let settled = Self::settle_window(pid, m);
+                app.verify()?;
+                return Ok(settled);
             }
             if Instant::now() >= deadline {
                 return Err(GlassError::Timeout(timeout_ms));
@@ -424,13 +456,13 @@ impl MacosPlatform {
         // Fail-closed: only sandbox:off may adopt an app glass can no longer contain.
         crate::bundle::handoff_gate(spec.sandbox)?;
         let id = crate::bundle::bundle_identifier(bundle)?;
-        let (pid, disposition) = match crate::ffi::running_pid_for_bundle_id(&id) {
+        let (pid, disposition, origin) = match crate::ffi::running_pid_for_bundle_id(&id) {
             Some(_) if crate::private_session::attached() => {
                 return Err(GlassError::AppNotStarted(
                     "this bundle is already running in the development account; close that instance before starting a new Glass session".into(),
                 ));
             }
-            Some(pid) => (pid, crate::bundle::Disposition::PreExisting),
+            Some(pid) => (pid, crate::bundle::Disposition::PreExisting, None),
             // `ffi::launch_bundle` blocks this thread on a channel until `NSWorkspace`'s
             // completion handler fires — on the true main thread, that handler could need a
             // run-loop turn this blocked thread isn't pumping.
@@ -439,13 +471,14 @@ impl MacosPlatform {
                 spec.run.get(1..).unwrap_or_default(),
                 spec.timeout_ms,
             ) {
-                Ok(pid) => (pid, crate::bundle::Disposition::Fresh),
+                Ok((pid, origin)) => (pid, crate::bundle::Disposition::Fresh, origin),
                 // `launch_bundle` can start the app yet still error before its pid is
                 // delivered (e.g. its completion handler timed out) — an orphan. The
                 // `None` just found above means any instance running now is one we
                 // spawned, so best-effort reclaim it before propagating the error.
                 Err(e) => {
                     if crate::private_session::attached() {
+                        crate::private_session::work::mark_uncertain();
                         return Err(GlassError::cleanup_failed("launching a private bundle", e,
                             GlassError::Backend("LaunchServices returned no owned process; unverified instances were left untouched".into())));
                     }
@@ -468,10 +501,15 @@ impl MacosPlatform {
         // after discovery succeeds, since `self.adopted` (what `stop_app`/`Drop` reap)
         // isn't set until below. Reaping here terminates only a `Fresh` launch — an
         // already-running instance we merely re-found is not ours to kill.
-        let m = match Self::discover_window_pid(pid, spec.timeout_ms) {
+        let adopted = Adopted {
+            pid,
+            disposition,
+            origin,
+        };
+        let m = match Self::discover_window_pid(&adopted, spec.timeout_ms) {
             Ok(m) => m,
             Err(e) => {
-                Adopted { pid, disposition }.reap();
+                adopted.reap();
                 return Err(e);
             }
         };
@@ -483,7 +521,7 @@ impl MacosPlatform {
         // `app_pid`'s `u32` is exact.
         self.app_pid = Some(pid as u32);
         self.active_window = Some(m.window_id);
-        self.adopted = Some(Adopted { pid, disposition });
+        self.adopted = Some(adopted);
         self.clip = None;
         self.clipboard_route = crate::clipboard_route::decide_route(SandboxLevel::Off, None);
         Ok(m.geometry)
@@ -787,13 +825,14 @@ impl Platform for MacosPlatform {
             self.clip = None;
             self.clipboard_route = ClipboardRoute::Unsupported;
             return if unverified_handoff {
+                crate::private_session::work::mark_uncertain();
                 Err(GlassError::cleanup_failed("rejecting an unverified LaunchServices process", primary,
                     GlassError::Backend("unverified process left untouched; its launch/cleanup could not be attributed".into())))
             } else {
                 Err(primary)
             };
         }
-        activate_launched(self.app_pid);
+        activate_launched(Some(self.active_pid()?));
         Ok(geometry)
     }
 
@@ -848,7 +887,7 @@ impl Platform for MacosPlatform {
             return Err(GlassError::deadline_not_started("capture"));
         }
         permissions::preflight()?;
-        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.active_pid()?;
         match self.active_window {
             Some(id) => {
                 crate::capture::capture_window_by_id_by(id, &[pid as i32], region, deadline)
@@ -890,7 +929,7 @@ impl Platform for MacosPlatform {
             return Err(GlassError::deadline_not_started("macOS input focus"));
         }
         permissions::preflight()?;
-        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.active_pid()?;
         let m = self.resolve_active_window(pid as i32, deadline)?;
         check_pointer_bounds(event, &m.geometry)?;
         crate::input::send_pointer_by(event, m.pid, m.scale, m.origin_pt, deadline)
@@ -912,7 +951,7 @@ impl Platform for MacosPlatform {
             return Err(GlassError::deadline_not_started("macOS input focus"));
         }
         permissions::preflight()?;
-        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.active_pid()?;
         let m = self.resolve_active_window(pid as i32, deadline)?;
         crate::input::send_key_by(event, m.pid, deadline)
     }
@@ -941,7 +980,7 @@ impl Platform for MacosPlatform {
         }
         permissions::preflight()?;
         let id = self.active_window.ok_or(GlassError::NoActiveSession)?;
-        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.active_pid()?;
 
         // `&[pid as i32]`-scoped (final-review fix 1): `id` came from this backend's own
         // `active_window`, but scoping the lookup here too means a stale/foreign id can
@@ -1038,7 +1077,7 @@ impl Platform for MacosPlatform {
             return Err(GlassError::deadline_not_started("macOS window list"));
         }
         permissions::preflight()?;
-        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.active_pid()?;
         let windows = crate::scwindow::list_app_windows_by(&[pid as i32], deadline)?;
         Ok(windows
             .into_iter()
@@ -1069,7 +1108,7 @@ impl Platform for MacosPlatform {
             return Err(GlassError::deadline_not_started("macOS window selection"));
         }
         permissions::preflight()?;
-        let pid = self.app_pid.ok_or(GlassError::NoActiveSession)?;
+        let pid = self.active_pid()?;
         let previous = self.active_window;
         crate::scwindow::find_window_by_id_by(
             id.0 as u32,
@@ -1358,6 +1397,7 @@ mod tests {
             adopted: Some(Adopted {
                 pid: 999_999,
                 disposition: crate::bundle::Disposition::Fresh,
+                origin: None,
             }),
             protected_host_paths: Vec::new(),
         };
@@ -1384,6 +1424,7 @@ mod tests {
             adopted: Some(Adopted {
                 pid: 999_999,
                 disposition: crate::bundle::Disposition::PreExisting,
+                origin: None,
             }),
             protected_host_paths: Vec::new(),
         };
@@ -1391,6 +1432,30 @@ mod tests {
         assert!(p.adopted.is_none());
         assert_eq!(p.app_pid(), None);
         assert_eq!(p.active_window, None);
+    }
+
+    #[test]
+    fn adopted_lifetime_replacement_is_refused_before_window_discovery() {
+        let mut origin = crate::private_session::work::observe(
+            std::process::id(),
+            rustix::process::geteuid().as_raw(),
+        )
+        .unwrap();
+        origin.unique += 1;
+        let adopted = Adopted {
+            pid: std::process::id() as i32,
+            disposition: crate::bundle::Disposition::Fresh,
+            origin: Some(origin),
+        };
+        assert!(matches!(adopted.verify(), Err(GlassError::AppExited(None))));
+        adopted.reap();
+        assert!(
+            crate::private_session::work::observe(
+                std::process::id(),
+                rustix::process::geteuid().as_raw(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

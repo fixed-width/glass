@@ -85,6 +85,17 @@ pub(crate) fn run(spec: &AppSpec) -> Result<Vec<(Stream, String)>> {
     let mut child = command
         .spawn()
         .map_err(|error| GlassError::AppNotStarted(format!("build command: {error}")))?;
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::private_session::work::record(child.id()) {
+        let stopped = child.kill().and_then(|()| child.wait().map(|_| ()));
+        let primary = GlassError::AppNotStarted(format!("recording build ownership: {error}"));
+        return Err(match stopped {
+            Ok(()) => primary,
+            Err(cleanup) => {
+                GlassError::cleanup_failed("stopping unrecorded build", primary, cleanup.into())
+            }
+        });
+    }
     let stdout = Arc::new(Mutex::new(Tail::default()));
     let stderr = Arc::new(Mutex::new(Tail::default()));
     let out = child

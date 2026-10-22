@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glass_core::Deadline;
+use glass_macos::private_session::work::{self, WorkObserver, WorkScope, WorkSnapshot};
 use glass_macos::private_session::{
     ProcessIdentity, account_processes, boot_identity, session_exists,
 };
@@ -62,15 +63,29 @@ struct Header {
     boot: Option<[u8; 16]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work: Option<WorkScope>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Event {
-    Header { value: Header },
-    Prepared { id: u64, change: PermissionChange },
-    Settled { id: u64 },
+    Header {
+        value: Header,
+    },
+    Prepared {
+        id: u64,
+        change: PermissionChange,
+    },
+    Settled {
+        id: u64,
+    },
     Closed,
+    WorkStarted,
+    WorkObserved {
+        snapshot: WorkSnapshot,
+        start_finished: bool,
+    },
 }
 
 pub(crate) struct PermissionJournal {
@@ -219,6 +234,7 @@ impl PermissionJournal {
                 baseline: Vec::new(),
                 boot: Some(boot_identity()?),
                 session,
+                work: None,
             },
             pending: BTreeMap::new(),
             next: 1,
@@ -232,10 +248,16 @@ impl PermissionJournal {
             // A recovery inspector may need one launchd-throttled activation before observing idle.
             result.recover_with(Deadline::from_millis(30_000), inspect)?;
         }
-        result.header.version = 2;
+        result.header.version = 3;
         result.header.boot = Some(boot_identity()?);
         result.header.session = session;
-        result.header.baseline = account_processes(worker)?;
+        let baseline = work::snapshot(worker)?;
+        result.header.baseline = baseline.iter().map(|origin| origin.process).collect();
+        result.header.work = Some(WorkScope {
+            baseline,
+            work: WorkSnapshot::default(),
+            launch_pending: false,
+        });
         result.reset()?;
         Ok(result)
     }
@@ -278,9 +300,10 @@ impl PermissionJournal {
             let event: Event = serde_json::from_slice(line).map_err(io::Error::other)?;
             match event {
                 Event::Header { value } if header.is_none() && self.pending.is_empty() => {
-                    if !matches!(value.version, 1 | 2)
-                        || (value.version == 2 && value.boot.is_none())
+                    if !matches!(value.version, 1..=3)
+                        || (value.version >= 2 && value.boot.is_none())
                         || (value.version == 1 && (value.boot.is_some() || value.session.is_some()))
+                        || (value.work.is_some() != (value.version == 3))
                         || value.session.is_some_and(|id| id == 0 || id == u32::MAX)
                         || value.owner != self.header.owner
                         || value.worker == 0
@@ -291,6 +314,9 @@ impl PermissionJournal {
                             io::ErrorKind::InvalidData,
                             "permission recovery account binding changed",
                         ));
+                    }
+                    if let Some(scope) = &value.work {
+                        scope.validate()?;
                     }
                     header = Some(value);
                 }
@@ -311,6 +337,31 @@ impl PermissionJournal {
                 }
                 Event::Closed if header.is_some() && self.pending.is_empty() => {
                     self.closed = true;
+                }
+                Event::WorkStarted if header.as_ref().is_some_and(|header| header.version == 3) => {
+                    let scope = header
+                        .as_mut()
+                        .and_then(|header| header.work.as_mut())
+                        .ok_or_else(|| io::Error::other("work scope missing"))?;
+                    if scope.launch_pending {
+                        return Err(io::Error::other("duplicate pending application launch"));
+                    }
+                    scope.launch_pending = true;
+                }
+                Event::WorkObserved {
+                    snapshot,
+                    start_finished,
+                } if header.as_ref().is_some_and(|header| header.version == 3) => {
+                    let scope = header
+                        .as_mut()
+                        .and_then(|header| header.work.as_mut())
+                        .ok_or_else(|| io::Error::other("work scope missing"))?;
+                    if start_finished && !scope.launch_pending {
+                        return Err(io::Error::other(
+                            "application launch settlement was not prepared",
+                        ));
+                    }
+                    scope.merge(snapshot, start_finished)?;
                 }
                 _ => {
                     return Err(io::Error::new(
@@ -354,9 +405,9 @@ impl PermissionJournal {
         }
         let mut bytes = serde_json::to_vec(event).map_err(io::Error::other)?;
         bytes.push(b'\n');
-        let settlement_reserve = if matches!(event, Event::Prepared { .. }) {
+        let settlement_reserve = if !matches!(event, Event::Settled { .. } | Event::Closed) {
             (self.pending.len() as u64)
-                .saturating_add(1)
+                .saturating_add(u64::from(matches!(event, Event::Prepared { .. })))
                 .saturating_mul(64)
                 .saturating_add(128)
         } else {
@@ -430,6 +481,44 @@ impl PermissionJournal {
         &self.root
     }
 
+    pub(crate) fn work_started(&mut self) -> io::Result<()> {
+        let mut scope = self
+            .header
+            .work
+            .clone()
+            .ok_or_else(|| io::Error::other("private work scope is unavailable"))?;
+        if scope.launch_pending {
+            return Err(io::Error::other("an application launch is already pending"));
+        }
+        scope.launch_pending = true;
+        self.append(&Event::WorkStarted)?;
+        self.header.work = Some(scope);
+        Ok(())
+    }
+
+    pub(crate) fn observe_work(
+        &mut self,
+        snapshot: WorkSnapshot,
+        start_finished: bool,
+    ) -> io::Result<()> {
+        let mut scope = self
+            .header
+            .work
+            .clone()
+            .ok_or_else(|| io::Error::other("private work scope is unavailable"))?;
+        if start_finished && !scope.launch_pending {
+            return Err(io::Error::other("application launch was not prepared"));
+        }
+        if scope.merge(snapshot.clone(), start_finished)? {
+            self.append(&Event::WorkObserved {
+                snapshot,
+                start_finished,
+            })?;
+            self.header.work = Some(scope);
+        }
+        Ok(())
+    }
+
     /// A failed bootstrap must stop its broker before checking the child-process baseline.
     pub(crate) fn wait_admission_exit(&self, deadline: Deadline) -> io::Result<()> {
         while let Some(admission) = &self.admission {
@@ -452,10 +541,15 @@ impl PermissionJournal {
     }
 
     pub(crate) fn wait_idle_with(
-        &self,
+        &mut self,
         deadline: Deadline,
         inspect: &mut IdleInspector<'_>,
     ) -> io::Result<()> {
+        if let Some(scope) = self.header.work.clone()
+            && !scope.work.roots.is_empty()
+        {
+            return self.wait_owned_work(&scope, deadline, inspect);
+        }
         let mut samples = IdleSamples::default();
         loop {
             if deadline.has_passed() {
@@ -496,6 +590,105 @@ impl PermissionJournal {
                     .map_or(Duration::from_millis(100), |left| {
                         left.min(Duration::from_millis(100))
                     }),
+            );
+        }
+    }
+
+    fn wait_owned_work(
+        &mut self,
+        scope: &WorkScope,
+        deadline: Deadline,
+        inspect: &mut IdleInspector<'_>,
+    ) -> io::Result<()> {
+        if self.header.boot != Some(boot_identity()?) {
+            return Ok(());
+        }
+        let mut observer = WorkObserver::new(scope)?;
+        let mut samples = IdleSamples::default();
+        loop {
+            if deadline.has_passed() {
+                return Err(io::Error::other(
+                    "private application cleanup deadline elapsed",
+                ));
+            }
+            let account = work::snapshot(self.header.worker)?;
+            let mut current = work::all_processes()?;
+            for root in &observer.known().roots {
+                if let Some(origin) = work::remaining_root(*root, self.header.worker)?
+                    && !current.contains(&origin)
+                {
+                    current.push(origin);
+                }
+            }
+            // The account read is mandatory even when unrelated host metadata is unavailable.
+            for origin in &account {
+                if !current.contains(origin) {
+                    current.push(*origin);
+                }
+            }
+            let mut observed = observer.observe(&current)?;
+            self.observe_work(observer.known(), false)?;
+            observed
+                .unresolved
+                .retain(|origin| account.contains(origin));
+            let unknown: Vec<_> = observed
+                .owned
+                .iter()
+                .chain(&observed.unresolved)
+                .map(|origin| origin.process)
+                .collect();
+            let idle = if observed.unresolved.is_empty() {
+                Vec::new()
+            } else {
+                inspect(
+                    &observed
+                        .unresolved
+                        .iter()
+                        .map(|origin| origin.process)
+                        .collect::<Vec<_>>(),
+                    deadline,
+                )?
+            };
+            if idle.iter().any(|process| {
+                !observed
+                    .unresolved
+                    .iter()
+                    .any(|origin| &origin.process == process)
+            }) {
+                return Err(io::Error::other(
+                    "idle-service proof included an owned or unrequested process",
+                ));
+            }
+            let mut relevant: Vec<_> = account.iter().map(|origin| origin.process).collect();
+            for owned in &observed.owned {
+                if !relevant.contains(&owned.process) {
+                    relevant.push(owned.process);
+                }
+            }
+            relevant.sort_by_key(ProcessIdentity::pid);
+            if deadline.has_passed() {
+                return Err(io::Error::other(
+                    "private application cleanup deadline elapsed",
+                ));
+            }
+            if samples.observe(&relevant, &unknown, &idle)? {
+                return Ok(());
+            }
+            if deadline
+                .remaining()
+                .is_some_and(|left| left <= Duration::from_millis(100))
+            {
+                return Err(io::Error::other(format!(
+                    "private application cleanup deferred: {} owned processes and {} unresolved process origins remain",
+                    observed.owned.len(),
+                    observed.unresolved.len()
+                )));
+            }
+            std::thread::sleep(
+                deadline
+                    .remaining()
+                    .unwrap_or(Duration::from_millis(100))
+                    .min(Duration::from_millis(100)),
             );
         }
     }
@@ -900,6 +1093,7 @@ mod tests {
         value.version = 1;
         value.boot = None;
         value.session = None;
+        value.work = None;
         std::fs::write(
             &path,
             format!(
@@ -916,7 +1110,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(next.header.version, 2);
+        assert_eq!(next.header.version, 3);
         assert_eq!(next.header.worker, u32::MAX - 1);
         assert_eq!(next.header.account, "another-account");
         assert_eq!(next.header.session, Some(42));
@@ -1108,6 +1302,7 @@ mod tests {
             baseline: Vec::new(),
             boot: Some([1; 16]),
             session: Some(42),
+            work: None,
         }
     }
 
@@ -1162,6 +1357,202 @@ mod tests {
                 |_, _| panic!("legacy session unavailable")
             )
             .unwrap()
+        );
+    }
+
+    fn work_root() -> work::ProcessOrigin {
+        serde_json::from_value(serde_json::json!({"process":{"pid":123,"seconds":1,"microseconds":0},"unique":123,"parent_unique":1})).unwrap()
+    }
+
+    #[test]
+    fn work_roots_and_pending_launches_are_durable_before_settlement() {
+        let root = test_root();
+        let mut journal = journal(root.path());
+        assert_eq!(journal.header.version, 3);
+        journal
+            .observe_work(
+                WorkSnapshot {
+                    roots: vec![work_root()],
+                    uncertain: false,
+                },
+                false,
+            )
+            .unwrap();
+        journal.work_started().unwrap();
+        let expected = journal.header.clone();
+        journal.read().unwrap();
+        assert_eq!(journal.header, expected);
+        assert!(journal.header.work.as_ref().unwrap().launch_pending);
+        journal
+            .observe_work(
+                WorkSnapshot {
+                    roots: vec![work_root()],
+                    uncertain: false,
+                },
+                true,
+            )
+            .unwrap();
+        let expected = journal.header.clone();
+        journal.read().unwrap();
+        assert_eq!(journal.header, expected);
+        assert!(!journal.header.work.as_ref().unwrap().launch_pending);
+    }
+
+    #[test]
+    fn learned_descendants_survive_journal_replay_without_their_parent() {
+        let root = test_root();
+        let mut journal = journal(root.path());
+        journal
+            .observe_work(
+                WorkSnapshot {
+                    roots: vec![work_root()],
+                    uncertain: false,
+                },
+                false,
+            )
+            .unwrap();
+        let child: work::ProcessOrigin = serde_json::from_value(serde_json::json!({
+            "process":{"pid":124,"seconds":2,"microseconds":0},
+            "unique":124,"parent_unique":123
+        }))
+        .unwrap();
+        let mut observer = WorkObserver::new(journal.header.work.as_ref().unwrap()).unwrap();
+        observer.observe(&[child]).unwrap();
+        journal.observe_work(observer.known(), false).unwrap();
+        journal.read().unwrap();
+        let mut reopened = WorkObserver::new(journal.header.work.as_ref().unwrap()).unwrap();
+        assert_eq!(reopened.observe(&[child]).unwrap().owned, vec![child]);
+    }
+
+    #[test]
+    fn uncertainty_or_pending_launch_cannot_discard_a_known_cross_uid_root() {
+        for pending in [false, true] {
+            let root = test_root();
+            let mut journal = PermissionJournal::open(
+                root.path(),
+                u32::MAX - 1,
+                "test-account".into(),
+                None,
+                None,
+            )
+            .unwrap();
+            let actual =
+                work::observe(std::process::id(), rustix::process::geteuid().as_raw()).unwrap();
+            journal
+                .observe_work(
+                    WorkSnapshot {
+                        roots: vec![actual],
+                        uncertain: !pending,
+                    },
+                    false,
+                )
+                .unwrap();
+            if pending {
+                journal.work_started().unwrap();
+            }
+            let failure = journal
+                .wait_idle_with(Deadline::from_millis(1000), &mut |_, _| {
+                    panic!("a known owned root cannot be offered for idle-service proof")
+                })
+                .unwrap_err();
+            assert_eq!(failure.raw_os_error(), Some(1));
+            assert!(!journal.closed);
+            journal.read().unwrap();
+            assert!(
+                journal
+                    .header
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .work
+                    .roots
+                    .contains(&actual)
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_session_cannot_bypass_unresolved_private_work_on_the_same_boot() {
+        use std::process::{Command, Stdio};
+
+        let root = test_root();
+        let mut journal = journal(root.path());
+        let worker = rustix::process::geteuid().as_raw();
+        let retired = i32::MAX as u32 - 2;
+        assert!(!session_exists(retired, worker).unwrap());
+        let mut gone = work_root();
+        gone.unique = u64::MAX - 1;
+        gone.process = serde_json::from_value(serde_json::json!({
+            "pid":i32::MAX - 1,"seconds":1,"microseconds":0
+        }))
+        .unwrap();
+        journal
+            .observe_work(
+                WorkSnapshot {
+                    roots: vec![gone],
+                    uncertain: true,
+                },
+                false,
+            )
+            .unwrap();
+        // Model private-account inventory with test-owned processes; no account is created.
+        journal.header.worker = worker;
+        journal.header.session = Some(retired);
+        journal.header.work.as_mut().unwrap().baseline = work::snapshot(worker).unwrap();
+        let mut child = Command::new("/bin/cat")
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_origin = work::observe(child.id(), worker).unwrap();
+        let mut inspections = 0;
+        let result = journal.wait_idle_with(Deadline::from_millis(500), &mut |unknown, _| {
+            inspections += 1;
+            assert!(unknown.contains(&child_origin.process));
+            Ok(Vec::new())
+        });
+        child.stdin.take();
+        child.wait().unwrap();
+        assert!(result.is_err());
+        assert!(inspections > 0);
+        assert!(!journal.closed);
+    }
+
+    #[test]
+    fn an_unprepared_launch_result_cannot_change_owned_work_history() {
+        let root = test_root();
+        let mut journal = journal(root.path());
+        let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+        assert!(
+            journal
+                .observe_work(
+                    WorkSnapshot {
+                        roots: vec![work_root()],
+                        uncertain: false
+                    },
+                    true
+                )
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn an_invalid_work_snapshot_keeps_the_launch_pending_and_its_history_intact() {
+        let root = test_root();
+        let mut journal = journal(root.path());
+        journal.work_started().unwrap();
+        let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+        assert!(journal.observe_work(WorkSnapshot::default(), true).is_err());
+        assert!(journal.header.work.as_ref().unwrap().launch_pending);
+        assert_eq!(
+            std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+            before
         );
     }
 }

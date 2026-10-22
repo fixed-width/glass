@@ -70,11 +70,12 @@ int glass_private_resolve_file(const GlassFileIdentity *identity, char *out, siz
 
 typedef struct { uint32_t pid; uint64_t seconds, microseconds; } GlassProcessIdentity;
 
-int glass_private_processes(uint32_t uid, GlassProcessIdentity *out, int capacity) {
+static int process_identities(uint32_t uid, GlassProcessIdentity *out, int capacity, bool all) {
     int *pids = calloc((size_t)capacity, sizeof(int));
     if (!pids) return -ENOMEM;
     errno = 0;
-    int bytes = proc_listpids(PROC_UID_ONLY, uid, pids, capacity * (int)sizeof(int));
+    int bytes = proc_listpids(all ? PROC_ALL_PIDS : PROC_UID_ONLY,
+                             all ? 0 : uid, pids, capacity * (int)sizeof(int));
     if (bytes < 0 || (bytes == 0 && errno) || bytes >= capacity * (int)sizeof(int)) {
         int failure = bytes >= capacity * (int)sizeof(int) ? EOVERFLOW : (errno ? errno : EIO);
         free(pids);
@@ -91,16 +92,25 @@ int glass_private_processes(uint32_t uid, GlassProcessIdentity *out, int capacit
         if (status != 0 || length != sizeof(info)) {
             if (status == 0 && length == 0) continue;
             if (errno == ESRCH || errno == ENOENT) continue;
+            if (all && (errno == EPERM || errno == EACCES)) continue;
             int failure = errno ? errno : EIO;
             free(pids);
             return -failure;
         }
-        if (info.kp_eproc.e_ucred.cr_uid != uid) continue;
+        if (!all && info.kp_eproc.e_ucred.cr_uid != uid) continue;
         out[count++] = (GlassProcessIdentity){(uint32_t)info.kp_proc.p_pid,
             (uint64_t)info.kp_proc.p_starttime.tv_sec, (uint64_t)info.kp_proc.p_starttime.tv_usec};
     }
     free(pids);
     return count;
+}
+
+int glass_private_processes(uint32_t uid, GlassProcessIdentity *out, int capacity) {
+    return process_identities(uid, out, capacity, false);
+}
+
+int glass_private_all_processes(GlassProcessIdentity *out, int capacity) {
+    return process_identities(0, out, capacity, true);
 }
 
 int glass_private_uid_empty(uint32_t uid) {
@@ -565,6 +575,43 @@ static bool process_matches(const GlassProcessIdentity *process, uint32_t uid) {
         info.kp_eproc.e_ucred.cr_uid == uid &&
         (uint64_t)info.kp_proc.p_starttime.tv_sec == process->seconds &&
         (uint64_t)info.kp_proc.p_starttime.tv_usec == process->microseconds;
+}
+
+typedef struct {
+    GlassProcessIdentity process;
+    uint64_t unique;
+    uint64_t parent_unique;
+} GlassProcessOrigin;
+
+int glass_private_process_origin(uint32_t pid, uint32_t uid, GlassProcessOrigin *out) {
+    if (!out || pid == 0 || pid > INT32_MAX) return EINVAL;
+    struct kinfo_proc info = {0};
+    size_t size = sizeof(info);
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+    if (sysctl(mib, 4, &info, &size, NULL, 0)) return errno;
+    if (size == 0) return ESRCH;
+    if (size != sizeof(info)) return EIO;
+    uint32_t actual_uid = info.kp_eproc.e_ucred.cr_uid;
+    if (uid != UINT32_MAX && actual_uid != uid) return EPERM;
+    GlassProcessIdentity process = {pid, (uint64_t)info.kp_proc.p_starttime.tv_sec,
+        (uint64_t)info.kp_proc.p_starttime.tv_usec};
+    // PROC_PIDUNIQIDENTIFIERINFO's fixed ABI is also readable for an unreaped child.
+    struct {
+        uint8_t uuid[16];
+        uint64_t unique, parent_unique;
+        int32_t version, original_parent_version;
+        uint64_t reserved[2];
+    } first = {0}, second = {0};
+    _Static_assert(sizeof(first) == 56, "process identity ABI");
+    errno = 0;
+    if (proc_pidinfo((int)pid, 17, 1, &first, sizeof(first)) != (int)sizeof(first)) return errno ? errno : EIO;
+    if (!first.unique || !process_matches(&process, actual_uid)) return ESRCH;
+    errno = 0;
+    if (proc_pidinfo((int)pid, 17, 1, &second, sizeof(second)) != (int)sizeof(second)) return errno ? errno : EIO;
+    if (first.unique != second.unique || first.parent_unique != second.parent_unique ||
+        !process_matches(&process, actual_uid)) return ESRCH;
+    *out = (GlassProcessOrigin){process, first.unique, first.parent_unique};
+    return 0;
 }
 
 // This is an eligibility observation, not permission to ignore a process without its launchd job.

@@ -164,9 +164,9 @@ pub(crate) fn running_pid_for_bundle_id(bundle_id: &str) -> Option<i32> {
 /// == false`, adopt an already-running instance of) the `.app` bundle at `bundle` via
 /// `NSWorkspace.openApplication(at:configuration:completionHandler:)`, blocking the calling
 /// thread on the async completion handler for up to `timeout_ms` (this module's documented
-/// async-bridge convention: the block sends only a plain `Result<i32, String>` — never a
+/// async-bridge convention: the block sends only owned process facts — never a
 /// `Retained<NSRunningApplication>` — across the channel). Returns the launched/adopted
-/// app's pid.
+/// app's pid and its private-session lifetime, captured inside the callback.
 ///
 /// [`GlassError::AppNotStarted`] carries the framework's own `NSError` description when the
 /// completion handler reports failure. `NSWorkspace` documents the handler as being called with
@@ -175,8 +175,12 @@ pub(crate) fn running_pid_for_bundle_id(bundle_id: &str) -> Option<i32> {
 /// silently dropping the reply. [`GlassError::Timeout`] covers a completion handler that never
 /// fires within `timeout_ms`; a handler dropped without ever firing (the channel sender gone) is
 /// reported as [`GlassError::AppNotStarted`], kept distinct from that timeout.
-pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> Result<i32> {
-    let (tx, rx) = mpsc::channel::<std::result::Result<i32, String>>();
+pub(crate) fn launch_bundle(
+    bundle: &Path,
+    args: &[String],
+    timeout_ms: u64,
+) -> Result<(i32, Option<crate::private_session::work::ProcessOrigin>)> {
+    let (tx, rx) = mpsc::channel();
 
     let url = NSURL::fileURLWithPath(&NSString::from_str(&bundle.to_string_lossy()));
     let configuration = NSWorkspaceOpenConfiguration::configuration();
@@ -199,8 +203,7 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
     let workspace = NSWorkspace::sharedWorkspace();
 
     // The completion handler decides success/failure synchronously inside the callback (this
-    // module's async-bridge convention) and only ever sends the plain owned `Result<i32,
-    // String>` declared above — never a `Retained<NSRunningApplication>` — across the channel.
+    // module's async-bridge convention); no AppKit object crosses the channel.
     let handler = RcBlock::new(move |app: *mut NSRunningApplication, err: *mut NSError| {
         // SAFETY: `openApplication`'s completion handler hands back either a valid, live
         // `NSRunningApplication` pointer (success) or a valid, live `NSError` pointer
@@ -208,7 +211,29 @@ pub(crate) fn launch_bundle(bundle: &Path, args: &[String], timeout_ms: u64) -> 
         // pointer into `Option<&T>`, safe regardless of which one (if either) is null.
         let app = unsafe { app.as_ref() };
         if let Some(app) = app {
-            let _ = tx.send(Ok(app.processIdentifier()));
+            let private = crate::private_session::attached();
+            let result = (|| {
+                if private && app.isTerminated() {
+                    return Err(
+                        "launched application exited before ownership observation".to_string()
+                    );
+                }
+                let pid = app.processIdentifier();
+                let origin = crate::private_session::work::record(pid as u32).map_err(|error| {
+                    format!("recording launched application ownership: {error}")
+                })?;
+                if private
+                    && (app.isTerminated()
+                        || !crate::private_session::work::matches_adopted(origin)
+                            .map_err(|error| error.to_string())?)
+                {
+                    return Err(
+                        "launched application changed during ownership observation".to_string()
+                    );
+                }
+                Ok((pid, origin))
+            })();
+            let _ = tx.send(result);
             return;
         }
         // SAFETY: same guarantee as above, applied to `err` instead of `app`.

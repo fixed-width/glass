@@ -581,7 +581,7 @@ impl NativeConnection {
         let stream = std::cell::RefCell::new(stream);
         self.cleanup.advance(
             || {
-                let journal = journal
+                let mut journal = journal
                     .lock()
                     .map_err(|_| error("permission journal is poisoned"))?;
                 if !self.established {
@@ -697,6 +697,13 @@ impl Connection for NativeConnection {
         if bytes.len() > MAX_MESSAGE {
             return Err(error("backend request exceeds message limit").before_dispatch());
         }
+        if matches!(request.operation, Operation::Start(_)) {
+            self.journal
+                .lock()
+                .map_err(|_| error("permission journal is poisoned"))?
+                .work_started()
+                .map_err(|failure| error(failure).before_dispatch())?;
+        }
         let outcome = (|| {
             for chunk in bytes.chunks(CHUNK) {
                 send(&mut self.stream, DATA, chunk, io_deadline, None)?;
@@ -704,13 +711,20 @@ impl Connection for NativeConnection {
             loop {
                 if let Some(end) = self.buffer.iter().position(|&byte| byte == b'\n') {
                     let remainder = self.buffer.split_off(end + 1);
-                    let reply: Response =
+                    let reply: crate::native_backend::Reply =
                         serde_json::from_slice(&self.buffer[..end]).map_err(error)?;
                     self.buffer = remainder;
-                    if reply.version != crate::backend_worker::VERSION || reply.id != request.id {
+                    if reply.response.version != crate::backend_worker::VERSION
+                        || reply.response.id != request.id
+                    {
                         return Err(error("backend reply does not match its request"));
                     }
-                    return Ok(reply);
+                    self.journal
+                        .lock()
+                        .map_err(|_| error("permission journal is poisoned"))?
+                        .observe_work(reply.work, matches!(request.operation, Operation::Start(_)))
+                        .map_err(error)?;
+                    return Ok(reply.response);
                 }
                 match receive(&mut self.stream, io_deadline, None)? {
                     (DATA, data) => {

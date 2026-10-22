@@ -2,6 +2,8 @@
 
 use glass_core::{GlassError, Result};
 
+pub mod work;
+
 unsafe extern "C" {
     fn glass_private_is_owner() -> i32;
     fn glass_private_attach(onboarding: i32) -> i32;

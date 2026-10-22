@@ -6,11 +6,29 @@ use glass_core::{Deadline, GlassError, Result};
 
 use crate::backend_worker::{Dispatcher, Properties, Request, Response, VERSION};
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Reply {
+    pub response: Response,
+    pub work: glass_macos::private_session::work::WorkSnapshot,
+}
+
+impl Reply {
+    fn new(response: Response) -> Result<Self> {
+        Ok(Self {
+            response,
+            work: glass_macos::private_session::work::recorded()
+                .map_err(|error| GlassError::Backend(error.to_string()))?,
+        })
+    }
+}
+
 pub fn run(owner: u32) -> anyhow::Result<()> {
     glass_macos::private_session::attach_for(owner, false)?;
+    glass_macos::private_session::work::begin()?;
     glass_macos::init_main_thread();
     let (requests, incoming) = std::sync::mpsc::channel::<Request>();
-    let (outgoing, responses) = std::sync::mpsc::channel::<Response>();
+    let (outgoing, responses) = std::sync::mpsc::channel::<Reply>();
     let thread = std::thread::Builder::new()
         .name("glass-platform".into())
         .spawn(move || {
@@ -27,12 +45,12 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
                             scope_basis: None,
                             coverage: glass_core::AxStateCoverage::NONE,
                         };
-                        let _ = outgoing.send(Response {
+                        let _ = outgoing.send(Reply::new(Response {
                             version: VERSION,
                             id: request.id,
                             properties,
                             result: Err(error),
-                        });
+                        })?);
                     }
                     return Ok::<_, GlassError>(());
                 }
@@ -47,7 +65,7 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
                         result: Err(GlassError::Backend(error.to_string()).before_dispatch()),
                     },
                 };
-                if outgoing.send(response).is_err() {
+                if outgoing.send(Reply::new(response)?).is_err() {
                     break;
                 }
             }

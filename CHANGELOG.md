@@ -55,6 +55,10 @@ internal refactors, CI, or test-only changes.
   within the cleanup deadline. Protective denials and mixed allow/deny records remain until
   process cleanup succeeds. Incomplete cleanup retains its recovery journal, reports an error
   and blocks new private application work.
+  New application leases record build/app process lifetimes and verified descendants, including
+  reparented children. Cleanup retains learned ownership after interruption and checks fresh
+  LaunchServices targets against PID reuse. Unattributed new account processes still require
+  verified idle-service evidence before permissions are fully restored.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   First login and privacy consent remain user actions.
