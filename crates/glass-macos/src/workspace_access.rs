@@ -1,5 +1,7 @@
 //! Scoped ACL additions for a private worker and normal-owner access to its outputs.
 
+pub mod outputs;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
 use std::fs::File;

@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/private_session.m");
     println!("cargo:rerun-if-changed=src/account_setup.m");
+    println!("cargo:rerun-if-changed=src/workspace_access/output_watch.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -17,6 +18,7 @@ fn main() {
         )
         .file("src/private_session.m")
         .file("src/account_setup.m")
+        .file("src/workspace_access/output_watch.m")
         .flag("-fobjc-arc")
         .flag("-std=c11")
         .warnings_into_errors(true)
@@ -27,6 +29,7 @@ fn main() {
         "ApplicationServices",
         "Security",
         "SystemConfiguration",
+        "CoreServices",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
