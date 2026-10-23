@@ -65,13 +65,19 @@ static ODRecord *desktop_group(ODNode *node, char uuid[37], NSError **error) {
 
 static NSArray *desktop_members(ODRecord *group, NSString *attribute, NSError **error) {
     NSError *observed = nil;
-    NSArray *values = [group valuesForAttribute:attribute error:&observed];
-    if (!values) {
+    NSDictionary *details = [group recordDetailsForAttributes:@[attribute] error:&observed];
+    if (!details) {
         if ([observed.domain isEqualToString:@"com.apple.OpenDirectory"] &&
             observed.code == kODErrorRecordAttributeNotFound) return @[];
         if (error) *error = observed ?: [NSError errorWithDomain:NSPOSIXErrorDomain code:EPROTO userInfo:nil];
         return nil;
     }
+    if (![details isKindOfClass:NSDictionary.class]) {
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EPROTO userInfo:nil];
+        return nil;
+    }
+    NSArray *values = details[attribute];
+    if (!values) return @[];
     if (![values isKindOfClass:NSArray.class]) {
         if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain code:EPROTO userInfo:nil];
         return nil;
@@ -393,6 +399,8 @@ int glass_account_verify_identity(const char *name_bytes, const char *uuid_bytes
 @property(nonatomic) BOOL idsAbsent;
 @property(nonatomic) BOOL namesAbsent;
 @property(nonatomic) BOOL readWarning;
+@property(nonatomic) BOOL omitEmptyAttributes;
+@property(nonatomic) BOOL detailsNil;
 @property(nonatomic) BOOL writeSucceeds;
 @property(nonatomic) BOOL writeError;
 @property(nonatomic) unsigned cachedMembershipReads;
@@ -407,6 +415,14 @@ int glass_account_verify_identity(const char *name_bytes, const char *uuid_bytes
     }
     if (self.readWarning) *error=[NSError errorWithDomain:NSPOSIXErrorDomain code:EIO userInfo:nil];
     return [attribute isEqualToString:kODAttributeTypeGroupMembers] ? self.ids:self.names;
+}
+- (NSDictionary *)recordDetailsForAttributes:(NSArray *)attributes error:(NSError **)error {
+    if(self.detailsNil)return nil;
+    NSString *attribute=attributes[0];
+    NSArray *values=[self valuesForAttribute:attribute error:error];
+    if(!values)return nil;
+    if(self.omitEmptyAttributes && !values.count)return @{};
+    return @{attribute:values};
 }
 - (BOOL)isMemberRecord:(ODRecord *)record error:(NSError **)error {
     (void)record;(void)error;self.cachedMembershipReads++;return NO;
@@ -456,7 +472,13 @@ int main(void) {
         if(desktop_direct_member((id)record,"development",uuid,&member,&error)||member!=1||error)return 14;
         record.writeSucceeds=NO;record.writeError=NO;diagnostic=(GlassDesktopAccessDiagnostic){0};
         if(desktop_mutate((id)record,nil,1,&diagnostic)!=EIO||diagnostic.mutation_acknowledged||diagnostic.domain||diagnostic.code)return 15;
-        puts("{\"direct_membership_cases\":9,\"mutation_outcome_cases\":5,\"ffi_layout_cases\":1,\"directory_mutated\":false}");
+        record.readWarning=NO;record.omitEmptyAttributes=YES;record.ids=@[];record.names=@[];member=-1;error=nil;
+        if(desktop_direct_member((id)record,"development",uuid,&member,&error)||member!=0||error)return 16;
+        record.ids=@[@(uuid)];member=-1;error=nil;
+        if(desktop_direct_member((id)record,"development",uuid,&member,&error)||member!=1)return 17;
+        record.detailsNil=YES;member=-1;error=nil;
+        if(desktop_direct_member((id)record,"development",uuid,&member,&error)!=EIO||member!=-1||!error)return 18;
+        puts("{\"direct_membership_cases\":12,\"mutation_outcome_cases\":5,\"ffi_layout_cases\":1,\"directory_mutated\":false}");
     }
     return 0;
 }
