@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <stdio.h>
 
 typedef struct {
@@ -263,6 +264,21 @@ int glass_private_writes_protected(int fd, uint32_t owner) {
     if (!result && (next != -1 || errno != EINVAL)) result = errno ? errno : EIO;
     acl_free(acl);
     return result;
+}
+
+int glass_private_system_nounlink(int fd) {
+    typedef int (*CsrConfigFn)(uint32_t *);
+    CsrConfigFn config = (CsrConfigFn)dlsym(RTLD_DEFAULT, "csr_get_active_config");
+    uint32_t flags = 0;
+    // CSR_ALLOW_UNRESTRICTED_FS disables the system flag's filesystem protection.
+    if (!config || config(&flags) != 0 || (flags & (1U << 1)) != 0) return 0;
+    struct stat info = {0};
+    return fstat(fd, &info) == 0 && info.st_uid == 0 && (info.st_flags & SF_NOUNLINK) != 0;
+}
+
+int glass_private_readonly_filesystem(int fd) {
+    struct statfs info = {0};
+    return fstatfs(fd, &info) == 0 && (info.f_flags & MNT_RDONLY) != 0;
 }
 
 static bool protected_directory(int fd) {
@@ -614,13 +630,16 @@ int glass_private_process_origin(uint32_t pid, uint32_t uid, GlassProcessOrigin 
     return 0;
 }
 
-// This is an eligibility observation, not permission to ignore a process without its launchd job.
-int glass_private_idle_executable(const GlassProcessIdentity *process, uint32_t uid,
-                                 char *out, size_t capacity) {
+// Callers must separately prove the service role of authenticated platform code.
+static int platform_executable(const GlassProcessIdentity *process, uint32_t uid,
+                               char *out, size_t capacity, uint32_t *state,
+                               char *identifier, size_t identifier_capacity) {
     @autoreleasepool {
         uint32_t dirty = 0;
+        const uint32_t known = PROC_DIRTY_TRACKED | PROC_DIRTY_ALLOWS_IDLE_EXIT | PROC_DIRTY_IS_DIRTY;
         if (!process_matches(process, uid) || proc_get_dirty((int)process->pid, &dirty) ||
-            dirty != (PROC_DIRTY_TRACKED | PROC_DIRTY_ALLOWS_IDLE_EXIT)) return 0;
+            !(dirty & PROC_DIRTY_TRACKED) || (dirty & ~known)) return 0;
+        const uint32_t observed = dirty;
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath((int)process->pid, path, sizeof(path)) <= 0) return 0;
         struct stat before = {0}, after = {0};
@@ -645,13 +664,17 @@ int glass_private_idle_executable(const GlassProcessIdentity *process, uint32_t 
         if (!status) status = SecStaticCodeCheckValidity(disk, kSecCSStrictValidate, apple);
         if (!status) status = SecCodeCopySigningInformation(disk, kSecCSSigningInformation, &disk_info);
         bool eligible = false;
+        NSString *identity = nil;
         if (!status) {
             NSDictionary *live = (__bridge NSDictionary *)live_info;
             NSDictionary *stored = (__bridge NSDictionary *)disk_info;
             id platform = live[(__bridge NSString *)kSecCodeInfoPlatformIdentifier];
             id digest = live[(__bridge NSString *)kSecCodeInfoUnique];
             NSURL *executable = live[(__bridge NSString *)kSecCodeInfoMainExecutable];
+            identity = live[(__bridge NSString *)kSecCodeInfoIdentifier];
             eligible = [platform isKindOfClass:NSNumber.class] && [platform unsignedIntValue] != 0 &&
+                [identity isKindOfClass:NSString.class] && identity.length != 0 &&
+                [identity isEqual:stored[(__bridge NSString *)kSecCodeInfoIdentifier]] &&
                 [digest isKindOfClass:NSData.class] && [digest length] != 0 &&
                 [digest isEqual:stored[(__bridge NSString *)kSecCodeInfoUnique]] &&
                 [executable isKindOfClass:NSURL.class] && [executable.path isEqual:url.path];
@@ -672,11 +695,31 @@ int glass_private_idle_executable(const GlassProcessIdentity *process, uint32_t 
             before.st_ino != after.st_ino || before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec ||
             before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
             !process_matches(process, uid) || proc_get_dirty((int)process->pid, &dirty) ||
-            dirty != (PROC_DIRTY_TRACKED | PROC_DIRTY_ALLOWS_IDLE_EXIT) ||
+            dirty != observed ||
             strlen(path) + 1 > capacity) return 0;
         memcpy(out, path, strlen(path) + 1);
+        if (identifier) {
+            const char *name = identity.UTF8String;
+            if (!name || strlen(name) + 1 > identifier_capacity) return 0;
+            memcpy(identifier, name, strlen(name) + 1);
+        }
+        *state = observed;
         return 1;
     }
+}
+
+int glass_private_platform_executable(const GlassProcessIdentity *process, uint32_t uid,
+                                     char *out, size_t capacity, uint32_t *state,
+                                     char *identifier, size_t identifier_capacity) {
+    return platform_executable(process, uid, out, capacity, state, identifier, identifier_capacity);
+}
+
+uint32_t glass_private_service_requestor(const GlassProcessIdentity *process, uint32_t uid) {
+    typedef pid_t (*lookup_t)(pid_t);
+    lookup_t lookup = (lookup_t)dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+    if (!lookup || !process_matches(process, uid)) return 0;
+    pid_t requestor = lookup((pid_t)process->pid);
+    return requestor > 0 && process_matches(process, uid) ? (uint32_t)requestor : 0;
 }
 
 int glass_private_copy_requirement(uint8_t **out, size_t *length) {

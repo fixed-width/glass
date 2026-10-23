@@ -297,7 +297,7 @@ fn probe(lease: Option<File>, request: u8) -> Result<crate::macos_setup::Readine
     Ok(readiness)
 }
 
-fn inspect_idle(
+fn inspect_services(
     stream: &mut UnixStream,
     processes: &[glass_macos::private_session::ProcessIdentity],
     deadline: Deadline,
@@ -310,36 +310,20 @@ fn inspect_idle(
         }
         send(
             stream,
-            INSPECT_IDLE,
+            INSPECT_SERVICES,
             &serde_json::to_vec(processes).map_err(error)?,
             deadline,
             None,
         )?;
         let (kind, bytes) = receive(stream, deadline, Some(Duration::from_secs(4)))?;
-        if kind != IDLE_SERVICES {
-            return Err(error("idle macOS service attribution unavailable"));
+        if kind != SYSTEM_SERVICES {
+            return Err(error("macOS service attribution unavailable"));
         }
-        let services: Vec<super::idle_services::IdleService> =
+        let services: Vec<super::system_services::SystemService> =
             serde_json::from_slice(&bytes).map_err(error)?;
         let worker = glass_macos::private_session::worker_uid();
-        let mut idle = Vec::new();
-        for service in services {
-            if !processes.contains(&service.process)
-                || idle.contains(&service.process)
-                || !super::idle_services::label_valid(&service.label)
-                || glass_macos::private_session::idle_system_executable(worker, &service.process)
-                    .is_none()
-            {
-                return Err(error("idle macOS service identity changed"));
-            }
-            eprintln!(
-                "glass: verified idle macOS system service {} (PID {})",
-                service.label,
-                service.process.pid()
-            );
-            idle.push(service.process);
-        }
-        Ok(idle)
+        super::system_services::validate_report(worker, processes.to_vec(), services, deadline)
+            .map_err(error)
     };
     run().map_err(std::io::Error::other)
 }
@@ -389,7 +373,7 @@ pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &F
             let mut idle = if candidates.is_empty() {
                 Vec::new()
             } else {
-                inspect_idle(&mut broker.stream, &candidates, deadline)?
+                inspect_services(&mut broker.stream, &candidates, deadline)?
             };
             if processes.contains(&broker.greeting.process)
                 && glass_macos::private_session::account_processes(worker)?
@@ -450,7 +434,7 @@ impl NativeConnection {
                 account,
                 Some(greeting.session),
                 Some(greeting.process),
-                &mut |processes, deadline| inspect_idle(&mut stream, processes, deadline),
+                &mut |processes, deadline| inspect_services(&mut stream, processes, deadline),
             )
             .map_err(error)?,
         ));
@@ -589,7 +573,7 @@ impl NativeConnection {
                 }
                 journal
                     .wait_idle_with(deadline, &mut |processes, deadline| {
-                        inspect_idle(&mut stream.borrow_mut(), processes, deadline)
+                        inspect_services(&mut stream.borrow_mut(), processes, deadline)
                     })
                     .map_err(error)
             },
@@ -608,7 +592,7 @@ impl NativeConnection {
                     .lock()
                     .map_err(|_| error("permission journal is poisoned"))?
                     .finish_with(deadline, &mut |processes, deadline| {
-                        inspect_idle(&mut stream.borrow_mut(), processes, deadline)
+                        inspect_services(&mut stream.borrow_mut(), processes, deadline)
                     })
                     .map_err(error)
             },

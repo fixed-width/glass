@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 8;
+const PROTOCOL: u32 = 9;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -26,9 +26,9 @@ const PROBE: u8 = 9;
 const READINESS: u8 = 10;
 const OPEN_ONBOARDING: u8 = 11;
 #[cfg(target_os = "macos")]
-const INSPECT_IDLE: u8 = 12;
+const INSPECT_SERVICES: u8 = 12;
 #[cfg(target_os = "macos")]
-const IDLE_SERVICES: u8 = 13;
+const SYSTEM_SERVICES: u8 = 13;
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(60);
 const SETUP_WAIT: Duration = Duration::from_secs(10);
 const EXIT_WAIT: Duration = Duration::from_secs(4);
@@ -353,10 +353,10 @@ mod native {
         let (kind, data) = loop {
             let (kind, data) =
                 tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await??;
-            if kind != INSPECT_IDLE {
+            if kind != INSPECT_SERVICES {
                 break (kind, data);
             }
-            inspect_idle(&mut stream, &data).await?;
+            inspect_services(&mut stream, &data).await?;
         };
         if kind == PROBE || kind == OPEN_ONBOARDING {
             ensure!(data.is_empty(), "readiness probe must have no payload");
@@ -391,7 +391,7 @@ mod native {
         if let Some(mut stream) = exit.stream {
             loop {
                 match tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await? {
-                    Ok((INSPECT_IDLE, data)) => inspect_idle(&mut stream, &data).await?,
+                    Ok((INSPECT_SERVICES, data)) => inspect_services(&mut stream, &data).await?,
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             error.kind() == std::io::ErrorKind::UnexpectedEof
@@ -411,20 +411,15 @@ mod native {
         }
     }
 
-    async fn inspect_idle(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
-        let result =
-            tokio::time::timeout(Duration::from_secs(3), super::idle_services::inspect(bytes))
-                .await;
+    async fn inspect_services(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::system_services::inspect(bytes),
+        )
+        .await;
         match result {
-            Ok(Ok(services)) => send_json(stream, IDLE_SERVICES, &services).await,
-            _ => {
-                send_json(
-                    stream,
-                    FAILED,
-                    &"idle macOS service attribution was unavailable",
-                )
-                .await
-            }
+            Ok(Ok(services)) => send_json(stream, SYSTEM_SERVICES, &services).await,
+            _ => send_json(stream, FAILED, &"macOS service attribution was unavailable").await,
         }
     }
 }
@@ -436,7 +431,7 @@ pub use native::worker;
 pub(crate) mod backend_transport;
 
 #[cfg(target_os = "macos")]
-mod idle_services;
+mod system_services;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn check_endpoint(owner: u32) -> anyhow::Result<()> {
@@ -502,9 +497,9 @@ mod tests {
             let mut stream = exit.stream.unwrap();
             assert_eq!(
                 read_frame(&mut stream).await.unwrap(),
-                (INSPECT_IDLE, b"[]".to_vec())
+                (INSPECT_SERVICES, b"[]".to_vec())
             );
-            write_frame(&mut stream, IDLE_SERVICES, b"[]")
+            write_frame(&mut stream, SYSTEM_SERVICES, b"[]")
                 .await
                 .unwrap();
             assert!(read_frame(&mut stream).await.is_err());
@@ -512,10 +507,12 @@ mod tests {
         assert_eq!(read_frame(&mut client).await.unwrap().0, ACCEPTED);
         write_frame(&mut client, CLOSE, b"").await.unwrap();
         assert_eq!(read_frame(&mut client).await.unwrap().0, EXIT);
-        write_frame(&mut client, INSPECT_IDLE, b"[]").await.unwrap();
+        write_frame(&mut client, INSPECT_SERVICES, b"[]")
+            .await
+            .unwrap();
         assert_eq!(
             read_frame(&mut client).await.unwrap(),
-            (IDLE_SERVICES, b"[]".to_vec())
+            (SYSTEM_SERVICES, b"[]".to_vec())
         );
         drop(client);
         handler.await.unwrap();

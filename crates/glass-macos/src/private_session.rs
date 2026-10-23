@@ -227,6 +227,25 @@ pub fn require_write_protected(file: &std::fs::File, owner: u32) -> std::io::Res
     }
 }
 
+/// A root-owned entry whose system flag prohibits removal, rename and mounting over it.
+pub fn system_nounlink(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn glass_private_system_nounlink(fd: i32) -> i32;
+    }
+    // SAFETY: the helper reads metadata from the borrowed descriptor.
+    unsafe { glass_private_system_nounlink(file.as_raw_fd()) == 1 }
+}
+
+pub fn readonly_filesystem(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn glass_private_readonly_filesystem(fd: i32) -> i32;
+    }
+    // SAFETY: the helper reads mount flags from the borrowed descriptor.
+    unsafe { glass_private_readonly_filesystem(file.as_raw_fd()) == 1 }
+}
+
 pub fn session_id() -> Result<u32> {
     unsafe extern "C" {
         fn glass_private_session_id() -> u32;
@@ -433,26 +452,100 @@ impl ProcessIdentity {
 
 /// Observe idle Apple platform code; its protected launchd definition must also be verified.
 pub fn idle_system_executable(uid: u32, process: &ProcessIdentity) -> Option<std::path::PathBuf> {
+    platform_executable(uid, process)
+        .filter(|code| code.idle)
+        .map(|code| code.path)
+}
+
+/// Authenticated platform code and transaction state; its service role still needs proof.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlatformExecutable {
+    pub path: std::path::PathBuf,
+    pub idle: bool,
+    pub allows_idle_exit: bool,
+    pub identifier: String,
+}
+
+fn transaction_state(flags: u32) -> Option<(bool, bool)> {
+    match flags {
+        1 => Some((true, false)),
+        3 => Some((true, true)),
+        5 => Some((false, false)),
+        7 => Some((false, true)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    #[test]
+    fn inactivity_is_independent_of_pressure_reclamation() {
+        for (flags, expected) in [
+            (1, Some((true, false))),
+            (3, Some((true, true))),
+            (5, Some((false, false))),
+            (7, Some((false, true))),
+        ] {
+            assert_eq!(super::transaction_state(flags), expected);
+        }
+        for flags in [0, 2, 4, 6, 9, 11, 13, 15, u32::MAX] {
+            assert_eq!(super::transaction_state(flags), None);
+        }
+    }
+}
+
+pub fn platform_executable(uid: u32, process: &ProcessIdentity) -> Option<PlatformExecutable> {
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
-        fn glass_private_idle_executable(
+        fn glass_private_platform_executable(
             process: *const ProcessIdentity,
             uid: u32,
             out: *mut std::ffi::c_char,
             capacity: usize,
+            state: *mut u32,
+            identifier: *mut std::ffi::c_char,
+            identifier_capacity: usize,
         ) -> i32;
     }
     let mut path = [0u8; 4096];
-    // SAFETY: the helper reads one repr(C) identity and writes a NUL-terminated path within capacity.
-    if unsafe { glass_private_idle_executable(process, uid, path.as_mut_ptr().cast(), path.len()) }
-        != 1
+    let mut state = 0;
+    let mut identifier = [0u8; 1024];
+    // SAFETY: the bridge borrows one repr(C) identity and initializes the bounded path and state.
+    if unsafe {
+        glass_private_platform_executable(
+            process,
+            uid,
+            path.as_mut_ptr().cast(),
+            path.len(),
+            &mut state,
+            identifier.as_mut_ptr().cast(),
+            identifier.len(),
+        )
+    } != 1
     {
         return None;
     }
+    let (idle, allows_idle_exit) = transaction_state(state)?;
     let end = path.iter().position(|&byte| byte == 0)?;
-    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
-        &path[..end],
-    )))
+    let identifier_end = identifier.iter().position(|&byte| byte == 0)?;
+    Some(PlatformExecutable {
+        path: std::ffi::OsStr::from_bytes(&path[..end]).into(),
+        idle,
+        allows_idle_exit,
+        identifier: std::str::from_utf8(&identifier[..identifier_end])
+            .ok()?
+            .into(),
+    })
+}
+
+/// A service-job lookup hint, never ownership proof; the loaded job must match the live process.
+pub fn service_requestor(uid: u32, process: &ProcessIdentity) -> Option<u32> {
+    unsafe extern "C" {
+        fn glass_private_service_requestor(process: *const ProcessIdentity, uid: u32) -> u32;
+    }
+    // SAFETY: the optional native lookup reads the supplied repr(C) lifetime without retaining it.
+    let pid = unsafe { glass_private_service_requestor(process, uid) };
+    (pid != 0).then_some(pid)
 }
 
 /// Authenticate the transient privileged setup role without relaxing worker authentication.
