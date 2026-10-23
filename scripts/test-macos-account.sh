@@ -149,19 +149,20 @@ sudo -n /bin/launchctl bootstrap system "$account_plist"
 account_deadline=$((SECONDS+180))
 account_seen_lines=0
 while (( SECONDS < account_deadline )); do
+  observe_account_job || { echo 'Could not verify the owned system job.' >&2; exit 1; }
   account_new_lines=$(wc -l < "$account_stdout" | tr -d '[:space:]')
   if (( account_new_lines > account_seen_lines )); then
     sed -n "$((account_seen_lines+1)),${account_new_lines}p" "$account_stdout"
     account_seen_lines=$account_new_lines
   fi
   account_last_line=$(tail -n 1 "$account_stdout")
-  observe_account_job || { echo 'Could not verify the owned system job.' >&2; exit 1; }
   if ! printf '%s\n' "$account_job_state" | grep -Eq '^[[:space:]]*pid = [0-9]+$' &&
      printf '%s\n' "$account_job_state" | grep -Eq '^[[:space:]]*last exit code = -?[0-9]+$'; then
     if printf '%s\n' "$account_job_state" | grep -Eq '^[[:space:]]*last exit code = 0$' &&
        validate_account_result "$account_last_line" 4294967295; then
       exit 0
     fi
+    cat "$account_stderr" >&2
     echo 'The system-context account process exited without a passing result.' >&2
     exit 1
   fi
