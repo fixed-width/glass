@@ -249,6 +249,15 @@ fn send_message(stream: &mut UnixStream, message: &Message) -> anyhow::Result<()
     account_creation::send(stream, &serde_json::to_vec(message)?)
 }
 
+fn grant_worker_access(
+    stream: &mut UnixStream,
+    registration: &File,
+    account: &Enrollment,
+) -> anyhow::Result<()> {
+    wait_for_socket(registration, account.owner_uid, account.uid)?;
+    send_message(stream, &Message::Granted)
+}
+
 /// Internal root role, reached only after native administrator approval and peer authentication.
 pub(super) fn privileged(endpoint: &Path) -> anyhow::Result<()> {
     let owner = root_owner()?;
@@ -336,7 +345,7 @@ pub(super) fn privileged(endpoint: &Path) -> anyhow::Result<()> {
                 .authenticate(credentials)?
                 .private_offer()?
                 .select_private()?;
-            send_message(&mut stream, &Message::Granted)?;
+            grant_worker_access(&mut stream, &registration, &account)?;
             stream.set_read_timeout(Some(Duration::from_secs(90)))?;
             ensure!(
                 &*account_creation::receive(&mut stream, 1)? == b"R",
@@ -344,7 +353,7 @@ pub(super) fn privileged(endpoint: &Path) -> anyhow::Result<()> {
             );
             drop(granted);
         } else {
-            send_message(&mut stream, &Message::Granted)?;
+            grant_worker_access(&mut stream, &registration, &account)?;
             stream.set_read_timeout(Some(Duration::from_secs(90)))?;
             ensure!(
                 &*account_creation::receive(&mut stream, 1)? == b"R",
@@ -584,6 +593,47 @@ mod tests {
             member,
             group_uuid: Some("group-uuid".into()),
         }
+    }
+
+    #[test]
+    fn invalid_activation_socket_never_advertises_worker_access() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("worker.sock"), b"preserved unrelated file").unwrap();
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let account = record().account;
+        assert!(
+            grant_worker_access(&mut sender, &File::open(root.path()).unwrap(), &account).is_err()
+        );
+        let mut byte = [0; 1];
+        assert_eq!(
+            receiver.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("worker.sock")).unwrap(),
+            b"preserved unrelated file"
+        );
+    }
+
+    #[test]
+    fn worker_access_is_validated_before_granted_even_for_a_retained_desktop() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("worker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut account = record().account;
+        account.owner_uid = rustix::process::getuid().as_raw();
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        grant_worker_access(&mut sender, &File::open(root.path()).unwrap(), &account).unwrap();
+        let message: Message =
+            serde_json::from_slice(&account_creation::receive(&mut receiver, 8192).unwrap())
+                .unwrap();
+        assert!(matches!(message, Message::Granted));
+        let info = std::fs::symlink_metadata(socket).unwrap();
+        assert_eq!(info.uid(), account.owner_uid);
+        assert_eq!(info.mode() & 0o777, 0o600);
     }
 
     #[test]

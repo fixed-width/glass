@@ -70,6 +70,7 @@ internal refactors, CI, or test-only changes.
   Application setup offers **Start environment…** for a missing graphical login, using a transient
   local account password and native administrator approval. It requires macOS Screen Sharing to be
   enabled explicitly, selects only a separate desktop, and restores any temporary account access.
+  After a new login, Glass restores the normal user's worker connection access before checking readiness.
   A running desktop is reused without another account password; interrupted access cleanup blocks
   application work until it finishes. First-time privacy consent remains a user action. Guided
   startup is awaiting runtime qualification and does not provide unattended post-reboot recovery.
