@@ -350,6 +350,30 @@ mod tests {
     }
 
     #[test]
+    fn pending_startup_cleanup_never_dispatches_worker_or_permission_repairs() {
+        let now = std::time::Instant::now();
+        let mut setup = Coordinator::new(true);
+        for elapsed in [0, 60, 3600] {
+            assert_eq!(
+                setup.next_at(
+                    &Phase::StartupCleanupRequired,
+                    false,
+                    now + std::time::Duration::from_secs(elapsed)
+                ),
+                Decision::Wait
+            );
+        }
+        assert_eq!(
+            setup.next(&Phase::StartupCleanupRequired, true),
+            Decision::Stop
+        );
+        assert_eq!(
+            Coordinator::new(false).next(&Phase::StartupCleanupRequired, false),
+            Decision::Stop
+        );
+    }
+
+    #[test]
     fn login_and_consent_waits_do_not_inherit_the_machine_startup_deadline() {
         let mut setup = Coordinator::new(true);
         let now = std::time::Instant::now();
