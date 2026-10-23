@@ -1144,6 +1144,7 @@ fn elevate_using(
 mod account_creation;
 mod desktop_start;
 mod guided;
+mod worker_activation;
 
 /// Internal privileged startup role; the account password never appears in arguments.
 pub fn start_environment(endpoint: &Path) -> anyhow::Result<()> {

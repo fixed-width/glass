@@ -78,10 +78,13 @@ fn interpret(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn inspect_for_setup(target: &str) -> anyhow::Result<Inspection> {
-    let result = std::process::Command::new("/bin/launchctl")
-        .args(["print", target])
-        .env("LC_ALL", "C")
-        .output()?;
+    let result = glass_core::run_bounded(
+        std::process::Command::new("/bin/launchctl")
+            .args(["print", target])
+            .env("LC_ALL", "C"),
+        Duration::from_secs(5),
+        "inspecting the registered launchd job",
+    )?;
     interpret(target, result.status.code(), result.stdout, result.stderr)
         .with_context(|| format!("cannot inspect launchd job {target}: {}", result.status))
 }
@@ -120,10 +123,13 @@ pub(crate) fn stop(target: &str, uid: u32) -> anyhow::Result<()> {
     if initial.is_none() {
         return Ok(());
     }
-    let result = std::process::Command::new("/bin/launchctl")
-        .args(["bootout", target])
-        .env("LC_ALL", "C")
-        .output()?;
+    let result = glass_core::run_bounded(
+        std::process::Command::new("/bin/launchctl")
+            .args(["bootout", target])
+            .env("LC_ALL", "C"),
+        Duration::from_secs(5),
+        "stopping the registered launchd job",
+    );
     // A command can report an error while its teardown request still takes effect.
     wait_removed(Duration::from_secs(15), Duration::from_millis(50), || {
         let process_gone = match process {
@@ -134,12 +140,13 @@ pub(crate) fn stop(target: &str, uid: u32) -> anyhow::Result<()> {
         };
         Ok(inspect(target)?.is_none() && process_gone)
     })
-    .with_context(|| {
-        format!(
+    .with_context(|| match result {
+        Ok(result) => format!(
             "stopping {target}; bootout returned {}: {}",
             result.status,
             String::from_utf8_lossy(&result.stderr).trim()
-        )
+        ),
+        Err(error) => format!("stopping {target}; bootout did not finish: {error:#}"),
     })
 }
 

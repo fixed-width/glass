@@ -71,6 +71,9 @@ internal refactors, CI, or test-only changes.
   local account password and native administrator approval. It requires macOS Screen Sharing to be
   enabled explicitly, selects only a separate desktop, and restores any temporary account access.
   After a new login, Glass restores the normal user's worker connection access before checking readiness.
+  Startup activates the existing signed worker and permission-helper jobs in the new desktop,
+  replacing a stale idle connection only after verifying its registration. Worker failures retain
+  their original diagnostic while temporary Screen Sharing access is cleaned up.
   Screen Sharing checks use fresh direct membership, preserve acknowledged changes for cleanup after
   later verification failures, and log the failing native stage without credential data.
   A running desktop is reused without another account password; interrupted access cleanup blocks

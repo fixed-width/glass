@@ -249,6 +249,54 @@ fn send_message(stream: &mut UnixStream, message: &Message) -> anyhow::Result<()
     account_creation::send(stream, &serde_json::to_vec(message)?)
 }
 
+fn worker_finished(stream: &mut UnixStream) -> anyhow::Result<()> {
+    let response = account_creation::receive(stream, 1)?;
+    ensure!(
+        &*response == b"R" || &*response == b"F",
+        "owner did not return a recognized worker-verification outcome"
+    );
+    Ok(())
+}
+
+fn wait_private_worker(
+    cancelled: &AtomicBool,
+    session: u32,
+    deadline: Instant,
+    mut current_session: impl FnMut() -> std::io::Result<u32>,
+    mut probe: impl FnMut() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    loop {
+        ensure!(
+            !cancelled.load(Ordering::Relaxed),
+            "desktop worker check cancelled"
+        );
+        ensure!(
+            current_session()? == session,
+            "normal desktop changed during worker verification"
+        );
+        let problem = match probe() {
+            Ok(true) => return Ok(()),
+            Ok(false) => "the authenticated worker is not attached to its private GUI".to_owned(),
+            Err(error) => format!("{error:#}").chars().take(2048).collect(),
+        };
+        ensure!(
+            Instant::now() < deadline,
+            "desktop was started, but worker verification did not finish: {problem}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+fn finish_owner(primary: Option<anyhow::Error>, cleanup: Result<(), String>) -> anyhow::Result<()> {
+    match (primary, cleanup) {
+        (None, result) => result.map_err(anyhow::Error::msg),
+        (Some(error), Ok(())) => Err(error),
+        (Some(error), Err(cleanup)) => {
+            Err(anyhow::anyhow!("{error:#}; startup cleanup: {cleanup}"))
+        }
+    }
+}
+
 fn record_grant_result(
     record: &mut Record,
     result: Result<
@@ -271,10 +319,9 @@ fn record_grant_result(
 
 fn grant_worker_access(
     stream: &mut UnixStream,
-    registration: &File,
-    account: &Enrollment,
+    prepare: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    wait_for_socket(registration, account.owner_uid, account.uid)?;
+    prepare()?;
     send_message(stream, &Message::Granted)
 }
 
@@ -365,20 +412,18 @@ pub(super) fn privileged(endpoint: &Path) -> anyhow::Result<()> {
                 .authenticate(credentials)?
                 .private_offer()?
                 .select_private()?;
-            grant_worker_access(&mut stream, &registration, &account)?;
+            grant_worker_access(&mut stream, || {
+                worker_activation::activate(&registration, &account)
+            })?;
             stream.set_read_timeout(Some(Duration::from_secs(90)))?;
-            ensure!(
-                &*account_creation::receive(&mut stream, 1)? == b"R",
-                "desktop readiness was not confirmed; access cleanup will run"
-            );
+            worker_finished(&mut stream)?;
             drop(granted);
         } else {
-            grant_worker_access(&mut stream, &registration, &account)?;
+            grant_worker_access(&mut stream, || {
+                worker_activation::activate(&registration, &account)
+            })?;
             stream.set_read_timeout(Some(Duration::from_secs(90)))?;
-            ensure!(
-                &*account_creation::receive(&mut stream, 1)? == b"R",
-                "existing desktop readiness was not confirmed"
-            );
+            worker_finished(&mut stream)?;
         }
         Ok(())
     })();
@@ -476,6 +521,7 @@ pub(super) fn run(
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let exchange = (|| -> anyhow::Result<()> {
             let mut supplied_password = false;
+            let mut worker_failure = None;
             let hello: Message =
                 serde_json::from_slice(&account_creation::receive(&mut stream, 8192)?)?;
             let Message::Hello {
@@ -488,8 +534,18 @@ pub(super) fn run(
             ensure!(received == account, "desktop helper account changed");
             cleanup_only = cleanup;
             loop {
-                let message: Message =
-                    serde_json::from_slice(&account_creation::receive(&mut stream, 8192)?)?;
+                let received = account_creation::receive(&mut stream, 8192).and_then(|bytes| {
+                    serde_json::from_slice::<Message>(&bytes).map_err(Into::into)
+                });
+                let message = match received {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return finish_owner(
+                            worker_failure,
+                            Err(format!("receiving the helper outcome: {error:#}")),
+                        );
+                    }
+                };
                 match message {
                     Message::Password => {
                         ensure!(
@@ -521,33 +577,33 @@ pub(super) fn run(
                         progress(Progress::waiting(
                             "The development desktop is available. Checking its installed Glass worker…",
                         ));
-                        let deadline = Instant::now() + Duration::from_secs(60);
-                        loop {
-                            ensure!(
-                                !cancelled.load(Ordering::Relaxed)
-                                    && private_session::owner_desktop_session()? == session,
-                                "desktop check cancelled or normal desktop changed"
+                        let checked = wait_private_worker(
+                            cancelled,
+                            session,
+                            Instant::now() + Duration::from_secs(60),
+                            private_session::owner_desktop_session,
+                            || {
+                                let readiness =
+                                    crate::macos_worker::backend_transport::readiness_with_lease(
+                                        lease.try_clone()?,
+                                    )
+                                    .map_err(anyhow::Error::msg)?;
+                                Ok(readiness.private_session)
+                            },
+                        );
+                        let response: &[u8] = if checked.is_ok() { b"R" } else { b"F" };
+                        worker_failure = checked.err();
+                        if let Err(error) = account_creation::send(&mut stream, response) {
+                            return finish_owner(
+                                worker_failure,
+                                Err(format!("notifying the helper: {error:#}")),
                             );
-                            if let Ok(readiness) =
-                                crate::macos_worker::backend_transport::readiness_with_lease(
-                                    lease.try_clone()?,
-                                )
-                                && readiness.private_session
-                            {
-                                break;
-                            }
-                            ensure!(
-                                Instant::now() < deadline,
-                                "desktop was started, but its signed worker is not ready; account and grants retained"
-                            );
-                            std::thread::sleep(Duration::from_millis(300));
                         }
-                        account_creation::send(&mut stream, b"R")?;
                         progress(Progress::applying(
                             "Finishing temporary desktop-access cleanup. Complete or cancel any macOS approval locally.",
                         ));
                     }
-                    Message::Finished { result } => return result.map_err(anyhow::Error::msg),
+                    Message::Finished { result } => return finish_owner(worker_failure, result),
                     Message::Hello { .. } => bail!("duplicate desktop helper introduction"),
                 }
             }
@@ -558,7 +614,9 @@ pub(super) fn run(
             .map_err(|_| anyhow::anyhow!("desktop authorization stopped"))?;
         match (exchange, authorized) {
             (Ok(()), result) | (result, Ok(())) => result,
-            (Err(error), Err(auth)) => Err(error.context(format!("desktop helper: {auth:#}"))),
+            (Err(error), Err(auth)) => {
+                Err(anyhow::anyhow!("{error:#}; privileged helper: {auth:#}"))
+            }
         }
     });
     started?;
@@ -613,6 +671,62 @@ mod tests {
             member,
             group_uuid: Some("group-uuid".into()),
         }
+    }
+
+    #[test]
+    fn worker_timeout_preserves_its_last_connection_error() {
+        let cancelled = AtomicBool::new(false);
+        let error = wait_private_worker(
+            &cancelled,
+            7,
+            Instant::now(),
+            || Ok(7),
+            || bail!("Connection refused (os error 61)"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Connection refused (os error 61)")
+        );
+    }
+
+    #[test]
+    fn worker_cancellation_never_dispatches_a_probe() {
+        assert!(
+            wait_private_worker(
+                &AtomicBool::new(true),
+                7,
+                Instant::now(),
+                || Ok(7),
+                || panic!("cancelled probe")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_failure_is_primary_when_cleanup_transport_also_fails() {
+        let error = finish_owner(
+            Some(anyhow::anyhow!("Connection refused (os error 61)")),
+            Err("Broken pipe (os error 32)".into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("Connection refused"));
+        assert!(error.contains("Broken pipe"));
+    }
+
+    #[test]
+    fn failed_worker_verification_is_a_cleanup_handshake_not_a_disconnect() {
+        for response in [b"R", b"F"] {
+            let (mut owner, mut helper) = UnixStream::pair().unwrap();
+            account_creation::send(&mut owner, response).unwrap();
+            worker_finished(&mut helper).unwrap();
+        }
+        let (mut owner, mut helper) = UnixStream::pair().unwrap();
+        account_creation::send(&mut owner, b"X").unwrap();
+        assert!(worker_finished(&mut helper).is_err());
     }
 
     #[test]
@@ -678,7 +792,12 @@ mod tests {
         receiver.set_nonblocking(true).unwrap();
         let account = record().account;
         assert!(
-            grant_worker_access(&mut sender, &File::open(root.path()).unwrap(), &account).is_err()
+            grant_worker_access(&mut sender, || wait_for_socket(
+                &File::open(root.path()).unwrap(),
+                account.owner_uid,
+                account.uid
+            ))
+            .is_err()
         );
         let mut byte = [0; 1];
         assert_eq!(
@@ -701,7 +820,14 @@ mod tests {
         let mut account = record().account;
         account.owner_uid = rustix::process::getuid().as_raw();
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
-        grant_worker_access(&mut sender, &File::open(root.path()).unwrap(), &account).unwrap();
+        grant_worker_access(&mut sender, || {
+            wait_for_socket(
+                &File::open(root.path()).unwrap(),
+                account.owner_uid,
+                account.uid,
+            )
+        })
+        .unwrap();
         let message: Message =
             serde_json::from_slice(&account_creation::receive(&mut receiver, 8192).unwrap())
                 .unwrap();
