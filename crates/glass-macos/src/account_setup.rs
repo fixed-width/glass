@@ -9,12 +9,68 @@ pub struct DesktopAccess {
     pub group_uuid: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DesktopAccessError {
+    pub status: i32,
+    pub stage: u32,
+    pub native_domain: u32,
+    pub native_code: i64,
+    pub mutation_acknowledged: bool,
+    pub direct_member: Option<bool>,
+}
+
+impl std::fmt::Display for DesktopAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stage = match self.stage {
+            1 => "account identity",
+            2 => "service authorization",
+            3 => "access group identity",
+            4 => "direct membership",
+            5 => "directory mutation",
+            6 => "fresh mutation verification",
+            7 => "authorization propagation",
+            _ => "request validation",
+        };
+        write!(
+            f,
+            "macOS Screen Sharing access failed during {stage}: status {}, native domain {}, code {}, mutation acknowledged {}, direct membership {:?}",
+            self.status,
+            self.native_domain,
+            self.native_code,
+            self.mutation_acknowledged,
+            self.direct_member
+        )
+    }
+}
+impl std::error::Error for DesktopAccessError {}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct DesktopAccessDiagnostic {
+    stage: u32,
+    domain: u32,
+    code: i64,
+    mutation_acknowledged: i32,
+}
+impl DesktopAccessDiagnostic {
+    fn failure(self, status: i32) -> DesktopAccessError {
+        DesktopAccessError {
+            status,
+            stage: self.stage,
+            native_domain: self.domain,
+            native_code: self.code,
+            mutation_acknowledged: self.mutation_acknowledged == 1,
+            direct_member: None,
+        }
+    }
+}
+
 fn desktop_access_using(
     name: &str,
     uuid: &str,
     uid: u32,
     change: Option<(&str, bool)>,
-) -> Result<DesktopAccess, String> {
+) -> Result<DesktopAccess, DesktopAccessError> {
     unsafe extern "C" {
         fn glass_desktop_access(
             name: *const std::ffi::c_char,
@@ -25,15 +81,17 @@ fn desktop_access_using(
             group: *mut std::ffi::c_char,
             member: *mut i32,
             authorized: *mut i32,
+            diagnostic: *mut DesktopAccessDiagnostic,
         ) -> i32;
     }
-    let name = CString::new(name).map_err(|_| "invalid account name")?;
-    let uuid = CString::new(uuid).map_err(|_| "invalid account identity")?;
+    let name = CString::new(name).map_err(|_| DesktopAccessDiagnostic::default().failure(22))?;
+    let uuid = CString::new(uuid).map_err(|_| DesktopAccessDiagnostic::default().failure(22))?;
     let group = change
         .map(|(uuid, _)| CString::new(uuid))
         .transpose()
-        .map_err(|_| "invalid access group identity")?;
+        .map_err(|_| DesktopAccessDiagnostic::default().failure(22))?;
     let action = change.map_or(0, |(_, member)| if member { 1 } else { 2 });
+    let mut diagnostic = DesktopAccessDiagnostic::default();
     let mut output = [0i8; 37];
     let (mut member, mut authorized) = (-1, -1);
     // SAFETY: all C strings and fixed-size output buffers stay live for the synchronous call.
@@ -49,20 +107,25 @@ fn desktop_access_using(
             output.as_mut_ptr(),
             &mut member,
             &mut authorized,
+            &mut diagnostic,
         )
     };
     if code != 0 {
-        return Err(format!(
-            "macOS Screen Sharing account access failed: {code}"
-        ));
+        let mut error = diagnostic.failure(code);
+        error.direct_member = match member {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        };
+        return Err(error);
     }
     if ![0, 1].contains(&member) || ![0, 1].contains(&authorized) {
-        return Err("invalid Screen Sharing access result".into());
+        return Err(diagnostic.failure(71));
     }
     // SAFETY: the bridge writes at most 36 UUID characters and a terminating NUL.
     let group = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
         .to_str()
-        .map_err(|_| "invalid access group UUID")?;
+        .map_err(|_| diagnostic.failure(71))?;
     Ok(DesktopAccess {
         authorized: authorized == 1,
         member: member == 1,
@@ -70,7 +133,11 @@ fn desktop_access_using(
     })
 }
 
-pub fn desktop_access(name: &str, uuid: &str, uid: u32) -> Result<DesktopAccess, String> {
+pub fn desktop_access(
+    name: &str,
+    uuid: &str,
+    uid: u32,
+) -> Result<DesktopAccess, DesktopAccessError> {
     desktop_access_using(name, uuid, uid, None)
 }
 
@@ -80,7 +147,7 @@ pub fn set_desktop_access(
     uid: u32,
     group_uuid: &str,
     member: bool,
-) -> Result<DesktopAccess, String> {
+) -> Result<DesktopAccess, DesktopAccessError> {
     desktop_access_using(name, uuid, uid, Some((group_uuid, member)))
 }
 
@@ -211,6 +278,53 @@ pub fn set_password(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_direct_membership_and_acknowledgment_survive_stale_or_failed_observers() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("membership-contract");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut command = std::process::Command::new("/usr/bin/clang");
+        command.args([
+            "-fobjc-arc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DGLASS_DESKTOP_ACCESS_TEST",
+        ]);
+        command
+            .arg(source.join("account_setup.m"))
+            .arg(source.join("private_session.m"));
+        command.args(["-lbsm", "-o"]).arg(&executable);
+        for framework in [
+            "Foundation",
+            "OpenDirectory",
+            "ApplicationServices",
+            "Security",
+            "SystemConfiguration",
+        ] {
+            command.args(["-framework", framework]);
+        }
+        let built = command.output().unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        let checked = std::process::Command::new(executable).output().unwrap();
+        assert!(
+            checked.status.success(),
+            "native membership contract returned {}",
+            checked.status
+        );
+        assert!(String::from_utf8_lossy(&checked.stdout).contains("\"directory_mutated\":false"));
+        assert_eq!(std::mem::size_of::<super::DesktopAccessDiagnostic>(), 24);
+        assert_eq!(
+            std::mem::offset_of!(super::DesktopAccessDiagnostic, mutation_acknowledged),
+            16
+        );
+    }
+
     #[test]
     fn initial_password_failures_preserve_native_errors_without_assuming_password_policy() {
         let message = super::preparation_status(

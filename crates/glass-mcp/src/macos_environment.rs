@@ -1508,6 +1508,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     guided::continue_existing(&name, &cancelled, &mut progress)
                 }
             });
+            if let Err(error) = &result {
+                eprintln!("glass: desktop startup failed: {error:#}");
+            }
             if let Ok(mut state) = state.lock() {
                 state.running = false;
                 state.can_cancel = true;

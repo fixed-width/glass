@@ -249,6 +249,26 @@ fn send_message(stream: &mut UnixStream, message: &Message) -> anyhow::Result<()
     account_creation::send(stream, &serde_json::to_vec(message)?)
 }
 
+fn record_grant_result(
+    record: &mut Record,
+    result: Result<
+        glass_macos::account_setup::DesktopAccess,
+        glass_macos::account_setup::DesktopAccessError,
+    >,
+    mut persist: impl FnMut(&Record) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if result.is_ok()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.mutation_acknowledged)
+    {
+        record.grant_confirmed = true;
+        persist(record)?;
+    }
+    result.map(|_| ()).map_err(anyhow::Error::new)
+}
+
 fn grant_worker_access(
     stream: &mut UnixStream,
     registration: &File,
@@ -327,16 +347,16 @@ pub(super) fn privileged(endpoint: &Path) -> anyhow::Result<()> {
                     .to_owned();
                 record.grant_intent = true;
                 remember(&parent, &key(owner), &record)?;
-                glass_macos::account_setup::set_desktop_access(
+                let changed = glass_macos::account_setup::set_desktop_access(
                     &account.name,
                     &account.record_uuid,
                     account.uid,
                     &group,
                     true,
-                )
-                .map_err(anyhow::Error::msg)?;
-                record.grant_confirmed = true;
-                remember(&parent, &key(owner), &record)?;
+                );
+                record_grant_result(&mut record, changed, |record| {
+                    remember(&parent, &key(owner), record)
+                })?;
             }
             let prepared = prepare_wire()?;
             record.authentication_dispatched = true;
@@ -593,6 +613,61 @@ mod tests {
             member,
             group_uuid: Some("group-uuid".into()),
         }
+    }
+
+    #[test]
+    fn acknowledged_directory_write_is_durable_even_when_verification_fails() {
+        let mut record = record();
+        record.grant_confirmed = false;
+        let failure = glass_macos::account_setup::DesktopAccessError {
+            status: 5,
+            stage: 6,
+            native_domain: 1,
+            native_code: 123,
+            mutation_acknowledged: true,
+            direct_member: None,
+        };
+        let mut persisted = false;
+        let result = record_grant_result(&mut record, Err(failure), |record| {
+            assert!(record.grant_confirmed);
+            persisted = true;
+            Ok(())
+        });
+        assert!(persisted);
+        assert!(result.is_err());
+        let present = std::cell::Cell::new(true);
+        restore_record(
+            &record,
+            &record.account,
+            || Ok(state(present.get())),
+            |_| {
+                present.set(false);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!present.get());
+    }
+
+    #[test]
+    fn unacknowledged_directory_failure_cannot_claim_or_remove_a_grant() {
+        let mut record = record();
+        record.grant_confirmed = false;
+        let failure = glass_macos::account_setup::DesktopAccessError {
+            status: 5,
+            stage: 5,
+            native_domain: 1,
+            native_code: 123,
+            mutation_acknowledged: false,
+            direct_member: None,
+        };
+        assert!(
+            record_grant_result(&mut record, Err(failure), |_| {
+                panic!("unacknowledged write cannot create cleanup authority")
+            })
+            .is_err()
+        );
+        assert!(!record.grant_confirmed);
     }
 
     #[test]
