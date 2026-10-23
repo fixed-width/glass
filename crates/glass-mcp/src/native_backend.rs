@@ -4,7 +4,9 @@ use std::io::{BufRead, Write};
 
 use glass_core::{Deadline, GlassError, Result};
 
-use crate::backend_worker::{Dispatcher, Properties, Request, Response, VERSION};
+use crate::backend_worker::{Dispatcher, Operation, Properties, Request, Response, VERSION, Value};
+
+mod outputs;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,9 +57,50 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
                     return Ok::<_, GlassError>(());
                 }
             };
+            let mut outputs = outputs::Outputs::new(owner)?;
             while let Ok(request) = incoming.recv() {
+                let deadline = crate::backend_worker::deadline(request.expires_ns)?;
                 let response = match glass_macos::private_session::require_private() {
-                    Ok(()) => dispatcher.handle(request),
+                    Ok(()) => {
+                        if request.version == VERSION
+                            && matches!(&request.operation, Operation::OutputAuthority(_))
+                        {
+                            let Operation::OutputAuthority(scope) = request.operation else {
+                                unreachable!()
+                            };
+                            Response {
+                                version: VERSION,
+                                id: request.id,
+                                properties: dispatcher.current_properties(),
+                                result: outputs
+                                    .register(scope, deadline)
+                                    .map(|()| Value::Unit)
+                                    .map_err(GlassError::before_dispatch),
+                            }
+                        } else {
+                            let ready = if request.version == VERSION
+                                && matches!(&request.operation, Operation::Start(_))
+                            {
+                                outputs.before_start(deadline)
+                            } else {
+                                Ok(())
+                            };
+                            match ready {
+                                Ok(()) => {
+                                    let mut response = dispatcher.handle(request);
+                                    response.result =
+                                        outputs::checked(response.result, outputs.flush(deadline));
+                                    response
+                                }
+                                Err(error) => Response {
+                                    version: VERSION,
+                                    id: request.id,
+                                    properties: dispatcher.current_properties(),
+                                    result: Err(error),
+                                },
+                            }
+                        }
+                    }
                     Err(error) => Response {
                         version: VERSION,
                         id: request.id,

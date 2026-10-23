@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 9;
+const PROTOCOL: u32 = 10;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -29,9 +29,31 @@ const OPEN_ONBOARDING: u8 = 11;
 const INSPECT_SERVICES: u8 = 12;
 #[cfg(target_os = "macos")]
 const SYSTEM_SERVICES: u8 = 13;
+#[cfg(target_os = "macos")]
+const RECONCILE_OUTPUT: u8 = 14;
+#[cfg(target_os = "macos")]
+const OUTPUT_RESULT: u8 = 15;
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(60);
 const SETUP_WAIT: Duration = Duration::from_secs(10);
-const EXIT_WAIT: Duration = Duration::from_secs(4);
+// App stop plus one bounded output callback drain must fit before forced child termination.
+const EXIT_WAIT: Duration = Duration::from_secs(8);
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputRequest {
+    expires_ns: Option<u64>,
+    nonce: [u8; 16],
+    scope: glass_macos::workspace_access::outputs::OutputScope,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputReceipt {
+    digest: [u8; 32],
+    error: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,10 +375,11 @@ mod native {
         let (kind, data) = loop {
             let (kind, data) =
                 tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await??;
-            if kind != INSPECT_SERVICES {
-                break (kind, data);
+            match kind {
+                INSPECT_SERVICES => inspect_services(&mut stream, &data).await?,
+                RECONCILE_OUTPUT => reconcile_output(&mut stream, &data, owner).await?,
+                _ => break (kind, data),
             }
-            inspect_services(&mut stream, &data).await?;
         };
         if kind == PROBE || kind == OPEN_ONBOARDING {
             ensure!(data.is_empty(), "readiness probe must have no payload");
@@ -392,6 +415,9 @@ mod native {
             loop {
                 match tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await? {
                     Ok((INSPECT_SERVICES, data)) => inspect_services(&mut stream, &data).await?,
+                    Ok((RECONCILE_OUTPUT, data)) => {
+                        reconcile_output(&mut stream, &data, owner).await?
+                    }
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             error.kind() == std::io::ErrorKind::UnexpectedEof
@@ -400,7 +426,7 @@ mod native {
                         break;
                     }
                     Err(error) => return Err(error),
-                    _ => bail!("only idle-service inspection is allowed after backend exit"),
+                    _ => bail!("only service/output recovery is allowed after backend exit"),
                 }
             }
         }
@@ -420,6 +446,70 @@ mod native {
         match result {
             Ok(Ok(services)) => send_json(stream, SYSTEM_SERVICES, &services).await,
             _ => send_json(stream, FAILED, &"macOS service attribution was unavailable").await,
+        }
+    }
+
+    async fn reconcile_output(
+        stream: &mut UnixStream,
+        bytes: &[u8],
+        owner: u32,
+    ) -> anyhow::Result<()> {
+        use sha2::Digest;
+        let request: OutputRequest = serde_json::from_slice(bytes)?;
+        let result = (|| -> anyhow::Result<()> {
+            let deadline = crate::backend_worker::deadline(request.expires_ns)?;
+            let access = glass_macos::workspace_access::outputs::OutputAccess::new(owner)?;
+            access.repair(&request.scope, deadline)?;
+            Ok(())
+        })();
+        send_json(
+            stream,
+            OUTPUT_RESULT,
+            &OutputReceipt {
+                digest: sha2::Sha256::digest(bytes).into(),
+                error: result
+                    .err()
+                    .map(|error| format!("reconciling private outputs: {error:#}")),
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    mod output_tests {
+        use super::*;
+        use sha2::Digest;
+
+        #[tokio::test]
+        async fn setup_failure_is_digest_bound_and_malformed_requests_terminate() {
+            let root = tempfile::tempdir_in("/private/tmp").unwrap();
+            let scope = glass_macos::workspace_access::outputs::OutputScope::capture(
+                root.path(),
+                u32::MAX,
+                &[],
+            )
+            .unwrap();
+            let bytes = serde_json::to_vec(&OutputRequest {
+                expires_ns: None,
+                nonce: [7; 16],
+                scope: scope.for_worker(),
+            })
+            .unwrap();
+            let (mut client, mut worker) = UnixStream::pair().unwrap();
+            reconcile_output(&mut worker, &bytes, rustix::process::geteuid().as_raw())
+                .await
+                .unwrap();
+            let (kind, response) = read_frame(&mut client).await.unwrap();
+            assert_eq!(kind, OUTPUT_RESULT);
+            let receipt: OutputReceipt = serde_json::from_slice(&response).unwrap();
+            assert_eq!(
+                receipt.digest,
+                <[u8; 32]>::from(sha2::Sha256::digest(&bytes))
+            );
+            assert!(receipt.error.is_some());
+            assert!(reconcile_output(&mut worker, b"{}", 0).await.is_err());
+            drop(worker);
+            assert!(read_frame(&mut client).await.is_err());
         }
     }
 }
@@ -446,6 +536,23 @@ pub(crate) use callback::broker_requirement;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn recovery_rpc_is_refused_while_a_native_child_is_active() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let command = Command::new("/bin/cat");
+        let handler = tokio::spawn(broker(server, command));
+        assert_eq!(read_frame(&mut client).await.unwrap().0, ACCEPTED);
+        write_frame(&mut client, RECONCILE_OUTPUT, b"{}")
+            .await
+            .unwrap();
+        let (kind, data) = read_frame(&mut client).await.unwrap();
+        assert_eq!(kind, EXIT);
+        let receipt: Receipt = serde_json::from_slice(&data).unwrap();
+        assert!(!receipt.connection_valid);
+        assert!(handler.await.unwrap().unwrap().stream.is_none());
+    }
 
     #[test]
     fn bootstrap_does_not_forward_transport_credentials_or_login_identity() {

@@ -12,6 +12,7 @@ use glass_macos::private_session::work::{self, WorkObserver, WorkScope, WorkSnap
 use glass_macos::private_session::{
     ProcessIdentity, account_processes, boot_identity, session_exists,
 };
+use glass_macos::workspace_access::outputs::OutputScope;
 use glass_macos::workspace_access::{PermissionChange, RecordChanges};
 use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 const LIMIT: u64 = 64 * 1024 * 1024;
 type IdleInspector<'a> =
     dyn FnMut(&[ProcessIdentity], Deadline) -> io::Result<Vec<ProcessIdentity>> + 'a;
+type OutputInspector<'a> = dyn FnMut(&[OutputScope], Deadline) -> io::Result<()> + 'a;
 
 #[derive(Default)]
 struct IdleSamples {
@@ -86,6 +88,63 @@ enum Event {
         snapshot: WorkSnapshot,
         start_finished: bool,
     },
+    OutputPending {
+        id: u64,
+        scope: OutputScope,
+    },
+    OutputReconciled {
+        id: u64,
+    },
+    Checkpoint {
+        value: Checkpoint,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Checkpoint {
+    next: u64,
+    next_output: u64,
+    pending: Vec<(u64, PermissionChange)>,
+    outputs: Vec<(u64, OutputScope)>,
+}
+
+impl Checkpoint {
+    fn validate(&self, header: &Header) -> io::Result<()> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid output recovery checkpoint",
+            )
+        };
+        if header.version != 4
+            || self.next == 0
+            || self.next_output == 0
+            || self.outputs.is_empty()
+            || self.outputs.len() > 64
+        {
+            return Err(invalid());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let boundary = &self.outputs[0].1;
+        for (id, scope) in &self.outputs {
+            if *id == 0 || *id >= self.next_output || !ids.insert(*id) {
+                return Err(invalid());
+            }
+            scope.validate_binding(header.owner, header.worker)?;
+            if !scope.same_protection(boundary) {
+                return Err(invalid());
+            }
+        }
+        ids.clear();
+        for (id, change) in &self.pending {
+            if *id == 0 || *id >= self.next || !ids.insert(*id) {
+                return Err(invalid());
+            }
+            boundary.validate_guard(change)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct PermissionJournal {
@@ -94,6 +153,8 @@ pub(crate) struct PermissionJournal {
     file: File,
     header: Header,
     pending: BTreeMap<u64, PermissionChange>,
+    outputs: BTreeMap<u64, OutputScope>,
+    next_output: u64,
     next: u64,
     closed: bool,
     loaded: bool,
@@ -179,6 +240,7 @@ impl PermissionJournal {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with(
         root: &Path,
         worker: u32,
@@ -186,6 +248,26 @@ impl PermissionJournal {
         session: Option<u32>,
         admission: Option<ProcessIdentity>,
         inspect: &mut IdleInspector<'_>,
+    ) -> io::Result<Self> {
+        Self::open_with_outputs(
+            root,
+            worker,
+            account,
+            session,
+            admission,
+            inspect,
+            &mut |_, _| Err(io::Error::other("output recovery executor is unavailable")),
+        )
+    }
+
+    pub(crate) fn open_with_outputs(
+        root: &Path,
+        worker: u32,
+        account: String,
+        session: Option<u32>,
+        admission: Option<ProcessIdentity>,
+        inspect: &mut IdleInspector<'_>,
+        outputs: &mut OutputInspector<'_>,
     ) -> io::Result<Self> {
         let owner = rustix::process::geteuid().as_raw();
         if owner == 0
@@ -237,6 +319,8 @@ impl PermissionJournal {
                 work: None,
             },
             pending: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            next_output: 1,
             next: 1,
             closed: false,
             loaded: false,
@@ -246,9 +330,9 @@ impl PermissionJournal {
         result.read()?;
         if result.loaded && !result.closed {
             // A recovery inspector may need one launchd-throttled activation before observing idle.
-            result.recover_with(Deadline::from_millis(30_000), inspect)?;
+            result.recover_with_outputs(Deadline::from_millis(30_000), inspect, outputs)?;
         }
-        result.header.version = 3;
+        result.header.version = 4;
         result.header.boot = Some(boot_identity()?);
         result.header.session = session;
         let baseline = work::snapshot(worker)?;
@@ -287,9 +371,10 @@ impl PermissionJournal {
             })?
             + 1;
         let mut header = None;
-        for line in bytes[..end]
+        for (index, line) in bytes[..end]
             .split(|&byte| byte == b'\n')
             .filter(|line| !line.is_empty())
+            .enumerate()
         {
             if self.closed {
                 return Err(io::Error::new(
@@ -300,10 +385,10 @@ impl PermissionJournal {
             let event: Event = serde_json::from_slice(line).map_err(io::Error::other)?;
             match event {
                 Event::Header { value } if header.is_none() && self.pending.is_empty() => {
-                    if !matches!(value.version, 1..=3)
+                    if !matches!(value.version, 1..=4)
                         || (value.version >= 2 && value.boot.is_none())
                         || (value.version == 1 && (value.boot.is_some() || value.session.is_some()))
-                        || (value.work.is_some() != (value.version == 3))
+                        || (value.work.is_some() != (value.version >= 3))
                         || value.session.is_some_and(|id| id == 0 || id == u32::MAX)
                         || value.owner != self.header.owner
                         || value.worker == 0
@@ -335,10 +420,12 @@ impl PermissionJournal {
                         ));
                     }
                 }
-                Event::Closed if header.is_some() && self.pending.is_empty() => {
+                Event::Closed
+                    if header.is_some() && self.pending.is_empty() && self.outputs.is_empty() =>
+                {
                     self.closed = true;
                 }
-                Event::WorkStarted if header.as_ref().is_some_and(|header| header.version == 3) => {
+                Event::WorkStarted if header.as_ref().is_some_and(|header| header.version >= 3) => {
                     let scope = header
                         .as_mut()
                         .and_then(|header| header.work.as_mut())
@@ -351,7 +438,7 @@ impl PermissionJournal {
                 Event::WorkObserved {
                     snapshot,
                     start_finished,
-                } if header.as_ref().is_some_and(|header| header.version == 3) => {
+                } if header.as_ref().is_some_and(|header| header.version >= 3) => {
                     let scope = header
                         .as_mut()
                         .and_then(|header| header.work.as_mut())
@@ -362,6 +449,53 @@ impl PermissionJournal {
                         ));
                     }
                     scope.merge(snapshot, start_finished)?;
+                }
+                Event::OutputPending { id, scope }
+                    if header.as_ref().is_some_and(|header| header.version == 4)
+                        && id == self.next_output
+                        && self.outputs.len() < 64 =>
+                {
+                    let binding = header
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("output authority has no header"))?;
+                    scope.validate_binding(binding.owner, binding.worker)?;
+                    if self
+                        .outputs
+                        .values()
+                        .any(|current| !current.same_protection(&scope))
+                    {
+                        return Err(io::Error::other(
+                            "protected output authority changed during replay",
+                        ));
+                    }
+                    self.outputs.insert(id, scope);
+                    self.next_output = self
+                        .next_output
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("output authority sequence overflow"))?;
+                }
+                Event::Checkpoint { value }
+                    if index == 1 && header.as_ref().is_some_and(|header| header.version == 4) =>
+                {
+                    value.validate(
+                        header
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("checkpoint header missing"))?,
+                    )?;
+                    self.next = value.next;
+                    self.next_output = value.next_output;
+                    self.pending = value.pending.into_iter().collect();
+                    self.outputs = value.outputs.into_iter().collect();
+                }
+                Event::OutputReconciled { id }
+                    if header.as_ref().is_some_and(|header| header.version == 4)
+                        && self.pending.values().all(|change| !change.has_allow()) =>
+                {
+                    if self.outputs.remove(&id).is_none() {
+                        return Err(io::Error::other(
+                            "output settlement has no pending authority",
+                        ));
+                    }
                 }
                 _ => {
                     return Err(io::Error::new(
@@ -405,10 +539,18 @@ impl PermissionJournal {
         }
         let mut bytes = serde_json::to_vec(event).map_err(io::Error::other)?;
         bytes.push(b'\n');
-        let settlement_reserve = if !matches!(event, Event::Settled { .. } | Event::Closed) {
+        let settlement_reserve = if !matches!(
+            event,
+            Event::Settled { .. } | Event::OutputReconciled { .. } | Event::Closed
+        ) {
             (self.pending.len() as u64)
                 .saturating_add(u64::from(matches!(event, Event::Prepared { .. })))
                 .saturating_mul(64)
+                .saturating_add(
+                    (self.outputs.len() as u64)
+                        .saturating_add(1)
+                        .saturating_mul(64),
+                )
                 .saturating_add(128)
         } else {
             0
@@ -436,9 +578,13 @@ impl PermissionJournal {
         result
     }
 
-    fn reset(&mut self) -> io::Result<()> {
-        if !self.pending.is_empty() {
-            return Err(io::Error::other("permission recovery is incomplete"));
+    fn replace_file(
+        &mut self,
+        bytes: &[u8],
+        sync_directory: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other("permission journal is poisoned"));
         }
         let temporary = format!("checkpoint-{:016x}", rand::random::<u64>());
         let mut checkpoint = File::from(rustix::fs::openat(
@@ -447,17 +593,10 @@ impl PermissionJournal {
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )?);
-        let result = (|| {
+        let prepared = (|| {
             glass_macos::workspace_access::require_owner_private(&checkpoint)?;
             fs4::FileExt::try_lock(&checkpoint).map_err(io::Error::other)?;
-            serde_json::to_writer(
-                &mut checkpoint,
-                &Event::Header {
-                    value: self.header.clone(),
-                },
-            )
-            .map_err(io::Error::other)?;
-            checkpoint.write_all(b"\n")?;
+            checkpoint.write_all(bytes)?;
             checkpoint.sync_all()?;
             rustix::fs::renameat(
                 &self.directory,
@@ -465,16 +604,79 @@ impl PermissionJournal {
                 &self.directory,
                 "pending.jsonl",
             )?;
-            self.directory.sync_all()
+            Ok::<_, io::Error>(())
         })();
-        if result.is_err() {
+        if let Err(error) = prepared {
             let _ = rustix::fs::unlinkat(&self.directory, &temporary, rustix::fs::AtFlags::empty());
-            return result;
+            return Err(error);
         }
+        // The namespace now names this locked inode, even if the directory sync fails.
         self.file = checkpoint;
+        if let Err(error) = sync_directory(&self.directory) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() || !self.outputs.is_empty() {
+            return Err(io::Error::other("permission recovery is incomplete"));
+        }
+        let mut bytes = serde_json::to_vec(&Event::Header {
+            value: self.header.clone(),
+        })
+        .map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        if bytes.len() as u64 > LIMIT {
+            return Err(io::Error::other("permission header exceeds its bound"));
+        }
+        self.replace_file(&bytes, File::sync_all)?;
         self.next = 1;
+        self.next_output = 1;
         self.closed = false;
         Ok(())
+    }
+
+    fn checkpoint(&mut self) -> io::Result<()> {
+        if self.header.version != 4
+            || self.outputs.is_empty()
+            || self.file.metadata()?.len() <= LIMIT / 2
+        {
+            return Ok(());
+        }
+        let value = Checkpoint {
+            next: self.next,
+            next_output: self.next_output,
+            pending: self
+                .pending
+                .iter()
+                .map(|(id, change)| (*id, change.clone()))
+                .collect(),
+            outputs: self
+                .outputs
+                .iter()
+                .map(|(id, scope)| (*id, scope.clone()))
+                .collect(),
+        };
+        value.validate(&self.header)?;
+        let mut bytes = serde_json::to_vec(&Event::Header {
+            value: self.header.clone(),
+        })
+        .map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        serde_json::to_writer(&mut bytes, &Event::Checkpoint { value })
+            .map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        let reserve = (self.pending.len() as u64)
+            .saturating_add(self.outputs.len() as u64)
+            .saturating_add(1)
+            .saturating_mul(64)
+            .saturating_add(128);
+        if (bytes.len() as u64).saturating_add(reserve) > LIMIT {
+            return Err(io::Error::other("output checkpoint exceeds its bound"));
+        }
+        self.replace_file(&bytes, File::sync_all)
     }
 
     pub(crate) fn protected_root(&self) -> &Path {
@@ -493,6 +695,36 @@ impl PermissionJournal {
         scope.launch_pending = true;
         self.append(&Event::WorkStarted)?;
         self.header.work = Some(scope);
+        Ok(())
+    }
+
+    pub(crate) fn output_pending(&mut self, scope: OutputScope) -> io::Result<()> {
+        scope.validate_owner(self.header.worker)?;
+        if self
+            .outputs
+            .values()
+            .any(|current| !current.same_protection(&scope))
+        {
+            return Err(io::Error::other(
+                "protected output authority changed during the lease",
+            ));
+        }
+        if self.header.version != 4 || self.outputs.len() >= 64 {
+            return Err(io::Error::other("output authority cannot be recorded"));
+        }
+        if self.outputs.values().any(|current| current == &scope) {
+            return Ok(());
+        }
+        let id = self.next_output;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("output authority sequence overflow"))?;
+        self.append(&Event::OutputPending {
+            id,
+            scope: scope.clone(),
+        })?;
+        self.outputs.insert(id, scope);
+        self.next_output = next;
         Ok(())
     }
 
@@ -694,6 +926,14 @@ impl PermissionJournal {
     }
 
     pub(crate) fn revoke_access(&mut self, deadline: Deadline) -> io::Result<()> {
+        if self.header.version == 4 {
+            for scope in self.outputs.values() {
+                scope.validate_accounts(self.header.worker)?;
+            }
+            for change in self.pending.values() {
+                change.validate(self.header.worker)?;
+            }
+        }
         let ids: Vec<_> = self.pending.keys().copied().rev().collect();
         for id in ids {
             if deadline.has_passed() {
@@ -706,13 +946,94 @@ impl PermissionJournal {
         Ok(())
     }
 
-    fn recover_with(
+    pub(crate) fn reconcile_outputs(
         &mut self,
         deadline: Deadline,
         inspect: &mut IdleInspector<'_>,
+        repair: &mut OutputInspector<'_>,
     ) -> io::Result<()> {
+        if self.outputs.is_empty() {
+            return Ok(());
+        }
         self.revoke_access(deadline)?;
         self.wait_idle_with(deadline, inspect)?;
+        self.checkpoint()?;
+        let scopes: Vec<_> = self.outputs.values().cloned().collect();
+        for scope in &scopes {
+            scope.validate_owner(self.header.worker)?;
+        }
+        let result = (|| {
+            let mut first = true;
+            loop {
+                let mut added = 0;
+                for scope in &scopes {
+                    added += scope.grant_inspection(self.header.worker, self, deadline)?;
+                }
+                match repair(&scopes, deadline) {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock && (first || added > 0) =>
+                    {
+                        // A partial creator scan can expose a hidden normal-owned directory for
+                        // the next narrow grant. Repeated attempts must make grant progress.
+                        first = false;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })();
+        let revoked = self.revoke_access(deadline);
+        match (result, revoked) {
+            (Ok(()), Ok(())) => {}
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+            (Err(error), Err(revoke)) => {
+                return Err(io::Error::other(format!(
+                    "{error}; inspection revocation: {revoke}"
+                )));
+            }
+        }
+        if self.pending.values().any(PermissionChange::has_allow) {
+            return Err(io::Error::other(
+                "temporary output inspection access remains pending",
+            ));
+        }
+        self.wait_idle_with(deadline, inspect)?;
+        for id in self.outputs.keys().copied().collect::<Vec<_>>() {
+            self.append(&Event::OutputReconciled { id })?;
+            self.outputs.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn recover_with_outputs(
+        &mut self,
+        deadline: Deadline,
+        inspect: &mut IdleInspector<'_>,
+        outputs: &mut OutputInspector<'_>,
+    ) -> io::Result<()> {
+        if let Err(revoke) = self.revoke_access(deadline) {
+            if self.outputs.is_empty() || !PermissionChange::path_inaccessible(&revoke) {
+                return Err(revoke);
+            }
+            // A creator-owned moved parent can hide an original normal-owned node. Add owner
+            // access using only grants that still exist; never regrant worker access here.
+            let scopes: Vec<_> = self.outputs.values().cloned().collect();
+            for scope in &scopes {
+                scope.validate_owner(self.header.worker)?;
+            }
+            match outputs(&scopes, deadline) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    return Err(io::Error::other(format!(
+                        "{revoke}; exposing inaccessible output parents: {error}"
+                    )));
+                }
+            }
+            self.revoke_access(deadline)?;
+        }
+        self.wait_idle_with(deadline, inspect)?;
+        self.reconcile_outputs(deadline, inspect, outputs)?;
         let ids: Vec<_> = self.pending.keys().copied().rev().collect();
         for id in ids {
             if deadline.has_passed() {
@@ -734,7 +1055,18 @@ impl PermissionJournal {
         deadline: Deadline,
         inspect: &mut IdleInspector<'_>,
     ) -> io::Result<()> {
-        self.recover_with(deadline, inspect)?;
+        self.finish_with_outputs(deadline, inspect, &mut |_, _| {
+            Err(io::Error::other("output recovery executor is unavailable"))
+        })
+    }
+
+    pub(crate) fn finish_with_outputs(
+        &mut self,
+        deadline: Deadline,
+        inspect: &mut IdleInspector<'_>,
+        outputs: &mut OutputInspector<'_>,
+    ) -> io::Result<()> {
+        self.recover_with_outputs(deadline, inspect, outputs)?;
         self.append(&Event::Closed)?;
         self.closed = true;
         Ok(())
@@ -835,6 +1167,434 @@ mod tests {
 
     fn journal(root: &Path) -> PermissionJournal {
         PermissionJournal::open(root, u32::MAX, "test-account".into(), None, None).unwrap()
+    }
+
+    fn output_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, OutputScope) {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let project = root.path().join("project");
+        let store = root.path().join("journal");
+        std::fs::create_dir(&project).unwrap();
+        let scope = OutputScope::capture(&project, u32::MAX, &[]).unwrap();
+        (root, project, store, scope)
+    }
+
+    fn acl(path: &Path) -> Vec<String> {
+        let output = std::process::Command::new("/bin/ls")
+            .arg("-lde")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn output_authority_survives_early_settlement_and_inspection_is_read_only() {
+        let (_root, project, store, scope) = output_fixture();
+        let before = acl(&project);
+        let mut journal = journal(&store);
+        journal.output_pending(scope.clone()).unwrap();
+        scope
+            .grant_inspection(u32::MAX, &mut journal, Deadline::UNBOUNDED)
+            .unwrap();
+        assert!(!journal.pending.is_empty());
+        journal.revoke_access(Deadline::UNBOUNDED).unwrap();
+        assert!(journal.pending.is_empty() && journal.outputs.len() == 1);
+        assert_eq!(acl(&project), before);
+        let mut calls = 0;
+        journal
+            .reconcile_outputs(
+                Deadline::from_millis(3000),
+                &mut |_, _| Ok(Vec::new()),
+                &mut |scopes, _| {
+                    calls += 1;
+                    assert_eq!(scopes, std::slice::from_ref(&scope));
+                    let events = std::fs::read_to_string(store.join("pending.jsonl"))?;
+                    for event in events
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    {
+                        if event["kind"] == "Prepared" {
+                            for entry in event["change"]["additions"].as_array().unwrap() {
+                                let permissions = entry["permissions"].as_u64().unwrap();
+                                // Darwin READ + EXECUTE; no write/delete/ACL-edit/inheritance rights.
+                                let read_search =
+                                    (1 << 1) | (1 << 3) | (1 << 7) | (1 << 9) | (1 << 11);
+                                assert_eq!(permissions & !read_search, 0);
+                                assert_eq!(entry["flags"], 0);
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert!(journal.outputs.is_empty() && journal.pending.is_empty());
+        assert_eq!(acl(&project), before);
+        journal.finish(Deadline::from_millis(3000)).unwrap();
+        assert!(journal.closed);
+    }
+
+    fn pad_with_empty_events(journal: &mut PermissionJournal, length: u64) {
+        journal.file.seek(SeekFrom::End(0)).unwrap();
+        let buffer = [b'\n'; 8192];
+        while journal.file.metadata().unwrap().len() < length {
+            let count =
+                (length - journal.file.metadata().unwrap().len()).min(buffer.len() as u64) as usize;
+            journal.file.write_all(&buffer[..count]).unwrap();
+        }
+        journal.file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn a_full_work_history_checkpoints_exact_guards_and_still_finishes_inspection() {
+        use glass_macos::workspace_access::{Access, Recorder, Sharing};
+        use std::sync::{Arc, Mutex};
+        let (_root, project, store, _) = output_fixture();
+        let protected = project.join("evidence");
+        std::fs::create_dir(&protected).unwrap();
+        let journal = Arc::new(Mutex::new(journal(&store)));
+        let recorder: Recorder = journal.clone();
+        let mut sharing = Sharing::recorded(u32::MAX, recorder).unwrap();
+        sharing
+            .path_excluding(
+                &project,
+                Access::ReadWrite,
+                std::slice::from_ref(&protected),
+            )
+            .unwrap();
+        let scope = OutputScope::capture_shared(
+            &project,
+            u32::MAX,
+            std::slice::from_ref(&protected),
+            &sharing,
+        )
+        .unwrap();
+        {
+            let mut journal = journal.lock().unwrap();
+            journal.output_pending(scope).unwrap();
+            journal.revoke_access(Deadline::UNBOUNDED).unwrap();
+            let header = journal.header.clone();
+            let next = journal.next;
+            let next_output = journal.next_output;
+            let guards: Vec<_> = journal.pending.keys().copied().collect();
+            assert!(!guards.is_empty() && next > guards.len() as u64 + 1);
+            pad_with_empty_events(&mut journal, LIMIT - 100);
+            journal
+                .reconcile_outputs(
+                    Deadline::from_millis(5000),
+                    &mut |_, _| Ok(Vec::new()),
+                    &mut |_, _| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(journal.header, header);
+            assert_eq!(journal.next_output, next_output);
+            assert!(journal.next > next);
+            assert_eq!(journal.pending.keys().copied().collect::<Vec<_>>(), guards);
+            assert!(journal.file.metadata().unwrap().len() < LIMIT / 2);
+        }
+        sharing.restore().unwrap();
+        journal
+            .lock()
+            .unwrap()
+            .finish(Deadline::from_millis(3000))
+            .unwrap();
+        drop(sharing);
+        drop(journal);
+        let mut reopened =
+            PermissionJournal::open(&store, u32::MAX, "test-account".into(), None, None).unwrap();
+        reopened.finish(Deadline::from_millis(3000)).unwrap();
+    }
+
+    #[test]
+    fn output_settlement_consumes_its_reserve_at_the_limit() {
+        let (_root, _project, store, scope) = output_fixture();
+        let mut journal = journal(&store);
+        journal.output_pending(scope).unwrap();
+        pad_with_empty_events(&mut journal, LIMIT - 100);
+        journal.append(&Event::OutputReconciled { id: 1 }).unwrap();
+        journal.outputs.remove(&1);
+        journal.append(&Event::Closed).unwrap();
+        assert!(journal.file.metadata().unwrap().len() <= LIMIT);
+    }
+
+    #[test]
+    fn post_rename_sync_failure_keeps_the_named_inode_locked_and_poisoned() {
+        let (_root, _project, store, scope) = output_fixture();
+        let mut journal = journal(&store);
+        journal.output_pending(scope).unwrap();
+        let bytes = std::fs::read(store.join("pending.jsonl")).unwrap();
+        assert!(
+            journal
+                .replace_file(&bytes, |_| Err(io::Error::other(
+                    "injected directory sync failure"
+                )))
+                .is_err()
+        );
+        assert!(journal.poisoned);
+        let named = File::open(store.join("pending.jsonl")).unwrap();
+        assert_eq!(
+            named.metadata().unwrap().ino(),
+            journal.file.metadata().unwrap().ino()
+        );
+        assert!(fs4::FileExt::try_lock(&named).is_err());
+        assert!(journal.append(&Event::WorkStarted).is_err());
+        drop(journal);
+        fs4::FileExt::try_lock(&named).unwrap();
+        fs4::FileExt::unlock(&named).unwrap();
+        let mut recovered = PermissionJournal::open_with_outputs(
+            &store,
+            u32::MAX,
+            "test-account".into(),
+            None,
+            None,
+            &mut |_, _| Ok(Vec::new()),
+            &mut |_, _| Ok(()),
+        )
+        .unwrap();
+        recovered.finish(Deadline::from_millis(3000)).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_replay_rejects_bad_position_counters_and_protected_boundaries() {
+        for mode in 0..5 {
+            let (_root, project, store, scope) = output_fixture();
+            let before = acl(&project);
+            let mut journal = journal(&store);
+            let mut value = Checkpoint {
+                next: 1,
+                next_output: 2,
+                pending: Vec::new(),
+                outputs: vec![(1, scope.clone())],
+            };
+            match mode {
+                0 => {
+                    journal
+                        .append(&Event::OutputPending { id: 1, scope })
+                        .unwrap();
+                }
+                1 => value.outputs.push((1, scope.clone())),
+                2 => value.next_output = 1,
+                3 => {
+                    let mut altered = serde_json::to_value(scope).unwrap();
+                    altered["protected_paths"] =
+                        serde_json::json!(["/private/changed-protected-boundary"]);
+                    value
+                        .outputs
+                        .push((2, serde_json::from_value(altered).unwrap()));
+                    value.next_output = 3;
+                }
+                4 => {
+                    journal.header.version = 3;
+                    journal.reset().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            journal.append(&Event::Checkpoint { value }).unwrap();
+            drop(journal);
+            let mut repairs = 0;
+            assert!(
+                PermissionJournal::open_with_outputs(
+                    &store,
+                    u32::MAX,
+                    "test-account".into(),
+                    None,
+                    None,
+                    &mut |_, _| Ok(Vec::new()),
+                    &mut |_, _| {
+                        repairs += 1;
+                        Ok(())
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(repairs, 0);
+            assert_eq!(acl(&project), before);
+        }
+    }
+
+    #[test]
+    fn interrupted_inspection_is_revoked_before_recovery_and_loss_keeps_output_pending() {
+        let (_root, project, store, scope) = output_fixture();
+        let before = acl(&project);
+        let mut first = journal(&store);
+        first.output_pending(scope.clone()).unwrap();
+        scope
+            .grant_inspection(u32::MAX, &mut first, Deadline::UNBOUNDED)
+            .unwrap();
+        assert_ne!(acl(&project), before);
+        drop(first);
+        let result = PermissionJournal::open_with_outputs(
+            &store,
+            u32::MAX,
+            "test-account".into(),
+            None,
+            None,
+            &mut |_, _| {
+                assert_eq!(acl(&project), before);
+                Ok(Vec::new())
+            },
+            &mut |_, _| Err(io::Error::other("injected broker loss")),
+        );
+        assert!(result.is_err());
+        assert_eq!(acl(&project), before);
+        let events: Vec<Event> = std::fs::read_to_string(store.join("pending.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::OutputPending { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::OutputReconciled { .. } | Event::Closed))
+        );
+        let mut repairs = 0;
+        let mut recovered = PermissionJournal::open_with_outputs(
+            &store,
+            u32::MAX,
+            "test-account".into(),
+            None,
+            None,
+            &mut |_, _| Ok(Vec::new()),
+            &mut |_, _| {
+                repairs += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(repairs, 1);
+        assert!(recovered.outputs.is_empty() && recovered.pending.is_empty());
+        assert_eq!(acl(&project), before);
+        recovered.finish(Deadline::from_millis(3000)).unwrap();
+    }
+
+    #[test]
+    fn failed_repair_retries_only_with_bounded_progress_and_never_closes() {
+        let (_root, project, store, scope) = output_fixture();
+        let before = acl(&project);
+        let mut journal = journal(&store);
+        journal.output_pending(scope).unwrap();
+        let mut calls = 0;
+        assert!(
+            journal
+                .reconcile_outputs(
+                    Deadline::from_millis(3000),
+                    &mut |_, _| Ok(Vec::new()),
+                    &mut |_, _| {
+                        calls += 1;
+                        Err(io::Error::new(io::ErrorKind::WouldBlock, "still blocked"))
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(calls, 2);
+        assert!(journal.outputs.len() == 1 && journal.pending.is_empty() && !journal.closed);
+        assert_eq!(acl(&project), before);
+        assert!(journal.finish(Deadline::from_millis(3000)).is_err());
+    }
+
+    #[test]
+    fn known_live_work_prevents_inspection_grants_and_output_completion() {
+        let (_root, project, store, scope) = output_fixture();
+        let before = acl(&project);
+        let mut journal = journal(&store);
+        journal.output_pending(scope).unwrap();
+        journal
+            .header
+            .work
+            .as_mut()
+            .unwrap()
+            .work
+            .roots
+            .push(work::observe(std::process::id(), rustix::process::geteuid().as_raw()).unwrap());
+        let mut repairs = 0;
+        assert!(
+            journal
+                .reconcile_outputs(
+                    Deadline::from_millis(200),
+                    &mut |_, _| Ok(Vec::new()),
+                    &mut |_, _| {
+                        repairs += 1;
+                        Ok(())
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(repairs, 0);
+        assert_eq!(acl(&project), before);
+        assert!(journal.outputs.len() == 1 && journal.pending.is_empty());
+    }
+
+    #[test]
+    fn invalid_permissions_do_not_trigger_additive_repair_or_revoke_a_valid_prefix() {
+        let (_root, project, store, scope) = output_fixture();
+        let mut journal = journal(&store);
+        journal.output_pending(scope.clone()).unwrap();
+        scope
+            .grant_inspection(u32::MAX, &mut journal, Deadline::UNBOUNDED)
+            .unwrap();
+        let granted = acl(&project);
+        let id = *journal.pending.keys().next().unwrap();
+        let mut change = serde_json::to_value(&journal.pending[&id]).unwrap();
+        let permissions = change["additions"][0]["permissions"].as_u64().unwrap();
+        change["additions"][0]["permissions"] = (permissions | (1 << 12)).into();
+        journal
+            .pending
+            .insert(id, serde_json::from_value(change).unwrap());
+        let mut repairs = 0;
+        let result = journal.recover_with_outputs(
+            Deadline::from_millis(3000),
+            &mut |_, _| Ok(Vec::new()),
+            &mut |_, _| {
+                repairs += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(repairs, 0);
+        assert_eq!(acl(&project), granted);
+        assert!(journal.outputs.len() == 1 && !journal.closed);
+    }
+
+    #[test]
+    fn old_headers_and_unrevoked_inspection_cannot_accept_output_completion() {
+        for legacy in [true, false] {
+            let (_root, _project, store, scope) = output_fixture();
+            let mut journal = journal(&store);
+            if legacy {
+                journal.header.version = 3;
+                journal.reset().unwrap();
+            }
+            journal
+                .append(&Event::OutputPending {
+                    id: 1,
+                    scope: scope.clone(),
+                })
+                .unwrap();
+            if !legacy {
+                scope
+                    .grant_inspection(u32::MAX, &mut journal, Deadline::UNBOUNDED)
+                    .unwrap();
+                journal.append(&Event::OutputReconciled { id: 1 }).unwrap();
+                journal.revoke_access(Deadline::UNBOUNDED).unwrap();
+            }
+            drop(journal);
+            assert!(
+                PermissionJournal::open(&store, u32::MAX, "test-account".into(), None, None)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1110,7 +1870,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(next.header.version, 3);
+        assert_eq!(next.header.version, 4);
         assert_eq!(next.header.worker, u32::MAX - 1);
         assert_eq!(next.header.account, "another-account");
         assert_eq!(next.header.session, Some(42));
@@ -1368,7 +2128,7 @@ mod tests {
     fn work_roots_and_pending_launches_are_durable_before_settlement() {
         let root = test_root();
         let mut journal = journal(root.path());
-        assert_eq!(journal.header.version, 3);
+        assert_eq!(journal.header.version, 4);
         journal
             .observe_work(
                 WorkSnapshot {

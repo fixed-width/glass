@@ -328,6 +328,59 @@ fn inspect_services(
     run().map_err(std::io::Error::other)
 }
 
+fn reconcile_outputs(
+    stream: &mut UnixStream,
+    scopes: &[glass_macos::workspace_access::outputs::OutputScope],
+    deadline: Deadline,
+) -> std::io::Result<()> {
+    use sha2::Digest;
+    let mut run = || -> Result<Option<String>> {
+        for scope in scopes {
+            let request = OutputRequest {
+                expires_ns: crate::backend_worker::expires(deadline)?,
+                nonce: rand::random(),
+                scope: scope.for_worker(),
+            };
+            let bytes = serde_json::to_vec(&request).map_err(error)?;
+            let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+            send(stream, RECONCILE_OUTPUT, &bytes, deadline, None)?;
+            let (kind, response) = receive(stream, deadline, None)?;
+            if kind != OUTPUT_RESULT {
+                return Err(error("output reconciliation did not match its authority"));
+            }
+            let receipt: OutputReceipt = serde_json::from_slice(&response).map_err(error)?;
+            if receipt.digest != digest {
+                return Err(error("output reconciliation did not match its authority"));
+            }
+            if receipt.error.is_some() {
+                return Ok(receipt.error);
+            }
+        }
+        Ok(None)
+    };
+    match run().map_err(std::io::Error::other)? {
+        None => Ok(()),
+        Some(failure) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("partial output reconciliation: {failure}"),
+        )),
+    }
+}
+
+fn require_output_frame(scope: &glass_macos::workspace_access::outputs::OutputScope) -> Result<()> {
+    let maximum = OutputRequest {
+        expires_ns: Some(u64::MAX),
+        nonce: [255; 16],
+        scope: scope.for_worker(),
+    };
+    if serde_json::to_vec(&maximum).map_err(error)?.len() > MAX_FRAME {
+        return Err(
+            error("output authority exceeds the recovery transport limit").before_dispatch(),
+        );
+    }
+    Ok(())
+}
+
 fn close_broker(
     stream: &UnixStream,
     process: Option<glass_macos::private_session::ProcessIdentity>,
@@ -349,22 +402,32 @@ fn close_broker(
     Ok(())
 }
 
+fn recovery_broker<'a>(
+    connection: &'a mut Option<BrokerConnection>,
+    worker: u32,
+    lease: &File,
+    deadline: Deadline,
+) -> std::io::Result<&'a mut BrokerConnection> {
+    if connection.is_none() {
+        let broker = connect_broker_until(Some(lease.try_clone()?), deadline)
+            .map_err(std::io::Error::other)?;
+        if broker.greeting.worker != worker {
+            return Err(std::io::Error::other("recovery worker account changed"));
+        }
+        *connection = Some(broker);
+    }
+    connection
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("recovery executor unavailable"))
+}
+
 pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &File) -> Result<()> {
-    let mut connection: Option<BrokerConnection> = None;
+    let connection = std::cell::RefCell::new(None);
     let result = (|| {
         let mut inspect = |processes: &[glass_macos::private_session::ProcessIdentity],
                            deadline| {
-            if connection.is_none() {
-                let broker = connect_broker_until(Some(lease.try_clone()?), deadline)
-                    .map_err(std::io::Error::other)?;
-                if broker.greeting.worker != worker {
-                    return Err(std::io::Error::other("recovery worker account changed"));
-                }
-                connection = Some(broker);
-            }
-            let broker = connection
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("recovery inspector unavailable"))?;
+            let mut connection = connection.borrow_mut();
+            let broker = recovery_broker(&mut connection, worker, lease, deadline)?;
             let candidates: Vec<_> = processes
                 .iter()
                 .copied()
@@ -383,20 +446,27 @@ pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &F
             }
             Ok(idle)
         };
-        let mut journal = crate::permission_journal::PermissionJournal::open_with(
+        let mut repair = |scopes: &[glass_macos::workspace_access::outputs::OutputScope],
+                          deadline| {
+            let mut connection = connection.borrow_mut();
+            let broker = recovery_broker(&mut connection, worker, lease, deadline)?;
+            reconcile_outputs(&mut broker.stream, scopes, deadline)
+        };
+        let mut journal = crate::permission_journal::PermissionJournal::open_with_outputs(
             &crate::permission_journal::PermissionJournal::root().map_err(error)?,
             worker,
             binding,
             None,
             None,
             &mut inspect,
+            &mut repair,
         )
         .map_err(error)?;
         journal
-            .finish_with(Deadline::from_millis(8000), &mut inspect)
+            .finish_with_outputs(Deadline::from_millis(8000), &mut inspect, &mut repair)
             .map_err(error)
     })();
-    let closed = connection.as_ref().map_or(Ok(()), |broker| {
+    let closed = connection.borrow().as_ref().map_or(Ok(()), |broker| {
         close_broker(
             &broker.stream,
             Some(broker.greeting.process),
@@ -427,17 +497,25 @@ impl NativeConnection {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-        let journal = Arc::new(Mutex::new(
-            crate::permission_journal::PermissionJournal::open_with(
-                &crate::permission_journal::PermissionJournal::root().map_err(error)?,
-                glass_macos::private_session::worker_uid(),
-                account,
-                Some(greeting.session),
-                Some(greeting.process),
-                &mut |processes, deadline| inspect_services(&mut stream, processes, deadline),
-            )
-            .map_err(error)?,
-        ));
+        let journal = {
+            let stream = std::cell::RefCell::new(&mut stream);
+            Arc::new(Mutex::new(
+                crate::permission_journal::PermissionJournal::open_with_outputs(
+                    &crate::permission_journal::PermissionJournal::root().map_err(error)?,
+                    glass_macos::private_session::worker_uid(),
+                    account,
+                    Some(greeting.session),
+                    Some(greeting.process),
+                    &mut |processes, deadline| {
+                        inspect_services(&mut stream.borrow_mut(), processes, deadline)
+                    },
+                    &mut |scopes, deadline| {
+                        reconcile_outputs(&mut stream.borrow_mut(), scopes, deadline)
+                    },
+                )
+                .map_err(error)?,
+            ))
+        };
         let mut connection = Self {
             _environment_lease: environment_lease,
             stream,
@@ -552,6 +630,9 @@ impl NativeConnection {
     fn restore_permissions(&mut self, deadline: Deadline) -> Result<()> {
         let journal = &self.journal;
         if self.cleanup == CleanupPhase::WaitingForIdle {
+            if let Some(prepare) = &mut self.prepare {
+                prepare.revoke_access(deadline).map_err(error)?;
+            }
             journal
                 .lock()
                 .map_err(|_| error("permission journal is poisoned"))?
@@ -578,6 +659,19 @@ impl NativeConnection {
                     .map_err(error)
             },
             || {
+                journal
+                    .lock()
+                    .map_err(|_| error("permission journal is poisoned"))?
+                    .reconcile_outputs(
+                        deadline,
+                        &mut |processes, deadline| {
+                            inspect_services(&mut stream.borrow_mut(), processes, deadline)
+                        },
+                        &mut |scopes, deadline| {
+                            reconcile_outputs(&mut stream.borrow_mut(), scopes, deadline)
+                        },
+                    )
+                    .map_err(error)?;
                 prepare
                     .as_mut()
                     .map_or(Ok(()), NativePrepare::restore)
@@ -624,6 +718,7 @@ impl Connection for NativeConnection {
             .prepare
             .as_mut()
             .ok_or_else(|| error("private backend was not initialized").before_dispatch())?;
+        let mut output_authority = None;
         match &mut operation {
             Operation::Configure(paths) => {
                 let root = self
@@ -647,7 +742,17 @@ impl Connection for NativeConnection {
                 }
             }
             Operation::Start(spec) => match prepare.prepare_spec(spec) {
-                Ok(()) => {}
+                Ok(scope) => {
+                    if let Some(scope) = &scope {
+                        require_output_frame(scope)?;
+                        self.journal
+                            .lock()
+                            .map_err(|_| error("permission journal is poisoned"))?
+                            .output_pending(scope.clone())
+                            .map_err(|failure| error(failure).before_dispatch())?;
+                    }
+                    output_authority = Some(scope);
+                }
                 Err(PreparationError::Refused(refused)) => {
                     return Err(error(refused).before_dispatch());
                 }
@@ -657,6 +762,19 @@ impl Connection for NativeConnection {
                 }
             },
             _ => {}
+        }
+        if let Some(scope) = output_authority {
+            let response = self.call(
+                Operation::OutputAuthority(scope.map(|scope| scope.for_worker())),
+                deadline,
+            )?;
+            if !matches!(response.result?, crate::backend_worker::Value::Unit) {
+                self.poisoned = true;
+                return Err(error(
+                    "output authority did not receive its readiness acknowledgement",
+                )
+                .before_dispatch());
+            }
         }
         self.sequence += 1;
         let request = Request {
@@ -792,6 +910,63 @@ impl Drop for NativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_recovery_accepts_only_the_fresh_authority_receipt() {
+        use sha2::Digest;
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let scope = glass_macos::workspace_access::outputs::OutputScope::capture(
+            root.path(),
+            u32::MAX,
+            &[],
+        )
+        .unwrap();
+        for mode in 0..3 {
+            let (mut owner, mut worker) = UnixStream::pair().unwrap();
+            owner.set_nonblocking(true).unwrap();
+            worker.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = Deadline::from_millis(3000);
+                let (kind, bytes) = receive(&mut worker, deadline, None).unwrap();
+                assert_eq!(kind, RECONCILE_OUTPUT);
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(
+                    request["scope"]["inspection"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                let mut digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+                if mode == 1 {
+                    digest[0] ^= 1;
+                }
+                let receipt = OutputReceipt {
+                    digest,
+                    error: (mode == 2).then(|| "blocked descendant".into()),
+                };
+                send(
+                    &mut worker,
+                    OUTPUT_RESULT,
+                    &serde_json::to_vec(&receipt).unwrap(),
+                    deadline,
+                    None,
+                )
+                .unwrap();
+            });
+            let result = reconcile_outputs(
+                &mut owner,
+                std::slice::from_ref(&scope),
+                Deadline::from_millis(3000),
+            );
+            match mode {
+                0 => result.unwrap(),
+                1 => assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other),
+                2 => assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock),
+                _ => unreachable!(),
+            }
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn aggregate_cleanup_budget_preserves_an_earlier_caller_deadline() {

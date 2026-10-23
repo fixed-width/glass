@@ -16,6 +16,8 @@ pub(crate) struct Request {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Operation {
+    #[cfg(target_os = "macos")]
+    OutputAuthority(Option<glass_macos::workspace_access::outputs::OutputScope>),
     Info,
     Configure(Vec<ProtectedHostPath>),
     Start(AppSpec),
@@ -129,7 +131,7 @@ pub(crate) fn expires(deadline: Deadline) -> Result<Option<u64>> {
         .transpose()
 }
 
-fn deadline(expires_ns: Option<u64>) -> Result<Deadline> {
+pub(crate) fn deadline(expires_ns: Option<u64>) -> Result<Deadline> {
     match expires_ns {
         None => Ok(Deadline::UNBOUNDED),
         Some(expires) => Ok(Deadline::at(
@@ -201,6 +203,11 @@ impl<P: Platform, A: Accessibility> Dispatcher<P, A> {
             return Err(GlassError::deadline_not_started("backend worker operation"));
         }
         match operation {
+            #[cfg(target_os = "macos")]
+            Operation::OutputAuthority(_) => Err(GlassError::Backend(
+                "output authority requires the private native worker".into(),
+            )
+            .before_dispatch()),
             Operation::Info => Ok(Value::Unit),
             Operation::Configure(paths) => self
                 .platform

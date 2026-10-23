@@ -12,6 +12,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
+use glass_core::Deadline;
 use serde::{Deserialize, Serialize};
 
 use rustix::fs::{Dir, FileType, Mode, OFlags, open, openat};
@@ -178,6 +179,36 @@ pub trait RecordChanges: Send {
 /// Shared recorder for independently rolled-back permission scopes.
 pub type Recorder = Arc<Mutex<dyn RecordChanges>>;
 
+#[derive(Debug)]
+struct PermissionLookupDenied(io::Error);
+
+impl std::fmt::Display for PermissionLookupDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "permission recovery path is inaccessible: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for PermissionLookupDenied {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn lookup_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            PermissionLookupDenied(error),
+        )
+    } else {
+        error
+    }
+}
+
 /// Refuse a recovery store with an ACL that authorizes another principal.
 pub fn require_owner_private(file: &File) -> io::Result<()> {
     let owner = rustix::process::geteuid().as_raw();
@@ -201,6 +232,34 @@ pub fn require_owner_private(file: &File) -> io::Result<()> {
 }
 
 impl PermissionChange {
+    /// Distinguish path-resolution failures from invalid evidence or ACL-write denials.
+    pub fn path_inaccessible(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|error| error.is::<PermissionLookupDenied>())
+    }
+
+    /// Validate recorded principals and allowed operations without changing the filesystem.
+    pub fn validate(&self, worker_uid: u32) -> io::Result<()> {
+        let sharing = Sharing::new(worker_uid)?;
+        self.validate_for(&sharing)?;
+        if self.additions.iter().any(|entry| {
+            entry.tag == Tag::Allow
+                && entry.principal == sharing.worker
+                && entry.permissions & WRITE_SECURITY != 0
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker ACL-edit authority is not owned",
+            ));
+        }
+        Ok(())
+    }
+    /// Whether this record carries temporary access, rather than protective denials alone.
+    pub fn has_allow(&self) -> bool {
+        self.additions.iter().any(|entry| entry.tag == Tag::Allow)
+    }
+
     /// Recover the same filesystem object, including after a rename; never act on its replacement.
     /// An unlinked object with no pathname has no grant reachable by a later open.
     pub fn restore(&self, worker_uid: u32) -> io::Result<()> {
@@ -214,6 +273,17 @@ impl PermissionChange {
 
     fn restore_for(&self, worker_uid: u32, retain_denials: bool) -> io::Result<bool> {
         let sharing = Sharing::new(worker_uid)?;
+        self.validate_for(&sharing)?;
+        if retain_denials && self.additions.iter().any(|entry| entry.tag == Tag::Deny) {
+            return Ok(false);
+        }
+        if let Some(file) = self.resolved_file()? {
+            self.restore_file(&file)?;
+        }
+        Ok(true)
+    }
+
+    fn validate_for(&self, sharing: &Sharing) -> io::Result<()> {
         if self.additions.is_empty()
             || self.additions.iter().any(|entry| match entry.tag {
                 Tag::Allow => {
@@ -233,13 +303,7 @@ impl PermissionChange {
                 "permission recovery evidence is not owned",
             ));
         }
-        if retain_denials && self.additions.iter().any(|entry| entry.tag == Tag::Deny) {
-            return Ok(false);
-        }
-        if let Some(file) = self.resolved_file()? {
-            self.restore_file(&file)?;
-        }
-        Ok(true)
+        Ok(())
     }
 
     fn resolved_file(&self) -> io::Result<Option<File>> {
@@ -258,7 +322,7 @@ impl PermissionChange {
             return Ok(None);
         }
         if code != 0 {
-            return Err(io::Error::from_raw_os_error(code));
+            return Err(lookup_error(io::Error::from_raw_os_error(code)));
         }
         let end = path.iter().position(|&byte| byte == 0).ok_or_else(|| {
             io::Error::new(
@@ -267,11 +331,14 @@ impl PermissionChange {
             )
         })?;
         use std::os::unix::ffi::OsStrExt;
-        let file = File::from(open(
-            Path::new(std::ffi::OsStr::from_bytes(&path[..end])),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
+        let file = File::from(
+            open(
+                Path::new(std::ffi::OsStr::from_bytes(&path[..end])),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| lookup_error(error.into()))?,
+        );
         if FileIdentity::read(&file)? != self.identity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -915,18 +982,50 @@ impl Sharing {
     /// Remove only this connection's additions from the current ACLs, retaining user edits.
     /// Errors keep unresolved entries owned by this object for an explicit retry or inspection.
     pub fn restore(&mut self) -> io::Result<()> {
+        self.restore_tags(&[Tag::Allow, Tag::Deny], false, Deadline::UNBOUNDED)
+    }
+
+    /// Revoke allows through pinned descriptors even after a parent stops permitting path lookup.
+    /// Mixed records retain their denials until full restoration.
+    pub fn revoke_access(&mut self, deadline: Deadline) -> io::Result<()> {
+        self.restore_tags(&[Tag::Allow], true, deadline)
+    }
+
+    fn restore_tags(
+        &mut self,
+        tags: &[Tag],
+        retain_guards: bool,
+        deadline: Deadline,
+    ) -> io::Result<()> {
         // Keep evidence denials until every temporary allow has been removed.
-        for tag in [Tag::Allow, Tag::Deny] {
+        for &tag in tags {
             let mut failure = None;
             for node in self.nodes.values_mut() {
+                if deadline.has_passed() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "workspace revocation deadline elapsed",
+                    ));
+                }
                 if !node.owned.iter().any(|entry| entry.tag == tag) {
                     continue;
                 }
                 let result = (|| {
                     if let Some(recorder) = &self.recorder {
                         for index in (0..node.records.len()).rev() {
+                            if deadline.has_passed() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "workspace revocation deadline elapsed",
+                                ));
+                            }
                             let (record, change) = &node.records[index];
                             if !change.additions.iter().any(|entry| entry.tag == tag) {
+                                continue;
+                            }
+                            if retain_guards
+                                && change.additions.iter().any(|entry| entry.tag == Tag::Deny)
+                            {
                                 continue;
                             }
                             let mut recorder = recorder
@@ -954,7 +1053,13 @@ impl Sharing {
                         }
                         acl.write(&node.file)?;
                     }
-                    node.owned.retain(|entry| entry.tag != tag);
+                    node.owned.retain(|entry| {
+                        entry.tag != tag
+                            || node
+                                .records
+                                .iter()
+                                .any(|(_, change)| change.additions.contains(entry))
+                    });
                     Ok::<_, io::Error>(())
                 })();
                 if let Err(error) = result {
@@ -1095,6 +1200,56 @@ mod tests {
         sharing.restore().unwrap();
         assert_eq!(entries(&file), before);
         assert_eq!(recorder.lock().unwrap().settled, vec![1]);
+    }
+
+    #[test]
+    fn pinned_revocation_survives_an_inaccessible_parent_and_keeps_guards() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let project = root.path().join("project");
+        let protected = project.join("evidence");
+        let original = project.join("normal");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("source"), "source").unwrap();
+        let records = Arc::new(Mutex::new(Recorded::default()));
+        let mut sharing = same_user_sharing();
+        sharing.recorder = Some(records.clone());
+        sharing
+            .path_excluding(
+                &project,
+                Access::ReadWrite,
+                std::slice::from_ref(&protected),
+            )
+            .unwrap();
+        let change = records
+            .lock()
+            .unwrap()
+            .changes
+            .iter()
+            .find(|change| {
+                change.resolved_file().unwrap().is_some_and(|file| {
+                    file.metadata().unwrap().ino() == original.metadata().unwrap().ino()
+                })
+            })
+            .unwrap()
+            .clone();
+        let hidden = root.path().join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::rename(&original, hidden.join("normal")).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = change.restore(sharing.worker_uid).unwrap_err();
+        assert!(PermissionChange::path_inaccessible(&error));
+        sharing.revoke_access(Deadline::from_millis(3000)).unwrap();
+        let protected_file = File::open(&protected).unwrap();
+        assert!(
+            entries(&protected_file)
+                .iter()
+                .any(|entry| entry.tag == Tag::Deny)
+        );
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(entries(&File::open(hidden.join("normal")).unwrap()).is_empty());
+        sharing.restore().unwrap();
+        assert!(entries(&protected_file).is_empty());
     }
 
     #[test]

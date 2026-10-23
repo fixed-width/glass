@@ -103,9 +103,11 @@ unenrollment; another normal user's setup cannot claim that creation record.
 The requested workspace is shared read/write for the run. Existing executable search paths and
 existing file/directory arguments receive read access; unrelated environment values are not treated
 as file-sharing requests. Temporary access is recorded before changes and restored after owned work
-has stopped. Generated files may belong to the development account; inherited permissions retain
-your read/write access. A surviving process, new background activity in that account or an unavailable
-filesystem can defer recovery; Glass reports that failure and preserves its journal for retry. Account homes, keychains and credentials are not copied.
+has stopped. Generated files may belong to the development account; Glass preserves your edit
+access in the selected workspace, including files atomically moved in from temporary storage.
+File contents and modes are preserved. Unreadable files, explicit access denials, surviving work
+or an unavailable filesystem can defer cleanup; Glass reports that failure and keeps its recovery
+journal for retry. Account homes, keychains and credentials are not copied.
 Default Seatbelt containment and protected artifact/trace paths still apply.
 
 Use `glass-mcp status` to inspect enrollment and whether the environment is in use. Use `glass_stop`
@@ -138,7 +140,8 @@ reservation after administrator authentication without changing the existing acc
 
 This is a preview. Setup, worker re-registration, and changed-build development loops through both
 stdio and HTTP have been tested on an Apple Silicon Mac mini without a physical monitor connected,
-using an existing initialized login. Simultaneous physical keyboard/mouse use remains unqualified.
+using an existing initialized login. Physical keyboard/mouse coexistence has also been checked
+in that retained-login setup.
 The current worker requires that account's graphical login; unattended startup after a reboot is
 not implemented. Keep the account logged in; after a restart, log into it again. This does not change
 Windows's shared-desktop behavior.

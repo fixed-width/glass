@@ -7,8 +7,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use glass_core::Deadline;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, open, openat, statat};
@@ -39,7 +39,7 @@ unsafe extern "C" {
 }
 
 /// Authority captured by the normal caller before dispatching private workspace work.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputScope {
     owner: u32,
@@ -50,9 +50,32 @@ pub struct OutputScope {
     identity: FileIdentity,
     protected_paths: Vec<PathBuf>,
     protected_identities: Vec<FileIdentity>,
+    inspection: Vec<InspectionDirectory>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectionDirectory {
+    identity: FileIdentity,
+    readable: bool,
 }
 
 impl OutputScope {
+    /// All writable roots in one lease must retain the same protected-object boundary.
+    pub fn same_protection(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.worker == other.worker
+            && self.owner_principal == other.owner_principal
+            && self.worker_principal == other.worker_principal
+            && self.protected_paths == other.protected_paths
+            && self.protected_identities == other.protected_identities
+    }
+    /// Private executors need root authority, not the normal actor's inspection capabilities.
+    pub fn for_worker(&self) -> Self {
+        let mut scope = self.clone();
+        scope.inspection.clear();
+        scope
+    }
     /// Capture one already-authorized writable root and the existing protected nodes.
     /// The caller must have selected this root for read/write access, not search-only access.
     pub fn capture(root: &Path, worker: u32, protected: &[PathBuf]) -> io::Result<Self> {
@@ -86,6 +109,16 @@ impl OutputScope {
                 protected_identities.push(FileIdentity::read(file)?);
             }
         }
+        let mut inspection = Vec::new();
+        for (index, ancestor) in path.ancestors().enumerate() {
+            let file = File::open(ancestor)?;
+            if file.metadata()?.uid() == owner {
+                inspection.push(InspectionDirectory {
+                    identity: FileIdentity::read(&file)?,
+                    readable: index == 0,
+                });
+            }
+        }
         Ok(Self {
             owner,
             worker,
@@ -95,7 +128,186 @@ impl OutputScope {
             identity,
             protected_paths,
             protected_identities,
+            inspection,
         })
+    }
+
+    /// Include directory access from this exact read/write preparation, excluding read-only inputs.
+    pub fn capture_shared(
+        root: &Path,
+        worker: u32,
+        protected: &[PathBuf],
+        sharing: &Sharing,
+    ) -> io::Result<Self> {
+        let mut scope = Self::capture(root, worker, protected)?;
+        if sharing.worker_uid != worker
+            || sharing.owner != scope.owner_principal
+            || sharing.worker != scope.worker_principal
+        {
+            return Err(refused("output preparation account binding changed"));
+        }
+        for node in sharing.nodes.values() {
+            if node.file.metadata()?.uid() == scope.owner
+                && node.file.metadata()?.is_dir()
+                && node.owned.iter().any(|entry| {
+                    entry.tag == Tag::Allow
+                        && entry.principal == sharing.worker
+                        && entry.permissions & WRITE != 0
+                })
+            {
+                let identity = FileIdentity::read(&node.file)?;
+                if let Some(directory) = scope
+                    .inspection
+                    .iter_mut()
+                    .find(|directory| directory.identity == identity)
+                {
+                    directory.readable = true;
+                } else {
+                    scope.inspection.push(InspectionDirectory {
+                        identity,
+                        readable: true,
+                    });
+                }
+            }
+        }
+        Ok(scope)
+    }
+
+    /// Validate stored structure without requiring an old, fully settled account to still exist.
+    pub fn validate_binding(&self, owner: u32, worker: u32) -> io::Result<()> {
+        if owner == 0
+            || worker == 0
+            || owner == worker
+            || self.owner != owner
+            || self.worker != worker
+            || ![owner, worker].contains(&self.identity.owner)
+            || !self.path.is_absolute()
+            || self
+                .path
+                .components()
+                .any(|part| matches!(part, Component::ParentDir))
+            || self.protected_paths.len() > 4096
+            || self.protected_identities.len() > 4096
+            || self.protected_paths.iter().any(|path| {
+                !path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| matches!(part, Component::ParentDir))
+            })
+            || self.inspection.len() > 1_000_000
+            || self
+                .inspection
+                .iter()
+                .any(|directory| directory.identity.owner != owner)
+        {
+            return Err(refused("output recovery account binding changed"));
+        }
+        Ok(())
+    }
+
+    /// Verify both current principals before any recovery effect, independent of path reachability.
+    pub fn validate_accounts(&self, worker: u32) -> io::Result<()> {
+        let owner = rustix::process::geteuid().as_raw();
+        self.validate_binding(owner, worker)?;
+        if owner != rustix::process::getuid().as_raw()
+            || principal(owner)? != self.owner_principal
+            || principal(worker)? != self.worker_principal
+        {
+            return Err(refused("output recovery account principals changed"));
+        }
+        Ok(())
+    }
+
+    /// Validate a retained guard against the original captured principal, without live lookup.
+    pub fn validate_guard(&self, change: &super::PermissionChange) -> io::Result<()> {
+        if change.additions.is_empty()
+            || change.additions.iter().any(|entry| {
+                entry.tag != Tag::Deny
+                    || entry.principal != self.worker_principal
+                    || entry.permissions != super::DELETE
+                    || entry.flags != 0
+            })
+        {
+            return Err(refused(
+                "output checkpoint contains unowned permission evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate durable authority as its ordinary normal-account owner, before inspection grants.
+    pub fn validate_owner(&self, worker: u32) -> io::Result<()> {
+        self.validate_accounts(worker)?;
+        let file = File::from(open(
+            &self.path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        if FileIdentity::read(&file)? != self.identity {
+            return Err(refused("output recovery root identity changed"));
+        }
+        Ok(())
+    }
+
+    /// After writer quiescence, durably add only non-inheriting directory read/search access.
+    /// The recorder owns revocation even after partial failure; it must settle grants before Closed.
+    pub fn grant_inspection(
+        &self,
+        worker: u32,
+        recorder: &mut dyn super::RecordChanges,
+        deadline: Deadline,
+    ) -> io::Result<usize> {
+        check_deadline(deadline)?;
+        self.validate_owner(worker)?;
+        let mut added = 0;
+        for directory in &self.inspection {
+            check_deadline(deadline)?;
+            if directory.identity.owner != self.owner {
+                return Err(refused(
+                    "output inspection directory belongs to another account",
+                ));
+            }
+            let binding = super::PermissionChange {
+                identity: directory.identity.clone(),
+                before: Vec::new(),
+                additions: Vec::new(),
+            };
+            let resolved = match binding.resolved_file() {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(file) = resolved else {
+                continue;
+            };
+            if !file.metadata()?.is_dir() {
+                return Err(refused("output inspection object is not a directory"));
+            }
+            let entry = Entry {
+                tag: Tag::Allow,
+                principal: self.worker_principal,
+                permissions: EXECUTE | if directory.readable { READ } else { 0 },
+                flags: 0,
+            };
+            let mut acl = Acl::read(&file)?;
+            let before = acl.entries()?;
+            if before.iter().any(|(_, current)| current.covers(&entry)) {
+                continue;
+            }
+            let change = super::PermissionChange {
+                identity: directory.identity.clone(),
+                before: before.into_iter().map(|(_, entry)| entry).collect(),
+                additions: vec![entry.clone()],
+            };
+            recorder.prepared(&change)?;
+            acl.append(&entry)?;
+            acl.write(&file)?;
+            if FileIdentity::read(&file)? != directory.identity {
+                return Err(refused("output inspection directory changed"));
+            }
+            added += 1;
+        }
+        Ok(added)
     }
 
     fn excludes(&self, file: &File, path: &Path) -> io::Result<bool> {
@@ -464,44 +676,50 @@ struct Observation {
 }
 
 struct ObservationState {
-    access: OutputAccess,
+    access: Arc<Mutex<OutputAccess>>,
     failure: Option<String>,
 }
 
 impl Observation {
     fn lock(&self, deadline: Deadline) -> io::Result<std::sync::MutexGuard<'_, ObservationState>> {
-        loop {
-            check_deadline(deadline)?;
-            match self.state.try_lock() {
-                Ok(state) => return Ok(state),
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    return Err(io::Error::other("output observation state is poisoned"));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(
-                    deadline
-                        .remaining()
-                        .unwrap_or(std::time::Duration::from_millis(5))
-                        .min(std::time::Duration::from_millis(5)),
-                ),
-            }
-        }
+        timed_lock(&self.state, deadline)
     }
 
     fn changed(&self, paths: &[PathBuf], full_scan: bool) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let deadline = Deadline::from_millis(5000);
-        let result = if full_scan {
-            state.access.repair(&self.scope, deadline).map(|_| ())
-        } else {
-            paths.iter().try_for_each(|path| {
-                state
-                    .access
-                    .repair_changed(&self.scope, path, deadline)
-                    .map(|_| ())
-            })
-        };
+        let result = (|| {
+            let access = timed_lock(&state.access, deadline)?;
+            if full_scan {
+                access.repair(&self.scope, deadline).map(|_| ())
+            } else {
+                paths.iter().try_for_each(|path| {
+                    access
+                        .repair_changed(&self.scope, path, deadline)
+                        .map(|_| ())
+                })
+            }
+        })();
         if let Err(error) = result {
             state.failure = Some(error.to_string());
+        }
+    }
+}
+
+fn timed_lock<T>(state: &Mutex<T>, deadline: Deadline) -> io::Result<std::sync::MutexGuard<'_, T>> {
+    loop {
+        check_deadline(deadline)?;
+        match state.try_lock() {
+            Ok(state) => return Ok(state),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other("output access state is poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(
+                deadline
+                    .remaining()
+                    .unwrap_or(std::time::Duration::from_millis(5))
+                    .min(std::time::Duration::from_millis(5)),
+            ),
         }
     }
 }
@@ -565,8 +783,20 @@ unsafe impl Send for OutputMonitor {}
 impl OutputMonitor {
     /// Arm observation before scanning so namespace changes during the initial scan are retained.
     pub fn new(scope: OutputScope, owner: u32, deadline: Deadline) -> io::Result<Self> {
-        let access = OutputAccess::new(owner)?;
-        access.open_root(&scope, deadline)?;
+        Self::with_access(
+            scope,
+            Arc::new(Mutex::new(OutputAccess::new(owner)?)),
+            deadline,
+        )
+    }
+
+    /// Serialize repair across overlapping roots and hard-link aliases in one broker.
+    pub fn with_access(
+        scope: OutputScope,
+        access: Arc<Mutex<OutputAccess>>,
+        deadline: Deadline,
+    ) -> io::Result<Self> {
+        timed_lock(&access, deadline)?.open_root(&scope, deadline)?;
         let path = std::ffi::CString::new(scope.path.as_os_str().as_bytes())?;
         let mut observation = Box::new(Observation {
             scope,
@@ -631,7 +861,10 @@ impl OutputMonitor {
                 }
                 continue;
             }
-            repair(&state.access, &self.observation.scope, deadline)?;
+            {
+                let access = timed_lock(&state.access, deadline)?;
+                repair(&access, &self.observation.scope, deadline)?;
+            }
             state.failure = None;
             // A save during recovery can queue behind the state lock. Drain again after releasing it.
         }
@@ -641,10 +874,10 @@ impl OutputMonitor {
     /// event flushing alone cannot include writes that fseventsd has not published yet.
     pub fn reconcile(&self, deadline: Deadline) -> io::Result<()> {
         self.flush(deadline)?;
-        self.observation
-            .lock(deadline)?
-            .access
-            .repair(&self.observation.scope, deadline)?;
+        {
+            let state = self.observation.lock(deadline)?;
+            timed_lock(&state.access, deadline)?.repair(&self.observation.scope, deadline)?;
+        }
         self.flush(deadline)
     }
 }
@@ -673,6 +906,7 @@ mod tests {
             identity: FileIdentity::read(&file).unwrap(),
             protected_paths: Vec::new(),
             protected_identities: Vec::new(),
+            inspection: Vec::new(),
         };
         (access, scope)
     }
@@ -990,7 +1224,7 @@ mod tests {
         let mut observation = Observation {
             scope,
             state: Mutex::new(ObservationState {
-                access,
+                access: Arc::new(Mutex::new(access)),
                 failure: None,
             }),
             generation: AtomicU64::new(0),

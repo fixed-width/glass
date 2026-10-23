@@ -79,6 +79,8 @@ pub(crate) struct NativePrepare {
     closed: bool,
     scopes: Vec<glass_macos::workspace_access::Sharing>,
     recorder: Option<glass_macos::workspace_access::Recorder>,
+    output: Option<glass_macos::workspace_access::outputs::OutputScope>,
+    started: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -105,6 +107,8 @@ impl NativePrepare {
             closed: false,
             scopes: Vec::new(),
             recorder: Some(recorder),
+            output: None,
+            started: false,
         };
         let mut scope = result.new_scope()?;
         if let Err(error) = result.share(
@@ -126,6 +130,12 @@ impl NativePrepare {
         paths: &[glass_core::ProtectedHostPath],
     ) -> Result<(), PreparationError> {
         use std::os::unix::fs::MetadataExt;
+
+        if self.started {
+            return Err(PreparationError::Refused(anyhow::anyhow!(
+                "protected paths cannot change after private application preparation"
+            )));
+        }
 
         let mut scope = self
             .new_scope()
@@ -167,7 +177,7 @@ impl NativePrepare {
     pub(crate) fn prepare_spec(
         &mut self,
         spec: &glass_core::AppSpec,
-    ) -> Result<(), PreparationError> {
+    ) -> Result<Option<glass_macos::workspace_access::outputs::OutputScope>, PreparationError> {
         self.prepare(&StartArgs {
             _rejected_input_mode: None,
             build: spec.build.clone(),
@@ -182,7 +192,8 @@ impl NativePrepare {
             window_hint: None,
             timeout_ms: Some(spec.timeout_ms),
             a11y: Some(spec.a11y),
-        })
+        })?;
+        Ok(self.output.take())
     }
 
     fn share(
@@ -236,6 +247,13 @@ impl NativePrepare {
         }
     }
 
+    pub(crate) fn revoke_access(&mut self, deadline: glass_core::Deadline) -> anyhow::Result<()> {
+        for scope in self.scopes.iter_mut().rev() {
+            scope.revoke_access(deadline)?;
+        }
+        Ok(())
+    }
+
     fn new_scope(&self) -> std::io::Result<glass_macos::workspace_access::Sharing> {
         match &self.recorder {
             Some(recorder) => {
@@ -256,6 +274,7 @@ impl Prepare for NativePrepare {
             )));
         }
         let paths = requested_paths(args, &self.base, self.inherited_path.as_deref());
+        self.output = None;
         let mut scope = self
             .new_scope()
             .map_err(|error| PreparationError::Refused(error.into()))?;
@@ -275,10 +294,26 @@ impl Prepare for NativePrepare {
                     self.share(&mut scope, argument, Access::Read)?;
                 }
             }
-            Ok::<_, anyhow::Error>(())
+            let cwd = paths.cwd.canonicalize()?;
+            let uid = std::os::unix::fs::MetadataExt::uid(&cwd.metadata()?);
+            let output = if cwd != self.home && [self.owner, self.worker].contains(&uid) {
+                Some(
+                    glass_macos::workspace_access::outputs::OutputScope::capture_shared(
+                        &cwd,
+                        self.worker,
+                        &self.protected,
+                        &scope,
+                    )?,
+                )
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>(output)
         })();
         match result {
-            Ok(()) => {
+            Ok(output) => {
+                self.output = output;
+                self.started = true;
                 self.scopes.push(scope);
                 Ok(())
             }
@@ -316,6 +351,8 @@ mod tests {
             closed: false,
             scopes: Vec::new(),
             recorder: None,
+            output: None,
+            started: false,
         };
         let args =
             serde_json::from_value(serde_json::json!({"run":["/usr/bin/true"], "a11y":false}))
