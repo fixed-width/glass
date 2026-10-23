@@ -20,6 +20,7 @@ pub struct SetupProgress {
     pub message: String,
     pub running: bool,
     pub can_cancel: bool,
+    pub start_account: Option<EnvironmentStart>,
 }
 
 pub struct SetupActions {
@@ -29,6 +30,7 @@ pub struct SetupActions {
     pub on_begin: Box<dyn Fn(String)>,
     pub on_disable: Box<dyn Fn()>,
     pub on_create: Box<dyn Fn(NewAccount)>,
+    pub on_start: Box<dyn Fn(StartAccount)>,
     pub poll: Box<dyn Fn() -> SetupProgress>,
     pub can_close: Box<dyn Fn() -> bool>,
 }
@@ -42,6 +44,46 @@ pub struct NewAccount {
 pub struct ResumeCreation {
     pub name: String,
     pub attempt: String,
+}
+
+pub struct StartAccount {
+    pub name: String,
+    pub password: Option<Zeroizing<String>>,
+}
+
+#[derive(Clone)]
+pub struct EnvironmentStart {
+    pub name: String,
+    pub needs_password: bool,
+}
+
+fn start_account_dialog(mtm: MainThreadMarker, name: &str) -> Option<StartAccount> {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Start the development desktop"));
+    alert.setInformativeText(&NSString::from_str(&format!("Enter the password for {name}. Glass uses macOS Screen Sharing locally to start its separate desktop and may request administrator approval. This password stays in memory and is not saved.")));
+    alert.addButtonWithTitle(&NSString::from_str("Start environment"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let password = NSSecureTextField::initWithFrame(
+        NSSecureTextField::alloc(mtm),
+        rect(0.0, 0.0, 360.0, 26.0),
+    );
+    password.setPlaceholderString(Some(&NSString::from_str("Development account password")));
+    alert.setAccessoryView(Some(&password));
+    let result = loop {
+        if alert.runModal() != 1000 {
+            break None;
+        }
+        let value = Zeroizing::new(password.stringValue().to_string());
+        if !value.is_empty() && value.len() <= 63 && !value.contains('\0') && name.len() <= 63 {
+            break Some(StartAccount {
+                name: name.to_owned(),
+                password: Some(value),
+            });
+        }
+        alert.setInformativeText(&NSString::from_str("Local macOS desktop startup supports nonempty passwords and account names up to 63 UTF-8 bytes. Glass will not truncate or change existing credentials."));
+    };
+    password.setStringValue(&NSString::from_str(""));
+    result
 }
 
 fn create_account_dialog(
@@ -233,9 +275,32 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     view.addSubview(&status);
 
     let account_field = account.clone();
+    let start_account = Rc::new(std::cell::RefCell::new(None::<EnvironmentStart>));
+    let start_choice = start_account.clone();
     let begin_target = ButtonTarget::new(
         mtm,
-        Box::new(move || (actions.on_begin)(account_field.stringValue().to_string())),
+        Box::new(move || {
+            let name = account_field.stringValue().to_string();
+            let start = start_choice
+                .borrow()
+                .as_ref()
+                .filter(|account| account.name == name)
+                .cloned();
+            if let Some(start) = start {
+                if !start.needs_password {
+                    (actions.on_start)(StartAccount {
+                        name,
+                        password: None,
+                    });
+                    return;
+                }
+                if let Some(request) = start_account_dialog(mtm, &name) {
+                    (actions.on_start)(request);
+                }
+            } else {
+                (actions.on_begin)(name);
+            }
+        }),
     );
     let begin = button(
         mtm,
@@ -302,6 +367,16 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         Box::new(move || {
             let progress = (actions.poll)();
             status.setStringValue(&NSString::from_str(&progress.message));
+            let starting = progress
+                .start_account
+                .as_ref()
+                .is_some_and(|start| start.name == account.stringValue().to_string());
+            *start_account.borrow_mut() = progress.start_account;
+            begin.setTitle(&NSString::from_str(if starting {
+                "Start environment…"
+            } else {
+                "Set up"
+            }));
             begin.setEnabled(!progress.running);
             create.setEnabled(!progress.running);
             disable.setEnabled(!progress.running);

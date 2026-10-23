@@ -1142,7 +1142,13 @@ fn elevate_using(
 }
 
 mod account_creation;
+mod desktop_start;
 mod guided;
+
+/// Internal privileged startup role; the account password never appears in arguments.
+pub fn start_environment(endpoint: &Path) -> anyhow::Result<()> {
+    desktop_start::privileged(endpoint)
+}
 
 /// Internal, authenticated root role; credentials arrive through its verified local connection.
 pub fn prepare_account(name: &str, endpoint: &Path) -> anyhow::Result<()> {
@@ -1150,6 +1156,10 @@ pub fn prepare_account(name: &str, endpoint: &Path) -> anyhow::Result<()> {
 }
 
 pub(crate) fn application_lease() -> anyhow::Result<crate::macos_setup::Lease> {
+    ensure!(
+        !desktop_start::pending(rustix::process::getuid().as_raw())?,
+        "Glass desktop startup or temporary-access cleanup needs attention; open application setup and choose Start environment"
+    );
     guided::environment_lease(crate::macos_setup::LeaseKind::Application)
 }
 
@@ -1217,6 +1227,12 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         Ok(false) => None,
         Err(error) => Some(Err(error)),
     };
+    let enrolled_name = existing
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|account| account.name.clone());
+    let diagnose =
+        enrolled_name.is_some() && automatic.is_none() && saved.is_none() && saved_error.is_none();
     let creation = if existing.is_none() {
         account_creation::last_created(rustix::process::getuid().as_raw())
     } else {
@@ -1305,6 +1321,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         message,
         running: false,
         can_cancel: true,
+        start_account: None,
     }));
     let cancelled = Arc::new(AtomicBool::new(false));
     let pending_id = Arc::new(Mutex::new(None::<String>));
@@ -1330,6 +1347,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 return;
             }
             state.running = true;
+            state.start_account = None;
             state.can_cancel = false;
             let previous = begin_pending
                 .lock()
@@ -1385,6 +1403,10 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.message = match result {
                         Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
                         Err(error) if error.is::<crate::macos_setup::pending::Superseded>() => "This saved setup was cancelled or replaced. This window did not restart it. Close this window; begin a new setup explicitly if needed.".into(),
+                        Err(error) if error.is::<guided::EnvironmentMissing>() => {
+                            state.start_account = desktop_start::choice(&name).ok();
+                            format!("The development desktop for {name} is not running. Choose Start environment… to start it here; Glass reuses existing registration and permissions.")
+                        }
                         Err(error) if error.is::<guided::AccountCreationIncomplete>() => {
                             match account_creation::completed_identity(rustix::process::getuid().as_raw(), &name) {
                                 Ok(Some(_)) => format!("{error:#}. The account and password are prepared. Choose Set up to finish registration; you do not need to enter the development-account password again."),
@@ -1403,6 +1425,141 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     let create_saved = saved.clone();
     let create_pending = pending_id.clone();
     let resume_begin = begin.clone();
+    let start_state = state.clone();
+    let start_cancelled = cancelled.clone();
+    let on_start = Box::new(move |request: glass_macos::setup_window::StartAccount| {
+        let password = match request
+            .password
+            .map(crate::macos_account::Password::from_text)
+            .transpose()
+        {
+            Ok(password) => password,
+            Err(error) => {
+                if let Ok(mut state) = start_state.lock() {
+                    state.message = error.to_string();
+                }
+                return;
+            }
+        };
+        let mut state = match start_state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.running {
+            return;
+        }
+        state.running = true;
+        state.can_cancel = false;
+        state.start_account = None;
+        state.message = "Starting the development desktop. Complete or cancel macOS approval locally; there is no deadline.".into();
+        drop(state);
+        start_cancelled.store(false, Ordering::Relaxed);
+        let state = start_state.clone();
+        let cancelled = start_cancelled.clone();
+        std::thread::spawn(move || {
+            let name = request.name;
+            let mut password = password;
+            let started = desktop_start::run(
+                &name,
+                &cancelled,
+                || {
+                    password
+                        .take()
+                        .context("the desktop is now missing; choose Start environment again to enter its password")
+                },
+                |progress| {
+                    if let Ok(mut state) = state.lock() {
+                        state.message = progress.message;
+                        state.can_cancel = progress.can_cancel;
+                    }
+                },
+            );
+            drop(password);
+            let mut progress = |progress: crate::macos_setup::Progress| {
+                if let Ok(mut state) = state.lock() {
+                    state.message = progress.message;
+                    state.can_cancel = progress.can_cancel;
+                }
+            };
+            let cleaned = matches!(started, Ok(desktop_start::Outcome::CleanupFinished));
+            let result = started.and_then(|_| {
+                if cleaned {
+                    return guided::continue_existing(&name, &cancelled, &mut progress);
+                }
+                if let Some(saved) = guided::saved()?
+                    && guided::can_resume(&saved)?
+                {
+                    let addr = saved.addr.clone();
+                    guided::run(
+                        guided::Options {
+                            name: &name,
+                            create: None,
+                            non_interactive: false,
+                            launchagent: saved.launchagent,
+                            addr: Some(&addr),
+                            system_dialog: true,
+                            cancelled: &cancelled,
+                            resume: Some(saved),
+                            previous: None,
+                        },
+                        &mut progress,
+                    )
+                } else {
+                    guided::continue_existing(&name, &cancelled, &mut progress)
+                }
+            });
+            if let Ok(mut state) = state.lock() {
+                state.running = false;
+                state.can_cancel = true;
+                state.start_account = result
+                    .as_ref()
+                    .err()
+                    .and_then(|_| desktop_start::choice(&name).ok());
+                state.message = match result {
+                    Ok(()) => format!(
+                        "{name} ready. Your existing MCP endpoint can run applications in its separate desktop."
+                    ),
+                    Err(error) if cleaned && error.is::<guided::EnvironmentMissing>() => format!(
+                        "Previous temporary access cleanup finished. The desktop for {name} is not running. Choose Start environment… to start it with a fresh local password; no authentication was replayed."
+                    ),
+                    Err(error) => format!(
+                        "Desktop startup needs attention: {error:#}. Account, password and files retained; retry only by choosing Start environment… explicitly."
+                    ),
+                };
+            }
+        });
+    });
+    if diagnose {
+        let diagnostic_state = state.clone();
+        if let Ok(mut state) = state.lock() {
+            state.running = true;
+            state.message = "Checking the enrolled development desktop…".into();
+        }
+        if let Some(name) = enrolled_name {
+            std::thread::spawn(move || {
+                let phase = guided::diagnostic_phase();
+                if let Ok(mut state) = diagnostic_state.lock() {
+                    state.running = false;
+                    state.can_cancel = true;
+                    state.start_account = phase
+                        .as_ref()
+                        .ok()
+                        .filter(|phase| {
+                            matches!(
+                                phase,
+                                crate::macos_setup::Phase::LoginRequired
+                                    | crate::macos_setup::Phase::StartupCleanupRequired
+                            )
+                        })
+                        .and_then(|_| desktop_start::choice(&name).ok());
+                    state.message = match phase {
+                        Ok(phase) => phase.message(&name),
+                        Err(error) => format!("Desktop status needs attention: {error:#}"),
+                    };
+                }
+            });
+        }
+    }
     let actions = SetupActions {
         account,
         resume_creation,
@@ -1411,6 +1568,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 as Box<dyn FnOnce()>
         }),
         on_begin: Box::new(move |name| begin(name, None, None)),
+        on_start,
         on_create: Box::new(move |request| {
             match crate::macos_account::Password::from_text(request.password) {
                 Ok(password) => {
@@ -1487,7 +1645,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
-            message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true,
+            message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true, start_account: None,
         })
         }),
         can_close: Box::new(move || {
@@ -1853,6 +2011,7 @@ pub fn remove_registration() -> anyhow::Result<()> {
             file
         };
         let _lease = lease;
+        desktop_start::restore_pending(&account)?;
         let agents = directory(
             &account.home.join("Library/LaunchAgents"),
             account.uid,

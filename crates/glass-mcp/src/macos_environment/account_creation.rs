@@ -7,14 +7,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-struct Endpoint {
+pub(super) struct Endpoint {
     path: PathBuf,
     retained: File,
-    listener: UnixListener,
+    pub(super) listener: UnixListener,
 }
 
 impl Endpoint {
-    fn new(owner: u32) -> anyhow::Result<Self> {
+    pub(super) fn new(owner: u32) -> anyhow::Result<Self> {
         let parent = std::fs::symlink_metadata("/private/tmp")?;
         ensure!(
             parent.is_dir() && parent.uid() == 0 && parent.mode() & 0o1000 != 0,
@@ -50,7 +50,7 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-    fn socket(&self) -> PathBuf {
+    pub(super) fn socket(&self) -> PathBuf {
         self.path.join("password.sock")
     }
 }
@@ -72,7 +72,7 @@ impl Drop for Endpoint {
     }
 }
 
-fn send(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
+pub(super) fn send(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
     ensure!(
         bytes.len() <= 8192,
         "account setup response exceeded its bound"
@@ -82,7 +82,10 @@ fn send(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn receive(stream: &mut UnixStream, maximum: usize) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+pub(super) fn receive(
+    stream: &mut UnixStream,
+    maximum: usize,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let mut header = [0; 4];
     stream.read_exact(&mut header)?;
     let length = u32::from_be_bytes(header) as usize;
@@ -198,7 +201,7 @@ pub(super) fn create(name: &str, password: &Password, system_dialog: bool) -> an
     })
 }
 
-fn connect(path: &Path, owner: u32) -> anyhow::Result<UnixStream> {
+pub(super) fn connect(path: &Path, owner: u32) -> anyhow::Result<UnixStream> {
     use std::os::unix::fs::FileTypeExt;
     let parent = path.parent().context("account endpoint has no directory")?;
     ensure!(

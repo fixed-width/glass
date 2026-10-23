@@ -142,9 +142,35 @@ This is a preview. Setup, worker re-registration, and changed-build development 
 stdio and HTTP have been tested on an Apple Silicon Mac mini without a physical monitor connected,
 using an existing initialized login. Physical keyboard/mouse coexistence has also been checked
 in that retained-login setup.
-The current worker requires that account's graphical login; unattended startup after a reboot is
-not implemented. Keep the account logged in; after a restart, log into it again. This does not change
-Windows's shared-desktop behavior.
+The worker requires that account's graphical login. Guided first-time onboarding and post-reboot
+startup still need qualification; unattended startup after a reboot is not implemented.
+
+### Start a stopped development desktop
+
+Keep the development account logged in between ordinary application runs. Stopping an application
+does not log that account out. When its desktop is missing, open **glass → Application setup…**
+in your normal account and choose **Start environment…** for the enrolled account.
+
+Enter that development account's password in Glass's secure dialog, then complete any separate
+macOS administrator approval. Neither prompt has a deadline. Glass does not save the password,
+change it, re-enroll the account or repeat existing privacy grants. A running desktop is reused
+without requesting its account password. Wait for **Ready** before starting application work.
+
+This preview startup path is awaiting runtime qualification. It requires **Screen Sharing** to
+already be enabled under **System Settings → General → Sharing**. Glass does not enable that
+host-wide service automatically. It connects locally and requests only a separate desktop; an
+unsupported or denied private selection stops with an error. Existing credentials longer than
+63 UTF-8 bytes are not supported by this startup protocol and are never truncated or reset.
+First-time macOS setup and privacy consent may still require signing into that account directly.
+
+If startup is interrupted, open setup and explicitly choose **Start environment…** again. Glass
+first finishes recorded temporary Screen Sharing access cleanup without an account password. If
+the desktop is still missing afterward, choose **Start environment…** once more for a fresh login
+request. Glass never repeats authentication automatically and preserves pre-existing access.
+If interruption made ownership of an access entry uncertain, Glass retains it and the recovery
+record. Review that account under **Screen Sharing → Allow access for**, remove its entry if
+appropriate, then reopen setup to finish cleanup. Unconfirmed cleanup blocks new application work
+and enrollment removal; completed account data, files and privacy grants are retained.
 
 ### Return to shared-desktop use
 

@@ -85,6 +85,7 @@ pub(crate) struct Readiness {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     LoginRequired,
+    StartupCleanupRequired,
     WorkerStarting,
     PermissionsRequired {
         accessibility: bool,
@@ -135,8 +136,9 @@ impl Phase {
     pub(crate) fn message(&self, account: &str) -> String {
         match self {
             Self::LoginRequired => format!(
-                "Log into {account} using Fast User Switching and finish macOS login. Glass will continue automatically. Keep this account logged in."
+                "The development desktop for {account} is not running. Choose Start environment… in Glass application setup; enter credentials only in its local secure dialog."
             ),
+            Self::StartupCleanupRequired => "A previous desktop startup needs its temporary access cleaned up. Choose Start environment… in Glass; an already running desktop is reused without authenticating again.".into(),
             Self::WorkerStarting => format!(
                 "{account} is logged in. Waiting for its Glass worker to start; registration will be checked automatically if it does not appear."
             ),
@@ -257,7 +259,7 @@ impl Coordinator {
                 Decision::Repair
             }
             Phase::RepairRequired(_) => Decision::Stop,
-            Phase::LoginRequired => {
+            Phase::LoginRequired | Phase::StartupCleanupRequired => {
                 self.repaired = false;
                 Decision::Wait
             }

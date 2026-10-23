@@ -25,6 +25,38 @@ pub fn require_private() -> Result<()> {
     check(unsafe { glass_private_still_private() })
 }
 
+/// Actual owner GUI context, independent of the global ConsoleUser label.
+pub fn owner_desktop_session() -> std::io::Result<u32> {
+    unsafe extern "C" {
+        fn glass_owner_desktop_session() -> u32;
+    }
+    // SAFETY: this observer has no arguments and mutates no desktop state.
+    let session = unsafe { glass_owner_desktop_session() };
+    if session == 0 {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "open Glass from your normal active desktop",
+        ))
+    } else {
+        Ok(session)
+    }
+}
+
+/// Bind an established local Apple service to its current root process lifetime.
+pub fn apple_server_identity(pid: u32) -> std::io::Result<ProcessIdentity> {
+    unsafe extern "C" {
+        fn glass_apple_server_identity(pid: u32, out: *mut ProcessIdentity) -> i32;
+    }
+    let mut process = ProcessIdentity::default();
+    // SAFETY: the bridge initializes one live repr(C) record without retaining its address.
+    let code = unsafe { glass_apple_server_identity(pid, &mut process) };
+    if code == 0 {
+        Ok(process)
+    } else {
+        Err(std::io::Error::from_raw_os_error(code))
+    }
+}
+
 fn check(code: i32) -> Result<()> {
     match code {
         0 => Ok(()),
@@ -307,6 +339,26 @@ pub fn login_observation(worker: u32) -> std::io::Result<LoginObservation> {
     }
     // SAFETY: the native helper reads session metadata and returns only a scalar classification.
     match unsafe { glass_private_login_observation(worker) } {
+        0 => Ok(LoginObservation::NotObserved),
+        1 => Ok(LoginObservation::Incomplete),
+        2 => Ok(LoginObservation::Complete),
+        code => Err(std::io::Error::from_raw_os_error(-code)),
+    }
+}
+
+/// A setup liveness observation backed by the current Apple loginwindow lifetime.
+/// Signed-worker readiness still decides whether applications can run.
+pub fn live_login_observation(worker: u32) -> std::io::Result<LoginObservation> {
+    live_login_for(rustix::process::getuid().as_raw(), worker)
+}
+
+/// The privileged startup helper may inspect the enrolled normal owner's login context.
+pub fn live_login_for(owner: u32, worker: u32) -> std::io::Result<LoginObservation> {
+    unsafe extern "C" {
+        fn glass_private_live_login_observation(owner: u32, worker: u32) -> i32;
+    }
+    // SAFETY: this bounded observer takes a scalar and mutates no login or account state.
+    match unsafe { glass_private_live_login_observation(owner, worker) } {
         0 => Ok(LoginObservation::NotObserved),
         1 => Ok(LoginObservation::Incomplete),
         2 => Ok(LoginObservation::Complete),

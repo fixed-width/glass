@@ -67,7 +67,12 @@ internal refactors, CI, or test-only changes.
   and never exempt a recorded Glass-owned process.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
-  First login and privacy consent remain user actions.
+  Application setup offers **Start environment…** for a missing graphical login, using a transient
+  local account password and native administrator approval. It requires macOS Screen Sharing to be
+  enabled explicitly, selects only a separate desktop, and restores any temporary account access.
+  A running desktop is reused without another account password; interrupted access cleanup blocks
+  application work until it finishes. First-time privacy consent remains a user action. Guided
+  startup is awaiting runtime qualification and does not provide unattended post-reboot recovery.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose
   worker is missing gets a startup check and one repair, rather than another login instruction;

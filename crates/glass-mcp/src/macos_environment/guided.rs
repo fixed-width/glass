@@ -91,6 +91,14 @@ pub(super) fn phase() -> anyhow::Result<Phase> {
         private_session::is_owner(),
         "account registration is disabled or invalid"
     );
+    if desktop_start::pending(account.owner_uid)? {
+        return Ok(Phase::StartupCleanupRequired);
+    }
+    if private_session::live_login_observation(account.uid)?
+        == private_session::LoginObservation::NotObserved
+    {
+        return Ok(Phase::LoginRequired);
+    }
     let lease = File::open(owner_root()?.join(ACCOUNT))?;
     match fs4::FileExt::try_lock(&lease) {
         Ok(()) => {}
@@ -114,9 +122,13 @@ pub(super) fn phase() -> anyhow::Result<Phase> {
 }
 
 fn unavailable_worker(uid: u32, socket_missing: bool, reason: String) -> Phase {
+    let login = private_session::live_login_observation(uid);
+    if matches!(login, Ok(private_session::LoginObservation::Incomplete)) {
+        return Phase::WorkerStarting;
+    }
     Phase::unavailable_worker(
         socket_missing,
-        private_session::login_observation(uid)
+        login
             .map(|login| login == private_session::LoginObservation::Complete)
             .map_err(|error| error.to_string()),
         reason,
@@ -238,6 +250,45 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
         Ok(())
     })();
     registered?;
+    wait_registered(
+        name,
+        non_interactive,
+        system_dialog,
+        cancelled,
+        &mut progress,
+        || {
+            finish_setup(launchagent, addr)?;
+            forget(&remembered)
+        },
+    )
+}
+
+#[derive(Debug)]
+pub(super) struct EnvironmentMissing;
+impl std::fmt::Display for EnvironmentMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the development desktop needs starting; choose Start environment in Glass application setup")
+    }
+}
+impl std::error::Error for EnvironmentMissing {}
+
+pub(super) fn continue_existing(
+    name: &str,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(Progress),
+) -> anyhow::Result<()> {
+    let _setup = lock_setup()?;
+    wait_registered(name, false, true, cancelled, &mut progress, || Ok(()))
+}
+
+fn wait_registered(
+    name: &str,
+    non_interactive: bool,
+    system_dialog: bool,
+    cancelled: &AtomicBool,
+    progress: &mut impl FnMut(Progress),
+    finish: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut coordinator = Coordinator::new(!non_interactive);
     let mut previous = None;
     loop {
@@ -246,6 +297,13 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
             "setup cancelled; completed registration and grants retained"
         );
         let current = phase()?;
+        if matches!(
+            current,
+            Phase::LoginRequired | Phase::StartupCleanupRequired
+        ) {
+            return Err(EnvironmentMissing.into());
+        }
+
         if current != Phase::Ready && previous.as_ref() != Some(&current) {
             progress(Progress::waiting(current.message(name)));
             previous = Some(current.clone());
@@ -260,8 +318,7 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
                     !cancelled.load(Ordering::Relaxed),
                     "setup cancelled; completed registration and grants retained"
                 );
-                finish_setup(launchagent, addr)?;
-                forget(&remembered)?;
+                finish()?;
                 progress(Progress::waiting(Phase::Ready.message(name)));
                 return Ok(());
             }

@@ -29,6 +29,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::MacosPrepareAccount { account, endpoint }) => {
             return glass_mcp::macos_environment::prepare_account(&account, &endpoint);
         }
+        Some(Command::MacosStartEnvironment { endpoint }) => {
+            return glass_mcp::macos_environment::start_environment(&endpoint);
+        }
         _ => {}
     }
     // AppKit setup precedes platform workers; offline evidence commands need none.
@@ -57,7 +60,8 @@ async fn main() -> anyhow::Result<()> {
             | Command::MacosEnroll { .. }
             | Command::MacosOnboarding { .. }
             | Command::MacosUnenroll
-            | Command::MacosPrepareAccount { .. },
+            | Command::MacosPrepareAccount { .. }
+            | Command::MacosStartEnvironment { .. },
         ) => {
             anyhow::bail!("internal macOS command was not dispatched before AppKit initialization")
         }

@@ -22,6 +22,8 @@ pub mod bundle; // pure .app-bundle logic — cross-platform, host-tested
 pub mod clipboard_route; // pure clipboard-routing policy — cross-platform, host-tested
 pub mod coords; // pure window-relative <-> global math — cross-platform, host-tested
 #[cfg(any(target_os = "macos", test))]
+pub mod desktop_transport;
+#[cfg(any(target_os = "macos", test))]
 mod input_deadline; // pure post-focus/input deadline sequencing — cross-platform, host-tested
 pub mod keymap; // pure ASCII -> (keycode, shift) US map — cross-platform, host-tested
 #[cfg(any(target_os = "macos", all(test, unix)))]

@@ -4,12 +4,59 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
+#include <membership.h>
+#include <uuid/uuid.h>
 
 static NSArray *records(ODNode *node, NSString *attribute, ODMatchType match, id value) {
     ODQuery *query = [ODQuery queryWithNode:node forRecordTypes:kODRecordTypeUsers
         attribute:attribute matchType:match queryValues:value
         returnAttributes:@[kODAttributeTypeUniqueID] maximumResults:65536 error:NULL];
     return query ? [query resultsAllowingPartial:NO error:NULL] : nil;
+}
+
+// Mutations are limited to one already-enrolled user and the existing Screen Sharing group.
+int glass_desktop_access(const char *name, const char *expected_user, uint32_t uid, int action,
+                         const char *expected_group, char group_uuid[37], int *member, int *authorized) {
+    @autoreleasepool {
+        if (!name || !expected_user || !group_uuid || !member || !authorized || uid < 501 || action < 0 || action > 2) return EINVAL;
+        if (action && (getuid() != 0 || geteuid() != 0)) return EPERM;
+        uuid_t user_id;
+        if (mbr_uid_to_uuid(uid, user_id)) return EIO;
+        uuid_t expected;
+        if (uuid_parse(expected_user, expected) || memcmp(expected, user_id, sizeof(uuid_t))) return EACCES;
+        ODNode *node = [ODNode nodeWithSession:[ODSession defaultSession] name:@"/Local/Default" error:NULL];
+        ODRecord *user = node ? [node recordWithRecordType:kODRecordTypeUsers name:@(name) attributes:@[kODAttributeTypeUniqueID,kODAttributeTypeGUID] error:NULL] : nil;
+        NSArray *ids = [user valuesForAttribute:kODAttributeTypeUniqueID error:NULL];
+        NSArray *uuids = [user valuesForAttribute:kODAttributeTypeGUID error:NULL];
+        if (ids.count != 1 || uuids.count != 1 || ![ids[0] isKindOfClass:NSString.class] || ![uuids[0] isKindOfClass:NSString.class] || ![ids[0] isEqualToString:[NSString stringWithFormat:@"%u",uid]] || [uuids[0] caseInsensitiveCompare:@(expected_user)] != NSOrderedSame) return EACCES;
+        int access = 0;
+        int status = mbr_check_service_membership(user_id, "screensharing", &access);
+        if (status == ENOENT) access = 1;
+        else if (status) return status;
+        *authorized = access ? 1 : 0;
+        group_uuid[0] = 0;
+        ODRecord *group = [node recordWithRecordType:kODRecordTypeGroups name:@"com.apple.access_screensharing" attributes:@[kODAttributeTypeGUID] error:NULL];
+        if (!group) { *member = 0; return action || !access ? ENOENT : 0; }
+        NSArray *values = [group valuesForAttribute:kODAttributeTypeGUID error:NULL];
+        if (values.count != 1 || ![values[0] isKindOfClass:NSString.class]) return EIO;
+        uuid_t group_id;
+        if (uuid_parse([values[0] UTF8String], group_id)) return EIO;
+        uuid_unparse_lower(group_id, group_uuid);
+        if (action) {
+            uuid_t selected;
+            if (!expected_group || uuid_parse(expected_group, selected) || memcmp(selected, group_id, sizeof(uuid_t))) return EACCES;
+            NSError *error = nil;
+            BOOL changed = action == 1 ? [group addMemberRecord:user error:&error] : [group removeMemberRecord:user error:&error];
+            if (!changed || error) return EIO;
+        }
+        NSError *error = nil;
+        BOOL present = [group isMemberRecord:user error:&error];
+        if (error) return EIO;
+        *member = present ? 1 : 0;
+        if (action == 1 && !present) return EIO;
+        if (action == 2 && present) return EIO;
+        return 0;
+    }
 }
 
 int glass_account_name_unused(const char *bytes) {

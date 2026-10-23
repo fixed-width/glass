@@ -168,15 +168,26 @@ static int login_observation(CFPropertyListRef value, uint32_t owner, uint32_t t
 }
 
 // A setup hint only; authenticated worker facts still decide whether Glass is ready.
-int glass_private_login_observation(uint32_t target) {
-    if (target < 501 || getuid() < 501 || getuid() != geteuid()) return -EINVAL;
+static int observe_login(uint32_t owner, uint32_t target) {
     SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("Glass account setup"), NULL, NULL);
     if (!store) return -EIO;
     CFPropertyListRef value = SCDynamicStoreCopyValue(store, CFSTR("State:/Users/ConsoleUser"));
-    int result = login_observation(value, getuid(), target);
+    int result = login_observation(value, owner, target);
     if (value) CFRelease(value);
     CFRelease(store);
     return result;
+}
+
+static int live_login_result(int hint, unsigned processes) {
+    if (hint < 0) return hint;
+    if (processes > 1) return -EAGAIN;
+    if (!processes) return 0;
+    return hint == 2 ? 2 : 1;
+}
+
+int glass_private_login_observation(uint32_t target) {
+    if (target < 501 || getuid() < 501 || getuid() != geteuid()) return -EINVAL;
+    return observe_login(getuid(), target);
 }
 
 #ifdef GLASS_PRIVATE_SESSION_TEST
@@ -230,6 +241,11 @@ static bool context_allowed(Context c, bool onboarding) {
     return c.user && c.dictionary_owner && c.console_known && (onboarding || !c.on_console) &&
         c.login_known && c.login_done && c.security_known && c.graphic && !c.root_security &&
         c.audit_owner && c.audit_session;
+}
+
+uint32_t glass_owner_desktop_session(void) {
+    Context c = read_context();
+    return context_allowed(c, true) && c.on_console ? c.asid : 0;
 }
 
 int glass_private_writes_protected(int fd, uint32_t owner) {
@@ -464,6 +480,9 @@ int main(void) {
     if (!owner_bound(501, 501, 502) || owner_bound(503, 501, 502) ||
         !owner_bound(501, 0, 501) || owner_bound(502, 0, 501)) return 7;
     if (login_observation_test()) return 8;
+    if (live_login_result(2,0) != 0 || live_login_result(0,1) != 1 ||
+        live_login_result(1,1) != 1 || live_login_result(2,1) != 2 ||
+        live_login_result(2,2) != -EAGAIN || live_login_result(-EIO,1) != -EIO) return 10;
     uint32_t runtime = kSecCodeStatusValid | kSecCodeSignatureRuntime;
     if (platform_service_status(runtime) ||
         !platform_service_status(runtime | kSecCodeSignatureLibraryValidation) ||
@@ -591,6 +610,83 @@ static bool process_matches(const GlassProcessIdentity *process, uint32_t uid) {
         info.kp_eproc.e_ucred.cr_uid == uid &&
         (uint64_t)info.kp_proc.p_starttime.tv_sec == process->seconds &&
         (uint64_t)info.kp_proc.p_starttime.tv_usec == process->microseconds;
+}
+
+int glass_apple_server_identity(uint32_t pid, GlassProcessIdentity *out) {
+    @autoreleasepool {
+        struct kinfo_proc info = {0};
+        size_t size = sizeof(info);
+        int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+        if (!out || pid <= 1 || pid > INT_MAX) return EINVAL;
+        if (sysctl(mib, 4, &info, &size, NULL, 0)) return errno;
+        if (size != sizeof(info) || info.kp_eproc.e_ucred.cr_uid != 0) return EACCES;
+        GlassProcessIdentity before = {pid, (uint64_t)info.kp_proc.p_starttime.tv_sec, (uint64_t)info.kp_proc.p_starttime.tv_usec};
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath((int)pid, path, sizeof(path)) <= 0 || strncmp(path, "/System/", 8)) return EACCES;
+        SecCodeRef code = NULL;
+        SecRequirementRef requirement = NULL;
+        CFDictionaryRef details = NULL;
+        NSDictionary *attributes = @{(__bridge NSString *)kSecGuestAttributePid: @(pid)};
+        OSStatus status = SecCodeCopyGuestWithAttributes(NULL, (__bridge CFDictionaryRef)attributes, 0, &code);
+        if (!status) status = SecRequirementCreateWithString(CFSTR("anchor apple"), 0, &requirement);
+        if (!status) status = SecCodeCheckValidity(code, kSecCSStrictValidate, requirement);
+        if (!status) status = SecCodeCopySigningInformation(code, kSecCSSigningInformation, &details);
+        bool platform = details && [[(__bridge NSDictionary *)details objectForKey:(__bridge NSString *)kSecCodeInfoPlatformIdentifier] unsignedIntValue] != 0;
+        if (details) CFRelease(details);
+        if (requirement) CFRelease(requirement);
+        if (code) CFRelease(code);
+        if (status || !platform || !process_matches(&before, 0)) return EACCES;
+        *out = before;
+        return 0;
+    }
+}
+
+// SessionInfo can outlive loginwindow. Require its current Apple process as well as the hint.
+int glass_private_live_login_observation(uint32_t owner, uint32_t target) {
+    @autoreleasepool {
+    if (target < 501 || owner < 501 || owner == target || getuid() != geteuid() || (getuid() != 0 && getuid() != owner)) return -EINVAL;
+    int hint = observe_login(owner, target);
+    if (hint < 0) return hint;
+    GlassProcessIdentity *processes = calloc(8192, sizeof(*processes));
+    if (!processes) return -ENOMEM;
+    int count = process_identities(target, processes, 8192, false);
+    if (count < 0) { free(processes); return count; }
+    unsigned matches = 0;
+    int failure = 0;
+    for (int index = 0; index < count; index++) {
+        GlassProcessIdentity identity = processes[index];
+        struct kinfo_proc info = {0};
+        size_t size = sizeof(info);
+        int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)identity.pid};
+        errno = 0;
+        if (sysctl(mib, 4, &info, &size, NULL, 0) || size != sizeof(info)) {
+            if (size == 0 || errno == ESRCH || errno == ENOENT) continue;
+            failure = errno ? errno : EIO; break;
+        }
+        if (strcmp(info.kp_proc.p_comm, "loginwindow")) continue;
+        if (info.kp_eproc.e_pcred.p_ruid != 0 || !process_matches(&identity, target)) {
+            failure = EAGAIN; break;
+        }
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath((int)identity.pid, path, sizeof(path)) <= 0 ||
+            strcmp(path, "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow")) {
+            failure = EACCES; break;
+        }
+        SecCodeRef code = NULL;
+        SecRequirementRef requirement = NULL;
+        NSDictionary *attributes = @{(__bridge NSString *)kSecGuestAttributePid: @(identity.pid)};
+        OSStatus status = SecCodeCopyGuestWithAttributes(NULL, (__bridge CFDictionaryRef)attributes, 0, &code);
+        if (!status) status = SecRequirementCreateWithString(CFSTR("anchor apple and identifier com.apple.loginwindow"), 0, &requirement);
+        if (!status) status = SecCodeCheckValidity(code, kSecCSStrictValidate, requirement);
+        if (code) CFRelease(code);
+        if (requirement) CFRelease(requirement);
+        if (status || !process_matches(&identity, target)) { failure = EACCES; break; }
+        matches++;
+    }
+    free(processes);
+    if (failure) return -failure;
+    return live_login_result(hint, matches);
+    }
 }
 
 typedef struct {

@@ -2,6 +2,88 @@
 
 use std::ffi::CString;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopAccess {
+    pub authorized: bool,
+    pub member: bool,
+    pub group_uuid: Option<String>,
+}
+
+fn desktop_access_using(
+    name: &str,
+    uuid: &str,
+    uid: u32,
+    change: Option<(&str, bool)>,
+) -> Result<DesktopAccess, String> {
+    unsafe extern "C" {
+        fn glass_desktop_access(
+            name: *const std::ffi::c_char,
+            uuid: *const std::ffi::c_char,
+            uid: u32,
+            action: i32,
+            expected_group: *const std::ffi::c_char,
+            group: *mut std::ffi::c_char,
+            member: *mut i32,
+            authorized: *mut i32,
+        ) -> i32;
+    }
+    let name = CString::new(name).map_err(|_| "invalid account name")?;
+    let uuid = CString::new(uuid).map_err(|_| "invalid account identity")?;
+    let group = change
+        .map(|(uuid, _)| CString::new(uuid))
+        .transpose()
+        .map_err(|_| "invalid access group identity")?;
+    let action = change.map_or(0, |(_, member)| if member { 1 } else { 2 });
+    let mut output = [0i8; 37];
+    let (mut member, mut authorized) = (-1, -1);
+    // SAFETY: all C strings and fixed-size output buffers stay live for the synchronous call.
+    let code = unsafe {
+        glass_desktop_access(
+            name.as_ptr(),
+            uuid.as_ptr(),
+            uid,
+            action,
+            group
+                .as_ref()
+                .map_or(std::ptr::null(), |group| group.as_ptr()),
+            output.as_mut_ptr(),
+            &mut member,
+            &mut authorized,
+        )
+    };
+    if code != 0 {
+        return Err(format!(
+            "macOS Screen Sharing account access failed: {code}"
+        ));
+    }
+    if ![0, 1].contains(&member) || ![0, 1].contains(&authorized) {
+        return Err("invalid Screen Sharing access result".into());
+    }
+    // SAFETY: the bridge writes at most 36 UUID characters and a terminating NUL.
+    let group = unsafe { std::ffi::CStr::from_ptr(output.as_ptr()) }
+        .to_str()
+        .map_err(|_| "invalid access group UUID")?;
+    Ok(DesktopAccess {
+        authorized: authorized == 1,
+        member: member == 1,
+        group_uuid: (!group.is_empty()).then(|| group.to_owned()),
+    })
+}
+
+pub fn desktop_access(name: &str, uuid: &str, uid: u32) -> Result<DesktopAccess, String> {
+    desktop_access_using(name, uuid, uid, None)
+}
+
+pub fn set_desktop_access(
+    name: &str,
+    uuid: &str,
+    uid: u32,
+    group_uuid: &str,
+    member: bool,
+) -> Result<DesktopAccess, String> {
+    desktop_access_using(name, uuid, uid, Some((group_uuid, member)))
+}
+
 #[derive(Default)]
 #[repr(C)]
 struct NativeError {

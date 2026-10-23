@@ -124,6 +124,11 @@ serde = { version = "1", features = ["derive"] }
 # feature set) out of the build entirely. Each list was derived and verified empirically
 # on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
+crypto-bigint = { version = "0.6.1", features = ["alloc", "zeroize"] }
+getrandom = "0.3"
+md-5 = "0.10.6"
+thiserror = "2"
 zeroize = "1"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
@@ -269,6 +274,12 @@ glass-pipe-unix.workspace = true
 glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
+crypto-bigint = { version = "0.6.1", features = ["alloc", "zeroize"] }
+getrandom = "0.3"
+md-5 = "0.10.6"
+thiserror = "2"
+zeroize = "1"
 tempfile.workspace = true
 serde_json = "1"
 
