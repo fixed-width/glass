@@ -421,6 +421,25 @@ fn recovery_broker<'a>(
         .ok_or_else(|| std::io::Error::other("recovery executor unavailable"))
 }
 
+pub(crate) fn finish_setup_journal(
+    journal: &mut crate::permission_journal::PermissionJournal,
+    inspect: &mut impl FnMut(
+        &[glass_macos::private_session::ProcessIdentity],
+        Deadline,
+    ) -> std::io::Result<Vec<glass_macos::private_session::ProcessIdentity>>,
+    outputs: &mut impl FnMut(
+        &[glass_macos::workspace_access::outputs::OutputScope],
+        Deadline,
+    ) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // The first recovery observation may need a launchd-throttled broker activation.
+    journal.finish_with_outputs(
+        bounded(Deadline::UNBOUNDED, Some(CLEANUP_WAIT)),
+        inspect,
+        outputs,
+    )
+}
+
 pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &File) -> Result<()> {
     let connection = std::cell::RefCell::new(None);
     let result = (|| {
@@ -462,9 +481,7 @@ pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &F
             &mut repair,
         )
         .map_err(error)?;
-        journal
-            .finish_with_outputs(Deadline::from_millis(8000), &mut inspect, &mut repair)
-            .map_err(error)
+        finish_setup_journal(&mut journal, &mut inspect, &mut repair).map_err(error)
     })();
     let closed = connection.borrow().as_ref().map_or(Ok(()), |broker| {
         close_broker(

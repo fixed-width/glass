@@ -1169,6 +1169,70 @@ mod tests {
         PermissionJournal::open(root, u32::MAX, "test-account".into(), None, None).unwrap()
     }
 
+    #[test]
+    fn setup_recovery_allows_delayed_activation_but_retains_a_timed_out_journal() {
+        use std::process::{Command, Stdio};
+
+        for (activation_delay, succeeds) in [(20, true), (31, false)] {
+            let root = test_root();
+            let mut journal = journal(root.path());
+            // Model the private inventory with a test-owned process, without another account.
+            let worker = rustix::process::geteuid().as_raw();
+            journal.header.worker = worker;
+            journal.header.baseline = account_processes(worker).unwrap();
+            let mut child = Command::new("/bin/cat")
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let mut inspected = false;
+            let mut saw_child = false;
+            let mut outputs_called = false;
+            let result = crate::macos_worker::backend_transport::finish_setup_journal(
+                &mut journal,
+                &mut |unknown, deadline| {
+                    inspected = true;
+                    saw_child |= unknown
+                        .iter()
+                        .any(|process| process.matches_pid(child.id()));
+                    if deadline.remaining().unwrap_or(Duration::ZERO)
+                        < Duration::from_secs(activation_delay)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "activation delayed",
+                        ));
+                    }
+                    Ok(unknown.to_vec())
+                },
+                &mut |_, _| {
+                    outputs_called = true;
+                    Err(io::Error::other("no output rights were recorded"))
+                },
+            );
+            drop(child.stdin.take());
+            let status = child.wait().unwrap();
+            assert!(status.success());
+            assert!(inspected);
+            assert!(saw_child);
+            assert!(!outputs_called);
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(journal.closed, succeeds);
+            let bytes = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let mut expected = before;
+            if succeeds {
+                expected.extend(serde_json::to_vec(&Event::Closed).unwrap());
+                expected.push(b'\n');
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            }
+            assert_eq!(bytes, expected);
+        }
+    }
+
     fn output_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, OutputScope) {
         let root = tempfile::tempdir_in("/private/tmp").unwrap();
         let project = root.path().join("project");
