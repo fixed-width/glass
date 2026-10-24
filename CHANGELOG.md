@@ -64,8 +64,8 @@ internal refactors, CI, or test-only changes.
   verified system-service evidence before permissions are fully restored. Protected Apple XPC
   providers with a shared per-user role may remain active as part of the desktop environment;
   app-scoped providers must be idle, including separately named service instances verified in
-  their requestor's process domain. These checks retain code, file and process identity proof
-  and never exempt a recorded Glass-owned process.
+  their requestor's process domain and private graphical login. These checks retain code, file and
+  process identity proof and never exempt a recorded Glass-owned process.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   Application setup offers **Start environment…** for a missing graphical login, using a transient

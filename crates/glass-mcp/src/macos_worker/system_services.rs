@@ -127,7 +127,7 @@ impl XpcDefinition {
         if if self.shared_user {
             actual != domain
         } else {
-            session != expected_session || actual != format!("{domain} [{session}]")
+            session != expected_session || !pid_domain_matches(actual, domain)
         } {
             return None;
         }
@@ -145,6 +145,21 @@ impl XpcDefinition {
         }
         Some(session)
     }
+}
+
+fn pid_domain_matches(actual: &str, expected: &str) -> bool {
+    // launchctl annotates PID domains with a name; the separate asid field binds the login.
+    actual
+        .strip_prefix(&format!("{expected} ["))
+        .and_then(|suffix| suffix.strip_suffix(']'))
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name.len() <= 255
+                && name.trim() == name
+                && !name
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '[' | ']'))
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1060,7 +1075,7 @@ mod tests {
         let target = "pid/42/com.apple.example.instance";
         let bundle = XPC_PROGRAM.strip_suffix("/Contents/MacOS/Example").unwrap();
         let job = format!(
-            "{target} = {{\n\tpath = {bundle}\n\ttype = XPCService\n\tstate = running\n\tbundle id = com.apple.example\n\tprogram = {XPC_PROGRAM}\n\tpid = 123\n\tdomain = pid/42 [456]\n\tasid = 456\n\tproperties = xpc bundle | system service | supports transactions | supports pressured exit\n}}\n"
+            "{target} = {{\n\tpath = {bundle}\n\ttype = XPCService\n\tstate = running\n\tbundle id = com.apple.example\n\tprogram = {XPC_PROGRAM}\n\tpid = 123\n\tdomain = pid/42 [com.apple.example.requestor.]\n\tasid = 456\n\tproperties = xpc bundle | system service | supports transactions | supports pressured exit\n}}\n"
         );
         assert_eq!(
             definition.matches_job(target, process(), 456, &job),
@@ -1075,9 +1090,9 @@ mod tests {
             ("state = running", "state = not running"),
             ("pid = 123\n", "pid = 124\n"),
             ("domain = pid/42 [", "domain = pid/43 ["),
-            ("domain = pid/42 [456]", "domain = pid/42 [457]"),
-            ("domain = pid/42 [456]", "domain = pid/42 [unknown]"),
-            ("domain = pid/42 [456]", "domain = pid/42 [456] [456]"),
+            ("[com.apple.example.requestor.]", "[]"),
+            ("[com.apple.example.requestor.]", "[example] [another]"),
+            ("[com.apple.example.requestor.]", "[example"),
             ("\tasid = 456", "\tasid = 457"),
             (
                 "bundle id = com.apple.example\n",
@@ -1098,6 +1113,30 @@ mod tests {
                 .matches_job("pid/42/com.apple.example", process(), 456, &job)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pid_domain_names_are_opaque_and_do_not_replace_audit_session_proof() {
+        for name in ["com.apple.example.requestor.", "Example App Ω", "456"] {
+            assert!(pid_domain_matches(&format!("pid/42 [{name}]"), "pid/42"));
+        }
+        for actual in [
+            "pid/43 [com.apple.example.requestor.]",
+            "pid/42 []",
+            "pid/42 [ ]",
+            "pid/42 [nested[name]]",
+            "pid/42 [name] [second]",
+            "pid/42 [name\n]",
+            "pid/42 [name\t]",
+            "pid/42 [name] suffix",
+            "pid/42 [ name]",
+        ] {
+            assert!(!pid_domain_matches(actual, "pid/42"), "{actual}");
+        }
+        assert!(!pid_domain_matches(
+            &format!("pid/42 [{}]", "x".repeat(256)),
+            "pid/42"
+        ));
     }
 
     #[test]
