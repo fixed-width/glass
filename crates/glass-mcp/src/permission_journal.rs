@@ -158,6 +158,7 @@ pub(crate) struct PermissionJournal {
     next: u64,
     closed: bool,
     loaded: bool,
+    header_only: bool,
     poisoned: bool,
     admission: Option<ProcessIdentity>,
 }
@@ -324,6 +325,7 @@ impl PermissionJournal {
             next: 1,
             closed: false,
             loaded: false,
+            header_only: false,
             poisoned: false,
             admission,
         };
@@ -347,6 +349,7 @@ impl PermissionJournal {
     }
 
     fn read(&mut self) -> io::Result<()> {
+        self.header_only = false;
         self.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         Read::by_ref(&mut self.file)
@@ -371,11 +374,13 @@ impl PermissionJournal {
             })?
             + 1;
         let mut header = None;
+        let mut events = 0;
         for (index, line) in bytes[..end]
             .split(|&byte| byte == b'\n')
             .filter(|line| !line.is_empty())
             .enumerate()
         {
+            events += 1;
             if self.closed {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -528,10 +533,12 @@ impl PermissionJournal {
         self.file.set_len(end as u64)?;
         self.file.sync_all()?;
         self.file.seek(SeekFrom::End(0))?;
+        self.header_only = events == 1;
         Ok(())
     }
 
     fn append(&mut self, event: &Event) -> io::Result<()> {
+        self.header_only = false;
         if self.poisoned {
             return Err(io::Error::other(
                 "permission journal write previously failed",
@@ -583,6 +590,7 @@ impl PermissionJournal {
         bytes: &[u8],
         sync_directory: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.header_only = false;
         if self.poisoned {
             return Err(io::Error::other("permission journal is poisoned"));
         }
@@ -620,6 +628,7 @@ impl PermissionJournal {
     }
 
     fn reset(&mut self) -> io::Result<()> {
+        self.header_only = false;
         if !self.pending.is_empty() || !self.outputs.is_empty() {
             return Err(io::Error::other("permission recovery is incomplete"));
         }
@@ -635,6 +644,7 @@ impl PermissionJournal {
         self.next = 1;
         self.next_output = 1;
         self.closed = false;
+        self.header_only = true;
         Ok(())
     }
 
@@ -1005,12 +1015,49 @@ impl PermissionJournal {
         Ok(())
     }
 
+    fn unused_setup_header(&self) -> bool {
+        self.header_only
+            && !self.poisoned
+            && !self.closed
+            && self.header.version == 4
+            && self.header.boot.is_some()
+            && self.header.session.is_none()
+            && self.admission.is_none()
+            && self.pending.is_empty()
+            && self.outputs.is_empty()
+            && self.next == 1
+            && self.next_output == 1
+            && self.header.work.as_ref().is_some_and(|scope| {
+                let mut processes = std::collections::BTreeSet::new();
+                scope.validate().is_ok()
+                    && scope.work.roots.is_empty()
+                    && !scope.work.uncertain
+                    && !scope.launch_pending
+                    && self.header.baseline.len() == scope.baseline.len()
+                    && self
+                        .header
+                        .baseline
+                        .iter()
+                        .zip(&scope.baseline)
+                        .all(|(process, origin)| {
+                            process == &origin.process && processes.insert(process.pid())
+                        })
+            })
+    }
+
     fn recover_with_outputs(
         &mut self,
         deadline: Deadline,
         inspect: &mut IdleInspector<'_>,
         outputs: &mut OutputInspector<'_>,
     ) -> io::Result<()> {
+        if deadline.has_passed() {
+            return Err(io::Error::other("permission recovery deadline elapsed"));
+        }
+        // A setup baseline carries no permissions or application work.
+        if self.unused_setup_header() {
+            return Ok(());
+        }
         if let Err(revoke) = self.revoke_access(deadline) {
             if self.outputs.is_empty() || !PermissionChange::path_inaccessible(&revoke) {
                 return Err(revoke);
@@ -1169,13 +1216,286 @@ mod tests {
         PermissionJournal::open(root, u32::MAX, "test-account".into(), None, None).unwrap()
     }
 
+    fn setup_header_with_observations(root: &Path) -> PermissionJournal {
+        let mut journal = journal(root);
+        let baseline: Vec<_> = (0..65).map(|index| process(40_000 + index, 1)).collect();
+        journal.header.baseline = baseline.clone();
+        journal.header.work.as_mut().unwrap().baseline = baseline
+            .iter()
+            .enumerate()
+            .map(|(index, process)| {
+                serde_json::from_value(serde_json::json!({
+                    "process":process,"unique":index + 2,"parent_unique":1
+                }))
+                .unwrap()
+            })
+            .collect();
+        journal.reset().unwrap();
+        // Re-establish history from disk rather than relying on the freshly written marker.
+        journal.header_only = false;
+        journal.read().unwrap();
+        journal
+    }
+
+    fn finish_with_unrelated_processes(journal: &mut PermissionJournal) -> (io::Result<()>, usize) {
+        // Model private-account inventory using this test's own UID; no account is created.
+        journal.header.worker = rustix::process::geteuid().as_raw();
+        let mut inspections = 0;
+        let result = crate::macos_worker::backend_transport::finish_setup_journal(
+            journal,
+            &mut |_, _| {
+                inspections += 1;
+                Err(io::Error::other(
+                    "unrelated service inspection was requested",
+                ))
+            },
+            &mut |_, _| Err(io::Error::other("unexpected output recovery")),
+        );
+        (result, inspections)
+    }
+
+    #[test]
+    fn untouched_setup_header_closes_without_classifying_unrelated_processes() {
+        let root = test_root();
+        let mut journal = setup_header_with_observations(root.path());
+        assert_eq!(journal.header.baseline.len(), 65);
+        let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+        let (result, inspections) = finish_with_unrelated_processes(&mut journal);
+        result.unwrap();
+        assert_eq!(inspections, 0);
+        assert!(journal.closed);
+        let mut expected = before;
+        expected.extend(serde_json::to_vec(&Event::Closed).unwrap());
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn untouched_setup_header_still_honors_an_expired_deadline() {
+        let root = test_root();
+        let mut journal = setup_header_with_observations(root.path());
+        let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+        let result = journal.finish_with_outputs(
+            Deadline::at(std::time::Instant::now()),
+            &mut |_, _| panic!("an expired recovery must not request inspection"),
+            &mut |_, _| panic!("an expired recovery must not request output repair"),
+        );
+        assert!(result.is_err());
+        assert!(!journal.closed);
+        assert_eq!(
+            std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn mismatched_setup_baselines_cannot_bypass_service_inspection() {
+        for mismatch in [
+            "pid",
+            "birth",
+            "count",
+            "duplicate",
+            "both_duplicate",
+            "oversized",
+        ] {
+            let root = test_root();
+            let mut journal = setup_header_with_observations(root.path());
+            match mismatch {
+                "pid" => journal.header.baseline[0] = process(60_000, 1),
+                "birth" => journal.header.baseline[0] = process(40_000, 2),
+                "count" => {
+                    journal.header.baseline.pop();
+                }
+                "duplicate" => journal.header.baseline[1] = journal.header.baseline[0],
+                "both_duplicate" => {
+                    journal.header.baseline[1] = journal.header.baseline[0];
+                    let scope = journal.header.work.as_mut().unwrap();
+                    scope.baseline[1].process = scope.baseline[0].process;
+                }
+                "oversized" => journal.header.baseline.resize(8193, process(40_000, 1)),
+                _ => unreachable!(),
+            }
+            journal.reset().unwrap();
+            journal.read().unwrap();
+            let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let (result, inspections) = finish_with_unrelated_processes(&mut journal);
+            assert!(result.is_err(), "{mismatch}");
+            assert!(inspections > 0, "{mismatch}");
+            assert!(!journal.closed, "{mismatch}");
+            assert_eq!(
+                std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+                before
+            );
+        }
+    }
+
+    fn with_settled_permissions(journal: PermissionJournal, project: &Path) -> PermissionJournal {
+        use glass_macos::workspace_access::{Access, Recorder, Sharing};
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(journal));
+        let recorder: Recorder = shared.clone();
+        let mut sharing = Sharing::recorded(u32::MAX, recorder).unwrap();
+        sharing.path(project, Access::ReadWrite).unwrap();
+        sharing.restore().unwrap();
+        drop(sharing);
+        Arc::try_unwrap(shared).ok().unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    fn settled_setup_activity_keeps_its_recovery_obligations() {
+        for history in ["permissions", "outputs", "work"] {
+            let root = test_root();
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let store = root.path().join("journal");
+            let mut journal = setup_header_with_observations(&store);
+            match history {
+                "permissions" => {
+                    journal = with_settled_permissions(journal, &project);
+                    assert!(journal.next > 1);
+                }
+                "outputs" => {
+                    let scope = OutputScope::capture(&project, u32::MAX, &[]).unwrap();
+                    journal.output_pending(scope).unwrap();
+                    journal.append(&Event::OutputReconciled { id: 1 }).unwrap();
+                    journal.outputs.remove(&1);
+                }
+                "work" => {
+                    journal.work_started().unwrap();
+                    let mut gone = work_root();
+                    gone.unique = u64::MAX - 1;
+                    gone.process = process(i32::MAX as u32 - 1, 1);
+                    journal
+                        .observe_work(
+                            WorkSnapshot {
+                                roots: vec![gone],
+                                uncertain: false,
+                            },
+                            true,
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(journal.pending.is_empty() && journal.outputs.is_empty());
+            journal.next = 1;
+            journal.next_output = 1;
+            journal.header_only = true;
+            journal.read().unwrap();
+            let before = std::fs::read(store.join("pending.jsonl")).unwrap();
+            let (result, inspections) = finish_with_unrelated_processes(&mut journal);
+            assert!(result.is_err(), "{history}");
+            assert!(history == "work" || inspections > 0, "{history}");
+            assert!(!journal.closed, "{history}");
+            assert_eq!(std::fs::read(store.join("pending.jsonl")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn setup_state_drift_does_not_make_recorded_authority_disappear() {
+        for state in [
+            "legacy1",
+            "legacy2",
+            "legacy3",
+            "session",
+            "admission",
+            "uncertain",
+            "launch",
+            "roots",
+            "next",
+            "next_output",
+            "unproven",
+            "poisoned",
+            "failed_append",
+        ] {
+            let root = test_root();
+            let mut journal = setup_header_with_observations(root.path());
+            match state {
+                "legacy1" => {
+                    journal.header.version = 1;
+                    journal.header.boot = None;
+                    journal.header.work = None;
+                }
+                "legacy2" => {
+                    journal.header.version = 2;
+                    journal.header.work = None;
+                }
+                "legacy3" => journal.header.version = 3,
+                "session" => journal.header.session = Some(0),
+                "admission" => journal.admission = Some(process(50_000, 1)),
+                "uncertain" => journal.header.work.as_mut().unwrap().work.uncertain = true,
+                "launch" => journal.header.work.as_mut().unwrap().launch_pending = true,
+                "roots" => journal
+                    .header
+                    .work
+                    .as_mut()
+                    .unwrap()
+                    .work
+                    .roots
+                    .push(work_root()),
+                "next" => journal.next = 2,
+                "next_output" => journal.next_output = 2,
+                "unproven" => journal.header_only = false,
+                "poisoned" => journal.poisoned = true,
+                "failed_append" => {
+                    journal.poisoned = true;
+                    assert!(journal.append(&Event::WorkStarted).is_err());
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let (result, _) = finish_with_unrelated_processes(&mut journal);
+            assert!(result.is_err(), "{state}");
+            assert!(!journal.closed, "{state}");
+            assert_eq!(
+                std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_history_and_failed_replacement_cannot_prove_an_unused_header() {
+        for failure in ["parse", "replace"] {
+            let root = test_root();
+            let mut journal = setup_header_with_observations(root.path());
+            if failure == "parse" {
+                journal.file.write_all(b"{}\n").unwrap();
+                journal.file.sync_all().unwrap();
+                assert!(journal.read().is_err());
+            } else {
+                let bytes = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+                assert!(
+                    journal
+                        .replace_file(&bytes, |_| Err(io::Error::other("sync failed")))
+                        .is_err()
+                );
+            }
+            let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let (result, _) = finish_with_unrelated_processes(&mut journal);
+            assert!(result.is_err(), "{failure}");
+            assert!(!journal.closed, "{failure}");
+            assert_eq!(
+                std::fs::read(root.path().join("pending.jsonl")).unwrap(),
+                before
+            );
+        }
+    }
+
     #[test]
     fn setup_recovery_allows_delayed_activation_but_retains_a_timed_out_journal() {
         use std::process::{Command, Stdio};
 
         for (activation_delay, succeeds) in [(20, true), (31, false)] {
             let root = test_root();
-            let mut journal = journal(root.path());
+            let store = root.path().join("journal");
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let mut journal = with_settled_permissions(journal(&store), &project);
             // Model the private inventory with a test-owned process, without another account.
             let worker = rustix::process::geteuid().as_raw();
             journal.header.worker = worker;
@@ -1187,7 +1507,7 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            let before = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let before = std::fs::read(store.join("pending.jsonl")).unwrap();
             let mut inspected = false;
             let mut saw_child = false;
             let mut outputs_called = false;
@@ -1221,7 +1541,7 @@ mod tests {
             assert!(!outputs_called);
             assert_eq!(result.is_ok(), succeeds);
             assert_eq!(journal.closed, succeeds);
-            let bytes = std::fs::read(root.path().join("pending.jsonl")).unwrap();
+            let bytes = std::fs::read(store.join("pending.jsonl")).unwrap();
             let mut expected = before;
             if succeeds {
                 expected.extend(serde_json::to_vec(&Event::Closed).unwrap());

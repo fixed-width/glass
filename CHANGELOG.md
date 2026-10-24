@@ -72,6 +72,8 @@ internal refactors, CI, or test-only changes.
   enabled explicitly, selects only a separate desktop, and restores any temporary account access.
   After a new login, Glass restores the normal user's worker connection access before checking readiness.
   Permission recovery also allows for the worker's restart delay after the first readiness check.
+  A setup record with no application work or permission changes can finish without inspecting
+  unrelated macOS services; recorded application work and permission changes retain full recovery checks.
   Startup activates the existing signed worker and permission-helper jobs in the new desktop,
   replacing a stale idle connection only after verifying its registration. Worker failures retain
   their original diagnostic while temporary Screen Sharing access is cleaned up.
