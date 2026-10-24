@@ -909,6 +909,22 @@ impl Definition {
         })
     }
 
+    fn kind_for_job(
+        &self,
+        code: &glass_macos::private_session::PlatformExecutable,
+        text: &str,
+    ) -> Option<ServiceKind> {
+        if self.service_kind(code) == Some(ServiceKind::SharedUserAgent)
+            && self.active_endpoints(text)
+        {
+            Some(ServiceKind::SharedUserAgent)
+        } else if self.transaction_idle(code) {
+            Some(ServiceKind::IdleAgent)
+        } else {
+            None
+        }
+    }
+
     fn matches_job(&self, uid: u32, session: u32, process: ProcessIdentity, text: &str) -> bool {
         let lines: Vec<_> = text.lines().collect();
         let Some(fields) = job_fields(text, &format!("gui/{uid}/{} = {{", self.label)) else {
@@ -1068,7 +1084,13 @@ impl AgentCandidate {
         };
         current.path == self.code.path
             && current.identifier == self.code.identifier
-            && self.definition.service_kind(&current) == Some(self.kind)
+            && match self.kind {
+                ServiceKind::IdleAgent => self.definition.transaction_idle(&current),
+                ServiceKind::SharedUserAgent => {
+                    self.definition.service_kind(&current) == Some(self.kind)
+                }
+                _ => false,
+            }
             && self.definition.unchanged()
             && self.definition.program_matches(&current.path)
             && current
@@ -1126,7 +1148,7 @@ async fn inspect_for_account(
             continue;
         }
         let catalog = entries.clone();
-        let Some(candidate) =
+        let Some(mut candidate) =
             tokio::task::spawn_blocking(move || agent_candidate(uid, process, &catalog)).await?
         else {
             continue;
@@ -1134,6 +1156,10 @@ async fn inspect_for_account(
         let Some(job) = loaded_job(uid, &candidate.definition.label).await else {
             continue;
         };
+        let Some(kind) = candidate.definition.kind_for_job(&candidate.code, &job) else {
+            continue;
+        };
+        candidate.kind = kind;
         let service = tokio::task::spawn_blocking(move || {
             let definition = &candidate.definition;
             (definition.matches_job(uid, session, process, &job)
@@ -1306,6 +1332,37 @@ mod tests {
         let mut empty = definition;
         empty.services.clear();
         assert!(!empty.active_endpoints(&job));
+    }
+
+    #[test]
+    fn shared_declarations_preserve_a_valid_idle_proof_without_active_ports() {
+        let definition = definition();
+        let mut code = glass_macos::private_session::PlatformExecutable {
+            path: definition.program.clone(),
+            identifier: definition.label.clone(),
+            idle: true,
+            allows_idle_exit: true,
+        };
+        let dormant = job().replace("active = 1", "active = 0");
+        assert_eq!(
+            definition.kind_for_job(&code, &dormant),
+            Some(ServiceKind::IdleAgent)
+        );
+        code.idle = false;
+        assert_eq!(definition.kind_for_job(&code, &dormant), None);
+        let active = job().replace(
+            "active = 1",
+            "port = 0x123\n\t\t\tactive = 1\n\t\t\tmanaged = 1",
+        );
+        assert_eq!(
+            definition.kind_for_job(&code, &active),
+            Some(ServiceKind::SharedUserAgent)
+        );
+        code.idle = true;
+        assert_eq!(
+            definition.kind_for_job(&code, &active),
+            Some(ServiceKind::SharedUserAgent)
+        );
     }
 
     #[test]

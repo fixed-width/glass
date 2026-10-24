@@ -70,6 +70,7 @@ internal refactors, CI, or test-only changes.
   Requests already handed to shared OS services may finish after the application's processes stop.
   System-service verification handles immutable OS declarations with hardlinks, default XPC
   executable names and protected Cryptex paths while retaining executable signature checks.
+  Idle infrastructure keeps its existing cleanup proof when a shared-service proof is unavailable.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   Application setup offers **Start environment…** for a missing graphical login, using a transient
