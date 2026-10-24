@@ -14,6 +14,10 @@ static void leaf(void) {
 
 int main(int argc, char **argv) {
     if (argc != 2) return 64;
+    if (strcmp(argv[1], "exec-leaf")) {
+        char release;
+        if (read(STDIN_FILENO, &release, 1) != 1) return 0;
+    }
     if (!strcmp(argv[1], "exec")) {
         puts("ready");
         fflush(stdout);

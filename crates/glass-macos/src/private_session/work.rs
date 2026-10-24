@@ -444,6 +444,7 @@ mod tests {
 
     struct Fixture {
         child: Child,
+        root: Option<ProcessOrigin>,
         _directory: tempfile::TempDir,
     }
     impl Drop for Fixture {
@@ -476,10 +477,21 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Fixture {
+        let mut fixture = Fixture {
             child,
+            root: None,
             _directory: directory,
-        }
+        };
+        fixture.root =
+            Some(observe(fixture.child.id(), rustix::process::geteuid().as_raw()).unwrap());
+        fixture
+            .child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"g")
+            .unwrap();
+        fixture
     }
 
     fn wait_gone(process: ProcessOrigin, uid: u32) {
@@ -508,7 +520,7 @@ mod tests {
     fn kernel_parent_identity_survives_setsid_and_reparenting() {
         let mut fixture = fixture("single");
         let uid = rustix::process::geteuid().as_raw();
-        let root = observe(fixture.child.id(), uid).unwrap();
+        let root = fixture.root.unwrap();
         let mut line = String::new();
         BufReader::new(fixture.child.stdout.take().unwrap())
             .read_line(&mut line)
@@ -526,7 +538,7 @@ mod tests {
     fn a_double_fork_with_a_lost_parent_cannot_be_reported_clean() {
         let mut fixture = fixture("double");
         let uid = rustix::process::geteuid().as_raw();
-        let root = observe(fixture.child.id(), uid).unwrap();
+        let root = fixture.root.unwrap();
         let mut line = String::new();
         BufReader::new(fixture.child.stdout.take().unwrap())
             .read_line(&mut line)
