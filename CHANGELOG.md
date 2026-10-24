@@ -51,8 +51,8 @@ internal refactors, CI, or test-only changes.
   unfinished or invalid recovery evidence is retained and still blocks that change.
   Consecutive worker readiness checks allow for macOS's restart throttle instead of timing out at
   its ten-second boundary. Worker activation remains bounded and keeps its authentication checks.
-  Workspace cleanup distinguishes verified idle macOS system services from unfinished application
-  work, restoring temporary permissions while retaining system-managed infrastructure, including
+  Workspace cleanup distinguishes verified macOS system infrastructure from unfinished application
+  work, restoring temporary permissions while retaining idle or explicitly shared services, including
   system jobs without explicit argument lists or Mach endpoints.
   If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
   within the cleanup deadline. Protective denials and mixed allow/deny records remain until
@@ -62,10 +62,14 @@ internal refactors, CI, or test-only changes.
   reparented children. Cleanup retains learned ownership after interruption and checks fresh
   LaunchServices targets against PID reuse. Unattributed new account processes still require
   verified system-service evidence before permissions are fully restored. Protected Apple XPC
-  providers with a shared per-user role may remain active as part of the desktop environment;
+  providers and registered system agents with a shared per-user role may remain active as part
+  of the desktop environment;
   app-scoped providers must be idle, including separately named service instances verified in
   their requestor's process domain and private graphical login. These checks retain code, file and
   process identity proof and never exempt a recorded Glass-owned process.
+  Requests already handed to shared OS services may finish after the application's processes stop.
+  System-service verification handles immutable OS declarations with hardlinks, default XPC
+  executable names and protected Cryptex paths while retaining executable signature checks.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   Application setup offers **Start environment…** for a missing graphical login, using a transient

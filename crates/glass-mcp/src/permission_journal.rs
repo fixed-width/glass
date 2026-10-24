@@ -40,7 +40,7 @@ impl IdleSamples {
             .any(|(index, process)| !unknown.contains(process) || idle[..index].contains(process))
         {
             return Err(io::Error::other(
-                "idle-service response included an unrequested or duplicate process",
+                "system-service response included an unrequested or duplicate process",
             ));
         }
         if unknown.iter().any(|process| !idle.contains(process)) {
@@ -898,7 +898,7 @@ impl PermissionJournal {
                     .any(|origin| &origin.process == process)
             }) {
                 return Err(io::Error::other(
-                    "idle-service proof included an owned or unrequested process",
+                    "system-service proof included an owned or unrequested process",
                 ));
             }
             let mut relevant: Vec<_> = account.iter().map(|origin| origin.process).collect();

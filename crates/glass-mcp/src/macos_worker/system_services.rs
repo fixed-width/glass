@@ -1,6 +1,6 @@
 //! Read-only attribution of platform services retained by the private desktop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 const ROOT: &str = "/System/Library/LaunchAgents";
+const SYSTEM_LIBRARY: &str = "/System/Library";
+const CRYPTEX_LIBRARY: &str = "/System/Cryptexes/OS/System/Library";
 const LIMIT: usize = 128 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,6 +31,7 @@ pub(super) struct SystemService {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum ServiceKind {
     IdleAgent,
+    SharedUserAgent,
     IdleXpc,
     SharedUserXpc,
 }
@@ -51,8 +54,14 @@ impl XpcDefinition {
             || contents.file_name()? != "Contents"
             || bundle.extension()? != "xpc"
             || value.get("CFBundlePackageType")?.as_string()? != "XPC!"
-            || value.get("CFBundleExecutable")?.as_string()? != program.file_name()?.to_str()?
         {
+            return None;
+        }
+        let executable = match value.get("CFBundleExecutable") {
+            Some(value) => value.as_string()?,
+            None => bundle.file_stem()?.to_str()?,
+        };
+        if executable != program.file_name()?.to_str()? {
             return None;
         }
         let label = value.get("CFBundleIdentifier")?.as_string()?;
@@ -271,8 +280,9 @@ fn xpc_candidate(uid: u32, process: ProcessIdentity) -> Option<(SystemService, X
     if !live.allows_idle_exit {
         return None;
     }
-    let info = live.path.parent()?.parent()?.join("Info.plist");
-    let mut source = ProtectedFile::open(&info)?;
+    let program = system_program(&live.path)?;
+    let info = program.parent()?.parent()?.join("Info.plist");
+    let mut source = ProtectedFile::system(&info, false)?;
     if source.file.metadata().ok()?.len() > LIMIT as u64 {
         return None;
     }
@@ -284,27 +294,25 @@ fn xpc_candidate(uid: u32, process: ProcessIdentity) -> Option<(SystemService, X
     if bytes.len() > LIMIT {
         return None;
     }
-    let definition = XpcDefinition::parse(
-        &live.path,
-        &plist::from_bytes(&bytes).ok()?,
-        &live.identifier,
-    )?;
+    let definition =
+        XpcDefinition::parse(&program, &plist::from_bytes(&bytes).ok()?, &live.identifier)?;
     definition.kind(live.idle)?;
-    let executable = ProtectedFile::open(&definition.program)?;
+    let executable = ProtectedFile::system(&definition.program, false)?;
     let current = platform_executable(uid, &process)?;
     let kind = definition.kind(current.idle)?;
-    let mut current_source = ProtectedFile::open(&info)?;
+    let mut current_source = ProtectedFile::system(&info, false)?;
     let mut current_bytes = Vec::new();
     Read::by_ref(&mut current_source.file)
         .take(LIMIT as u64 + 1)
         .read_to_end(&mut current_bytes)
         .ok()?;
-    if current.path != definition.program
+    if current.path != live.path
         || !current.allows_idle_exit
         || current.identifier != definition.label
         || !source.same(&current_source)
         || bytes != current_bytes
-        || !ProtectedFile::open(&current.path).is_some_and(|now| executable.same(&now))
+        || !ProtectedFile::system(&definition.program, false)
+            .is_some_and(|now| executable.same(&now))
         || work::observe(process.pid(), uid).ok()? != origin
     {
         return None;
@@ -414,6 +422,13 @@ pub(super) fn validate_report(
             }
             let valid = match service.kind {
                 ServiceKind::IdleAgent => idle_system_executable(uid, &service.process).is_some(),
+                ServiceKind::SharedUserAgent => system_catalog().ok().is_some_and(|catalog| {
+                    agent_candidate(uid, service.process, &catalog).is_some_and(|candidate| {
+                        candidate.kind == ServiceKind::SharedUserAgent
+                            && candidate.definition.label == service.label
+                            && candidate.still_valid(uid, service.process)
+                    })
+                }),
                 _ => xpc_candidate(uid, service.process).is_some_and(|(current, _)| {
                     current.label == service.label && current.kind == service.kind
                 }),
@@ -447,6 +462,7 @@ struct Definition {
     program: PathBuf,
     arguments: Option<Vec<String>>,
     services: Vec<String>,
+    shared_mach_services: bool,
     pressured_exit: bool,
     source: Option<(ProtectedFile, Vec<u8>)>,
 }
@@ -456,6 +472,48 @@ struct ProtectedFile {
     parents: Vec<File>,
     directory: bool,
     anchors: Vec<File>,
+    resolved: PathBuf,
+    aliases: Vec<ProtectedAlias>,
+}
+
+struct ProtectedAlias {
+    path: PathBuf,
+    parent: ProtectedFile,
+    device: u64,
+    inode: u64,
+    target: PathBuf,
+}
+
+impl ProtectedAlias {
+    fn valid(&self) -> bool {
+        self.parent.valid_chain()
+            && std::fs::symlink_metadata(&self.path).is_ok_and(|info| {
+                info.is_symlink()
+                    && info.uid() == 0
+                    && info.dev() == self.device
+                    && info.ino() == self.inode
+            })
+            && std::fs::read_link(&self.path).is_ok_and(|target| target == self.target)
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.device == other.device
+            && self.inode == other.inode
+            && self.target == other.target
+            && self.parent.same(&other.parent)
+    }
+}
+
+fn system_program(path: &Path) -> Option<PathBuf> {
+    if path.starts_with(SYSTEM_LIBRARY) {
+        return Some(path.into());
+    }
+    let root = ProtectedFile::system(Path::new(CRYPTEX_LIBRARY), true)?;
+    let logical = Path::new(SYSTEM_LIBRARY).join(path.strip_prefix(&root.resolved).ok()?);
+    let executable = ProtectedFile::system(&logical, false)?;
+    (executable.resolved == path && root.valid_chain() && executable.valid_chain())
+        .then_some(logical)
 }
 
 impl ProtectedFile {
@@ -505,7 +563,66 @@ impl ProtectedFile {
             parents,
             directory,
             anchors: Vec::new(),
+            resolved: path.into(),
+            aliases: Vec::new(),
         })
+    }
+
+    fn system(path: &Path, directory: bool) -> Option<Self> {
+        if !(path.starts_with(SYSTEM_LIBRARY) || path.starts_with(CRYPTEX_LIBRARY))
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        {
+            return None;
+        }
+        let canonical = path.canonicalize().ok()?;
+        let mut file = Self::open_kind(&canonical, directory)?;
+        if canonical == path {
+            return Some(file);
+        }
+        let mut pending: VecDeque<_> = path
+            .components()
+            .map(|part| part.as_os_str().to_owned())
+            .collect();
+        let mut resolved = PathBuf::from("/");
+        let mut steps = 0;
+        while let Some(part) = pending.pop_front() {
+            steps += 1;
+            if steps > 1024 {
+                return None;
+            }
+            if part == "/" {
+                resolved = PathBuf::from("/");
+            } else if part == ".." {
+                if !resolved.pop() {
+                    return None;
+                }
+            } else if part != "." {
+                let next = resolved.join(part);
+                let info = std::fs::symlink_metadata(&next).ok()?;
+                if info.is_symlink() {
+                    if info.uid() != 0 || file.aliases.len() >= 40 {
+                        return None;
+                    }
+                    let parent = Self::open_kind(&resolved, true)?;
+                    let target = std::fs::read_link(&next).ok()?;
+                    for part in target.components().rev() {
+                        pending.push_front(part.as_os_str().to_owned());
+                    }
+                    file.aliases.push(ProtectedAlias {
+                        path: next,
+                        parent,
+                        device: info.dev(),
+                        inode: info.ino(),
+                        target,
+                    });
+                } else {
+                    resolved = next;
+                }
+            }
+        }
+        (resolved == canonical && file.valid_chain()).then_some(file)
     }
 
     fn root_owned(file: &File, directory: bool) -> bool {
@@ -514,7 +631,10 @@ impl ProtectedFile {
                 && if directory {
                     metadata.is_dir()
                 } else {
-                    metadata.is_file() && metadata.nlink() == 1
+                    metadata.is_file()
+                        && metadata.nlink() > 0
+                        && (metadata.nlink() == 1
+                            || glass_macos::private_session::readonly_filesystem(file))
                 }
         }) && glass_macos::private_session::require_write_protected(file, 0).is_ok()
     }
@@ -547,6 +667,7 @@ impl ProtectedFile {
                 .anchors
                 .iter()
                 .all(|anchor| Self::protected(anchor, true))
+            && self.aliases.iter().all(ProtectedAlias::valid)
     }
 
     fn same(&self, other: &Self) -> bool {
@@ -555,6 +676,12 @@ impl ProtectedFile {
             && other.valid_chain()
             && self.parents.len() == other.parents.len()
             && self.anchors.len() == other.anchors.len()
+            && self.aliases.len() == other.aliases.len()
+            && self
+                .aliases
+                .iter()
+                .zip(&other.aliases)
+                .all(|(before, after)| before.same(after))
             && self
                 .parents
                 .iter()
@@ -625,6 +752,7 @@ impl Definition {
         if !Path::new(program).is_absolute() || program.contains(['\n', '\r', '\0']) {
             return None;
         }
+        let mut shared_mach_services = false;
         let services = match value.get("MachServices") {
             Some(services) => {
                 let services = services.as_dictionary()?;
@@ -636,6 +764,10 @@ impl Definition {
                 }) {
                     return None;
                 }
+                shared_mach_services = !services.is_empty()
+                    && services
+                        .iter()
+                        .all(|(name, value)| label_valid(name) && value.as_boolean() == Some(true));
                 services.keys().cloned().collect()
             }
             None => Vec::new(),
@@ -647,6 +779,7 @@ impl Definition {
             program: program.into(),
             arguments,
             services,
+            shared_mach_services,
             pressured_exit,
             source: None,
         })
@@ -709,6 +842,71 @@ impl Definition {
 
     fn transaction_idle(&self, code: &glass_macos::private_session::PlatformExecutable) -> bool {
         code.idle && code.allows_idle_exit == self.pressured_exit
+    }
+
+    fn service_kind(
+        &self,
+        code: &glass_macos::private_session::PlatformExecutable,
+    ) -> Option<ServiceKind> {
+        if self.shared_mach_services
+            && !self.services.is_empty()
+            && self.pressured_exit
+            && code.allows_idle_exit
+        {
+            Some(ServiceKind::SharedUserAgent)
+        } else if self.transaction_idle(code) {
+            Some(ServiceKind::IdleAgent)
+        } else {
+            None
+        }
+    }
+
+    fn active_endpoints(&self, text: &str) -> bool {
+        if self.services.is_empty() {
+            return false;
+        }
+        let lines: Vec<_> = text.lines().collect();
+        let Some(endpoints) = block(&lines, "endpoints") else {
+            return false;
+        };
+        self.services.iter().all(|name| {
+            let header = format!("\t\t\"{name}\" = {{");
+            let mut starts = endpoints
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| **line == header);
+            let Some((start, _)) = starts.next() else {
+                return false;
+            };
+            if starts.next().is_some() {
+                return false;
+            }
+            let start = start + 1;
+            let Some(end) = endpoints[start..].iter().position(|line| *line == "\t\t}") else {
+                return false;
+            };
+            let mut fields = BTreeMap::new();
+            for line in &endpoints[start..start + end] {
+                let Some((key, value)) = line
+                    .strip_prefix("\t\t\t")
+                    .filter(|line| !line.starts_with('\t'))
+                    .and_then(|line| line.split_once(" = "))
+                else {
+                    return false;
+                };
+                if fields.insert(key, value).is_some() {
+                    return false;
+                }
+            }
+            fields.get("active") == Some(&"1")
+                && fields.get("managed") == Some(&"1")
+                && fields.get("port").is_some_and(|value| {
+                    value
+                        .strip_prefix("0x")
+                        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                        .is_some_and(|port| port != 0)
+                })
+        })
     }
 
     fn matches_job(&self, uid: u32, session: u32, process: ProcessIdentity, text: &str) -> bool {
@@ -842,76 +1040,119 @@ pub(super) async fn inspect(bytes: &[u8]) -> anyhow::Result<Vec<SystemService>> 
     inspect_for_account(uid, session, processes).await
 }
 
+fn system_catalog() -> std::io::Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(ROOT)?
+        .take(4097)
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if entries.len() > 4096 {
+        return Err(std::io::Error::other(
+            "system service catalog exceeds bound",
+        ));
+    }
+    Ok(entries)
+}
+
+struct AgentCandidate {
+    code: glass_macos::private_session::PlatformExecutable,
+    executable: ProtectedFile,
+    definition: Definition,
+    kind: ServiceKind,
+    origin: work::ProcessOrigin,
+}
+
+impl AgentCandidate {
+    fn still_valid(&self, uid: u32, process: ProcessIdentity) -> bool {
+        let Some(current) = platform_executable(uid, &process) else {
+            return false;
+        };
+        current.path == self.code.path
+            && current.identifier == self.code.identifier
+            && self.definition.service_kind(&current) == Some(self.kind)
+            && self.definition.unchanged()
+            && self.definition.program_matches(&current.path)
+            && current
+                .path
+                .canonicalize()
+                .ok()
+                .and_then(|path| ProtectedFile::open(&path))
+                .is_some_and(|file| self.executable.same(&file))
+            && work::observe(process.pid(), uid).ok() == Some(self.origin)
+    }
+}
+
+fn agent_candidate(
+    uid: u32,
+    process: ProcessIdentity,
+    catalog: &[PathBuf],
+) -> Option<AgentCandidate> {
+    let origin = work::observe(process.pid(), uid).ok()?;
+    if origin.process != process || origin.parent_unique != work::observe(1, 0).ok()?.unique {
+        return None;
+    }
+    let code = platform_executable(uid, &process)?;
+    let executable = ProtectedFile::open(&code.path.canonicalize().ok()?)?;
+    let mut matching = catalog
+        .iter()
+        .filter_map(|path| Definition::read(path.clone()))
+        .filter(|definition| {
+            definition.program_matches(&code.path) && definition.service_kind(&code).is_some()
+        });
+    let definition = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    let kind = definition.service_kind(&code)?;
+    Some(AgentCandidate {
+        code,
+        executable,
+        definition,
+        kind,
+        origin,
+    })
+}
+
 async fn inspect_for_account(
     uid: u32,
     session: u32,
     processes: Vec<ProcessIdentity>,
 ) -> anyhow::Result<Vec<SystemService>> {
-    let entries = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<PathBuf>> {
-        let entries = std::fs::read_dir(ROOT)?
-            .take(4097)
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::io::Result<Vec<_>>>()?;
-        anyhow::ensure!(
-            entries.len() <= 4096,
-            "system service catalog exceeds bound"
-        );
-        Ok(entries)
-    })
-    .await??;
+    let entries = tokio::task::spawn_blocking(system_catalog).await??;
     let entries = std::sync::Arc::new(entries);
-    let mut idle = Vec::new();
+    let mut verified = Vec::new();
     for process in processes {
         if let Some(service) = verified_xpc(uid, session, process).await? {
-            idle.push(service);
+            verified.push(service);
             continue;
         }
         let catalog = entries.clone();
-        let Some((code, executable, definition)) = tokio::task::spawn_blocking(move || {
-            let code = platform_executable(uid, &process).filter(|code| code.idle)?;
-            let executable = ProtectedFile::open(&code.path.canonicalize().ok()?)?;
-            let mut matching = catalog
-                .iter()
-                .filter_map(|path| Definition::read(path.clone()))
-                .filter(|definition| {
-                    definition.program_matches(&code.path) && definition.transaction_idle(&code)
-                });
-            let definition = matching.next()?;
-            if matching.next().is_some() {
-                return None;
-            }
-            Some((code, executable, definition))
-        })
-        .await?
+        let Some(candidate) =
+            tokio::task::spawn_blocking(move || agent_candidate(uid, process, &catalog)).await?
         else {
             continue;
         };
-        let Some(job) = loaded_job(uid, &definition.label).await else {
+        let Some(job) = loaded_job(uid, &candidate.definition.label).await else {
             continue;
         };
         let service = tokio::task::spawn_blocking(move || {
+            let definition = &candidate.definition;
             (definition.matches_job(uid, session, process, &job)
-                && platform_executable(uid, &process).as_ref() == Some(&code)
-                && definition.unchanged()
-                && definition.program_matches(&code.path)
-                && code
-                    .path
-                    .canonicalize()
-                    .ok()
-                    .and_then(|path| ProtectedFile::open(&path))
-                    .is_some_and(|current| executable.same(&current)))
+                && (candidate.kind != ServiceKind::SharedUserAgent
+                    || definition.active_endpoints(&job))
+                && candidate.still_valid(uid, process)
+                && glass_macos::private_session::session_exists(session, uid).ok() == Some(true))
             .then_some(SystemService {
                 process,
-                label: definition.label,
-                kind: ServiceKind::IdleAgent,
+                label: candidate.definition.label,
+                kind: candidate.kind,
             })
         })
         .await?;
         if let Some(service) = service {
-            idle.push(service);
+            verified.push(service);
         }
     }
-    Ok(idle)
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -996,6 +1237,75 @@ mod tests {
         assert!(
             XpcDefinition::parse(Path::new(XPC_PROGRAM), &value, "com.apple.example").is_none()
         );
+    }
+
+    #[test]
+    fn an_absent_executable_uses_only_the_xpc_bundle_stem() {
+        let mut value = xpc_value(None);
+        value.remove("CFBundleExecutable");
+        assert!(
+            XpcDefinition::parse(Path::new(XPC_PROGRAM), &value, "com.apple.example").is_some()
+        );
+        let wrong = XPC_PROGRAM.replace("/MacOS/Example", "/MacOS/Other");
+        assert!(XpcDefinition::parse(Path::new(&wrong), &value, "com.apple.example").is_none());
+        for executable in ["".into(), "Other".into(), true.into(), 1.into()] {
+            value.insert("CFBundleExecutable".into(), executable);
+            assert!(
+                XpcDefinition::parse(Path::new(XPC_PROGRAM), &value, "com.apple.example").is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn only_declared_shared_mach_providers_can_remain_busy() {
+        let mut definition = definition();
+        let mut code = glass_macos::private_session::PlatformExecutable {
+            path: definition.program.clone(),
+            idle: false,
+            allows_idle_exit: true,
+            identifier: definition.label.clone(),
+        };
+        assert_eq!(
+            definition.service_kind(&code),
+            Some(ServiceKind::SharedUserAgent)
+        );
+        code.idle = true;
+        assert_eq!(
+            definition.service_kind(&code),
+            Some(ServiceKind::SharedUserAgent)
+        );
+        definition.shared_mach_services = false;
+        assert_eq!(definition.service_kind(&code), Some(ServiceKind::IdleAgent));
+        code.idle = false;
+        assert_eq!(definition.service_kind(&code), None);
+        definition.shared_mach_services = true;
+        code.allows_idle_exit = false;
+        assert_eq!(definition.service_kind(&code), None);
+    }
+
+    #[test]
+    fn shared_providers_require_active_managed_declared_ports() {
+        let definition = definition();
+        let names = definition.services.iter().map(|name| format!(
+            "\t\t\"{name}\" = {{\n\t\t\tport = 0x123\n\t\t\tactive = 1\n\t\t\tmanaged = 1\n\t\t}}"
+        )).collect::<Vec<_>>().join("\n");
+        let job = format!("job = {{\n\tendpoints = {{\n{names}\n\t}}\n}}\n");
+        assert!(definition.active_endpoints(&job));
+        for (before, after) in [
+            ("active = 1", "active = 0"),
+            ("managed = 1", "managed = 0"),
+            ("port = 0x123", "port = 0x0"),
+            ("active = 1", "active = 1\n\t\t\tactive = 1"),
+            ("\t\t}", "\t\tbroken"),
+        ] {
+            assert!(
+                !definition.active_endpoints(&job.replace(before, after)),
+                "{before}"
+            );
+        }
+        let mut empty = definition;
+        empty.services.clear();
+        assert!(!empty.active_endpoints(&job));
     }
 
     #[test]

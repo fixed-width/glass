@@ -151,6 +151,10 @@ Keep the development account logged in between ordinary application runs. Stoppi
 does not log that account out. When its desktop is missing, open **glass → Application setup…**
 in your normal account and choose **Start environment…** for the enrolled account.
 
+Stop ends Glass-owned app and build processes and restores temporary workspace permissions.
+Verified shared macOS services remain part of the development desktop; requests already sent
+to those services may finish after the application's processes stop.
+
 Enter that development account's password in Glass's secure dialog, then complete any separate
 macOS administrator approval. Neither prompt has a deadline. Glass does not save the password,
 change it, re-enroll the account or repeat existing privacy grants. A running desktop is reused

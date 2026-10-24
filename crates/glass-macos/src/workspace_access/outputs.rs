@@ -249,7 +249,7 @@ impl OutputScope {
         Ok(())
     }
 
-    /// After writer quiescence, durably add only non-inheriting directory read/search access.
+    /// After attributed writers stop, durably add only non-inheriting directory read/search access.
     /// The recorder owns revocation even after partial failure; it must settle grants before Closed.
     pub fn grant_inspection(
         &self,
@@ -870,7 +870,7 @@ impl OutputMonitor {
         }
     }
 
-    /// Complete an explicit full scan. Final cleanup must establish writer quiescence first;
+    /// Complete an explicit full scan. Final cleanup must stop attributed writers first;
     /// event flushing alone cannot include writes that fseventsd has not published yet.
     pub fn reconcile(&self, deadline: Deadline) -> io::Result<()> {
         self.flush(deadline)?;

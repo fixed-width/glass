@@ -757,7 +757,13 @@ static int platform_executable(const GlassProcessIdentity *process, uint32_t uid
             kSecCSSigningInformation | kSecCSDynamicInformation, &live_info);
         // Preserve the live architecture (including arm64e) when validating its on-disk code.
         if (!status) status = SecCodeCopyStaticCode(code, 0, &disk);
-        if (!status) status = SecStaticCodeCheckValidity(disk, kSecCSStrictValidate, apple);
+        if (!status) {
+            status = SecStaticCodeCheckValidity(disk, kSecCSStrictValidate, apple);
+            // System components can retain legacy resource rules; validate their executable strictly.
+            if (status == errSecCSWeakResourceRules)
+                status = SecStaticCodeCheckValidity(disk,
+                    kSecCSStrictValidate | kSecCSDoNotValidateResources, apple);
+        }
         if (!status) status = SecCodeCopySigningInformation(disk, kSecCSSigningInformation, &disk_info);
         bool eligible = false;
         NSString *identity = nil;
