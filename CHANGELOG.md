@@ -71,6 +71,8 @@ internal refactors, CI, or test-only changes.
   System-service verification handles immutable OS declarations with hardlinks, default XPC
   executable names and protected Cryptex paths while retaining executable signature checks.
   Idle infrastructure keeps its existing cleanup proof when a shared-service proof is unavailable.
+  Interrupted app-start recovery avoids waiting for its own authenticated inspection worker to stop;
+  recorded application processes still block cleanup.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
   Application setup offers **Start environment…** for a missing graphical login, using a transient

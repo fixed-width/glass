@@ -870,9 +870,9 @@ impl PermissionJournal {
             }
             let mut observed = observer.observe(&current)?;
             self.observe_work(observer.known(), false)?;
-            observed
-                .unresolved
-                .retain(|origin| account.contains(origin));
+            observed.unresolved.retain(|origin| {
+                account.contains(origin) && self.admission.as_ref() != Some(&origin.process)
+            });
             let unknown: Vec<_> = observed
                 .owned
                 .iter()
@@ -1918,6 +1918,74 @@ mod tests {
         assert_eq!(repairs, 0);
         assert_eq!(acl(&project), before);
         assert!(journal.outputs.len() == 1 && journal.pending.is_empty());
+    }
+
+    #[test]
+    fn ownership_recovery_excludes_only_the_unowned_admission_lifetime() {
+        let root = test_root();
+        let mut journal = journal(root.path());
+        let uid = rustix::process::geteuid().as_raw();
+        let admission = work::observe(std::process::id(), uid).unwrap();
+        let baseline: Vec<_> = work::snapshot(uid)
+            .unwrap()
+            .into_iter()
+            .filter(|origin| *origin != admission)
+            .collect();
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let retired = work::observe(child.id(), uid).unwrap();
+        child.stdin.take();
+        child.wait().unwrap();
+        let mut scope = WorkScope {
+            baseline,
+            work: WorkSnapshot {
+                roots: vec![retired],
+                uncertain: false,
+            },
+            launch_pending: false,
+        };
+        journal.header.worker = uid;
+        journal.header.baseline = scope.baseline.iter().map(|origin| origin.process).collect();
+        journal.header.work = Some(scope.clone());
+        journal.admission = Some(admission.process);
+        journal
+            .wait_owned_work(&scope, Deadline::from_millis(3000), &mut |processes, _| {
+                assert!(!processes.contains(&admission.process));
+                Ok(processes.to_vec())
+            })
+            .unwrap();
+
+        scope.work.roots.push(admission);
+        journal.header.work = Some(scope.clone());
+        assert!(
+            journal
+                .wait_owned_work(&scope, Deadline::from_millis(200), &mut |processes, _| {
+                    assert!(
+                        !processes.contains(&admission.process),
+                        "owned work must not be offered for exemption"
+                    );
+                    Ok(processes.to_vec())
+                })
+                .is_err(),
+            "positive ownership must override admission exclusion"
+        );
+
+        scope.work.roots.retain(|origin| *origin != admission);
+        journal.header.work = Some(scope.clone());
+        journal.admission = Some(process(admission.process.pid(), 1));
+        let mut saw_actual = false;
+        assert!(
+            journal
+                .wait_owned_work(&scope, Deadline::from_millis(1000), &mut |processes, _| {
+                    saw_actual |= processes.contains(&admission.process);
+                    Err(io::Error::other("do not exempt a reused admission PID"))
+                })
+                .is_err()
+        );
+        assert!(saw_actual);
     }
 
     #[test]
