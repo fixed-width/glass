@@ -192,6 +192,21 @@ jobs:
       - name: glass-mcp headless stdio smoke (initialize + tools/list; no grants needed)
         run: ./scripts/test-macos-mcp.sh
 
+  macos-account:
+    name: macOS account APIs (${{ matrix.image }}, ${{ matrix.context }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-14, xcode-27]
+        context: [direct, system]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Test native account preparation on the disposable host
+        timeout-minutes: 5
+        run: ./scripts/test-macos-account.sh '${{ matrix.context }}'
+
   windows:
     name: Windows (build · clippy · test)
     runs-on: windows-latest

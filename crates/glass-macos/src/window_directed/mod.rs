@@ -91,8 +91,8 @@ fn require_same_process(before: ProcessIdentity, after: ProcessIdentity) -> Resu
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn refusal(reason: &'static str) -> GlassError {
     GlassError::UnsupportedOperation {
-        operation: "native window inspection",
-        reason,
+        operation: "native window inspection".into(),
+        reason: reason.into(),
     }
     .before_dispatch()
 }

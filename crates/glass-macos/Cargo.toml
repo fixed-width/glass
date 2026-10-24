@@ -112,6 +112,7 @@ path = "src/bin/sandbox_probe.rs"
 glass-a11y-macos.workspace = true
 glass-core.workspace = true
 plist = "1"
+serde = { version = "1", features = ["derive"] }
 
 # macOS-only FFI deps (objc2 family). Kept in this target table so the crate's pure
 # modules still build off macOS with zero macOS deps. Versions pinned to
@@ -123,11 +124,19 @@ plist = "1"
 # feature set) out of the build entirely. Each list was derived and verified empirically
 # on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
+crypto-bigint = { version = "0.6.1", features = ["alloc", "zeroize"] }
+getrandom = "0.3"
+md-5 = "0.10.6"
+thiserror = "2"
+zeroize = "1"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
     "NSEnumerator",
     "NSError",
+    "NSTimer",
+    "NSRunLoop",
     "NSString",
     # `NSURL` — `ffi.rs::launch_bundle`'s `NSURL::fileURLWithPath`, building the file URL
     # `NSWorkspace.openApplicationAtURL:...` takes.
@@ -135,6 +144,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 ] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
+    "NSAlert",
     "NSResponder",
     # The visible menu-bar app (`menubar.rs`): the system status bar (`NSStatusBar`), its
     # variable-length item (`NSStatusItem`) and the item's clickable button
@@ -164,6 +174,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSWindow",
     "NSGraphics",
     "NSTextField",
+    "NSSecureTextField",
     # `CGFloat` — the status-item length type: `NSStatusBar::statusItemWithLength:` and the
     # `NSVariableStatusItemLength` constant are both `cfg`-gated on app-kit's own
     # `objc2-core-foundation` feature (which pulls the `CGFloat` alias in).
@@ -263,10 +274,21 @@ glass-pipe-unix.workspace = true
 glass-sandbox-macos.workspace = true
 
 [dev-dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
+crypto-bigint = { version = "0.6.1", features = ["alloc", "zeroize"] }
+getrandom = "0.3"
+md-5 = "0.10.6"
+thiserror = "2"
+zeroize = "1"
 tempfile.workspace = true
+serde_json = "1"
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix.workspace = true
+glass-pipe-unix.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+cc = "1"

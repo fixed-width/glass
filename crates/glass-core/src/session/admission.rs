@@ -65,8 +65,10 @@ impl Glass {
             Mutation::SelectWindow => "window selection",
         };
         Err(GlassError::UnsupportedOperation {
-            operation,
-            reason: "this session only admits qualified coordinate left clicks and vertical scrolls",
+            operation: operation.into(),
+            reason:
+                "this session only admits qualified coordinate left clicks and vertical scrolls"
+                    .into(),
         }
         .before_dispatch())
     }
@@ -82,11 +84,12 @@ fn require_targeted_support(
         return Ok(());
     }
     Err(GlassError::UnsupportedOperation {
-        operation,
+        operation: operation.into(),
         reason: capability
             .support
             .note
-            .unwrap_or("no qualified input without desktop interference"),
+            .clone()
+            .unwrap_or_else(|| "no qualified input without desktop interference".into()),
     }
     .before_dispatch())
 }

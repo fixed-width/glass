@@ -251,6 +251,8 @@ pub(crate) fn launch_agent_plist_path(home: &str) -> std::path::PathBuf {
 /// be transposed at the call site without a field-name mismatch.
 #[derive(Debug, Clone)]
 pub struct SetupArgs {
+    /// Existing standard account used for private macOS application work.
+    pub account: Option<String>,
     /// Fail/assume-a-default instead of prompting (scripting/CI).
     pub non_interactive: bool,
     /// Force the `gui/<uid>` LaunchAgent (unattended `serve --http`) instead of asking.
@@ -270,6 +272,7 @@ pub struct SetupArgs {
 /// asking; `addr` overrides the LaunchAgent's HTTP bind address.
 pub fn run(args: SetupArgs) -> Result<()> {
     let SetupArgs {
+        account,
         non_interactive,
         launchagent,
         no_launchagent,
@@ -277,13 +280,35 @@ pub fn run(args: SetupArgs) -> Result<()> {
     } = args;
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (non_interactive, launchagent, no_launchagent, addr);
+        let _ = (account, non_interactive, launchagent, no_launchagent, addr);
         Err(glass_core::GlassError::Backend(
             "setup is macOS-only".into(),
         ))
     }
     #[cfg(target_os = "macos")]
     {
+        if let Some(account) = account.as_deref() {
+            let mode = match run_mode_from_flags(launchagent, no_launchagent) {
+                Some(mode) => mode,
+                None if non_interactive => RunMode::Stdio,
+                None => macos_impl::prompt_run_mode(),
+            };
+            return crate::macos_environment::setup(
+                account,
+                non_interactive,
+                mode == RunMode::Http,
+                addr.as_deref(),
+            )
+            .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
+        }
+        if glass_macos::private_session::configured()? {
+            return crate::macos_environment::resume_setup(
+                non_interactive,
+                run_mode_from_flags(launchagent, no_launchagent),
+                addr.as_deref(),
+            )
+            .map_err(|error| glass_core::GlassError::Backend(format!("{error:#}")));
+        }
         // Step 1: preconditions. Resolve the running binary's own path — used for the
         // signing-identity warning right below, and later as both the LaunchAgent's
         // `ProgramArguments[0]` and the registration line's binary path.
@@ -423,6 +448,33 @@ pub(crate) fn install_launch_agent(
     addr: &str,
 ) -> Result<Option<(&'static str, String)>> {
     macos_impl::install_launch_agent(app_bin, addr)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn verify_private_launch_agent(addr: &str) -> Result<()> {
+    macos_impl::verify_private_launch_agent(addr)
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn loaded_agent_pid(output: &str) -> Option<u32> {
+    let mut depth = 0_usize;
+    let mut pid = None;
+    for line in output.lines().map(str::trim) {
+        if line == "}" {
+            depth = depth.checked_sub(1)?;
+        } else if depth == 1
+            && let Some(value) = line.strip_prefix("pid = ")
+        {
+            if pid.is_some() {
+                return None;
+            }
+            pid = Some(value.parse::<u32>().ok().filter(|&pid| pid != 0)?);
+        }
+        if line.ends_with(" = {") || line.ends_with(" => {") {
+            depth += 1;
+        }
+    }
+    if depth == 0 { pid } else { None }
 }
 
 /// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
@@ -718,14 +770,8 @@ mod macos_impl {
 
         let uid = self_uid();
         let target = super::launch_agent_target(uid);
-        // Idempotent (re)load. `bootstrap` fails with "already loaded" on a second run — which
-        // the flow itself asks for, since a Screen Recording grant only takes effect after a
-        // relaunch — and wouldn't pick up an `--addr` change. Unload first, ignoring the exit
-        // status (a harmless no-op when nothing is loaded), so every re-run converges.
-        let _ = Command::new("launchctl")
-            .arg("bootout")
-            .arg(&target)
-            .status();
+        crate::launchd::stop(&target, uid)
+            .map_err(|error| GlassError::Backend(format!("{error:#}")))?;
 
         let status = Command::new("launchctl")
             .arg("bootstrap")
@@ -758,6 +804,38 @@ mod macos_impl {
             );
             println!("\n  \u{2717} {instruction}");
             Ok(Some(("LaunchAgent", instruction)))
+        }
+    }
+
+    pub(super) fn verify_private_launch_agent(addr: &str) -> Result<()> {
+        let target = super::launch_agent_target(self_uid());
+        let ready = poll_until(
+            || {
+                let Ok(job) = Command::new("/bin/launchctl")
+                    .args(["print", &target])
+                    .output()
+                else {
+                    return false;
+                };
+                if !job.status.success() {
+                    return false;
+                }
+                let Some(pid) = super::loaded_agent_pid(&String::from_utf8_lossy(&job.stdout))
+                else {
+                    return false;
+                };
+                super::fetch_health(addr).is_some_and(|health| health.private_account_ready(pid))
+            },
+            LIVENESS_POLL_INTERVAL,
+            LIVENESS_TIMEOUT,
+            || {},
+        );
+        if ready {
+            Ok(())
+        } else {
+            Err(GlassError::Backend(format!(
+                "the managed Glass HTTP server at {addr} did not confirm account routing; check for a port conflict and rerun setup --account ACCOUNT --launchagent"
+            )))
         }
     }
 
@@ -1158,12 +1236,39 @@ mod tests {
         assert!(!codesign_report_is_unstable(report));
     }
 
+    #[test]
+    fn managed_pid_is_read_only_from_the_loaded_job() {
+        assert_eq!(
+            loaded_agent_pid(
+                "gui/501/job = {\n state = running\n child = {\n pid = 9\n }\n pid = 42\n}\n"
+            ),
+            Some(42)
+        );
+        assert_eq!(
+            loaded_agent_pid(
+                "job = {\n environment = {\n \"reqs\" => {\n pid = 9\n }\n }\n pid = 42\n}"
+            ),
+            Some(42)
+        );
+        for invalid in [
+            "job = {\n child = {\n pid = 9\n }\n}",
+            "job = {\n pid = 0\n}",
+            "job = {\n pid = invalid\n}",
+            "job = {\n pid = 42\n pid = 43\n}",
+            "job = {\n pid = 42\n",
+            "pid = 42\n}",
+        ] {
+            assert_eq!(loaded_agent_pid(invalid), None, "{invalid}");
+        }
+    }
+
     // --- run (non-macOS stub) -----------------------------------------------------------
 
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn run_fails_fast_off_macos() {
         let err = run(SetupArgs {
+            account: None,
             non_interactive: false,
             launchagent: false,
             no_launchagent: false,

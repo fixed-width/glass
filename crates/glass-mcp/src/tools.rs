@@ -1,7 +1,6 @@
 //! Pure tool logic: parse already-deserialized args, call `Glass`, format
-//! results. No rmcp, no X11 — unit-tested against a fake `Platform`. Every
-//! failure returns `Err(String)` (an agent-readable message); the server shell
-//! turns that into an MCP error result. Never a silent success.
+//! results. No rmcp, no X11 — unit-tested against a fake `Platform`. Failures
+//! return an agent-readable error, preserving untrusted observations separately.
 //!
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -532,7 +531,7 @@ pub(crate) fn core_error_message(tool: &'static str, error: glass_core::GlassErr
     ContextualError::from_error(error).standalone_message(tool)
 }
 
-pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
+fn start_spec(a: &StartArgs) -> Result<AppSpec, String> {
     if a.run.is_empty() {
         return Err("`run` must contain at least the program to launch".into());
     }
@@ -572,11 +571,32 @@ pub fn start(glass: &mut Glass, a: &StartArgs) -> ToolResult {
         );
         spec.a11y = false;
     }
+    Ok(spec)
+}
+
+pub(crate) fn start(glass: &mut Glass, a: &StartArgs) -> BatchToolResult {
+    let spec =
+        start_spec(a).map_err(|message| ToolOutput(vec![OutContent::trusted_error(message)]))?;
     let geo = match a.backend.as_deref() {
         Some(b) => glass.start_on(b, &spec),
         None => glass.start(&spec),
     }
-    .map_err(|error| core_error_message("glass_start", error))?;
+    .map_err(|error| {
+        let diagnostic = match error.cause() {
+            glass_core::GlassError::BuildFailed { stdout, stderr, .. } => {
+                Some(OutContent::untrusted_observation(
+                    &json!({"stdout": stdout, "stderr": stderr}).to_string(),
+                ))
+            }
+            _ => None,
+        };
+        let mut output = vec![OutContent::trusted_error(core_error_message(
+            "glass_start",
+            error,
+        ))];
+        output.extend(diagnostic);
+        ToolOutput(output)
+    })?;
     Ok(ToolOutput::result("glass_start", geometry_value(&geo)))
 }
 

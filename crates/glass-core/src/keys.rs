@@ -1,7 +1,7 @@
 use crate::{GlassError, Result};
 
 /// Modifier names glass recognizes in chords (shared X11/XKB keysym namespace).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Modifier {
     Shift,
     Control,

@@ -1,6 +1,6 @@
 use super::{AxRole, ElementInfo, SemanticState};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AxStateCoverage {
     pub enabled: bool,
     pub visible: bool,
@@ -284,7 +284,7 @@ impl ActionabilityReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PointerHit {
     Target,
     AcceptedAncestor,

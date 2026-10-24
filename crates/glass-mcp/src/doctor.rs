@@ -199,19 +199,19 @@ fn diagnose_inner(deep: bool, audit: Option<&crate::audit::AuditReport>) -> Diag
         ));
         // Mirrors the Linux/Windows "sandbox" section: Seatbelt containment posture.
         sections.push(Section::new("sandbox", None, glass_sandbox_macos::checks()));
-        // A dedicated section for the a11y-tool reader itself, distinct from the "macos"
-        // section above (the platform backend's own TCC posture). The Accessibility grant
-        // check is deliberately duplicated: here it answers "will the a11y tools work",
-        // there "is this Mac set up at all". Both read the same
-        // `glass_macos::accessibility_granted()` fact and remedy string.
-        sections.push(Section::new(
-            "accessibility (macos)",
-            Some("macos".into()),
+        let accessibility = if !matches!(glass_macos::private_session::configured(), Ok(false)) {
+            private_macos_a11y_checks()
+        } else {
             macos_a11y_checks(
                 glass_a11y_macos::doctor::probe(),
                 glass_macos::accessibility_granted(),
                 console_session(glass_macos::session_state()),
-            ),
+            )
+        };
+        sections.push(Section::new(
+            "accessibility (macos)",
+            Some("macos".into()),
+            accessibility,
         ));
     }
 
@@ -411,6 +411,9 @@ fn macos_checks_from(
 /// [`macos_checks_from`].
 #[cfg(target_os = "macos")]
 fn macos_checks(resolved_backend: &str) -> Vec<Check> {
+    if !matches!(glass_macos::private_session::configured(), Ok(false)) {
+        return crate::macos_environment::checks();
+    }
     macos_checks_from(
         resolved_backend,
         glass_macos::screen_recording_granted(),
@@ -445,6 +448,15 @@ fn console_session(state: glass_macos::SessionState) -> glass_a11y_macos::doctor
 ///
 /// Argument order matches `glass_a11y_macos::doctor::a11y_checks`, which it delegates to.
 #[cfg(target_os = "macos")]
+fn private_macos_a11y_checks() -> Vec<Check> {
+    vec![Check::new(
+        "AX reader",
+        CheckStatus::Skip,
+        "checked in the enrolled development account by setup and at worker start",
+    )]
+}
+
+#[cfg(target_os = "macos")]
 fn macos_a11y_checks(
     probe: glass_a11y_macos::doctor::SystemWideProbe,
     accessibility_granted: bool,
@@ -469,6 +481,15 @@ fn macos_a11y_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn private_accessibility_posture_defers_to_the_worker_without_claiming_readiness() {
+        let checks = private_macos_a11y_checks();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, CheckStatus::Skip);
+        assert!(checks[0].detail.contains("development account"));
+    }
 
     #[test]
     fn default_backend_check_warns_only_on_a_set_but_unrecognized_value() {

@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use thiserror::Error;
 
 use crate::Whose;
 
 /// Which bound ended a call that produced no answer — the distinction
 /// [`crate::run_bounded_until`] makes and [`GlassError::Bounded`] carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BoundKind {
     /// The call ran and was killed when its effective bound elapsed — its own budget or the
     /// deadline it shares, whichever was nearer.
@@ -20,7 +21,7 @@ pub enum BoundKind {
 }
 
 /// Whether a bounded failure proves that no external work was dispatched.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BoundDispatch {
     /// The bound was spent before glass dispatched any external work.
     NotDispatched,
@@ -29,8 +30,8 @@ pub enum BoundDispatch {
 }
 
 /// Render a backend's own explanation as the clause closing [`GlassError::AxValueNotApplied`].
-fn render_why(why: &Option<&'static str>) -> String {
-    why.map(|w| format!(" — {w}")).unwrap_or_default()
+fn render_why(why: &Option<Cow<'static, str>>) -> String {
+    why.as_ref().map(|w| format!(" — {w}")).unwrap_or_default()
 }
 
 /// Render a read-back for [`GlassError::AxValueNotApplied`] as the clause following "the element".
@@ -48,12 +49,12 @@ fn render_observed(observed: &Option<String>) -> String {
 ///
 /// Variants map to the actionable error kinds the MCP layer surfaces to the
 /// agent. Backend crates fold their OS-specific failures into `Backend`.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, serde::Serialize, serde::Deserialize)]
 pub enum GlassError {
     #[error("{operation} is unsupported by this session: {reason}")]
     UnsupportedOperation {
-        operation: &'static str,
-        reason: &'static str,
+        operation: Cow<'static, str>,
+        reason: Cow<'static, str>,
     },
     #[error("no active session — call glass_start to launch an app first")]
     NoActiveSession,
@@ -63,6 +64,14 @@ pub enum GlassError {
 
     #[error("app failed to start: {0}")]
     AppNotStarted(String),
+
+    /// A build failed; its output is application-controlled diagnostic data.
+    #[error("build command failed with status {status}")]
+    BuildFailed {
+        status: String,
+        stdout: String,
+        stderr: String,
+    },
 
     #[error("app exited (code {0:?})")]
     AppExited(Option<i32>),
@@ -127,7 +136,7 @@ pub enum GlassError {
     InvalidRegion(String),
 
     #[error("invalid pointer input: {0}")]
-    InvalidPointerInput(&'static str),
+    InvalidPointerInput(Cow<'static, str>),
 
     #[error("frames differ in size: {a:?} vs {b:?}")]
     SizeMismatch { a: (u32, u32), b: (u32, u32) },
@@ -221,7 +230,7 @@ pub enum GlassError {
         /// What this element's own backend knows about a write that does not arrive, which the
         /// shared message cannot say: it is written for no backend in particular, and a remedy
         /// aimed at the wrong one sends a caller somewhere futile.
-        why: Option<&'static str>,
+        why: Option<Cow<'static, str>>,
     },
 
     #[error("element #{0} exposes no native activation action")]
@@ -317,7 +326,7 @@ pub enum GlassError {
     /// is uncertain.
     #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
     InputCleanupFailed {
-        operation: &'static str,
+        operation: Cow<'static, str>,
         #[source]
         primary: Box<GlassError>,
         cleanup: Box<GlassError>,
@@ -326,7 +335,7 @@ pub enum GlassError {
     /// Both an operation and generic mandatory cleanup failed.
     #[error("{primary}; cleanup failed while {operation}: {cleanup}")]
     CleanupFailed {
-        operation: &'static str,
+        operation: Cow<'static, str>,
         #[source]
         primary: Box<GlassError>,
         cleanup: Box<GlassError>,
@@ -341,7 +350,11 @@ pub enum GlassError {
     AfterDispatch(Box<GlassError>),
 
     #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(
+        #[from]
+        #[serde(with = "io_wire")]
+        std::io::Error,
+    ),
 }
 
 impl GlassError {
@@ -506,18 +519,18 @@ impl GlassError {
             id,
             requested: requested.to_string(),
             observed: observed.map(str::to_string),
-            why: Some(why),
+            why: Some(why.into()),
         }
     }
 
     /// Preserve both a failed input operation and the mandatory release that also failed.
     pub fn input_cleanup_failed(
-        operation: &'static str,
+        operation: impl Into<Cow<'static, str>>,
         primary: GlassError,
         cleanup: GlassError,
     ) -> GlassError {
         GlassError::InputCleanupFailed {
-            operation,
+            operation: operation.into(),
             primary: Box::new(primary),
             cleanup: Box::new(cleanup),
         }
@@ -525,12 +538,12 @@ impl GlassError {
 
     /// Preserve both a primary operation failure and a mandatory cleanup failure.
     pub fn cleanup_failed(
-        operation: &'static str,
+        operation: impl Into<Cow<'static, str>>,
         primary: GlassError,
         cleanup: GlassError,
     ) -> GlassError {
         GlassError::CleanupFailed {
-            operation,
+            operation: operation.into(),
             primary: Box::new(primary),
             cleanup: Box::new(cleanup),
         }
@@ -744,7 +757,7 @@ mod tests {
     #[test]
     fn input_cleanup_failure_preserves_both_sources_and_metadata() {
         let error = GlassError::InputCleanupFailed {
-            operation: "releasing held input",
+            operation: "releasing held input".into(),
             primary: Box::new(GlassError::caller_deadline_elapsed("pointer input")),
             cleanup: Box::new(GlassError::ToolFailed {
                 call: "release-input".into(),
@@ -1558,5 +1571,267 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("Screen Recording"), "{msg}");
         assert!(msg.contains("System Settings"), "{msg}");
+    }
+}
+
+mod io_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    #[derive(Serialize, Deserialize)]
+    struct Io {
+        errno: Option<i32>,
+        kind: String,
+        message: String,
+    }
+    fn kind(name: &str) -> Result<std::io::ErrorKind, String> {
+        match name {
+            "NotFound" => Ok(std::io::ErrorKind::NotFound),
+            "PermissionDenied" => Ok(std::io::ErrorKind::PermissionDenied),
+            "ConnectionRefused" => Ok(std::io::ErrorKind::ConnectionRefused),
+            "ConnectionReset" => Ok(std::io::ErrorKind::ConnectionReset),
+            "HostUnreachable" => Ok(std::io::ErrorKind::HostUnreachable),
+            "NetworkUnreachable" => Ok(std::io::ErrorKind::NetworkUnreachable),
+            "ConnectionAborted" => Ok(std::io::ErrorKind::ConnectionAborted),
+            "NotConnected" => Ok(std::io::ErrorKind::NotConnected),
+            "AddrInUse" => Ok(std::io::ErrorKind::AddrInUse),
+            "AddrNotAvailable" => Ok(std::io::ErrorKind::AddrNotAvailable),
+            "NetworkDown" => Ok(std::io::ErrorKind::NetworkDown),
+            "BrokenPipe" => Ok(std::io::ErrorKind::BrokenPipe),
+            "AlreadyExists" => Ok(std::io::ErrorKind::AlreadyExists),
+            "WouldBlock" => Ok(std::io::ErrorKind::WouldBlock),
+            "NotADirectory" => Ok(std::io::ErrorKind::NotADirectory),
+            "IsADirectory" => Ok(std::io::ErrorKind::IsADirectory),
+            "DirectoryNotEmpty" => Ok(std::io::ErrorKind::DirectoryNotEmpty),
+            "ReadOnlyFilesystem" => Ok(std::io::ErrorKind::ReadOnlyFilesystem),
+            "StaleNetworkFileHandle" => Ok(std::io::ErrorKind::StaleNetworkFileHandle),
+            "InvalidInput" => Ok(std::io::ErrorKind::InvalidInput),
+            "InvalidData" => Ok(std::io::ErrorKind::InvalidData),
+            "TimedOut" => Ok(std::io::ErrorKind::TimedOut),
+            "WriteZero" => Ok(std::io::ErrorKind::WriteZero),
+            "StorageFull" => Ok(std::io::ErrorKind::StorageFull),
+            "NotSeekable" => Ok(std::io::ErrorKind::NotSeekable),
+            "QuotaExceeded" => Ok(std::io::ErrorKind::QuotaExceeded),
+            "FileTooLarge" => Ok(std::io::ErrorKind::FileTooLarge),
+            "ResourceBusy" => Ok(std::io::ErrorKind::ResourceBusy),
+            "ExecutableFileBusy" => Ok(std::io::ErrorKind::ExecutableFileBusy),
+            "Deadlock" => Ok(std::io::ErrorKind::Deadlock),
+            "CrossesDevices" => Ok(std::io::ErrorKind::CrossesDevices),
+            "TooManyLinks" => Ok(std::io::ErrorKind::TooManyLinks),
+            "InvalidFilename" => Ok(std::io::ErrorKind::InvalidFilename),
+            "ArgumentListTooLong" => Ok(std::io::ErrorKind::ArgumentListTooLong),
+            "Interrupted" => Ok(std::io::ErrorKind::Interrupted),
+            "Unsupported" => Ok(std::io::ErrorKind::Unsupported),
+            "UnexpectedEof" => Ok(std::io::ErrorKind::UnexpectedEof),
+            "OutOfMemory" => Ok(std::io::ErrorKind::OutOfMemory),
+            "Other" => Ok(std::io::ErrorKind::Other),
+            _ => Err(format!("unsupported IO error kind: {name}")),
+        }
+    }
+    pub(super) fn serialize<S: Serializer>(
+        error: &std::io::Error,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Io {
+            errno: error.raw_os_error(),
+            kind: format!("{:?}", error.kind()),
+            message: error.to_string(),
+        }
+        .serialize(serializer)
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<std::io::Error, D::Error> {
+        let error = Io::deserialize(deserializer)?;
+        Ok(match error.errno {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::new(
+                kind(&error.kind).map_err(serde::de::Error::custom)?,
+                error.message,
+            ),
+        })
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_nested_error_keeps_dispatch_deadline_and_write_provenance() {
+        let error = GlassError::write_unconfirmed_because(
+            42,
+            "readback deadline",
+            GlassError::caller_deadline_elapsed("readback"),
+        );
+        let message = error.to_string();
+        let copy: GlassError =
+            serde_json::from_slice(&serde_json::to_vec(&error).unwrap()).unwrap();
+        assert_eq!(copy.to_string(), message);
+        assert_eq!(copy.bound_owner(), Some(Whose::Caller));
+        assert_eq!(
+            copy.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(copy.set_value_failed_after_writing());
+    }
+
+    #[test]
+    fn serialized_owned_notes_and_custom_io_errors_keep_their_meaning() {
+        let error = GlassError::UnsupportedOperation {
+            operation: "custom operation".to_string().into(),
+            reason: "owned explanation".to_string().into(),
+        }
+        .before_dispatch();
+        let copy: GlassError =
+            serde_json::from_slice(&serde_json::to_vec(&error).unwrap()).unwrap();
+        assert_eq!(copy.to_string(), error.to_string());
+        assert!(matches!(
+            copy.cause(),
+            GlassError::UnsupportedOperation { .. }
+        ));
+        let io = GlassError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decoder failed",
+        ));
+        let copy: GlassError = serde_json::from_slice(&serde_json::to_vec(&io).unwrap()).unwrap();
+        match copy {
+            GlassError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidData),
+            _ => panic!("wrong IO category"),
+        }
+    }
+
+    #[test]
+    fn serialized_custom_io_errors_preserve_each_supported_kind_and_message() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::PermissionDenied,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::AddrInUse,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::NetworkDown,
+            ErrorKind::BrokenPipe,
+            ErrorKind::AlreadyExists,
+            ErrorKind::WouldBlock,
+            ErrorKind::NotADirectory,
+            ErrorKind::IsADirectory,
+            ErrorKind::DirectoryNotEmpty,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+            ErrorKind::WriteZero,
+            ErrorKind::StorageFull,
+            ErrorKind::NotSeekable,
+            ErrorKind::QuotaExceeded,
+            ErrorKind::FileTooLarge,
+            ErrorKind::ResourceBusy,
+            ErrorKind::ExecutableFileBusy,
+            ErrorKind::Deadlock,
+            ErrorKind::CrossesDevices,
+            ErrorKind::TooManyLinks,
+            ErrorKind::InvalidFilename,
+            ErrorKind::ArgumentListTooLong,
+            ErrorKind::Interrupted,
+            ErrorKind::Unsupported,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+        ] {
+            let message = "worker resource unavailable: Ω";
+            let error = GlassError::Io(std::io::Error::new(kind, message));
+            let wire = serde_json::to_value(&error).unwrap();
+            assert_eq!(wire["Io"]["kind"], format!("{kind:?}"));
+            let copy: GlassError = serde_json::from_value(wire)
+                .unwrap_or_else(|error| panic!("{kind:?} failed to deserialize: {error}"));
+            let GlassError::Io(copy) = copy else {
+                panic!("{kind:?} lost its IO category");
+            };
+            assert_eq!(
+                (copy.kind(), copy.raw_os_error(), copy.to_string()),
+                (kind, None, message.to_owned()),
+                "{kind:?} lost transport data"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_os_io_errors_preserve_errno_kind_and_platform_message() {
+        let original = std::io::Error::from_raw_os_error(13);
+        let expected = (
+            original.kind(),
+            original.raw_os_error(),
+            original.to_string(),
+        );
+        let wire = serde_json::to_vec(&GlassError::Io(original)).unwrap();
+        let copy: GlassError = serde_json::from_slice(&wire).unwrap();
+        let GlassError::Io(copy) = copy else {
+            panic!("OS error lost its IO category");
+        };
+        assert_eq!(
+            (copy.kind(), copy.raw_os_error(), copy.to_string()),
+            expected
+        );
+    }
+
+    #[test]
+    fn io_errno_remains_authoritative_when_the_named_kind_is_unrecognized() {
+        let wire = serde_json::json!({
+            "Io": {"errno": 13, "kind": "FutureKind", "message": "remote message"}
+        });
+        let copy: GlassError = serde_json::from_value(wire).unwrap();
+        let GlassError::Io(copy) = copy else {
+            panic!("OS error lost its IO category");
+        };
+        assert_eq!(copy.raw_os_error(), Some(13));
+    }
+
+    #[test]
+    fn custom_io_errors_with_unrecognized_kinds_are_rejected() {
+        let wire = serde_json::json!({
+            "Io": {"errno": null, "kind": "FutureKind", "message": "remote message"}
+        });
+        let error = serde_json::from_value::<GlassError>(wire).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported IO error kind: FutureKind"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn serialized_build_failure_preserves_diagnostics_without_trusting_their_display() {
+        let error = GlassError::cleanup_failed(
+            "start cleanup",
+            GlassError::BuildFailed {
+                status: "exit status: 23".into(),
+                stdout: "project stdout".into(),
+                stderr: "project stderr".into(),
+            }
+            .after_dispatch(),
+            GlassError::Backend("cleanup detail".into()),
+        );
+        let copy: GlassError =
+            serde_json::from_slice(&serde_json::to_vec(&error).unwrap()).unwrap();
+        assert!(copy.to_string().contains("exit status: 23"));
+        assert!(!copy.to_string().contains("project"));
+        let GlassError::BuildFailed {
+            status,
+            stdout,
+            stderr,
+        } = copy.cause()
+        else {
+            panic!("lost build failure");
+        };
+        assert_eq!(
+            (status.as_str(), stdout.as_str(), stderr.as_str()),
+            ("exit status: 23", "project stdout", "project stderr")
+        );
     }
 }

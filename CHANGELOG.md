@@ -21,6 +21,79 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Preview macOS account setup with `glass-mcp setup --account ACCOUNT`: enroll an existing standard
+  account for off-desktop development using the normal MCP tools over stdio or HTTP. Glass reuses
+  its login and grants, verifies worker access and managed HTTP routing during setup, and supports
+  protected trace directories inside workspaces. It releases per-app workers and temporary workspace
+  permissions on stop and recovers recorded permission changes after an interrupted client.
+  Development-account outputs retain the normal user's edit access, including files atomically
+  moved into the selected workspace. Output access failures remain pending during cleanup;
+  recovery does not silently broaden file modes or discard protected paths.
+  Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
+  restores shared-desktop use while keeping the app, development account and MCP startup integration.
+  Uninstall also removes startup integration while retaining the account, home and app data.
+  The app's Application setup window and CLI share a resumable permission flow with automatic
+  worker checks, fresh-process grant updates, standard-home preparation and bounded registration
+  repair. Registration changes wait for the original process and launchd job to stop, and setup
+  displays native authorization and repair failures. Doctor checks live worker readiness. Active macOS application sessions block setup or
+  disable; the menu provides setup and disable without a second Glass installation.
+  Create a standard development account in that window with a local password, retained only in
+  memory during native administrator-authenticated setup. Refused setup connections are recorded
+  in the app log. New account IDs are checked against existing login domains without creating
+  domains during allocation; unavailable inventories return an error. Interrupted creation resumes its recorded account identity;
+  existing accounts and passwords are preserved. Native setup waits for its authenticated helper's
+  reply, reports record/password failures by stage and native error code, and records bounded failures
+  in the app log. Initial password failures do not assume a password-policy rejection.
+  Accounts that have not completed their first graphical login retain worker and permission-helper
+  registration for that login instead of failing setup when their graphical launchd domain is unavailable.
+  Interrupted registration continues with Set up and preserves an already prepared account password.
+  A fully closed permission-recovery journal can start a lease for a different development account;
+  unfinished or invalid recovery evidence is retained and still blocks that change.
+  Consecutive worker readiness checks allow for macOS's restart throttle instead of timing out at
+  its ten-second boundary. Worker activation remains bounded and keeps its authentication checks.
+  Workspace cleanup distinguishes verified macOS system infrastructure from unfinished application
+  work, restoring temporary permissions while retaining idle or explicitly shared services, including
+  system jobs without explicit argument lists or Mach endpoints.
+  If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
+  within the cleanup deadline. Protective denials and mixed allow/deny records remain until
+  process cleanup succeeds. Incomplete cleanup retains its recovery journal, reports an error
+  and blocks new private application work.
+  New application leases record build/app process lifetimes and verified descendants, including
+  reparented children. Cleanup retains learned ownership after interruption and checks fresh
+  LaunchServices targets against PID reuse. Unattributed new account processes still require
+  verified system-service evidence before permissions are fully restored. Protected Apple XPC
+  providers and registered system agents with a shared per-user role may remain active as part
+  of the desktop environment;
+  app-scoped providers must be idle, including separately named service instances verified in
+  their requestor's process domain and private graphical login. These checks retain code, file and
+  process identity proof and never exempt a recorded Glass-owned process.
+  Requests already handed to shared OS services may finish after the application's processes stop.
+  System-service verification handles immutable OS declarations with hardlinks, default XPC
+  executable names and protected Cryptex paths while retaining executable signature checks.
+  Permission journals release their locks when the owning operation ends, including during
+  concurrent process creation.
+  Application setup offers **Start environment…** for a missing graphical login, using a transient
+  local account password and native administrator approval. It requires macOS Screen Sharing to be
+  enabled explicitly, selects only a separate desktop, and restores any temporary account access.
+  After a new login, Glass restores the normal user's worker connection access before checking readiness.
+  Permission recovery also allows for the worker's restart delay after the first readiness check.
+  A setup record with no application work or permission changes can finish without inspecting
+  unrelated macOS services; recorded application work and permission changes retain full recovery checks.
+  Startup activates the existing signed worker and permission-helper jobs in the new desktop,
+  replacing a stale idle connection only after verifying its registration. Worker failures retain
+  their original diagnostic while temporary Screen Sharing access is cleaned up.
+  Screen Sharing checks use fresh direct membership, preserve acknowledged changes for cleanup after
+  later verification failures, and log the failing native stage without credential data.
+  A running desktop is reused without another account password; interrupted access cleanup blocks
+  application work until it finishes. First-time privacy consent remains a user action. Guided
+  startup has been checked with an initialized account and existing grants, through Ready and an
+  ordinary build/interact/rebuild loop without extra setup. First-time onboarding and post-reboot
+  startup remain under validation; unattended recovery is not implemented.
+  Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
+  disable clear that pending request; stale windows cannot restart it. A logged-in account whose
+  worker is missing gets a startup check and one repair, rather than another login instruction;
+  administrator approval does not consume the worker's startup time.
+
 - `glass_capabilities` adds a read-only `scope: "session"` report for click, scroll and text support,
   including whether admitted input can affect your desktop. It recognizes existing Linux/mobile
   isolation, explicit X11 display attachment, shared native macOS/Windows input and connected mobile
@@ -36,6 +109,10 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- macOS build output is captured in application logs instead of reaching the MCP transport; build failures return bounded compiler diagnostics as untrusted application output, separately from the error status.
+- Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.
+- Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.
+- macOS contained launches inspect relative executable paths in the requested working directory, so eligible rebuilt apps retain clipboard support. Bare commands use the launch PATH rather than a same-named file in Glass's directory.
 - macOS accessibility actions can recover a target whose tree position changed when one complete bounded search finds the same role and name at its original bounds. Ambiguous matches, unreadable searches and moved targets still refuse the action.
 - macOS double and triple clicks now send the full sequence of paired mouse events, allowing Qt controls to recognize word selection correctly. Multi-click deadlines still release a pressed button before stopping.
 - macOS typing now sends Unicode characters, including accented text, CJK and emoji, through keyboard events while preserving ASCII keys and keyboard chords.

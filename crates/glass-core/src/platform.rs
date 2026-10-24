@@ -6,13 +6,13 @@ use crate::frame::{Frame, Region};
 use crate::keys::Modifier;
 use crate::logbuf::Stream;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProtectedHostPathKind {
     Directory,
     File,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProtectedHostPath {
     pub path: PathBuf,
     pub kind: ProtectedHostPathKind,
@@ -34,7 +34,7 @@ impl ProtectedHostPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HostPathProtectionMode {
     #[default]
     SandboxRules,
@@ -92,7 +92,7 @@ const _: () = assert!(
 
 /// How aggressively to contain the process tree a backend launches. Platform-agnostic
 /// *policy*; the Linux mechanism (bubblewrap) lives in the `glass-sandbox-linux` crate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SandboxLevel {
     /// Filesystem/process containment, network allowed. The secure default.
     #[default]
@@ -143,7 +143,7 @@ impl std::fmt::Display for SandboxLevel {
 }
 
 /// Window geometry in screen coordinates, as reported by a backend.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowGeometry {
     pub x: i32,
     pub y: i32,
@@ -151,7 +151,7 @@ pub struct WindowGeometry {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MouseButton {
     Left,
     Right,
@@ -160,7 +160,7 @@ pub enum MouseButton {
 
 /// One pointer's straight path within a multi-touch gesture, in **window-relative** px.
 /// `from == to` is a finger held stationary for the gesture's duration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Segment {
     pub from_x: i32,
     pub from_y: i32,
@@ -178,7 +178,7 @@ pub const MAX_CLICK_COUNT: u32 = 10;
 pub const MAX_SCROLL_NOTCHES: u32 = 100;
 
 /// A pointer action in **window-relative** coordinates (0,0 = top-left).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PointerEvent {
     Move {
         x: i32,
@@ -221,7 +221,7 @@ pub fn validate_click_count(count: u32) -> crate::Result<()> {
         Ok(())
     } else {
         Err(
-            GlassError::InvalidPointerInput("click count must be between 1 and 10")
+            GlassError::InvalidPointerInput("click count must be between 1 and 10".into())
                 .before_dispatch(),
         )
     }
@@ -233,10 +233,10 @@ pub fn validate_scroll_delta(delta: i32) -> crate::Result<u32> {
     if magnitude <= MAX_SCROLL_NOTCHES {
         Ok(magnitude)
     } else {
-        Err(
-            GlassError::InvalidPointerInput("scroll dx and dy must each be between -100 and 100")
-                .before_dispatch(),
+        Err(GlassError::InvalidPointerInput(
+            "scroll dx and dy must each be between -100 and 100".into(),
         )
+        .before_dispatch())
     }
 }
 
@@ -254,14 +254,14 @@ pub fn validate_pointer_input(event: &PointerEvent) -> crate::Result<()> {
 }
 
 /// A keyboard action: either literal text to type or a chord like `ctrl+s`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum KeyEvent {
     Text(String),
     Chord(String),
 }
 
 /// A window-management request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WindowOp {
     Focus,
     Resize { width: u32, height: u32 },
@@ -271,11 +271,11 @@ pub enum WindowOp {
 
 /// Opaque, backend-assigned window identity. May change across calls (a closed
 /// and reopened window gets a new id); callers should re-list rather than cache.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WindowId(pub u64);
 
 /// A top-level window belonging to the launched app.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowInfo {
     pub id: WindowId,
     pub title: Option<String>,
@@ -286,7 +286,7 @@ pub struct WindowInfo {
 }
 
 /// Hint to disambiguate the target window when more than one appears.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowHint {
     pub title: Option<String>,
     pub class: Option<String>,
@@ -303,7 +303,7 @@ pub struct A11yBind<'a> {
 }
 
 /// Everything a backend needs to build, launch, and locate an app's window.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppSpec {
     /// Optional shell command run (in `cwd`) before launching.
     pub build: Option<String>,

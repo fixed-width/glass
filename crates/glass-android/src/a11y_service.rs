@@ -5381,7 +5381,7 @@ mod tests {
             matches!(&err, GlassError::AxValueNotApplied { id: 1, requested, observed, why }
                 if requested == "new"
                     && observed.as_deref() == Some("old")
-                    && why.is_some_and(|w| w.contains("ACTION_SET_TEXT")
+                    && why.as_deref().is_some_and(|w| w.contains("ACTION_SET_TEXT")
                         && w.contains("GLASS_ANDROID_A11Y=off"))),
             "{err}"
         );
