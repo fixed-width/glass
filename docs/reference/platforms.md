@@ -29,8 +29,10 @@ account creation, enrollment and permissions from one Glass installation. Enroll
 with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
 development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
 using an existing initialized login, including simultaneous physical keyboard/mouse use.
-The current worker requires the development account's graphical login again after a reboot;
-unattended reboot recovery is not implemented.
+**Start environment…** has been tested starting a stopped desktop with an initialized account and
+existing permissions, followed by an ordinary build/interact/rebuild loop without extra setup.
+The worker requires the development account's graphical login; post-reboot startup remains under
+validation and unattended reboot recovery is not implemented.
 The guided first-time production-app flow remains under validation. Setup attempts identity-checked
 repair of an idle worker's registration/socket; it preserves running or unbound jobs and reports the
 failure. The [recovery guide](../how-to/setup-macos.md#recover-a-refused-worker-connection) includes

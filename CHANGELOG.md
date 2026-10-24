@@ -78,7 +78,9 @@ internal refactors, CI, or test-only changes.
   later verification failures, and log the failing native stage without credential data.
   A running desktop is reused without another account password; interrupted access cleanup blocks
   application work until it finishes. First-time privacy consent remains a user action. Guided
-  startup is awaiting runtime qualification and does not provide unattended post-reboot recovery.
+  startup has been checked with an initialized account and existing grants, through Ready and an
+  ordinary build/interact/rebuild loop without extra setup. First-time onboarding and post-reboot
+  startup remain under validation; unattended recovery is not implemented.
   Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose
   worker is missing gets a startup check and one repair, rather than another login instruction;

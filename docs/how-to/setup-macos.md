@@ -156,8 +156,10 @@ macOS administrator approval. Neither prompt has a deadline. Glass does not save
 change it, re-enroll the account or repeat existing privacy grants. A running desktop is reused
 without requesting its account password. Wait for **Ready** before starting application work.
 
-This preview startup path is awaiting runtime qualification. It requires **Screen Sharing** to
-already be enabled under **System Settings → General → Sharing**. Glass does not enable that
+This preview startup path has been tested with an initialized development account and existing
+permissions, through Ready and an ordinary build/interact/rebuild loop. Post-reboot startup and
+first-time onboarding remain under validation. It requires **Screen Sharing** to already be enabled
+under **System Settings → General → Sharing**. Glass does not enable that
 host-wide service automatically. It connects locally and requests only a separate desktop; an
 unsupported or denied private selection stops with an error. Existing credentials longer than
 63 UTF-8 bytes are not supported by this startup protocol and are never truncated or reset.
