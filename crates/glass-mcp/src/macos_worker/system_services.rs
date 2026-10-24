@@ -38,6 +38,7 @@ struct XpcDefinition {
     label: String,
     program: PathBuf,
     shared_user: bool,
+    multiple_instances: bool,
 }
 
 impl XpcDefinition {
@@ -67,10 +68,18 @@ impl XpcDefinition {
                 _ => return None,
             },
         };
+        let multiple_instances = match service.get("_MultipleInstances") {
+            None => false,
+            Some(value) => value.as_boolean()?,
+        };
+        if shared_user && multiple_instances {
+            return None;
+        }
         Some(Self {
             label: label.into(),
             program: program.into(),
             shared_user,
+            multiple_instances,
         })
     }
 
@@ -84,19 +93,13 @@ impl XpcDefinition {
         }
     }
 
-    fn job_target(&self, uid: u32, process: ProcessIdentity) -> Option<String> {
-        let domain = if self.shared_user {
-            format!("user/{uid}")
-        } else {
-            format!(
-                "pid/{}",
-                glass_macos::private_session::service_requestor(uid, &process)?
-            )
-        };
-        Some(format!("{domain}/{}", self.label))
-    }
-
-    fn matches_job(&self, target: &str, process: ProcessIdentity, text: &str) -> Option<u32> {
+    fn matches_job(
+        &self,
+        target: &str,
+        process: ProcessIdentity,
+        expected_session: u32,
+        text: &str,
+    ) -> Option<u32> {
         let fields = job_fields(text, &format!("{target} = {{"))?;
         let bundle = self.program.parent()?.parent()?.parent()?.to_str()?;
         for (key, expected) in [
@@ -117,10 +120,14 @@ impl XpcDefinition {
         }
         let domain = target.rsplit_once('/')?.0;
         let actual = *fields.get("domain")?;
+        let session = fields.get("asid")?.parse::<u32>().ok()?;
+        if session == 0 || session >= i32::MAX as u32 {
+            return None;
+        }
         if if self.shared_user {
             actual != domain
         } else {
-            !actual.starts_with(&format!("{domain} [")) || !actual.ends_with(']')
+            session != expected_session || actual != format!("{domain} [{session}]")
         } {
             return None;
         }
@@ -136,9 +143,108 @@ impl XpcDefinition {
         {
             return None;
         }
-        let session = fields.get("asid")?.parse::<u32>().ok()?;
-        (session > 0 && session < i32::MAX as u32).then_some(session)
+        Some(session)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XpcScope {
+    User(u32),
+    Process(work::ProcessOrigin),
+}
+
+impl XpcScope {
+    fn observe(uid: u32, process: ProcessIdentity, shared_user: bool) -> Option<Self> {
+        if shared_user {
+            return Some(Self::User(uid));
+        }
+        let pid = glass_macos::private_session::service_requestor(uid, &process)?;
+        let origin = work::observe(pid, uid).ok()?;
+        (glass_macos::private_session::service_requestor(uid, &process)? == pid)
+            .then_some(Self::Process(origin))
+    }
+
+    fn domain(self) -> String {
+        match self {
+            Self::User(uid) => format!("user/{uid}"),
+            Self::Process(origin) => format!("pid/{}", origin.process.pid()),
+        }
+    }
+}
+
+fn instance_label<'a>(
+    text: &'a str,
+    domain: &str,
+    process: ProcessIdentity,
+    base: &str,
+) -> Option<&'a str> {
+    if text.len() > LIMIT || text.contains('\0') {
+        return None;
+    }
+    let mut lines = text.lines();
+    if lines.next()? != format!("{domain} = {{") {
+        return None;
+    }
+    let mut stack = vec![domain];
+    let mut services = false;
+    let mut found = None;
+    for line in lines {
+        let line = line.trim();
+        if stack.is_empty() {
+            return None;
+        }
+        if matches!(line, "}" | "};") {
+            stack.pop()?;
+            continue;
+        }
+        if let Some(name) = line
+            .strip_suffix(" = {")
+            .or_else(|| line.strip_suffix(" => {"))
+            .or_else(|| line.strip_suffix(": {"))
+        {
+            if stack.len() >= 32 || (stack.len() == 2 && stack[1] == "services") {
+                return None;
+            }
+            if stack.len() == 1 && name == "services" {
+                if services {
+                    return None;
+                }
+                services = true;
+            }
+            stack.push(name);
+            continue;
+        }
+        if stack.len() != 2 || stack[1] != "services" {
+            continue;
+        }
+        let mut columns = line.split_whitespace();
+        let Some(pid) = columns.next() else {
+            continue;
+        };
+        if pid.parse::<u32>().ok() != Some(process.pid()) {
+            continue;
+        }
+        let second = columns.next()?;
+        let label = match columns.next() {
+            None => second,
+            Some(label)
+                if columns.next().is_none()
+                    && (second == "=" || second == "-" || second.parse::<i32>().is_ok()) =>
+            {
+                label
+            }
+            _ => return None,
+        };
+        if found.is_some()
+            || !label_valid(label)
+            || !label.strip_prefix(base)?.starts_with('.')
+            || label.len() <= base.len() + 1
+        {
+            return None;
+        }
+        found = Some(label);
+    }
+    (stack.is_empty() && services).then_some(found).flatten()
 }
 
 fn xpc_candidate(uid: u32, process: ProcessIdentity) -> Option<(SystemService, XpcDefinition)> {
@@ -196,30 +302,56 @@ fn xpc_candidate(uid: u32, process: ProcessIdentity) -> Option<(SystemService, X
     Some((service, definition))
 }
 
-async fn verified_xpc(uid: u32, process: ProcessIdentity) -> anyhow::Result<Option<SystemService>> {
+async fn verified_xpc(
+    uid: u32,
+    expected_session: u32,
+    process: ProcessIdentity,
+) -> anyhow::Result<Option<SystemService>> {
     let Some((service, definition)) =
         tokio::task::spawn_blocking(move || xpc_candidate(uid, process)).await?
     else {
         return Ok(None);
     };
-    let Some(target) = definition.job_target(uid, process) else {
+    let Some(scope) = XpcScope::observe(uid, process, definition.shared_user) else {
         return Ok(None);
     };
+    let domain = scope.domain();
+    let label = if definition.multiple_instances {
+        let Some(listing) = loaded_target(&domain).await else {
+            return Ok(None);
+        };
+        let Some(label) = instance_label(&listing, &domain, process, &definition.label) else {
+            return Ok(None);
+        };
+        label.to_owned()
+    } else {
+        definition.label.clone()
+    };
+    let target = format!("{domain}/{label}");
     let Some(job) = loaded_target(&target).await else {
         return Ok(None);
     };
-    let Some(session) = definition.matches_job(&target, process, &job) else {
+    let Some(session) = definition.matches_job(&target, process, expected_session, &job) else {
         return Ok(None);
     };
     if !glass_macos::private_session::session_exists(session, uid)? {
         return Ok(None);
     }
-    let Some((current, current_definition)) =
-        tokio::task::spawn_blocking(move || xpc_candidate(uid, process)).await?
+    let Some((current, current_definition, current_scope)) =
+        tokio::task::spawn_blocking(move || {
+            let (current, definition) = xpc_candidate(uid, process)?;
+            let scope = XpcScope::observe(uid, process, definition.shared_user)?;
+            Some((current, definition, scope))
+        })
+        .await?
     else {
         return Ok(None);
     };
-    Ok((current.kind == service.kind && current_definition == definition).then_some(current))
+    Ok((current.kind == service.kind
+        && current_definition == definition
+        && current_scope == scope
+        && glass_macos::private_session::session_exists(session, uid)?)
+    .then_some(current))
 }
 
 fn within_deadline<T: Send + 'static>(
@@ -715,7 +847,7 @@ async fn inspect_for_account(
     let entries = std::sync::Arc::new(entries);
     let mut idle = Vec::new();
     for process in processes {
-        if let Some(service) = verified_xpc(uid, process).await? {
+        if let Some(service) = verified_xpc(uid, session, process).await? {
             idle.push(service);
             continue;
         }
@@ -797,6 +929,177 @@ mod tests {
 
     const XPC_PROGRAM: &str = "/System/Library/Frameworks/Example.framework/XPCServices/Example.xpc/Contents/MacOS/Example";
 
+    fn multiple_xpc_value(value: plist::Value) -> plist::Dictionary {
+        let mut definition = xpc_value(Some("Application".into()));
+        definition
+            .get_mut("XPCService")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("_MultipleInstances".into(), value);
+        definition
+    }
+
+    #[test]
+    fn multiple_instances_require_a_protected_boolean_application_definition() {
+        for (value, expected) in [(true, true), (false, false)] {
+            let definition = XpcDefinition::parse(
+                Path::new(XPC_PROGRAM),
+                &multiple_xpc_value(value.into()),
+                "com.apple.example",
+            )
+            .unwrap();
+            assert_eq!(definition.multiple_instances, expected);
+            assert_eq!(definition.kind(false), None);
+        }
+        assert!(
+            !XpcDefinition::parse(
+                Path::new(XPC_PROGRAM),
+                &xpc_value(None),
+                "com.apple.example",
+            )
+            .unwrap()
+            .multiple_instances
+        );
+        for value in ["true".into(), 1.into(), plist::Value::Array(vec![])] {
+            assert!(
+                XpcDefinition::parse(
+                    Path::new(XPC_PROGRAM),
+                    &multiple_xpc_value(value),
+                    "com.apple.example"
+                )
+                .is_none()
+            );
+        }
+        let mut value = multiple_xpc_value(true.into());
+        value
+            .get_mut("XPCService")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("ServiceType".into(), "User".into());
+        assert!(
+            XpcDefinition::parse(Path::new(XPC_PROGRAM), &value, "com.apple.example").is_none()
+        );
+    }
+
+    #[test]
+    fn instance_lookup_requires_one_reported_pid_and_protected_label() {
+        let label = "com.apple.example.opaque-instance";
+        for row in [
+            format!("123\t-\t{label}"),
+            format!("123\t0\t{label}"),
+            format!("123\t-9\t{label}"),
+            format!("123\t{label}"),
+            format!("123 = {label}"),
+        ] {
+            let listing = format!(
+                "pid/42 = {{\n\tservices = {{\n\t\t999 - com.apple.other.instance\n\t\t{row}\n\t}}\n}}\n"
+            );
+            assert_eq!(
+                instance_label(&listing, "pid/42", process(), "com.apple.example"),
+                Some(label),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_lookup_refuses_templates_ambiguity_and_malformed_target_rows() {
+        for rows in [
+            "123 - com.apple.example",
+            "124 - com.apple.example.instance",
+            "123 - com.apple.example.",
+            "123 - com.apple.examples.instance",
+            "123 - com.apple.other.instance",
+            "123 - com.apple.example.bad/target",
+            "123 - com.apple.example.bad\\target",
+            "123 invalid com.apple.example.instance",
+            "123 - com.apple.example.instance extra",
+            "123 - com.apple.example.instance\n123 - com.apple.example.instance",
+            "123 - com.apple.example.one\n123 - com.apple.example.two",
+            "123 - com.apple.example.instance\n123 bad row",
+            "123",
+        ] {
+            let listing = format!("pid/42 = {{\n\tservices = {{\n{rows}\n\t}}\n}}\n");
+            assert!(
+                instance_label(&listing, "pid/42", process(), "com.apple.example").is_none(),
+                "{rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_lookup_ignores_nested_data_and_refuses_incomplete_or_oversized_domains() {
+        let row = "123 - com.apple.example.instance";
+        let listing = format!("pid/42 = {{\n\tservices = {{\n{row}\n\t}}\n}}\n");
+        for invalid in [
+            listing.replace("pid/42", "pid/43"),
+            listing.replace("\tservices = {", "\tenvironment = {"),
+            listing.replace("\tservices = {", "\targuments = {\n\tservices = {") + "}\n",
+            listing.replace(row, &format!("\tnested = {{\n{row}\n\t}}")),
+            listing.replace("\t}\n}", "\t}"),
+            listing.clone() + "}\n",
+            listing.replace("\t}\n}", &format!("\t}}\n\tservices = {{\n{row}\n\t}}\n}}")),
+            listing.clone() + &" ".repeat(LIMIT),
+            listing.replace(row, &format!("123 - com.apple.example.{}", "x".repeat(255))),
+            listing.replace(row, &format!("{row}\0")),
+        ] {
+            assert!(instance_label(&invalid, "pid/42", process(), "com.apple.example").is_none());
+        }
+    }
+
+    #[test]
+    fn dynamic_instance_still_requires_the_exact_live_job_and_base_bundle_identity() {
+        let definition = XpcDefinition::parse(
+            Path::new(XPC_PROGRAM),
+            &multiple_xpc_value(true.into()),
+            "com.apple.example",
+        )
+        .unwrap();
+        let target = "pid/42/com.apple.example.instance";
+        let bundle = XPC_PROGRAM.strip_suffix("/Contents/MacOS/Example").unwrap();
+        let job = format!(
+            "{target} = {{\n\tpath = {bundle}\n\ttype = XPCService\n\tstate = running\n\tbundle id = com.apple.example\n\tprogram = {XPC_PROGRAM}\n\tpid = 123\n\tdomain = pid/42 [456]\n\tasid = 456\n\tproperties = xpc bundle | system service | supports transactions | supports pressured exit\n}}\n"
+        );
+        assert_eq!(
+            definition.matches_job(target, process(), 456, &job),
+            Some(456)
+        );
+        assert!(
+            definition
+                .matches_job(target, process(), 457, &job)
+                .is_none()
+        );
+        for (before, after) in [
+            ("state = running", "state = not running"),
+            ("pid = 123\n", "pid = 124\n"),
+            ("domain = pid/42 [", "domain = pid/43 ["),
+            ("domain = pid/42 [456]", "domain = pid/42 [457]"),
+            ("domain = pid/42 [456]", "domain = pid/42 [unknown]"),
+            ("domain = pid/42 [456]", "domain = pid/42 [456] [456]"),
+            ("\tasid = 456", "\tasid = 457"),
+            (
+                "bundle id = com.apple.example\n",
+                "bundle id = com.apple.example.instance\n",
+            ),
+            ("supports transactions", "unrelated"),
+            ("\tasid = 456", "\targuments = {\n\t}\n\tasid = 456"),
+            ("\tasid = 456", "\tasid = 0"),
+        ] {
+            assert!(
+                definition
+                    .matches_job(target, process(), 456, &job.replace(before, after))
+                    .is_none()
+            );
+        }
+        assert!(
+            definition
+                .matches_job("pid/42/com.apple.example", process(), 456, &job)
+                .is_none()
+        );
+    }
+
     #[test]
     fn signed_identifier_and_live_xpc_job_must_both_match() {
         let value = xpc_value(Some("User".into()));
@@ -815,7 +1118,14 @@ mod tests {
             "{target} = {{\n\tpath = {}\n\ttype = XPCService\n\tstate = running\n\tbundle id = com.apple.example\n\tprogram = {XPC_PROGRAM}\n\tpid = 123\n\tdomain = user/502\n\tasid = 456\n\tproperties = xpc bundle | system service | supports transactions | supports pressured exit\n}}\n",
             bundle.display()
         );
-        assert_eq!(definition.matches_job(target, process(), &job), Some(456));
+        assert_eq!(
+            definition.matches_job(target, process(), 456, &job),
+            Some(456)
+        );
+        assert_eq!(
+            definition.matches_job(target, process(), 457, &job),
+            Some(456)
+        );
         for (before, after) in [
             ("type = XPCService", "type = LaunchAgent"),
             ("pid = 123", "pid = 124"),
@@ -829,14 +1139,14 @@ mod tests {
         ] {
             assert!(
                 definition
-                    .matches_job(target, process(), &job.replace(before, after))
+                    .matches_job(target, process(), 456, &job.replace(before, after))
                     .is_none(),
                 "{before}"
             );
         }
         assert!(
             definition
-                .matches_job("user/502/user-submitted", process(), &job)
+                .matches_job("user/502/user-submitted", process(), 456, &job)
                 .is_none()
         );
     }

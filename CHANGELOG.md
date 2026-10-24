@@ -63,7 +63,8 @@ internal refactors, CI, or test-only changes.
   LaunchServices targets against PID reuse. Unattributed new account processes still require
   verified system-service evidence before permissions are fully restored. Protected Apple XPC
   providers with a shared per-user role may remain active as part of the desktop environment;
-  app-scoped providers must be idle. These checks retain code, file and process identity proof
+  app-scoped providers must be idle, including separately named service instances verified in
+  their requestor's process domain. These checks retain code, file and process identity proof
   and never exempt a recorded Glass-owned process.
   Permission journals release their locks when the owning operation ends, including during
   concurrent process creation.
