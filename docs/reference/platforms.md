@@ -28,7 +28,7 @@ account creation, enrollment and permissions from one Glass installation. Enroll
 `glass-mcp unenroll` restores that user's shared-desktop route. It routes the normal tools to the account,
 with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
 development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
-using an existing initialized login. Simultaneous physical keyboard/mouse use remains unqualified.
+using an existing initialized login, including simultaneous physical keyboard/mouse use.
 The current worker requires the development account's graphical login again after a reboot;
 unattended reboot recovery is not implemented.
 The guided first-time production-app flow remains under validation. Setup attempts identity-checked
@@ -171,9 +171,9 @@ containment the clipboard is isolated **and working** for an app not built with 
 runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. The opt-in
 [separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
 apps off your desktop using an existing initialized login. This has been tested on an Apple Silicon
-Mac mini without a physical monitor connected. Simultaneous physical keyboard/mouse use remains
-unqualified. The current startup path requires logging into the development account again after a
-reboot and does not provide unattended recovery. Containment details are in
+Mac mini without a physical monitor connected, including physical keyboard/mouse coexistence.
+The worker requires the development account's graphical login; guided first-time onboarding and
+post-reboot startup remain under validation. Unattended recovery is not implemented. Containment details are in
 [explanation/containment.md](../explanation/containment.md).
 
 ## Status
