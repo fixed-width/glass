@@ -513,17 +513,19 @@ pub fn idle_system_executable(uid: u32, process: &ProcessIdentity) -> Option<std
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlatformExecutable {
     pub path: std::path::PathBuf,
+    pub transaction_tracked: bool,
     pub idle: bool,
     pub allows_idle_exit: bool,
     pub identifier: String,
 }
 
-fn transaction_state(flags: u32) -> Option<(bool, bool)> {
+fn transaction_state(flags: u32) -> Option<(bool, bool, bool)> {
     match flags {
-        1 => Some((true, false)),
-        3 => Some((true, true)),
-        5 => Some((false, false)),
-        7 => Some((false, true)),
+        0 => Some((false, false, false)),
+        1 => Some((true, true, false)),
+        3 => Some((true, true, true)),
+        5 => Some((true, false, false)),
+        7 => Some((true, false, true)),
         _ => None,
     }
 }
@@ -533,14 +535,15 @@ mod transaction_tests {
     #[test]
     fn inactivity_is_independent_of_pressure_reclamation() {
         for (flags, expected) in [
-            (1, Some((true, false))),
-            (3, Some((true, true))),
-            (5, Some((false, false))),
-            (7, Some((false, true))),
+            (0, Some((false, false, false))),
+            (1, Some((true, true, false))),
+            (3, Some((true, true, true))),
+            (5, Some((true, false, false))),
+            (7, Some((true, false, true))),
         ] {
             assert_eq!(super::transaction_state(flags), expected);
         }
-        for flags in [0, 2, 4, 6, 9, 11, 13, 15, u32::MAX] {
+        for flags in [2, 4, 6, 9, 11, 13, 15, u32::MAX] {
             assert_eq!(super::transaction_state(flags), None);
         }
     }
@@ -577,11 +580,12 @@ pub fn platform_executable(uid: u32, process: &ProcessIdentity) -> Option<Platfo
     {
         return None;
     }
-    let (idle, allows_idle_exit) = transaction_state(state)?;
+    let (transaction_tracked, idle, allows_idle_exit) = transaction_state(state)?;
     let end = path.iter().position(|&byte| byte == 0)?;
     let identifier_end = identifier.iter().position(|&byte| byte == 0)?;
     Some(PlatformExecutable {
         path: std::ffi::OsStr::from_bytes(&path[..end]).into(),
+        transaction_tracked,
         idle,
         allows_idle_exit,
         identifier: std::str::from_utf8(&identifier[..identifier_end])

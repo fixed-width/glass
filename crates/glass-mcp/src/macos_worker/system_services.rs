@@ -467,6 +467,8 @@ struct Definition {
     arguments: Option<Vec<String>>,
     services: Vec<String>,
     shared_mach_services: bool,
+    transactions: bool,
+    persistent_login: bool,
     pressured_exit: bool,
     multiple_instances: bool,
     user_domain: bool,
@@ -747,7 +749,19 @@ impl Definition {
             Some(_) => return None,
             None => false,
         };
-        if !label_valid(&label) || !(transactions || pressured_exit) {
+        let persistent_login = value
+            .get("EnableTransactions")
+            .and_then(plist::Value::as_boolean)
+            == Some(false)
+            && value.get("KeepAlive").and_then(plist::Value::as_boolean) == Some(true)
+            && value.get("RunAtLoad").and_then(plist::Value::as_boolean) == Some(true)
+            && value
+                .get("LimitLoadToSessionType")
+                .and_then(plist::Value::as_string)
+                == Some("Aqua")
+            && !pressured_exit
+            && !multiple_instances;
+        if !label_valid(&label) || !(transactions || pressured_exit || persistent_login) {
             return None;
         }
         let arguments = match value.get("ProgramArguments") {
@@ -802,6 +816,8 @@ impl Definition {
             arguments,
             services,
             shared_mach_services,
+            transactions,
+            persistent_login,
             pressured_exit,
             multiple_instances,
             user_domain,
@@ -865,7 +881,7 @@ impl Definition {
     }
 
     fn transaction_idle(&self, code: &glass_macos::private_session::PlatformExecutable) -> bool {
-        code.idle && code.allows_idle_exit == self.pressured_exit
+        code.transaction_tracked && code.idle && code.allows_idle_exit == self.pressured_exit
     }
 
     fn service_kind(
@@ -874,8 +890,11 @@ impl Definition {
     ) -> Option<ServiceKind> {
         if self.shared_mach_services
             && !self.services.is_empty()
-            && self.pressured_exit
-            && code.allows_idle_exit
+            && ((self.pressured_exit && code.transaction_tracked && code.allows_idle_exit)
+                || (self.persistent_login
+                    && !code.transaction_tracked
+                    && !code.idle
+                    && !code.allows_idle_exit))
         {
             Some(ServiceKind::SharedUserAgent)
         } else if self.transaction_idle(code) {
@@ -1021,9 +1040,17 @@ impl Definition {
         if self.multiple_instances && !properties.split(" | ").any(|value| value == "is copy") {
             return None;
         }
-        if ["system service", "supports transactions"]
-            .iter()
-            .any(|needed| !properties.split(" | ").any(|property| property == *needed))
+        if !properties
+            .split(" | ")
+            .any(|property| property == "system service")
+            || properties
+                .split(" | ")
+                .any(|property| property == "supports transactions")
+                != (self.transactions || self.pressured_exit)
+            || (self.persistent_login
+                && ["keepalive", "runatload"]
+                    .iter()
+                    .any(|needed| !properties.split(" | ").any(|property| property == *needed)))
         {
             return None;
         }
@@ -1417,6 +1444,7 @@ mod tests {
     fn only_declared_shared_mach_providers_can_remain_busy() {
         let mut definition = definition();
         let mut code = glass_macos::private_session::PlatformExecutable {
+            transaction_tracked: true,
             path: definition.program.clone(),
             idle: false,
             allows_idle_exit: true,
@@ -1469,6 +1497,7 @@ mod tests {
     fn shared_declarations_preserve_a_valid_idle_proof_without_active_ports() {
         let definition = definition();
         let mut code = glass_macos::private_session::PlatformExecutable {
+            transaction_tracked: true,
             path: definition.program.clone(),
             identifier: definition.label.clone(),
             idle: true,
@@ -1805,6 +1834,7 @@ mod tests {
             for idle in [false, true] {
                 for allows_idle_exit in [false, true] {
                     let code = glass_macos::private_session::PlatformExecutable {
+                        transaction_tracked: true,
                         path: "/usr/libexec/example".into(),
                         idle,
                         allows_idle_exit,
@@ -1885,6 +1915,140 @@ mod tests {
             </dict></plist>"#,
         )
         .unwrap()
+    }
+
+    fn persistent_definition_value() -> plist::Dictionary {
+        let mut value = definition_value();
+        for (key, flag) in [
+            ("EnableTransactions", false),
+            ("EnablePressuredExit", false),
+            ("KeepAlive", true),
+            ("RunAtLoad", true),
+        ] {
+            value.insert(key.into(), flag.into());
+        }
+        value.insert("LimitLoadToSessionType".into(), "Aqua".into());
+        value
+    }
+
+    fn persistent_job() -> String {
+        job()
+            .replace(
+                "supports transactions | supports pressured exit | system service",
+                "keepalive | runatload | system service",
+            )
+            .replace(
+                "active = 1",
+                "port = 0x123\n\t\t\tactive = 1\n\t\t\tmanaged = 1",
+            )
+    }
+
+    #[test]
+    fn untracked_persistent_login_services_need_full_declaration_and_live_endpoint_proof() {
+        let definition = Definition::parse(
+            format!("{ROOT}/com.apple.example.plist").into(),
+            persistent_definition_value(),
+        )
+        .unwrap();
+        let code = glass_macos::private_session::PlatformExecutable {
+            path: definition.program.clone(),
+            identifier: definition.label.clone(),
+            transaction_tracked: false,
+            idle: false,
+            allows_idle_exit: false,
+        };
+        assert!(!definition.transaction_idle(&code));
+        assert!(definition.matches_job(502, 456, process(), &persistent_job()));
+        assert_eq!(
+            definition.kind_for_job(&code, &persistent_job()),
+            Some(ServiceKind::SharedUserAgent)
+        );
+        for (before, after) in [
+            ("active = 1", "active = 0"),
+            ("managed = 1", "managed = 0"),
+            ("port = 0x123", "port = 0x0"),
+        ] {
+            assert_eq!(
+                definition.kind_for_job(&code, &persistent_job().replace(before, after)),
+                None,
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_service_source_flags_are_explicit_and_nonconditional() {
+        for (key, replacement) in [
+            ("EnableTransactions", None),
+            ("EnableTransactions", Some("false".into())),
+            ("KeepAlive", None),
+            ("KeepAlive", Some(false.into())),
+            ("KeepAlive", Some(plist::Dictionary::new().into())),
+            ("RunAtLoad", None),
+            ("RunAtLoad", Some(false.into())),
+            ("LimitLoadToSessionType", None),
+            ("LimitLoadToSessionType", Some("Background".into())),
+            ("MultipleInstances", Some(true.into())),
+        ] {
+            let mut value = persistent_definition_value();
+            value.remove(key);
+            if let Some(value_to_set) = replacement {
+                value.insert(key.into(), value_to_set);
+            }
+            assert!(
+                Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value)
+                    .is_none(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_login_jobs_require_corresponding_loaded_lifecycle_properties() {
+        let definition = Definition::parse(
+            format!("{ROOT}/com.apple.example.plist").into(),
+            persistent_definition_value(),
+        )
+        .unwrap();
+        for (before, after) in [
+            ("keepalive | ", ""),
+            ("runatload | ", ""),
+            ("system service", "not system service"),
+            (
+                "keepalive | runatload",
+                "keepalive | runatload | supports transactions",
+            ),
+            (
+                "keepalive | runatload",
+                "keepalive | runatload | supports pressured exit",
+            ),
+        ] {
+            assert!(
+                !definition.matches_job(
+                    502,
+                    456,
+                    process(),
+                    &persistent_job().replace(before, after)
+                ),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn untracked_code_cannot_claim_inactivity_or_an_ordinary_transient_agent_role() {
+        let ordinary = definition();
+        let mut code = glass_macos::private_session::PlatformExecutable {
+            path: ordinary.program.clone(),
+            identifier: ordinary.label.clone(),
+            transaction_tracked: false,
+            idle: false,
+            allows_idle_exit: false,
+        };
+        assert_eq!(ordinary.service_kind(&code), None);
+        code.idle = true;
+        assert!(!ordinary.transaction_idle(&code));
+        assert_eq!(ordinary.service_kind(&code), None);
     }
 
     fn definition() -> Definition {
@@ -2030,6 +2194,7 @@ mod tests {
         let definition = background_instance();
         assert!(!definition.shared_mach_services);
         let mut code = glass_macos::private_session::PlatformExecutable {
+            transaction_tracked: true,
             path: definition.program.clone(),
             identifier: definition.label.clone(),
             idle: false,

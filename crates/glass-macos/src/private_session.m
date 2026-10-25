@@ -734,7 +734,7 @@ static int platform_executable(const GlassProcessIdentity *process, uint32_t uid
         uint32_t dirty = 0;
         const uint32_t known = PROC_DIRTY_TRACKED | PROC_DIRTY_ALLOWS_IDLE_EXIT | PROC_DIRTY_IS_DIRTY;
         if (!process_matches(process, uid) || proc_get_dirty((int)process->pid, &dirty) ||
-            !(dirty & PROC_DIRTY_TRACKED) || (dirty & ~known)) return 0;
+            (dirty & ~known) || (!(dirty & PROC_DIRTY_TRACKED) && dirty)) return 0;
         const uint32_t observed = dirty;
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath((int)process->pid, path, sizeof(path)) <= 0) return 0;
