@@ -2,6 +2,22 @@
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn selected_account(
+    enrolled: Option<&str>,
+    pending: Option<&str>,
+    creation: Option<&crate::macos_account::Receipt>,
+) -> String {
+    enrolled
+        .or(pending)
+        .or_else(|| {
+            creation
+                .filter(|receipt| !receipt.created || !receipt.password_set)
+                .map(|receipt| receipt.name.as_str())
+        })
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[cfg(unix)]
 pub(crate) mod pending;
 
@@ -271,6 +287,47 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn creation(completed: bool) -> crate::macos_account::Receipt {
+        crate::macos_account::Receipt {
+            version: 1,
+            owner: 501,
+            name: "previousdev".into(),
+            uid: 502,
+            uuid: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            created: true,
+            password_set: completed,
+        }
+    }
+
+    #[test]
+    fn completed_creation_history_does_not_select_an_account_after_uninstall() {
+        assert_eq!(selected_account(None, None, Some(&creation(true))), "");
+    }
+
+    #[test]
+    fn interrupted_creation_keeps_its_selected_name() {
+        assert_eq!(
+            selected_account(None, None, Some(&creation(false))),
+            "previousdev"
+        );
+    }
+
+    #[test]
+    fn current_enrollment_takes_precedence_over_pending_and_historical_accounts() {
+        assert_eq!(
+            selected_account(Some("current"), Some("pending"), Some(&creation(false))),
+            "current"
+        );
+    }
+
+    #[test]
+    fn explicit_saved_setup_keeps_its_account_instead_of_completed_history() {
+        assert_eq!(
+            selected_account(None, Some("pending"), Some(&creation(true))),
+            "pending"
+        );
+    }
 
     #[test]
     fn a_logged_in_account_with_a_missing_worker_is_not_told_to_log_in_again() {

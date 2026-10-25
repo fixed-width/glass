@@ -236,7 +236,7 @@ fn button(
 pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("Glass setup must run on the AppKit thread")?;
     let app = NSApplication::sharedApplication(mtm);
-    let frame = rect(0.0, 0.0, 580.0, 340.0);
+    let frame = rect(0.0, 0.0, 580.0, 410.0);
     // SAFETY: fresh NSWindow allocation with valid content rectangle and style.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -258,8 +258,14 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         ),
         mtm,
     );
-    introduction.setFrame(rect(24.0, 257.0, 532.0, 60.0));
+    introduction.setFrame(rect(24.0, 327.0, 532.0, 60.0));
     view.addSubview(&introduction);
+    let existing_label = NSTextField::labelWithString(
+        &NSString::from_str("Or use an existing standard macOS account:"),
+        mtm,
+    );
+    existing_label.setFrame(rect(24.0, 246.0, 532.0, 24.0));
+    view.addSubview(&existing_label);
     let account =
         NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(24.0, 216.0, 310.0, 28.0));
     account.setPlaceholderString(Some(&NSString::from_str("Development account name")));
@@ -304,7 +310,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     );
     let begin = button(
         mtm,
-        "Set up",
+        "Use existing account",
         rect(340.0, 214.0, 216.0, 32.0),
         &begin_target,
     );
@@ -336,7 +342,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let create = button(
         mtm,
         "Create account…",
-        rect(24.0, 24.0, 154.0, 32.0),
+        rect(24.0, 282.0, 210.0, 36.0),
         &create_target,
     );
     view.addSubview(&create);
@@ -344,7 +350,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let disable = button(
         mtm,
         "Disable isolation",
-        rect(187.0, 24.0, 166.0, 32.0),
+        rect(24.0, 24.0, 180.0, 32.0),
         &disable_target,
     );
     view.addSubview(&disable);
@@ -375,7 +381,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
             begin.setTitle(&NSString::from_str(if starting {
                 "Start environment…"
             } else {
-                "Set up"
+                "Use existing account"
             }));
             begin.setEnabled(!progress.running);
             create.setEnabled(!progress.running);

@@ -82,6 +82,11 @@ staples it via `xcrun notarytool` + `stapler`, and uploads
 Release. Both carry `../README-macos.md` as `README.md` beside the bundle — never inside
 it, which would break the signature.
 
+`make-dmg.sh` preserves signed app contents and the stapled ticket while removing inherited
+ACLs and making the staged bundle readable and traversable by other macOS accounts. It does
+not modify its input bundle. Run `bash scripts/test-macos-packaging.sh` to check a signed
+bundle copied from private build directories without launching a GUI or requesting privacy grants.
+
 The job **skips cleanly** (no failure) until these repository secrets are set, so releases
 still publish the Linux/Windows artifacts before macOS signing is available:
 

@@ -64,7 +64,13 @@ fn account_record(name: &str, owner: u32, enrollment: bool) -> anyhow::Result<En
     if enrollment {
         command.arg("AuthenticationAuthority");
     }
-    let bytes = checked(&mut command)?;
+    let result = command.output()?;
+    let bytes = crate::macos_account::account_lookup(
+        name,
+        result.status.success(),
+        result.stdout,
+        &result.stderr,
+    )?;
     let attributes: plist::Dictionary = plist::from_bytes(&bytes)?;
     let one = |key: &str| -> anyhow::Result<&str> {
         let values = attributes
@@ -1260,26 +1266,18 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     } else {
         None
     };
-    let account = existing
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .map(|account| account.name.clone())
-        .or_else(|| saved.as_ref().map(|saved| saved.name.clone()))
-        .or_else(|| {
-            creation
-                .as_ref()
-                .ok()
-                .and_then(|value| value.as_ref())
-                .map(|receipt| receipt.name.clone())
-        })
-        .unwrap_or_default();
+    let account = crate::macos_setup::selected_account(
+        enrolled_name.as_deref(),
+        saved.as_ref().map(|saved| saved.name.as_str()),
+        creation.as_ref().ok().and_then(|receipt| receipt.as_ref()),
+    );
     let message = if let Some(Err(error)) = existing {
         format!(
             "Existing setup needs attention: {error:#}. Enter the development account name to check it. Glass will preserve unverified registration files."
         )
     } else if let Some(error) = saved_error {
         format!(
-            "Saved setup needs attention: {error}. Choose Set up or Create account… to begin a new explicit attempt; completed account data are retained."
+            "Saved setup needs attention: {error}. Choose Use existing account or Create account… to begin a new explicit attempt; completed account data are retained."
         )
     } else if let Some(saved) = &saved
         && automatic.is_none()
@@ -1291,7 +1289,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             )
         } else {
             format!(
-                "Saved setup for {} is paused. Choose Set up to check registration and continue, or Close to cancel the saved setup. Accounts, passwords and files are retained.",
+                "Saved setup for {} is paused. Choose Use existing account to check registration and continue, or Close to cancel the saved setup. Accounts, passwords and files are retained.",
                 saved.name
             )
         }
@@ -1302,7 +1300,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     } else if let Ok(Some(receipt)) = &creation {
         if receipt.created && receipt.password_set {
             format!(
-                "{} was created and retained. Set up checks registration and resumes the remaining login/permission steps.",
+                "A previous Glass setup created {}. Uninstall keeps development accounts and their files. Create a new account above, or enter an existing account's short name to reuse it.",
                 receipt.name
             )
         } else {
@@ -1315,7 +1313,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         "Create a standard development account here, or enter the short name of an existing one. Glass handles registration and permission checks.".into()
     } else {
         format!(
-            "{account} is enrolled. Set up checks its live worker and resumes any pending setup. Disable isolation returns this user to shared-desktop use."
+            "{account} is enrolled. Use existing account checks its live worker and resumes any pending setup. Disable isolation returns this user to shared-desktop use."
         )
     };
     let state = Arc::new(Mutex::new(SetupProgress {
@@ -1404,18 +1402,19 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.message = match result {
                         Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
                         Err(error) if error.is::<crate::macos_setup::pending::Superseded>() => "This saved setup was cancelled or replaced. This window did not restart it. Close this window; begin a new setup explicitly if needed.".into(),
+                        Err(error) if error.is::<crate::macos_account::MissingAccount>() => error.to_string(),
                         Err(error) if error.is::<guided::EnvironmentMissing>() => {
                             state.start_account = desktop_start::choice(&name).ok();
                             format!("The development desktop for {name} is not running. Choose Start environment… to start it here; Glass reuses existing registration and permissions.")
                         }
                         Err(error) if error.is::<guided::AccountCreationIncomplete>() => {
                             match account_creation::completed_identity(rustix::process::getuid().as_raw(), &name) {
-                                Ok(Some(_)) => format!("{error:#}. The account and password are prepared. Choose Set up to finish registration; you do not need to enter the development-account password again."),
+                                Ok(Some(_)) => format!("{error:#}. The account and password are prepared. Choose Use existing account to finish registration; you do not need to enter the development-account password again."),
                                 Ok(None) => format!("{error:#}. Completed account data and grants are retained. Choose Create account… with the same name and original chosen password to resume."),
                                 Err(check) => format!("{error:#}. The saved account checkpoint could not be verified: {check:#}. Existing account data are retained; close and reopen application setup to check it."),
                             }
                         }
-                        Err(error) => format!("{error:#}. Completed registration and grants are retained. Fix the reported cause, then choose Set up."),
+                        Err(error) => format!("{error:#}. Completed registration and grants are retained. Fix the reported cause, then choose Use existing account."),
                     };
                 }
             });

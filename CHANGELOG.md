@@ -39,14 +39,19 @@ internal refactors, CI, or test-only changes.
   disable; the menu provides setup and disable without a second Glass installation.
   Create a standard development account in that window with a local password, retained only in
   memory during native administrator-authenticated setup. Refused setup connections are recorded
-  in the app log. New account IDs are checked against existing login domains without creating
+  in the app log. Account creation is the first action in the setup window; selecting an existing
+  account is labeled separately. A fresh setup explains retained creation history without selecting
+  a completed historical account, and a missing existing account offers account creation directly.
+  Disk-image packaging gives the installed app readable, traversable permissions for development
+  accounts even when its signed input bundle came from private build directories.
+  New account IDs are checked against existing login domains without creating
   domains during allocation; unavailable inventories return an error. Interrupted creation resumes its recorded account identity;
   existing accounts and passwords are preserved. Native setup waits for its authenticated helper's
   reply, reports record/password failures by stage and native error code, and records bounded failures
   in the app log. Initial password failures do not assume a password-policy rejection.
   Accounts that have not completed their first graphical login retain worker and permission-helper
   registration for that login instead of failing setup when their graphical launchd domain is unavailable.
-  Interrupted registration continues with Set up and preserves an already prepared account password.
+  Interrupted registration continues with Use existing account and preserves an already prepared account password.
   A fully closed permission-recovery journal can start a lease for a different development account;
   unfinished or invalid recovery evidence is retained and still blocks that change.
   Consecutive worker readiness checks allow for macOS's restart throttle instead of timing out at

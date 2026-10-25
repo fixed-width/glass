@@ -18,12 +18,15 @@ Stop any current Glass application with `glass_stop` before changing its environ
 1. Install the signed, hardened `GlassMcp.app` in `/Applications`. Use that one app for both your
    normal account and the development account. This signing requirement applies to Glass.
 2. Open Glass. On first run, choose **Off your desktop…**; if the menu-bar app is already running,
-   choose **glass → Application setup…**. Choose **Create account…** to create a dedicated **Standard**
+   choose **glass → Application setup…**. Choose **Create account…** at the top of the window to create a dedicated **Standard**
    account: enter its short name and a new password twice. The default name is `glassdev`; new names
    start with an ASCII letter and use at most 64 letters, digits or underscores. Glass does not save
    the password. You will use it for the account's first login; its display name is
    **Glass development (NAME)**, with your chosen short name in parentheses.
-   To reuse an existing standard account, enter its short name and click **Set up** instead. Existing
+   Earlier installations can leave account-creation history after uninstall; this does not enroll that
+   account again or select it for a fresh setup.
+   To reuse an existing standard account, enter its short name under **Or use an existing standard
+   macOS account** and click **Use existing account**. Existing
    names may contain 1–64 ASCII letters, digits or underscores. Glass never resets an existing account's password.
 3. Authenticate locally when macOS asks for administrator approval. This is separate from the new
    account password. Glass creates the account if requested, then registers its worker and permission
@@ -52,7 +55,7 @@ Stop any current Glass application with `glass_stop` before changing its environ
    Glass continues setup automatically, checks workspace recovery
    and verifies the actual worker's readiness before reporting **Ready**. Registration repair may
    request administrator authentication. A failed repair stops with its cause and retains completed
-   registration and grants; **Set up** retries the outstanding work. **Cancel setup** stops waiting and
+   registration and grants; **Use existing account** retries the outstanding work. **Cancel setup** stops waiting and
    retains completed setup steps. If the account is already logged in but its worker is missing,
    Glass checks startup and attempts one registration repair before reporting the failure. Time
    spent approving administrator authentication does not count against worker startup. While native registration, repair or disable is in progress, finish
@@ -120,7 +123,7 @@ tested end to end through the production app. Initial macOS login and privacy co
 user action. If creation is interrupted before password preparation is confirmed, **Create account…**
 with the same name resumes only the record whose identity Glass saved before creation. Supply the
 original chosen password. Once Glass confirms that the account and password are prepared, choose
-**Set up** to finish registration without entering that development-account password again.
+**Use existing account** to finish registration without entering that development-account password again.
 Worker and permission-helper jobs are saved for the account's first graphical login.
 Glass keeps created accounts and homes after a failure; it refuses a different account,
 changed identity or preexisting home instead of overwriting them. A deleted completed account is not
@@ -128,14 +131,14 @@ recreated from its old receipt; select a new name or an existing account.
 If Glass exits during setup, reopening the app or its menu-bar server opens the same setup window.
 For the same enabled enrollment with its permission-helper registration saved, Glass continues
 worker and permission checks automatically with the saved integration and address. Incomplete
-registration waits for **Set up** and any required administrator authentication. An unfinished account creation reopens the secure password
+registration waits for **Use existing account** and any required administrator authentication. An unfinished account creation reopens the secure password
 dialog for the same account; enter the original chosen password. Glass stores only setup metadata,
 never that password. Missing, disabled or changed enrollment pauses for explicit action instead
 of being enabled automatically. Closing or cancelling setup clears its pending request while
 retaining accounts, files and grants; **Disable isolation** also clears that request.
 
 Reopening setup restores the creating user's last saved name and progress. If a rejected attempt only
-reserved a name belonging to a different existing account, **Set up** can retire that user's unused
+reserved a name belonging to a different existing account, **Use existing account** can retire that user's unused
 reservation after administrator authentication without changing the existing account or its password.
 
 This is a preview. Setup, worker re-registration, and changed-build development loops through both
@@ -421,7 +424,7 @@ journal, and leave other directories intact.
 
 ### Recover a refused worker connection
 
-Stop active Glass work, then open **glass → Application setup… → Set up**. The coordinator attempts
+Stop active Glass work, then open **glass → Application setup… → Use existing account**. The coordinator attempts
 identity-checked repair of an idle registered worker and its socket, requesting administrator
 authentication if needed. A running or unbound job is retained and reported. Finish the reported
 work or resolve the registration mismatch before retrying.

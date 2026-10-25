@@ -4,6 +4,46 @@ use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+#[derive(Debug)]
+pub(crate) struct MissingAccount(pub(crate) String);
+
+impl std::fmt::Display for MissingAccount {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "The account {} does not exist. Choose Create account… to create it, or enter an existing account's short name.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for MissingAccount {}
+
+pub(crate) fn account_lookup(
+    name: &str,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    if !success {
+        let missing = b"DS Error: -14136 (eDSRecordNotFound)";
+        if [stdout.as_slice(), stderr]
+            .into_iter()
+            .any(|bytes| bytes.windows(missing.len()).any(|part| part == missing))
+        {
+            return Err(MissingAccount(name.to_owned()).into());
+        }
+        anyhow::bail!(
+            "macOS could not read the existing account {name}; account lookup was refused"
+        );
+    }
+    ensure!(
+        stdout.len() <= 1024 * 1024,
+        "unexpected account response size"
+    );
+    Ok(stdout)
+}
+
 pub(crate) struct Password(Zeroizing<Vec<u8>>);
 
 impl Password {
@@ -156,6 +196,35 @@ mod tests {
             created: false,
             password_set: false,
         }
+    }
+
+    #[test]
+    fn missing_account_lookup_offers_creation_without_enrolling_anything() {
+        let error = account_lookup(
+            "newdev",
+            false,
+            Vec::new(),
+            b"<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<MissingAccount>().unwrap().0, "newdev");
+        assert!(error.to_string().contains("Choose Create account…"));
+    }
+
+    #[test]
+    fn directory_access_failure_does_not_claim_the_account_is_missing() {
+        let error =
+            account_lookup("existing", false, Vec::new(), b"Permission denied").unwrap_err();
+        assert!(!error.is::<MissingAccount>());
+    }
+
+    #[test]
+    fn successful_record_lookup_preserves_the_directory_result() {
+        let bytes = b"checked plist bytes".to_vec();
+        assert_eq!(
+            account_lookup("existing", true, bytes.clone(), b"").unwrap(),
+            bytes
+        );
     }
 
     #[test]

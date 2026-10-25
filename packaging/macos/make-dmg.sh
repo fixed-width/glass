@@ -24,9 +24,14 @@ mkdir -p "$out"
 name="glass-mcp-${version}-universal-apple-darwin"
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
-# ditto (not cp -R) is the guaranteed-faithful copy for a signed bundle — it preserves the
-# bundle layout + code signature, matching release.yml's Package step.
-ditto "$app" "$staging/$(basename "$app")"
+# Preserve signed bytes and the stapled ticket without inheriting machine-specific ACLs.
+staged_app="$staging/$(basename "$app")"
+ditto --noacl "$app" "$staged_app"
+# Private build directories must not make the installed app inaccessible to other accounts.
+chmod 755 "$staging"
+find "$staged_app" -type d -exec chmod 755 {} +
+find "$staged_app" -type f -exec chmod a+rX,go-w {} +
+codesign --verify --deep --strict "$staged_app"
 # Beside the bundle, never inside it — a file added within the .app would invalidate its
 # signature — and resolved from this script's own location rather than passed in, so no
 # caller can pass the wrong one.

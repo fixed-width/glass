@@ -183,7 +183,7 @@ pub fn require_unused_name(name: &str) -> Result<(), String> {
     // SAFETY: this is a read-only query; name stays live for the call.
     let code = unsafe { glass_account_name_unused(name.as_ptr()) };
     if code == 2 {
-        return Err("that account name already exists; use Set up for the existing account or choose a different new name".into());
+        return Err("that account name already exists; choose Use existing account or choose a different new name".into());
     }
     status(code)
 }
