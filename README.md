@@ -32,12 +32,12 @@ retained between runs. Enrollment applies to your macOS user; `glass-mcp unenrol
 shared-desktop use while retaining the app, development account and MCP startup integration.
 Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.
 These runtime checks used an initialized development account and include physical keyboard/mouse
-coexistence and starting a stopped development desktop with its existing permissions.
-Guided first-time onboarding and post-reboot startup remain unqualified. Application setup includes
+coexistence, recovery after an interrupted client, and starting its development desktop after a real
+reboot with existing permissions. Guided first-time onboarding remains unqualified. Application setup includes
 **Start environment…** for a missing development desktop, using local account credentials and an
-already enabled macOS Screen Sharing service. It has been tested through Ready and an ordinary
-build/interact/rebuild loop without repeating enrollment or permission setup. It does not provide
-unattended recovery.
+already enabled macOS Screen Sharing service. This guided post-reboot flow and ordinary
+build/interact/rebuild/stop loops in an indexed workspace have been tested without repeating
+enrollment or permission setup. Unattended development-desktop startup is not implemented.
 
 ## See it
 

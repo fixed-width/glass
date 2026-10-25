@@ -142,8 +142,9 @@ This is a preview. Setup, worker re-registration, and changed-build development 
 stdio and HTTP have been tested on an Apple Silicon Mac mini without a physical monitor connected,
 using an existing initialized login. Physical keyboard/mouse coexistence has also been checked
 in that retained-login setup.
-The worker requires that account's graphical login. Guided first-time onboarding and post-reboot
-startup still need qualification; unattended startup after a reboot is not implemented.
+The worker requires that account's graphical login. Guided post-reboot startup and subsequent
+build/interact/rebuild/stop loops in an indexed workspace have been checked with existing grants.
+Guided first-time onboarding still needs qualification; unattended startup after a reboot is not implemented.
 
 ### Start a stopped development desktop
 
@@ -160,9 +161,10 @@ macOS administrator approval. Neither prompt has a deadline. Glass does not save
 change it, re-enroll the account or repeat existing privacy grants. A running desktop is reused
 without requesting its account password. Wait for **Ready** before starting application work.
 
-This preview startup path has been tested with an initialized development account and existing
-permissions, through Ready and an ordinary build/interact/rebuild loop. Post-reboot startup and
-first-time onboarding remain under validation. It requires **Screen Sharing** to already be enabled
+This preview startup path has been tested after a real reboot with an initialized development
+account and existing permissions, through Ready and ordinary build/interact/rebuild/stop loops
+in an indexed workspace. It required no account switching, reenrollment or repeated privacy grants.
+First-time onboarding remains under validation. It requires **Screen Sharing** to already be enabled
 under **System Settings → General → Sharing**. Glass does not enable that
 host-wide service automatically. It connects locally and requests only a separate desktop; an
 unsupported or denied private selection stops with an error. Existing credentials longer than

@@ -29,10 +29,11 @@ account creation, enrollment and permissions from one Glass installation. Enroll
 with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
 development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
 using an existing initialized login, including simultaneous physical keyboard/mouse use.
-**Start environment…** has been tested starting a stopped desktop with an initialized account and
-existing permissions, followed by an ordinary build/interact/rebuild loop without extra setup.
-The worker requires the development account's graphical login; post-reboot startup remains under
-validation and unattended reboot recovery is not implemented.
+**Start environment…** has been tested after a real reboot with an initialized account and existing
+permissions, followed by build/interact/rebuild/stop loops in an indexed workspace without account
+switching, reenrollment or repeated privacy grants. Interrupted-client recovery has also been checked.
+The worker requires the development account's graphical login; starting that desktop remains
+user-assisted. Unattended development-desktop startup is not implemented.
 The guided first-time production-app flow remains under validation. Setup attempts identity-checked
 repair of an idle worker's registration/socket; it preserves running or unbound jobs and reports the
 failure. The [recovery guide](../how-to/setup-macos.md#recover-a-refused-worker-connection) includes
@@ -174,8 +175,9 @@ runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. T
 [separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
 apps off your desktop using an existing initialized login. This has been tested on an Apple Silicon
 Mac mini without a physical monitor connected, including physical keyboard/mouse coexistence.
-The worker requires the development account's graphical login; guided first-time onboarding and
-post-reboot startup remain under validation. Unattended recovery is not implemented. Containment details are in
+The worker requires the development account's graphical login. Guided post-reboot startup and
+indexed-workspace app loops have been tested with existing grants; first-time onboarding remains
+under validation. Unattended development-desktop startup is not implemented. Containment details are in
 [explanation/containment.md](../explanation/containment.md).
 
 ## Status
