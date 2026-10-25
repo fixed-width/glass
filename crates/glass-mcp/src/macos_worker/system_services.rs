@@ -6,6 +6,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use glass_macos::private_session::{
@@ -19,6 +20,7 @@ const ROOT: &str = "/System/Library/LaunchAgents";
 const SYSTEM_LIBRARY: &str = "/System/Library";
 const CRYPTEX_LIBRARY: &str = "/System/Cryptexes/OS/System/Library";
 const LIMIT: usize = 128 * 1024;
+const AGENT_CANDIDATE_LIMIT: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -423,11 +425,13 @@ pub(super) fn validate_report(
             let valid = match service.kind {
                 ServiceKind::IdleAgent => idle_system_executable(uid, &service.process).is_some(),
                 ServiceKind::SharedUserAgent => system_catalog().ok().is_some_and(|catalog| {
-                    agent_candidate(uid, service.process, &catalog).is_some_and(|candidate| {
-                        candidate.kind == ServiceKind::SharedUserAgent
-                            && candidate.definition.label == service.label
-                            && candidate.still_valid(uid, service.process)
-                    })
+                    agent_candidate(uid, service.process, &catalog, &service.label).is_some_and(
+                        |candidate| {
+                            candidate.kind == ServiceKind::SharedUserAgent
+                                && candidate.definition.label == service.label
+                                && candidate.still_valid(uid, service.process)
+                        },
+                    )
                 }),
                 _ => xpc_candidate(uid, service.process).is_some_and(|(current, _)| {
                     current.label == service.label && current.kind == service.kind
@@ -464,6 +468,8 @@ struct Definition {
     services: Vec<String>,
     shared_mach_services: bool,
     pressured_exit: bool,
+    multiple_instances: bool,
+    user_domain: bool,
     source: Option<(ProtectedFile, Vec<u8>)>,
 }
 
@@ -725,6 +731,22 @@ impl Definition {
             Some(value) => value.as_boolean()?,
             None => false,
         };
+        let multiple_instances = match value.get("MultipleInstances") {
+            Some(value) => value.as_boolean()?,
+            None => false,
+        };
+        let user_domain = match value.get("LimitLoadToSessionType") {
+            Some(plist::Value::String(session)) => session == "Background",
+            Some(plist::Value::Array(sessions)) => {
+                let sessions = sessions
+                    .iter()
+                    .map(plist::Value::as_string)
+                    .collect::<Option<Vec<_>>>()?;
+                sessions.as_slice() == ["Background"]
+            }
+            Some(_) => return None,
+            None => false,
+        };
         if !label_valid(&label) || !(transactions || pressured_exit) {
             return None;
         }
@@ -781,6 +803,8 @@ impl Definition {
             services,
             shared_mach_services,
             pressured_exit,
+            multiple_instances,
+            user_domain,
             source: None,
         })
     }
@@ -866,7 +890,7 @@ impl Definition {
             return false;
         }
         let lines: Vec<_> = text.lines().collect();
-        let Some(endpoints) = block(&lines, "endpoints") else {
+        let Some(endpoints) = block(&lines, self.endpoint_block_name()) else {
             return false;
         };
         self.services.iter().all(|name| {
@@ -925,41 +949,90 @@ impl Definition {
         }
     }
 
-    fn matches_job(&self, uid: u32, session: u32, process: ProcessIdentity, text: &str) -> bool {
+    fn domain(&self, uid: u32) -> String {
+        format!("{}/{uid}", if self.user_domain { "user" } else { "gui" })
+    }
+
+    fn endpoint_block_name(&self) -> &'static str {
+        if self.multiple_instances {
+            "instance-specific endpoints"
+        } else {
+            "endpoints"
+        }
+    }
+
+    fn verified_job_session(
+        &self,
+        uid: u32,
+        session: u32,
+        process: ProcessIdentity,
+        text: &str,
+    ) -> Option<u32> {
         let lines: Vec<_> = text.lines().collect();
-        let Some(fields) = job_fields(text, &format!("gui/{uid}/{} = {{", self.label)) else {
-            return false;
-        };
+        let domain = self.domain(uid);
+        let label = lines
+            .first()?
+            .strip_suffix(" = {")?
+            .strip_prefix(&format!("{domain}/"))?;
+        if self.multiple_instances {
+            if !label_valid(label)
+                || !label.strip_prefix(&self.label)?.starts_with('.')
+                || label.len() <= self.label.len() + 1
+            {
+                return None;
+            }
+        } else if label != self.label {
+            return None;
+        }
+        let fields = job_fields(text, &format!("{domain}/{label} = {{"))?;
+        let observed_session = fields.get("asid")?.parse::<u32>().ok()?;
+        if observed_session == 0
+            || observed_session >= i32::MAX as u32
+            || (!self.user_domain && observed_session != session)
+        {
+            return None;
+        }
+        if self.multiple_instances && fields.get("original").copied() != Some(self.label.as_str()) {
+            return None;
+        }
         let expected = [
             ("path", self.loaded_path.to_string_lossy().into_owned()),
             ("type", "LaunchAgent".to_owned()),
             ("state", "running".to_owned()),
             ("program", self.program.to_string_lossy().into_owned()),
             ("pid", process.pid().to_string()),
-            ("asid", session.to_string()),
-            ("domain", format!("gui/{uid} [{session}]")),
+            ("asid", observed_session.to_string()),
+            (
+                "domain",
+                if self.user_domain {
+                    domain
+                } else {
+                    format!("{domain} [{session}]")
+                },
+            ),
         ];
         if expected
             .iter()
             .any(|(key, value)| fields.get(key).copied() != Some(value.as_str()))
         {
-            return false;
+            return None;
         }
-        let Some(properties) = fields.get("properties") else {
-            return false;
-        };
+        let properties = fields.get("properties")?;
+        if self.multiple_instances && !properties.split(" | ").any(|value| value == "is copy") {
+            return None;
+        }
         if ["system service", "supports transactions"]
             .iter()
             .any(|needed| !properties.split(" | ").any(|property| property == *needed))
         {
-            return false;
+            return None;
         }
         if properties
             .split(" | ")
             .any(|property| property == "supports pressured exit")
             != self.pressured_exit
         {
-            return false;
+            return None;
         }
         match (&self.arguments, block(&lines, "arguments")) {
             (None, None) if !fields.contains_key("arguments") => {}
@@ -970,17 +1043,16 @@ impl Definition {
                         .map(|line| line.strip_prefix("\t\t"))
                         .collect::<Option<Vec<_>>>()
                         == Some(expected.iter().map(String::as_str).collect()) => {}
-            _ => return false,
+            _ => return None,
         }
         if self.services.is_empty() {
-            return true;
+            return Some(observed_session);
         }
-        let Some(endpoints) = block(&lines, "endpoints") else {
-            return false;
-        };
+        let endpoints = block(&lines, self.endpoint_block_name())?;
         self.services
             .iter()
             .all(|name| endpoints.contains(&format!("\t\t\"{name}\" = {{").as_str()))
+            .then_some(observed_session)
     }
 }
 
@@ -1010,10 +1082,6 @@ fn block<'a>(lines: &'a [&str], name: &str) -> Option<&'a [&'a str]> {
         + 1;
     let end = start + lines[start..].iter().position(|line| *line == "\t}")?;
     Some(&lines[start..end])
-}
-
-async fn loaded_job(uid: u32, label: &str) -> Option<String> {
-    loaded_target(&format!("gui/{uid}/{label}")).await
 }
 
 async fn loaded_target(target: &str) -> Option<String> {
@@ -1070,8 +1138,8 @@ fn system_catalog() -> std::io::Result<Vec<PathBuf>> {
 }
 
 struct AgentCandidate {
-    code: glass_macos::private_session::PlatformExecutable,
-    executable: ProtectedFile,
+    code: Arc<glass_macos::private_session::PlatformExecutable>,
+    executable: Arc<ProtectedFile>,
     definition: Definition,
     kind: ServiceKind,
     origin: work::ProcessOrigin,
@@ -1107,31 +1175,52 @@ fn agent_candidate(
     uid: u32,
     process: ProcessIdentity,
     catalog: &[PathBuf],
+    label: &str,
 ) -> Option<AgentCandidate> {
+    unique_match(
+        agent_candidates(uid, process, catalog)?
+            .into_iter()
+            .filter(|candidate| candidate.definition.label == label),
+    )
+}
+
+fn unique_match<T>(values: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut values = values.into_iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn agent_candidates(
+    uid: u32,
+    process: ProcessIdentity,
+    catalog: &[PathBuf],
+) -> Option<Vec<AgentCandidate>> {
     let origin = work::observe(process.pid(), uid).ok()?;
     if origin.process != process || origin.parent_unique != work::observe(1, 0).ok()?.unique {
         return None;
     }
-    let code = platform_executable(uid, &process)?;
-    let executable = ProtectedFile::open(&code.path.canonicalize().ok()?)?;
-    let mut matching = catalog
+    let code = Arc::new(platform_executable(uid, &process)?);
+    let executable = Arc::new(ProtectedFile::open(&code.path.canonicalize().ok()?)?);
+    let matching = catalog
         .iter()
         .filter_map(|path| Definition::read(path.clone()))
         .filter(|definition| {
             definition.program_matches(&code.path) && definition.service_kind(&code).is_some()
         });
-    let definition = matching.next()?;
-    if matching.next().is_some() {
-        return None;
-    }
-    let kind = definition.service_kind(&code)?;
-    Some(AgentCandidate {
-        code,
-        executable,
-        definition,
-        kind,
-        origin,
-    })
+    let candidates: Vec<_> = matching
+        .filter_map(|definition| {
+            let kind = definition.service_kind(&code)?;
+            Some(AgentCandidate {
+                code: code.clone(),
+                executable: executable.clone(),
+                definition,
+                kind,
+                origin,
+            })
+        })
+        .take(AGENT_CANDIDATE_LIMIT + 1)
+        .collect();
+    (candidates.len() <= AGENT_CANDIDATE_LIMIT).then_some(candidates)
 }
 
 async fn inspect_for_account(
@@ -1140,7 +1229,7 @@ async fn inspect_for_account(
     processes: Vec<ProcessIdentity>,
 ) -> anyhow::Result<Vec<SystemService>> {
     let entries = tokio::task::spawn_blocking(system_catalog).await??;
-    let entries = std::sync::Arc::new(entries);
+    let entries = Arc::new(entries);
     let mut verified = Vec::new();
     for process in processes {
         if let Some(service) = verified_xpc(uid, session, process).await? {
@@ -1148,33 +1237,62 @@ async fn inspect_for_account(
             continue;
         }
         let catalog = entries.clone();
-        let Some(mut candidate) =
-            tokio::task::spawn_blocking(move || agent_candidate(uid, process, &catalog)).await?
+        let Some(candidates) =
+            tokio::task::spawn_blocking(move || agent_candidates(uid, process, &catalog)).await?
         else {
             continue;
         };
-        let Some(job) = loaded_job(uid, &candidate.definition.label).await else {
-            continue;
-        };
-        let Some(kind) = candidate.definition.kind_for_job(&candidate.code, &job) else {
-            continue;
-        };
-        candidate.kind = kind;
-        let service = tokio::task::spawn_blocking(move || {
-            let definition = &candidate.definition;
-            (definition.matches_job(uid, session, process, &job)
-                && (candidate.kind != ServiceKind::SharedUserAgent
+        let mut matches = Vec::new();
+        for mut candidate in candidates {
+            let domain = candidate.definition.domain(uid);
+            let label = if candidate.definition.multiple_instances {
+                let Some(listing) = loaded_target(&domain).await else {
+                    continue;
+                };
+                let Some(label) =
+                    instance_label(&listing, &domain, process, &candidate.definition.label)
+                else {
+                    continue;
+                };
+                label.to_owned()
+            } else {
+                candidate.definition.label.clone()
+            };
+            let Some(job) = loaded_target(&format!("{domain}/{label}")).await else {
+                continue;
+            };
+            let Some(job_session) = candidate
+                .definition
+                .verified_job_session(uid, session, process, &job)
+            else {
+                continue;
+            };
+            let Some(kind) = candidate.definition.kind_for_job(&candidate.code, &job) else {
+                continue;
+            };
+            candidate.kind = kind;
+            let service = tokio::task::spawn_blocking(move || {
+                let definition = &candidate.definition;
+                ((candidate.kind != ServiceKind::SharedUserAgent
                     || definition.active_endpoints(&job))
-                && candidate.still_valid(uid, process)
-                && glass_macos::private_session::session_exists(session, uid).ok() == Some(true))
-            .then_some(SystemService {
-                process,
-                label: candidate.definition.label,
-                kind: candidate.kind,
+                    && candidate.still_valid(uid, process)
+                    && glass_macos::private_session::session_exists(job_session, uid).ok()
+                        == Some(true))
+                .then_some(SystemService {
+                    process,
+                    label: candidate.definition.label,
+                    kind: candidate.kind,
+                })
             })
-        })
-        .await?;
-        if let Some(service) = service {
+            .await?;
+            if let Some(service) = service {
+                matches.push(service);
+                if matches.len() > 1 {
+                    break;
+                }
+            }
+        }
+        if let Some(service) = unique_match(matches) {
             verified.push(service);
         }
     }
@@ -1184,6 +1302,19 @@ async fn inspect_for_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Definition {
+        fn matches_job(
+            &self,
+            uid: u32,
+            session: u32,
+            process: ProcessIdentity,
+            text: &str,
+        ) -> bool {
+            self.verified_job_session(uid, session, process, text)
+                .is_some()
+        }
+    }
 
     fn xpc_value(service_type: Option<plist::Value>) -> plist::Dictionary {
         let mut service = plist::Dictionary::new();
@@ -1762,6 +1893,193 @@ mod tests {
             definition_value(),
         )
         .unwrap()
+    }
+
+    fn background_instance() -> Definition {
+        let mut value = definition_value();
+        value.insert("MultipleInstances".into(), true.into());
+        value.insert("LimitLoadToSessionType".into(), "Background".into());
+        let mut options = plist::Dictionary::new();
+        options.insert("ResetAtClose".into(), true.into());
+        let mut services = plist::Dictionary::new();
+        services.insert("com.apple.example".into(), options.into());
+        value.insert("MachServices".into(), services.into());
+        Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value).unwrap()
+    }
+
+    fn background_instance_job() -> String {
+        job()
+            .replacen(
+                "gui/502/com.apple.example = {",
+                "user/502/com.apple.example.00000000-0100-0000 = {\n\toriginal = com.apple.example",
+                1,
+            )
+            .replace("domain = gui/502 [456]", "domain = user/502")
+            .replace("asid = 456", "asid = 789")
+            .replace("system service", "is copy | system service")
+            .replace("\tendpoints = {", "\tinstance-specific endpoints = {")
+    }
+
+    #[test]
+    fn declared_background_instances_verify_their_own_user_session() {
+        let instance = background_instance();
+        assert_eq!(instance.domain(502), "user/502");
+        assert_eq!(
+            instance.verified_job_session(502, 456, process(), &background_instance_job()),
+            Some(789)
+        );
+        assert!(
+            definition()
+                .verified_job_session(502, 456, process(), &background_instance_job())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn loaded_provenance_disambiguates_templates_sharing_one_program() {
+        let first = background_instance();
+        let mut second = background_instance();
+        second.label = "com.apple.other".into();
+        second.path = format!("{ROOT}/com.apple.other.plist").into();
+        second.loaded_path = second.path.clone();
+        second
+            .arguments
+            .as_mut()
+            .unwrap()
+            .push("--other-role".into());
+        assert_eq!(first.program, second.program);
+        let templates = [&first, &second];
+        let matches = |job: &str| {
+            templates
+                .iter()
+                .filter_map(|definition| definition.verified_job_session(502, 456, process(), job))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unique_match(matches(&background_instance_job())), Some(789));
+        assert!(
+            unique_match(matches(
+                &background_instance_job().replace("pid = 123", "pid = 124")
+            ))
+            .is_none()
+        );
+        let duplicate_matches = [&first, &first].into_iter().filter_map(|definition| {
+            definition.verified_job_session(502, 456, process(), &background_instance_job())
+        });
+        assert!(unique_match(duplicate_matches).is_none());
+    }
+
+    #[test]
+    fn existing_mixed_session_declarations_keep_the_exact_gui_proof() {
+        for session in [
+            "Aqua".into(),
+            plist::Value::Array(vec!["LoginWindow".into(), "Aqua".into()]),
+            plist::Value::Array(vec!["Aqua".into(), "CryptexContainer".into()]),
+            plist::Value::Array(vec!["Background".into(), "Aqua".into()]),
+        ] {
+            let mut value = definition_value();
+            value.insert("LimitLoadToSessionType".into(), session);
+            let definition =
+                Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value).unwrap();
+            assert_eq!(definition.domain(502), "gui/502");
+            assert_eq!(
+                definition.verified_job_session(502, 456, process(), &job()),
+                Some(456)
+            );
+            assert!(
+                definition
+                    .verified_job_session(502, 457, process(), &job())
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn instance_jobs_require_the_declared_copy_identity_and_exact_runtime_bindings() {
+        let definition = background_instance();
+        for (before, after) in [
+            ("original = com.apple.example", "original = com.apple.other"),
+            ("\toriginal = com.apple.example\n", ""),
+            ("is copy | ", ""),
+            ("user/502", "user/503"),
+            ("com.apple.example.00000000", "com.apple.other.00000000"),
+            ("com.apple.example.00000000-0100-0000", "com.apple.example."),
+            ("asid = 789", "asid = 0"),
+            ("asid = 789", "asid = 2147483647"),
+            ("pid = 123", "pid = 124"),
+            ("/usr/libexec/example", "/usr/libexec/other"),
+            ("supports transactions", "other property"),
+            ("system service", "user service"),
+            ("instance-specific endpoints", "endpoints"),
+        ] {
+            assert!(
+                definition
+                    .verified_job_session(
+                        502,
+                        456,
+                        process(),
+                        &background_instance_job().replace(before, after),
+                    )
+                    .is_none(),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_endpoints_do_not_turn_background_instances_into_shared_providers() {
+        let definition = background_instance();
+        assert!(!definition.shared_mach_services);
+        let mut code = glass_macos::private_session::PlatformExecutable {
+            path: definition.program.clone(),
+            identifier: definition.label.clone(),
+            idle: false,
+            allows_idle_exit: true,
+        };
+        assert!(
+            definition
+                .kind_for_job(&code, &background_instance_job())
+                .is_none()
+        );
+        code.idle = true;
+        assert_eq!(
+            definition.kind_for_job(&code, &background_instance_job()),
+            Some(ServiceKind::IdleAgent)
+        );
+    }
+
+    #[test]
+    fn instance_and_session_metadata_must_have_the_declared_types() {
+        for value in ["true".into(), 1u64.into(), plist::Value::Array(Vec::new())] {
+            let mut fields = definition_value();
+            fields.insert("MultipleInstances".into(), value);
+            assert!(
+                Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), fields)
+                    .is_none()
+            );
+        }
+        for value in [
+            true.into(),
+            1u64.into(),
+            plist::Value::Array(vec![false.into()]),
+        ] {
+            let mut fields = definition_value();
+            fields.insert("LimitLoadToSessionType".into(), value);
+            assert!(
+                Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), fields)
+                    .is_none()
+            );
+        }
+        let mut fields = definition_value();
+        fields.insert(
+            "LimitLoadToSessionType".into(),
+            plist::Value::Array(vec!["Background".into()]),
+        );
+        assert_eq!(
+            Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), fields)
+                .unwrap()
+                .domain(502),
+            "user/502"
+        );
     }
 
     fn job() -> String {
