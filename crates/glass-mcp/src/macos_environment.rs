@@ -1325,17 +1325,20 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         running: false,
         can_cancel: true,
         start_account: None,
+        resume_creation: resume_creation.clone(),
     }));
     let cancelled = Arc::new(AtomicBool::new(false));
-    let pending_id = Arc::new(Mutex::new(None::<String>));
+    let pending_id = Arc::new(Mutex::new(crate::macos_setup::pending::WindowAttempt::new(
+        saved.clone(),
+    )));
     let begin_state = state.clone();
     let begin_cancelled = cancelled.clone();
     let begin_pending = pending_id.clone();
-    let displayed_id = saved.as_ref().map(|saved| saved.id.clone());
     let addr = addr.to_owned();
     #[cfg(feature = "network")]
     let disable_addr = addr.clone();
     let disable_state = state.clone();
+    let disable_pending = pending_id.clone();
     let close_state = state.clone();
     let close_cancelled = cancelled.clone();
     let begin = Arc::new(
@@ -1349,14 +1352,16 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             if state.running {
                 return;
             }
+            let previous = match begin_pending.lock() {
+                Ok(attempt) => attempt.previous_id().map(str::to_owned),
+                Err(_) => {
+                    state.message = "Setup intent state is unavailable. Close this window and open application setup again.".into();
+                    return;
+                }
+            };
             state.running = true;
             state.start_account = None;
             state.can_cancel = false;
-            let previous = begin_pending
-                .lock()
-                .ok()
-                .and_then(|id| id.clone())
-                .or_else(|| displayed_id.clone());
             state.message =
                 "Checking setup. Complete any macOS authentication locally; take your time.".into();
             drop(state);
@@ -1389,18 +1394,28 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                             if let Some(id) = progress.pending_id
                                 && let Ok(mut pending) = pending_id.lock()
                             {
-                                *pending = Some(id);
+                                pending.remember(id);
                             }
                             state.message = progress.message;
                             state.can_cancel = progress.can_cancel;
                         }
                     },
                 );
+                let result = result.and_then(|()| {
+                    pending_id
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("setup intent state is unavailable"))?
+                        .complete();
+                    Ok(())
+                });
                 if let Err(error) = &result {
                     let details: String = format!("{error:#}").chars().take(8192).collect();
                     eprintln!("glass: application setup failed: {details}");
                 }
                 if let Ok(mut state) = state.lock() {
+                    if result.is_ok() {
+                        state.resume_creation = None;
+                    }
                     state.running = false;
                     state.can_cancel = true;
                     state.message = match result {
@@ -1426,10 +1441,10 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     );
     let create = begin.clone();
     let create_state = state.clone();
-    let create_saved = saved.clone();
     let create_pending = pending_id.clone();
     let resume_begin = begin.clone();
     let start_state = state.clone();
+    let start_pending = pending_id.clone();
     let start_cancelled = cancelled.clone();
     let on_start = Box::new(move |request: glass_macos::setup_window::StartAccount| {
         let password = match request
@@ -1459,6 +1474,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         drop(state);
         start_cancelled.store(false, Ordering::Relaxed);
         let state = start_state.clone();
+        let pending_id = start_pending.clone();
         let cancelled = start_cancelled.clone();
         std::thread::spawn(move || {
             let name = request.name;
@@ -1481,6 +1497,12 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             drop(password);
             let mut progress = |progress: crate::macos_setup::Progress| {
                 if let Ok(mut state) = state.lock() {
+                    if let Some(id) = progress.pending_id {
+                        if let Ok(mut attempt) = pending_id.lock() {
+                            attempt.remember(id);
+                        }
+                        state.resume_creation = None;
+                    }
                     state.message = progress.message;
                     state.can_cancel = progress.can_cancel;
                 }
@@ -1512,10 +1534,20 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     guided::continue_existing(&name, &cancelled, &mut progress)
                 }
             });
+            let result = result.and_then(|()| {
+                pending_id
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("setup intent state is unavailable"))?
+                    .complete();
+                Ok(())
+            });
             if let Err(error) = &result {
                 eprintln!("glass: desktop startup failed: {error:#}");
             }
             if let Ok(mut state) = state.lock() {
+                if result.is_ok() {
+                    state.resume_creation = None;
+                }
                 state.running = false;
                 state.can_cancel = true;
                 state.start_account = result
@@ -1580,14 +1612,12 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             match crate::macos_account::Password::from_text(request.password) {
                 Ok(password) => {
                     let resume = (|| -> anyhow::Result<_> {
-                        let owned = create_pending
+                        let attempt = create_pending
                             .lock()
                             .map_err(|_| anyhow::anyhow!("setup state is unavailable"))?
                             .clone();
                         let current = guided::saved()?;
-                        crate::macos_setup::pending::Pending::creation_retry(
-                            create_saved.as_ref(),
-                            owned.as_deref(),
+                        attempt.creation_retry(
                             current.as_ref(),
                             &request.name,
                             request.previous_attempt.as_deref(),
@@ -1626,10 +1656,17 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             state.message = "Disabling isolation. Glass will restart its managed server; the account and its files will be kept. Authenticate locally if asked.".into();
             drop(state);
             let state = disable_state.clone();
+            let pending_id = disable_pending.clone();
             #[cfg(feature = "network")]
             let addr = disable_addr.clone();
             std::thread::spawn(move || {
-                let result = leave_account_using(false, true);
+                let result = leave_account_using(false, true).and_then(|()| {
+                    pending_id
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("setup intent state is unavailable"))?
+                        .complete();
+                    Ok(())
+                });
                 #[cfg(feature = "network")]
                 let restart_error = result
                     .as_ref()
@@ -1640,6 +1677,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 if let Ok(mut state) = state.lock() {
                     state.running = false;
                     state.can_cancel = true;
+                    if result.is_ok() {
+                        state.resume_creation = None;
+                    }
                     state.message = match result {
                         Ok(()) => match restart_error {
                             Some(error) => format!("Isolation disabled; the account and files were kept. Managed-server restart needs attention: {error:#}"),
@@ -1652,7 +1692,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
-            message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true, start_account: None,
+            message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true, start_account: None, resume_creation: None,
         })
         }),
         can_close: Box::new(move || {
@@ -1670,12 +1710,15 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     };
     let result = glass_macos::setup_window::run_setup(actions).map_err(anyhow::Error::msg);
     cancelled.store(true, Ordering::Relaxed);
-    let owned_id = pending_id.lock().ok().and_then(|id| id.clone());
-    if let Some(id) = owned_id {
-        guided::forget(&id)?;
-    } else if let Some(saved) = saved {
+    let attempt = pending_id
+        .lock()
+        .map_err(|_| anyhow::anyhow!("setup intent state is unavailable"))?
+        .clone();
+    if let Some(id) = attempt.owned_id() {
+        guided::forget(id)?;
+    } else if let Some(id) = attempt.displayed_id() {
         match guided::environment_lease(crate::macos_setup::LeaseKind::Application) {
-            Ok(_setup) => guided::forget(&saved.id)?,
+            Ok(_setup) => guided::forget(id)?,
             Err(error)
                 if matches!(
                     error.downcast_ref::<fs4::TryLockError>(),

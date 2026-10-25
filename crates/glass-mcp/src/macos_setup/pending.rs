@@ -46,6 +46,57 @@ pub(crate) struct Pending {
     pub addr: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct WindowAttempt {
+    displayed: Option<Pending>,
+    owned: Option<String>,
+}
+
+impl WindowAttempt {
+    pub(crate) fn new(displayed: Option<Pending>) -> Self {
+        Self {
+            displayed,
+            owned: None,
+        }
+    }
+
+    pub(crate) fn previous_id(&self) -> Option<&str> {
+        self.owned_id().or_else(|| self.displayed_id())
+    }
+
+    pub(crate) fn owned_id(&self) -> Option<&str> {
+        self.owned.as_deref()
+    }
+
+    pub(crate) fn displayed_id(&self) -> Option<&str> {
+        self.displayed.as_ref().map(|pending| pending.id.as_str())
+    }
+
+    pub(crate) fn remember(&mut self, id: String) {
+        self.owned = Some(id);
+    }
+
+    pub(crate) fn complete(&mut self) {
+        self.owned = None;
+        self.displayed = None;
+    }
+
+    pub(crate) fn creation_retry(
+        &self,
+        current: Option<&Pending>,
+        name: &str,
+        prompted: Option<&str>,
+    ) -> anyhow::Result<Option<Pending>> {
+        Pending::creation_retry(
+            self.displayed.as_ref(),
+            self.owned_id(),
+            current,
+            name,
+            prompted,
+        )
+    }
+}
+
 impl Pending {
     pub(crate) fn creation_retry(
         displayed: Option<&Self>,
@@ -307,6 +358,88 @@ mod tests {
         )
         .unwrap();
         (directory, root, pending)
+    }
+
+    #[test]
+    fn a_completed_window_can_begin_another_explicit_setup() {
+        let (_directory, root, first) = storage();
+        remember(&root, &first, None).unwrap();
+        let mut window = WindowAttempt::new(Some(first.clone()));
+        window.remember(first.id.clone());
+        forget(&root, first.owner, &first.id).unwrap();
+        window.complete();
+        let mut next = first.clone();
+        next.id = "b".repeat(32);
+        remember(&root, &next, window.previous_id()).unwrap();
+        assert_eq!(read(&root, first.owner).unwrap(), Some(next));
+    }
+
+    #[test]
+    fn completion_of_an_attempt_created_in_this_window_retires_its_token() {
+        let (_directory, root, first) = storage();
+        let mut window = WindowAttempt::new(None);
+        remember(&root, &first, window.previous_id()).unwrap();
+        window.remember(first.id.clone());
+        forget(&root, first.owner, &first.id).unwrap();
+        window.complete();
+        let mut next = first.clone();
+        next.id = "b".repeat(32);
+        remember(&root, &next, window.previous_id()).unwrap();
+        assert_eq!(read(&root, first.owner).unwrap(), Some(next));
+    }
+
+    #[test]
+    fn a_cancelled_window_without_completion_cannot_restart_its_attempt() {
+        let (_directory, root, first) = storage();
+        remember(&root, &first, None).unwrap();
+        let mut window = WindowAttempt::new(Some(first.clone()));
+        window.remember(first.id.clone());
+        forget(&root, first.owner, &first.id).unwrap();
+        assert!(
+            remember(&root, &first, window.previous_id())
+                .unwrap_err()
+                .is::<Superseded>()
+        );
+        assert!(read(&root, first.owner).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_old_window_cannot_replace_another_windows_current_attempt() {
+        let (_directory, root, first) = storage();
+        remember(&root, &first, None).unwrap();
+        let mut window = WindowAttempt::new(Some(first.clone()));
+        window.remember(first.id.clone());
+        let mut newer = first.clone();
+        newer.id = "b".repeat(32);
+        remember(&root, &newer, Some(&first.id)).unwrap();
+        assert!(
+            remember(&root, &first, window.previous_id())
+                .unwrap_err()
+                .is::<Superseded>()
+        );
+        assert_eq!(read(&root, first.owner).unwrap(), Some(newer));
+    }
+
+    #[test]
+    fn completed_creation_is_not_offered_as_a_password_resume() {
+        let (_directory, _root, mut first) = storage();
+        first.create = true;
+        first.identity = None;
+        let mut window = WindowAttempt::new(Some(first.clone()));
+        window.remember(first.id.clone());
+        window.complete();
+        assert!(
+            window
+                .creation_retry(None, "newaccount", None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            window
+                .creation_retry(None, &first.name, Some(&first.id))
+                .unwrap_err()
+                .is::<Superseded>()
+        );
     }
 
     #[test]

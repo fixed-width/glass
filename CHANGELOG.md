@@ -42,6 +42,8 @@ internal refactors, CI, or test-only changes.
   in the app log. Account creation is the first action in the setup window; selecting an existing
   account is labeled separately. A fresh setup explains retained creation history without selecting
   a completed historical account, and a missing existing account offers account creation directly.
+  A completed setup window can check an existing account again without reusing its finished attempt
+  or offering the old account-creation password dialog.
   Disk-image packaging gives the installed app readable, traversable permissions for development
   accounts even when its signed input bundle came from private build directories.
   New account IDs are checked against existing login domains without creating

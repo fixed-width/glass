@@ -21,6 +21,7 @@ pub struct SetupProgress {
     pub running: bool,
     pub can_cancel: bool,
     pub start_account: Option<EnvironmentStart>,
+    pub resume_creation: Option<ResumeCreation>,
 }
 
 pub struct SetupActions {
@@ -41,6 +42,7 @@ pub struct NewAccount {
     pub previous_attempt: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ResumeCreation {
     pub name: String,
     pub attempt: String,
@@ -316,14 +318,16 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     );
     view.addSubview(&begin);
     let create_field = account.clone();
-    let resume_creation = actions.resume_creation;
-    let automatic_creation = resume_creation.is_some();
+    let resume_creation = Rc::new(std::cell::RefCell::new(actions.resume_creation));
+    let automatic_creation = resume_creation.borrow().is_some();
+    let create_resume = resume_creation.clone();
     let create_action: Rc<dyn Fn() -> bool> = Rc::new(move || {
         let name = create_field.stringValue().to_string();
+        let resume = create_resume.borrow().clone();
         if let Some(request) = create_account_dialog(
             mtm,
             &name,
-            resume_creation.as_ref().filter(|saved| saved.name == name),
+            resume.as_ref().filter(|saved| saved.name == name),
         ) {
             create_field.setStringValue(&NSString::from_str(&request.name));
             (actions.on_create)(request);
@@ -378,6 +382,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
                 .as_ref()
                 .is_some_and(|start| start.name == account.stringValue().to_string());
             *start_account.borrow_mut() = progress.start_account;
+            *resume_creation.borrow_mut() = progress.resume_creation;
             begin.setTitle(&NSString::from_str(if starting {
                 "Start environment…"
             } else {
