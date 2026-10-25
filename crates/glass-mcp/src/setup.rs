@@ -456,25 +456,50 @@ pub(crate) fn verify_private_launch_agent(addr: &str) -> Result<()> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn loaded_agent_pid(output: &str) -> Option<u32> {
+pub(crate) fn checked_loaded_agent_pid(output: &str) -> anyhow::Result<Option<u32>> {
+    use anyhow::Context;
+
     let mut depth = 0_usize;
+    let mut roots = 0;
     let mut pid = None;
     for line in output.lines().map(str::trim) {
         if line == "}" {
-            depth = depth.checked_sub(1)?;
+            depth = depth
+                .checked_sub(1)
+                .context("unbalanced launchd job output")?;
         } else if depth == 1
-            && let Some(value) = line.strip_prefix("pid = ")
+            && line
+                .strip_prefix("pid")
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '=']))
         {
-            if pid.is_some() {
-                return None;
-            }
-            pid = Some(value.parse::<u32>().ok().filter(|&pid| pid != 0)?);
+            anyhow::ensure!(pid.is_none(), "duplicate launchd worker PID fields");
+            let value = line
+                .strip_prefix("pid = ")
+                .context("invalid launchd worker PID field")?;
+            anyhow::ensure!(
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "invalid launchd worker PID"
+            );
+            let value = value.parse::<u32>().context("invalid launchd worker PID")?;
+            anyhow::ensure!(value != 0, "invalid launchd worker PID");
+            pid = Some(value);
+        } else if depth == 0
+            && !line.is_empty()
+            && !line.ends_with(" = {")
+            && !line.ends_with(" => {")
+        {
+            anyhow::bail!("unexpected text outside launchd job output");
         }
         if line.ends_with(" = {") || line.ends_with(" => {") {
+            if depth == 0 {
+                roots += 1;
+                anyhow::ensure!(roots == 1, "multiple launchd job blocks");
+            }
             depth += 1;
         }
     }
-    if depth == 0 { pid } else { None }
+    anyhow::ensure!(depth == 0 && roots == 1, "incomplete launchd job output");
+    Ok(pid)
 }
 
 /// Restart the already-installed LaunchAgent — a thin `pub(crate)` forwarder to
@@ -820,7 +845,8 @@ mod macos_impl {
                 if !job.status.success() {
                     return false;
                 }
-                let Some(pid) = super::loaded_agent_pid(&String::from_utf8_lossy(&job.stdout))
+                let Ok(Some(pid)) =
+                    super::checked_loaded_agent_pid(&String::from_utf8_lossy(&job.stdout))
                 else {
                     return false;
                 };
@@ -1237,28 +1263,60 @@ mod tests {
     }
 
     #[test]
+    fn checked_loaded_agent_pid_distinguishes_idle_from_running() {
+        assert_eq!(
+            checked_loaded_agent_pid("job = {\n state = not running\n child = {\n pid = 9\n }\n}")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            checked_loaded_agent_pid("job = {\n pid = 42\n}").unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn checked_loaded_agent_pid_refuses_ambiguous_or_incomplete_output() {
+        for invalid in [
+            "",
+            "job = {\n pid = 0\n}",
+            "job = {\n pid = invalid\n}",
+            "job = {\n pid=42\n}",
+            "job = {\n pid =42\n}",
+            "job = {\n pid = 42\n pid = 43\n}",
+            "job = {\n pid = 42\n",
+            "job = {\n child = {\n}\n",
+            "job = {\n}\nother = {\n}",
+            "pid = 42\n}",
+        ] {
+            assert!(checked_loaded_agent_pid(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn managed_pid_is_read_only_from_the_loaded_job() {
         assert_eq!(
-            loaded_agent_pid(
+            checked_loaded_agent_pid(
                 "gui/501/job = {\n state = running\n child = {\n pid = 9\n }\n pid = 42\n}\n"
-            ),
+            )
+            .unwrap(),
             Some(42)
         );
         assert_eq!(
-            loaded_agent_pid(
+            checked_loaded_agent_pid(
                 "job = {\n environment = {\n \"reqs\" => {\n pid = 9\n }\n }\n pid = 42\n}"
-            ),
+            )
+            .unwrap(),
             Some(42)
         );
         for invalid in [
-            "job = {\n child = {\n pid = 9\n }\n}",
             "job = {\n pid = 0\n}",
             "job = {\n pid = invalid\n}",
             "job = {\n pid = 42\n pid = 43\n}",
             "job = {\n pid = 42\n",
             "pid = 42\n}",
         ] {
-            assert_eq!(loaded_agent_pid(invalid), None, "{invalid}");
+            assert!(checked_loaded_agent_pid(invalid).is_err(), "{invalid}");
         }
     }
 

@@ -312,7 +312,7 @@ fn install_onboarding(
                 ),
                 "loaded permission helper belongs to another installation"
             );
-            if crate::setup::loaded_agent_pid(&loaded).is_none() {
+            if crate::setup::checked_loaded_agent_pid(&loaded)?.is_none() {
                 checked(Command::new("/bin/launchctl").args(["kickstart", &target]))?;
             }
         }
@@ -382,7 +382,7 @@ fn onboarding_state(owner: u32) -> anyhow::Result<Option<(String, bool)>> {
         "permission helper is not bound to this installation"
     );
     let running =
-        crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout)).is_some();
+        crate::setup::checked_loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout))?.is_some();
     Ok(Some((target, running)))
 }
 
@@ -1053,7 +1053,7 @@ pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow
             "loaded worker belongs to another installation; registration retained"
         );
         ensure!(
-            crate::setup::loaded_agent_pid(&loaded).is_none(),
+            crate::setup::checked_loaded_agent_pid(&loaded)?.is_none(),
             "the worker process is still running; its registration was retained"
         );
         stop_registered_worker(&target, &account)?;
@@ -1062,8 +1062,8 @@ pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow
         remove_socket(&root, account.owner_uid, account.uid)?;
     }
     enable_worker(&root, &account, || {
-        match crate::launchd::inspect_for_setup(&target)? {
-            crate::launchd::Inspection::Loaded(_) => Ok(true),
+        let registered = match crate::launchd::inspect_for_setup(&target)? {
+            crate::launchd::Inspection::Loaded(_) => true,
             crate::launchd::Inspection::MissingJob => {
                 // launchd leaves its socket node behind when a registration is removed.
                 remove_socket(&root, account.owner_uid, account.uid)?;
@@ -1073,16 +1073,20 @@ pub fn enroll_with_options(name: &str, onboarding: bool, repair: bool) -> anyhow
                         .arg(&domain)
                         .arg(account.home.join("Library/LaunchAgents").join(JOB)),
                 )?;
-                Ok(true)
+                true
             }
             crate::launchd::Inspection::MissingDomain
             | crate::launchd::Inspection::GuiUnavailable => {
                 eprintln!(
                     "glass: registration saved; log into the selected account once to load its worker"
                 );
-                Ok(false)
+                false
             }
+        };
+        if registered {
+            worker_activation::start_if_missing(&root, &account, &binary)?;
         }
+        Ok(registered)
     })?;
     if onboarding {
         install_onboarding(&account, &binary, &root, &agents)?;
@@ -1750,7 +1754,7 @@ fn finish_setup(launchagent: bool, addr: Option<&str>) -> anyhow::Result<()> {
             .args(["print", &target])
             .output()?;
         let running_here = loaded.status.success()
-            && crate::setup::loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout))
+            && crate::setup::checked_loaded_agent_pid(&String::from_utf8_lossy(&loaded.stdout))?
                 == Some(std::process::id());
         if !running_here
             && let Some((label, pending)) =

@@ -48,6 +48,61 @@ fn socket_identity(root: &File) -> anyhow::Result<Option<(u64, u64)>> {
     }
 }
 
+fn start_if_missing_with(
+    root: &File,
+    account: &Enrollment,
+    binary: &Path,
+    loaded: &str,
+    start: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    binding(loaded, account, binary)?;
+    if socket_identity(root)?.is_none() && crate::setup::checked_loaded_agent_pid(loaded)?.is_none()
+    {
+        // First-login domains can defer even socket setup until the job has explicit demand.
+        if let Err(error) = start()
+            && socket_identity(root)?.is_none()
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn start_job(target: &str) -> anyhow::Result<()> {
+    let result = glass_core::run_bounded(
+        Command::new("/bin/launchctl")
+            .args(["kickstart", target])
+            .env("LC_ALL", "C"),
+        std::time::Duration::from_secs(15),
+        "starting the registered development worker",
+    )?;
+    ensure!(
+        result.status.success(),
+        "launchd worker start returned {}: {}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+            .trim()
+            .chars()
+            .take(2048)
+            .collect::<String>()
+    );
+    Ok(())
+}
+
+/// Caller holds the owner and worker mutation locks after enabling registration.
+pub(super) fn start_if_missing(
+    root: &File,
+    account: &Enrollment,
+    binary: &Path,
+) -> anyhow::Result<()> {
+    let target = format!("gui/{}/{LABEL}", account.uid);
+    let crate::launchd::Inspection::Loaded(loaded) = crate::launchd::inspect_for_setup(&target)?
+    else {
+        bail!("registered development worker disappeared before startup; registration retained");
+    };
+    start_if_missing_with(root, account, binary, &loaded, || start_job(&target))
+}
+
 fn activate_with(
     root: &File,
     account: &Enrollment,
@@ -55,6 +110,7 @@ fn activate_with(
     mut inspect: impl FnMut() -> anyhow::Result<crate::launchd::Inspection>,
     mut stop: impl FnMut() -> anyhow::Result<()>,
     mut bootstrap: impl FnMut() -> anyhow::Result<()>,
+    start: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let state = inspect()?;
     if let crate::launchd::Inspection::Loaded(loaded) = &state {
@@ -72,7 +128,7 @@ fn activate_with(
     match state {
         crate::launchd::Inspection::Loaded(loaded) => {
             ensure!(
-                crate::setup::loaded_agent_pid(&loaded).is_none(),
+                crate::setup::checked_loaded_agent_pid(&loaded)?.is_none(),
                 "the registered worker is still starting or busy; it was not interrupted"
             );
             stop()?;
@@ -102,7 +158,7 @@ fn activate_with(
             });
         }
     };
-    binding(&loaded, account, binary)?;
+    start_if_missing_with(root, account, binary, &loaded, start)?;
     wait_for_socket(root, account.owner_uid, account.uid)?;
     ensure!(
         before.is_none() || socket_identity(root)? != before,
@@ -194,6 +250,7 @@ pub(super) fn activate(root: &File, account: &Enrollment) -> anyhow::Result<()> 
                 &account.home.join("Library/LaunchAgents").join(JOB),
             )
         },
+        || start_job(&target),
     )?;
     onboarding_loaded(account, &binary)
 }
@@ -268,6 +325,7 @@ mod tests {
                 *live.borrow_mut() = Some(listener(&path));
                 Ok(())
             },
+            || panic!("an existing socket does not need an explicit start"),
         )
         .unwrap();
         assert_eq!(bootstraps.get(), 1);
@@ -291,7 +349,8 @@ mod tests {
                 binary(),
                 || Ok(crate::launchd::Inspection::Loaded(wrong.clone())),
                 || panic!("unbound stop"),
-                || panic!("unbound bootstrap")
+                || panic!("unbound bootstrap"),
+                || panic!("unbound start")
             )
             .is_err()
         );
@@ -313,7 +372,8 @@ mod tests {
                     Some(123)
                 ))),
                 || panic!("active worker stop"),
-                || panic!("active worker bootstrap")
+                || panic!("active worker bootstrap"),
+                || panic!("active worker start")
             )
             .is_err()
         );
@@ -338,7 +398,8 @@ mod tests {
                         crate::launchd::Inspection::MissingDomain
                     }),
                     || panic!("domain stop"),
-                    || panic!("domain bootstrap")
+                    || panic!("domain bootstrap"),
+                    || panic!("domain start")
                 )
                 .is_err()
             );
@@ -372,6 +433,7 @@ mod tests {
                 *live.borrow_mut() = Some(listener(&path));
                 Ok(())
             },
+            || panic!("a bootstrapped listener does not need an explicit start"),
         )
         .unwrap();
         let _connection = UnixStream::connect(&path).unwrap();
@@ -400,6 +462,7 @@ mod tests {
                 *live.borrow_mut() = Some(listener(&path));
                 bail!("command reported failure after job creation")
             },
+            || panic!("an existing listener does not need an explicit start"),
         )
         .unwrap();
         assert_eq!(calls.get(), 1);
@@ -420,10 +483,153 @@ mod tests {
                 || {
                     calls.set(calls.get() + 1);
                     bail!("failed before dispatch")
-                }
+                },
+                || panic!("failed bootstrap must not demand a start")
             )
             .is_err()
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn deferred_socket_setup_gets_one_explicit_start_after_bound_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        let states = RefCell::new(VecDeque::from([
+            crate::launchd::Inspection::MissingJob,
+            crate::launchd::Inspection::Loaded(loaded(&account, None)),
+        ]));
+        let bootstrapped = Cell::new(false);
+        let starts = Cell::new(0);
+        let live = RefCell::new(None);
+        activate_with(
+            &root,
+            &account,
+            binary(),
+            || Ok(states.borrow_mut().pop_front().unwrap()),
+            || panic!("a missing job cannot be stopped"),
+            || {
+                bootstrapped.set(true);
+                Ok(())
+            },
+            || {
+                assert!(bootstrapped.get());
+                assert!(!path.exists());
+                starts.set(starts.get() + 1);
+                *live.borrow_mut() = Some(listener(&path));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(starts.get(), 1);
+        let _connection = UnixStream::connect(path).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_job_after_bootstrap_is_never_demand_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        let wrong = loaded(&account, None).replace("macos-worker", "other-command");
+        let states = RefCell::new(VecDeque::from([
+            crate::launchd::Inspection::MissingJob,
+            crate::launchd::Inspection::Loaded(wrong),
+        ]));
+        assert!(
+            activate_with(
+                &root,
+                &account,
+                binary(),
+                || Ok(states.borrow_mut().pop_front().unwrap()),
+                || panic!("no prior job"),
+                || Ok(()),
+                || panic!("unbound demand start"),
+            )
+            .is_err()
+        );
+        assert!(!directory.path().join("worker.sock").exists());
+    }
+
+    #[test]
+    fn a_running_worker_waits_for_its_socket_without_another_start_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        start_if_missing_with(
+            &root,
+            &account,
+            binary(),
+            &loaded(&account, Some(123)),
+            || panic!("running worker must not be started again"),
+        )
+        .unwrap();
+        assert!(!directory.path().join("worker.sock").exists());
+    }
+
+    #[test]
+    fn a_failed_start_without_a_socket_is_not_replayed_or_hidden() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        let calls = Cell::new(0);
+        let error =
+            start_if_missing_with(&root, &account, binary(), &loaded(&account, None), || {
+                calls.set(calls.get() + 1);
+                bail!("start was refused")
+            })
+            .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error.to_string(), "start was refused");
+    }
+
+    #[test]
+    fn ambiguous_pid_output_never_authorizes_a_stop_or_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        for field in ["pid = 0", "pid = invalid", "pid=42", "pid = 42\n\tpid = 43"] {
+            let job = loaded(&account, None).replacen('\n', &format!("\n\t{field}\n"), 1);
+            assert!(
+                start_if_missing_with(&root, &account, binary(), &job, || panic!(
+                    "ambiguous start"
+                ))
+                .is_err(),
+                "{field}"
+            );
+            assert!(
+                activate_with(
+                    &root,
+                    &account,
+                    binary(),
+                    || Ok(crate::launchd::Inspection::Loaded(job.clone())),
+                    || panic!("ambiguous stop"),
+                    || panic!("ambiguous bootstrap"),
+                    || panic!("ambiguous start"),
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_start_error_after_socket_publication_is_reconciled_without_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        let calls = Cell::new(0);
+        let live = RefCell::new(None);
+        start_if_missing_with(&root, &account, binary(), &loaded(&account, None), || {
+            calls.set(calls.get() + 1);
+            *live.borrow_mut() = Some(listener(&path));
+            bail!("start completed before reporting an error")
+        })
+        .unwrap();
+        wait_for_socket(&root, account.owner_uid, account.uid).unwrap();
+        assert_eq!(calls.get(), 1);
+        let _connection = UnixStream::connect(path).unwrap();
     }
 }

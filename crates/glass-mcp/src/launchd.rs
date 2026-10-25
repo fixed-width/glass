@@ -113,16 +113,15 @@ fn wait_removed(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn stop(target: &str, uid: u32) -> anyhow::Result<()> {
-    let initial = inspect(target)?;
-    let process = match initial.as_deref().and_then(crate::setup::loaded_agent_pid) {
+    let Some(initial) = inspect(target)? else {
+        return Ok(());
+    };
+    let process = match crate::setup::checked_loaded_agent_pid(&initial)? {
         Some(pid) => glass_macos::private_session::account_processes(uid)?
             .into_iter()
             .find(|process| process.matches_pid(pid)),
         None => None,
     };
-    if initial.is_none() {
-        return Ok(());
-    }
     let result = glass_core::run_bounded(
         std::process::Command::new("/bin/launchctl")
             .args(["bootout", target])

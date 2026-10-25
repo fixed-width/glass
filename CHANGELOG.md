@@ -51,6 +51,8 @@ internal refactors, CI, or test-only changes.
   in the app log. Initial password failures do not assume a password-policy rejection.
   Accounts that have not completed their first graphical login retain worker and permission-helper
   registration for that login instead of failing setup when their graphical launchd domain is unavailable.
+  Environment startup and registration repair explicitly start the verified idle worker when macOS
+  defers its socket activation during first login, without restarting an active worker.
   Interrupted registration continues with Use existing account and preserves an already prepared account password.
   A fully closed permission-recovery journal can start a lease for a different development account;
   unfinished or invalid recovery evidence is retained and still blocks that change.
