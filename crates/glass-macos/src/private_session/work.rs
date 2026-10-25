@@ -525,12 +525,14 @@ mod tests {
         BufReader::new(fixture.child.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
+        // Child::wait closes stored stdin; the orphan must keep its pipe until observation.
+        let input = fixture.child.stdin.take().unwrap();
         fixture.child.wait().unwrap();
         let child = observe(line.trim().parse().unwrap(), uid).unwrap();
         assert_eq!(child.parent_unique, root.unique);
         let mut observer = WorkObserver::new(&scope(vec![root])).unwrap();
         assert_eq!(observer.observe(&[child]).unwrap().owned, vec![child]);
-        fixture.child.stdin.take();
+        drop(input);
         wait_gone(child, uid);
     }
 
@@ -543,12 +545,13 @@ mod tests {
         BufReader::new(fixture.child.stdout.take().unwrap())
             .read_line(&mut line)
             .unwrap();
+        let input = fixture.child.stdin.take().unwrap();
         fixture.child.wait().unwrap();
         let child = observe(line.trim().parse().unwrap(), uid).unwrap();
         assert_ne!(child.parent_unique, root.unique);
         let mut observer = WorkObserver::new(&scope(vec![root])).unwrap();
         assert_eq!(observer.observe(&[child]).unwrap().unresolved, vec![child]);
-        fixture.child.stdin.take();
+        drop(input);
         wait_gone(child, uid);
     }
 
