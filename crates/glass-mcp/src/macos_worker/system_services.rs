@@ -904,7 +904,7 @@ impl Definition {
         }
     }
 
-    fn active_endpoints(&self, text: &str) -> bool {
+    fn valid_shared_endpoints(&self, text: &str) -> bool {
         if self.services.is_empty() {
             return false;
         }
@@ -912,7 +912,8 @@ impl Definition {
         let Some(endpoints) = block(&lines, self.endpoint_block_name()) else {
             return false;
         };
-        self.services.iter().all(|name| {
+        let mut any_active = false;
+        let valid = self.services.iter().all(|name| {
             let header = format!("\t\t\"{name}\" = {{");
             let mut starts = endpoints
                 .iter()
@@ -941,15 +942,20 @@ impl Definition {
                     return false;
                 }
             }
-            fields.get("active") == Some(&"1")
-                && fields.get("managed") == Some(&"1")
+            match fields.get("active") {
+                Some(&"1") => any_active = true,
+                Some(&"0") if self.pressured_exit => {}
+                _ => return false,
+            }
+            fields.get("managed") == Some(&"1")
                 && fields.get("port").is_some_and(|value| {
                     value
                         .strip_prefix("0x")
                         .and_then(|hex| u32::from_str_radix(hex, 16).ok())
                         .is_some_and(|port| port != 0)
                 })
-        })
+        });
+        valid && any_active
     }
 
     fn kind_for_job(
@@ -958,7 +964,7 @@ impl Definition {
         text: &str,
     ) -> Option<ServiceKind> {
         if self.service_kind(code) == Some(ServiceKind::SharedUserAgent)
-            && self.active_endpoints(text)
+            && self.valid_shared_endpoints(text)
         {
             Some(ServiceKind::SharedUserAgent)
         } else if self.transaction_idle(code) {
@@ -1301,7 +1307,7 @@ async fn inspect_for_account(
             let service = tokio::task::spawn_blocking(move || {
                 let definition = &candidate.definition;
                 ((candidate.kind != ServiceKind::SharedUserAgent
-                    || definition.active_endpoints(&job))
+                    || definition.valid_shared_endpoints(&job))
                     && candidate.still_valid(uid, process)
                     && glass_macos::private_session::session_exists(job_session, uid).ok()
                         == Some(true))
@@ -1469,13 +1475,13 @@ mod tests {
     }
 
     #[test]
-    fn shared_providers_require_active_managed_declared_ports() {
+    fn shared_providers_require_valid_managed_ports_and_an_active_service() {
         let definition = definition();
         let names = definition.services.iter().map(|name| format!(
             "\t\t\"{name}\" = {{\n\t\t\tport = 0x123\n\t\t\tactive = 1\n\t\t\tmanaged = 1\n\t\t}}"
         )).collect::<Vec<_>>().join("\n");
         let job = format!("job = {{\n\tendpoints = {{\n{names}\n\t}}\n}}\n");
-        assert!(definition.active_endpoints(&job));
+        assert!(definition.valid_shared_endpoints(&job));
         for (before, after) in [
             ("active = 1", "active = 0"),
             ("managed = 1", "managed = 0"),
@@ -1484,13 +1490,86 @@ mod tests {
             ("\t\t}", "\t\tbroken"),
         ] {
             assert!(
-                !definition.active_endpoints(&job.replace(before, after)),
+                !definition.valid_shared_endpoints(&job.replace(before, after)),
                 "{before}"
             );
         }
         let mut empty = definition;
         empty.services.clear();
-        assert!(!empty.active_endpoints(&job));
+        assert!(!empty.valid_shared_endpoints(&job));
+    }
+
+    #[test]
+    fn shared_providers_can_have_dormant_declared_sibling_ports() {
+        let mut value = definition_value();
+        value
+            .get_mut("MachServices")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap()
+            .insert("com.apple.example.optional".into(), true.into());
+        let mut definition =
+            Definition::parse(format!("{ROOT}/com.apple.example.plist").into(), value).unwrap();
+        let primary = "\t\t\"com.apple.example\" = {\n\t\t\tport = 0x123\n\t\t\tactive = 1\n\t\t\tmanaged = 1\n\t\t}";
+        let sibling = "\t\t\"com.apple.example.optional\" = {\n\t\t\tport = 0x456\n\t\t\tactive = 0\n\t\t\tmanaged = 1\n\t\t}";
+        let loaded = |primary: &str, sibling: &str| {
+            format!("job = {{\n\tendpoints = {{\n{primary}\n{sibling}\n\t}}\n}}\n")
+        };
+        let code = glass_macos::private_session::PlatformExecutable {
+            transaction_tracked: true,
+            path: definition.program.clone(),
+            identifier: definition.label.clone(),
+            idle: false,
+            allows_idle_exit: true,
+        };
+        assert_eq!(
+            definition.kind_for_job(&code, &loaded(primary, sibling)),
+            Some(ServiceKind::SharedUserAgent)
+        );
+        assert!(definition.valid_shared_endpoints(&loaded(
+            primary,
+            &sibling.replace("active = 0", "active = 1")
+        )));
+        assert!(!definition.valid_shared_endpoints(&loaded(
+            &primary.replace("active = 1", "active = 0"),
+            sibling
+        )));
+        for active in ["0", "1"] {
+            let sibling = sibling.replace("active = 0", &format!("active = {active}"));
+            for malformed in [
+                sibling.replace(&format!("active = {active}"), "active = 2"),
+                sibling.replace(&format!("\t\t\tactive = {active}\n"), ""),
+                sibling.replace(
+                    &format!("active = {active}"),
+                    &format!("active = {active}\n\t\t\tactive = {active}"),
+                ),
+                sibling.replace("managed = 1", "managed = 0"),
+                sibling.replace("port = 0x456", "port = 0x0"),
+                sibling.replace("port = 0x456", "port = invalid"),
+                sibling.replace("\t\t\tmanaged = 1\n", ""),
+                sibling.replace("managed = 1", "managed = 1\n\t\t\tmanaged = 1"),
+            ] {
+                assert!(
+                    !definition.valid_shared_endpoints(&loaded(primary, &malformed)),
+                    "{malformed}"
+                );
+            }
+        }
+        assert!(!definition.valid_shared_endpoints(&loaded(primary, "")));
+        assert!(
+            !definition.valid_shared_endpoints(&loaded(primary, &format!("{sibling}\n{sibling}")))
+        );
+        let dormant = loaded(&primary.replace("active = 1", "active = 0"), sibling);
+        let undeclared_active = dormant.replace(
+            "\tendpoints = {",
+            &format!(
+                "\tendpoints = {{\n{}",
+                primary.replace("com.apple.example", "com.apple.undeclared")
+            ),
+        );
+        assert!(!definition.valid_shared_endpoints(&undeclared_active));
+        definition.pressured_exit = false;
+        assert!(!definition.valid_shared_endpoints(&loaded(primary, sibling)));
     }
 
     #[test]

@@ -67,6 +67,8 @@ internal refactors, CI, or test-only changes.
   in an indexed folder.
   Verified persistent macOS login services without transaction tracking may remain after app Stop;
   their protected declaration, loaded lifecycle and active service endpoints must match.
+  Shared transaction-tracked macOS services may retain inactive sibling endpoints when every
+  declared endpoint remains valid and managed and at least one is active.
   If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
   within the cleanup deadline. Protective denials and mixed allow/deny records remain until
   process cleanup succeeds. Incomplete cleanup retains its recovery journal, reports an error
