@@ -411,6 +411,11 @@ pub(super) fn validate_report(
     deadline: glass_core::Deadline,
 ) -> std::io::Result<Vec<ProcessIdentity>> {
     within_deadline(deadline, move || {
+        let catalog = services
+            .iter()
+            .any(|service| service.kind == ServiceKind::SharedUserAgent)
+            .then(system_catalog)
+            .transpose()?;
         let mut retained = Vec::new();
         for service in services {
             if deadline.has_passed()
@@ -424,8 +429,8 @@ pub(super) fn validate_report(
             }
             let valid = match service.kind {
                 ServiceKind::IdleAgent => idle_system_executable(uid, &service.process).is_some(),
-                ServiceKind::SharedUserAgent => system_catalog().ok().is_some_and(|catalog| {
-                    agent_candidate(uid, service.process, &catalog, &service.label).is_some_and(
+                ServiceKind::SharedUserAgent => catalog.as_ref().is_some_and(|catalog| {
+                    agent_candidate(uid, service.process, catalog, &service.label).is_some_and(
                         |candidate| {
                             candidate.kind == ServiceKind::SharedUserAgent
                                 && candidate.definition.label == service.label
@@ -1157,7 +1162,22 @@ pub(super) async fn inspect(bytes: &[u8]) -> anyhow::Result<Vec<SystemService>> 
     inspect_for_account(uid, session, processes).await
 }
 
-fn system_catalog() -> std::io::Result<Vec<PathBuf>> {
+struct AgentHint {
+    source: PathBuf,
+    program: PathBuf,
+}
+
+impl AgentHint {
+    fn read_for(&self, executable: &Path) -> Option<Definition> {
+        if self.program != executable {
+            return None;
+        }
+        let definition = Definition::read(self.source.clone())?;
+        definition.program_matches(executable).then_some(definition)
+    }
+}
+
+fn system_catalog() -> std::io::Result<Vec<AgentHint>> {
     let entries = std::fs::read_dir(ROOT)?
         .take(4097)
         .map(|entry| entry.map(|entry| entry.path()))
@@ -1167,7 +1187,18 @@ fn system_catalog() -> std::io::Result<Vec<PathBuf>> {
             "system service catalog exceeds bound",
         ));
     }
-    Ok(entries)
+    Ok(entries
+        .into_iter()
+        .filter_map(|path| {
+            let definition = Definition::read(path)?;
+            let program = definition.program.canonicalize().ok()?;
+            // Release discovery descriptors; hints never carry proof across processes.
+            Some(AgentHint {
+                source: definition.path,
+                program,
+            })
+        })
+        .collect())
 }
 
 struct AgentCandidate {
@@ -1207,7 +1238,7 @@ impl AgentCandidate {
 fn agent_candidate(
     uid: u32,
     process: ProcessIdentity,
-    catalog: &[PathBuf],
+    catalog: &[AgentHint],
     label: &str,
 ) -> Option<AgentCandidate> {
     unique_match(
@@ -1226,17 +1257,18 @@ fn unique_match<T>(values: impl IntoIterator<Item = T>) -> Option<T> {
 fn agent_candidates(
     uid: u32,
     process: ProcessIdentity,
-    catalog: &[PathBuf],
+    catalog: &[AgentHint],
 ) -> Option<Vec<AgentCandidate>> {
     let origin = work::observe(process.pid(), uid).ok()?;
     if origin.process != process || origin.parent_unique != work::observe(1, 0).ok()?.unique {
         return None;
     }
     let code = Arc::new(platform_executable(uid, &process)?);
-    let executable = Arc::new(ProtectedFile::open(&code.path.canonicalize().ok()?)?);
+    let canonical = code.path.canonicalize().ok()?;
+    let executable = Arc::new(ProtectedFile::open(&canonical)?);
     let matching = catalog
         .iter()
-        .filter_map(|path| Definition::read(path.clone()))
+        .filter_map(|hint| hint.read_for(&canonical))
         .filter(|definition| {
             definition.program_matches(&code.path) && definition.service_kind(&code).is_some()
         });
@@ -2402,6 +2434,19 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn a_matching_discovery_hint_cannot_authorize_an_unprotected_definition() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("com.apple.example.plist");
+        plist::to_file_xml(&source, &definition_value()).unwrap();
+        let executable = Path::new("/usr/libexec/example");
+        let hint = AgentHint {
+            source,
+            program: executable.into(),
+        };
+        assert!(hint.read_for(executable).is_none());
     }
 
     #[test]

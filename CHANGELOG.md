@@ -69,6 +69,8 @@ internal refactors, CI, or test-only changes.
   their protected declaration, loaded lifecycle and active service endpoints must match.
   Shared transaction-tracked macOS services may retain inactive sibling endpoints when every
   declared endpoint remains valid and managed and at least one is active.
+  Service verification avoids repeated full-catalog reads while retaining fresh source and
+  process checks, reducing recovery work under macOS background scheduling.
   Opening Glass after enrollment starts or reuses its menu-bar server without reopening setup
   or restarting existing application work. Interrupted setup remains available from Application setup….
   If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
