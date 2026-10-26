@@ -46,6 +46,24 @@ struct XpcDefinition {
     multiple_instances: bool,
 }
 
+#[derive(Clone, Copy)]
+enum XpcSession {
+    Private(u32),
+    SharedRequester(ServiceKind, u32),
+}
+
+impl XpcSession {
+    fn accepts(self, shared_user: bool, observed: u32) -> bool {
+        match self {
+            Self::Private(expected) => shared_user || observed == expected,
+            Self::SharedRequester(ServiceKind::SharedUserXpc, expected) => {
+                !shared_user && observed == expected
+            }
+            Self::SharedRequester(_, _) => false,
+        }
+    }
+}
+
 impl XpcDefinition {
     fn parse(program: &Path, value: &plist::Dictionary, identifier: &str) -> Option<Self> {
         let macos = program.parent()?;
@@ -111,6 +129,16 @@ impl XpcDefinition {
         expected_session: u32,
         text: &str,
     ) -> Option<u32> {
+        self.matches_job_in(target, process, XpcSession::Private(expected_session), text)
+    }
+
+    fn matches_job_in(
+        &self,
+        target: &str,
+        process: ProcessIdentity,
+        expected_session: XpcSession,
+        text: &str,
+    ) -> Option<u32> {
         let fields = job_fields(text, &format!("{target} = {{"))?;
         let bundle = self.program.parent()?.parent()?.parent()?.to_str()?;
         for (key, expected) in [
@@ -135,11 +163,13 @@ impl XpcDefinition {
         if session == 0 || session >= i32::MAX as u32 {
             return None;
         }
-        if if self.shared_user {
-            actual != domain
-        } else {
-            session != expected_session || !pid_domain_matches(actual, domain)
-        } {
+        if !expected_session.accepts(self.shared_user, session)
+            || if self.shared_user {
+                actual != domain
+            } else {
+                !pid_domain_matches(actual, domain)
+            }
+        {
             return None;
         }
         let properties = fields.get("properties")?;
@@ -332,6 +362,17 @@ async fn verified_xpc(
     expected_session: u32,
     process: ProcessIdentity,
 ) -> anyhow::Result<Option<SystemService>> {
+    Ok(verified_xpc_at(uid, expected_session, process, 0)
+        .await?
+        .map(|(service, _)| service))
+}
+
+async fn verified_xpc_at(
+    uid: u32,
+    expected_session: u32,
+    process: ProcessIdentity,
+    depth: u8,
+) -> anyhow::Result<Option<(SystemService, u32)>> {
     let Some((service, definition)) =
         tokio::task::spawn_blocking(move || xpc_candidate(uid, process)).await?
     else {
@@ -356,11 +397,53 @@ async fn verified_xpc(
     let Some(job) = loaded_target(&target).await else {
         return Ok(None);
     };
-    let Some(session) = definition.matches_job(&target, process, expected_session, &job) else {
-        return Ok(None);
-    };
+    let (session, shared_requestor) =
+        match definition.matches_job(&target, process, expected_session, &job) {
+            Some(session) => (session, None),
+            None if depth == 0 && !definition.shared_user => {
+                let XpcScope::Process(requestor) = scope else {
+                    return Ok(None);
+                };
+                let Some((parent, session)) = Box::pin(verified_xpc_at(
+                    uid,
+                    expected_session,
+                    requestor.process,
+                    depth + 1,
+                ))
+                .await?
+                else {
+                    return Ok(None);
+                };
+                if definition.matches_job_in(
+                    &target,
+                    process,
+                    XpcSession::SharedRequester(parent.kind, session),
+                    &job,
+                ) != Some(session)
+                {
+                    return Ok(None);
+                }
+                (session, Some(requestor))
+            }
+            None => return Ok(None),
+        };
     if !glass_macos::private_session::session_exists(session, uid)? {
         return Ok(None);
+    }
+    if let Some(requestor) = shared_requestor {
+        let Some((parent, current_session)) = Box::pin(verified_xpc_at(
+            uid,
+            expected_session,
+            requestor.process,
+            depth + 1,
+        ))
+        .await?
+        else {
+            return Ok(None);
+        };
+        if parent.kind != ServiceKind::SharedUserXpc || current_session != session {
+            return Ok(None);
+        }
     }
     let Some((current, current_definition, current_scope)) =
         tokio::task::spawn_blocking(move || {
@@ -376,7 +459,7 @@ async fn verified_xpc(
         && current_definition == definition
         && current_scope == scope
         && glass_macos::private_session::session_exists(session, uid)?)
-    .then_some(current))
+    .then_some((current, session)))
 }
 
 fn within_deadline<T: Send + 'static>(
@@ -1775,6 +1858,85 @@ mod tests {
             &format!("pid/42 [{}]", "x".repeat(256)),
             "pid/42"
         ));
+    }
+
+    #[test]
+    fn idle_application_xpc_must_match_its_verified_shared_requester_session() {
+        let definition = XpcDefinition::parse(
+            Path::new(XPC_PROGRAM),
+            &xpc_value(None),
+            "com.apple.example",
+        )
+        .unwrap();
+        let target = "pid/42/com.apple.example";
+        let bundle = XPC_PROGRAM.strip_suffix("/Contents/MacOS/Example").unwrap();
+        let job = format!(
+            "{target} = {{\n\tpath = {bundle}\n\ttype = XPCService\n\tstate = running\n\tbundle id = com.apple.example\n\tprogram = {XPC_PROGRAM}\n\tpid = 123\n\tdomain = pid/42 [SharedProvider]\n\tasid = 789\n\tproperties = xpc bundle | system service | supports transactions | supports pressured exit\n}}\n"
+        );
+        assert_eq!(definition.kind(true), Some(ServiceKind::IdleXpc));
+        assert_eq!(definition.kind(false), None);
+        assert!(
+            definition
+                .matches_job(target, process(), 456, &job)
+                .is_none()
+        );
+        assert_eq!(
+            definition.matches_job_in(
+                target,
+                process(),
+                XpcSession::SharedRequester(ServiceKind::SharedUserXpc, 789),
+                &job
+            ),
+            Some(789)
+        );
+        for kind in [
+            ServiceKind::IdleXpc,
+            ServiceKind::IdleAgent,
+            ServiceKind::SharedUserAgent,
+        ] {
+            assert!(
+                definition
+                    .matches_job_in(
+                        target,
+                        process(),
+                        XpcSession::SharedRequester(kind, 789),
+                        &job
+                    )
+                    .is_none()
+            );
+        }
+        assert!(
+            definition
+                .matches_job_in(
+                    target,
+                    process(),
+                    XpcSession::SharedRequester(ServiceKind::SharedUserXpc, 790),
+                    &job
+                )
+                .is_none()
+        );
+        for (before, after) in [
+            ("pid = 123", "pid = 124"),
+            ("pid/42 [SharedProvider]", "pid/43 [SharedProvider]"),
+            ("state = running", "state = not running"),
+            ("supports pressured exit", "other property"),
+            (
+                "bundle id = com.apple.example",
+                "bundle id = com.apple.other",
+            ),
+        ] {
+            assert!(
+                definition
+                    .matches_job_in(
+                        target,
+                        process(),
+                        XpcSession::SharedRequester(ServiceKind::SharedUserXpc, 789),
+                        &job.replace(before, after)
+                    )
+                    .is_none(),
+                "{before}"
+            );
+        }
     }
 
     #[test]

@@ -71,6 +71,8 @@ internal refactors, CI, or test-only changes.
   declared endpoint remains valid and managed and at least one is active.
   Service verification avoids repeated full-catalog reads while retaining fresh source and
   process checks, reducing recovery work under macOS background scheduling.
+  Idle app-scoped XPC helpers may remain in a verified shared per-user provider's session;
+  their live requester, owning job and inherited session must match.
   Opening Glass after enrollment starts or reuses its menu-bar server without reopening setup
   or restarting existing application work. Interrupted setup remains available from Application setup….
   If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
@@ -84,7 +86,8 @@ internal refactors, CI, or test-only changes.
   providers and registered system agents with a shared per-user role may remain active as part
   of the desktop environment;
   app-scoped providers must be idle, including separately named service instances verified in
-  their requestor's process domain and private graphical login. These checks retain code, file and
+  their requestor's process domain and private graphical login or verified shared requester's
+  session. These checks retain code, file and
   process identity proof and never exempt a recorded Glass-owned process.
   Requests already handed to shared OS services may finish after the application's processes stop.
   System-service verification handles immutable OS declarations with hardlinks, default XPC
