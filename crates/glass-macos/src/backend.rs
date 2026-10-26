@@ -559,15 +559,12 @@ fn release_clip(clip: Option<&ClipLaunch>) {
 /// otherwise `glass_a11y_snapshot` `WindowNotFound`s until the first input activates it. This
 /// front-loads the raise the first `glass_click`/`glass_type` would do anyway.
 ///
-/// **Best-effort — never fatal.** `input::focus` discards an OS-declined activation and returns
-/// `Ok`, so its only possible error is `AppExited`: the app died after `discover_window`
-/// confirmed its window. The launch still succeeded, and the next capture/a11y/input op
-/// surfaces that `AppExited`, so this logs and continues.
+/// Launch remains observable if activation fails; input independently verifies activation.
 fn activate_launched(app_pid: Option<u32>) {
     if let Some(pid) = app_pid
         && let Err(e) = crate::input::focus(pid as i32)
     {
-        eprintln!("glass-macos: launched app (pid {pid}) exited before it could be activated: {e}");
+        eprintln!("glass-macos: launched app (pid {pid}) could not be activated: {e}");
     }
 }
 

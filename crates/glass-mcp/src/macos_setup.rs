@@ -93,6 +93,7 @@ pub(crate) fn lock_for(root: &std::fs::File, owner: u32, kind: LeaseKind) -> any
 #[serde(deny_unknown_fields)]
 pub(crate) struct Readiness {
     pub private_session: bool,
+    pub login_setup_pending: bool,
     pub accessibility: bool,
     pub screen_recording: bool,
     pub onboarding_running: bool,
@@ -101,6 +102,7 @@ pub(crate) struct Readiness {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     LoginRequired,
+    LoginSetupRequired,
     StartupCleanupRequired,
     WorkerStarting,
     PermissionsRequired {
@@ -117,7 +119,9 @@ pub(crate) enum Phase {
 
 impl Readiness {
     pub(crate) fn phase(self) -> Phase {
-        if !self.accessibility || !self.screen_recording {
+        if self.login_setup_pending {
+            Phase::LoginSetupRequired
+        } else if !self.accessibility || !self.screen_recording {
             Phase::PermissionsRequired {
                 accessibility: !self.accessibility,
                 screen_recording: !self.screen_recording,
@@ -153,6 +157,9 @@ impl Phase {
         match self {
             Self::LoginRequired => format!(
                 "The development desktop for {account} is not running. Choose Start environment… in Glass application setup; enter credentials only in its local secure dialog."
+            ),
+            Self::LoginSetupRequired => format!(
+                "macOS first-login setup is still open in {account}. Switch to that account and finish the macOS welcome screens, then return here without logging it out. No Glass reinstallation or repeated permission grants are needed."
             ),
             Self::StartupCleanupRequired => "A previous desktop startup needs its temporary access cleaned up. Choose Start environment… in Glass; an already running desktop is reused without authenticating again.".into(),
             Self::WorkerStarting => format!(
@@ -694,6 +701,7 @@ mod tests {
                 for screen_recording in [false, true] {
                     let facts = Readiness {
                         private_session,
+                        login_setup_pending: false,
                         accessibility,
                         screen_recording,
                         onboarding_running: false,
@@ -711,6 +719,7 @@ mod tests {
     fn granted_console_session_requires_return_to_the_normal_account() {
         let facts = Readiness {
             private_session: false,
+            login_setup_pending: false,
             accessibility: true,
             screen_recording: true,
             onboarding_running: false,
@@ -722,6 +731,7 @@ mod tests {
     fn helper_exit_precedes_workspace_recovery_and_ready() {
         let mut facts = Readiness {
             private_session: true,
+            login_setup_pending: false,
             accessibility: true,
             screen_recording: true,
             onboarding_running: true,
@@ -737,6 +747,7 @@ mod tests {
     fn revoked_permission_returns_setup_to_only_the_missing_step() {
         let facts = Readiness {
             private_session: true,
+            login_setup_pending: false,
             accessibility: true,
             screen_recording: false,
             onboarding_running: false,
@@ -757,9 +768,41 @@ mod tests {
         for bytes in [
             r#"{}"#,
             r#"{"private_session":true,"accessibility":true}"#,
+            r#"{"private_session":true,"accessibility":true,"screen_recording":true,"onboarding_running":false}"#,
             r#"{"private_session":true,"accessibility":true,"screen_recording":true,"extra":true}"#,
         ] {
             assert!(serde_json::from_str::<Readiness>(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn macos_welcome_screens_precede_permissions_and_ready() {
+        for private_session in [false, true] {
+            for accessibility in [false, true] {
+                for screen_recording in [false, true] {
+                    let mut facts = Readiness {
+                        private_session,
+                        login_setup_pending: true,
+                        accessibility,
+                        screen_recording,
+                        onboarding_running: false,
+                    };
+                    assert_eq!(facts.phase(), Phase::LoginSetupRequired);
+                    assert_eq!(
+                        Coordinator::new(true).next(&facts.phase(), false),
+                        Decision::Wait
+                    );
+                    assert_eq!(
+                        Coordinator::new(false).next(&facts.phase(), false),
+                        Decision::Stop
+                    );
+                    facts.login_setup_pending = false;
+                    assert_eq!(
+                        facts.phase() == Phase::Ready,
+                        private_session && accessibility && screen_recording
+                    );
+                }
+            }
         }
     }
 }

@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 11;
+const PROTOCOL: u32 = 12;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -396,8 +396,16 @@ mod native {
                     return Err(error);
                 }
             };
+            let login_setup_pending = match glass_macos::private_session::login_setup_pending() {
+                Ok(pending) => pending,
+                Err(error) => {
+                    send_json(&mut stream, FAILED, &error.to_string()).await?;
+                    return Err(error.into());
+                }
+            };
             let readiness = crate::macos_setup::Readiness {
                 private_session: glass_macos::private_session::require_private().is_ok(),
+                login_setup_pending,
                 accessibility: glass_macos::accessibility_granted(),
                 screen_recording: glass_macos::screen_recording_granted(),
                 onboarding_running,
@@ -408,7 +416,10 @@ mod native {
         ensure!(kind == HELLO, "private worker bootstrap missing");
         let bootstrap: Bootstrap = serde_json::from_slice(&data)?;
         bootstrap.validate()?;
-        glass_macos::private_session::require_private()?;
+        if let Err(error) = glass_macos::private_session::require_application_desktop() {
+            send_json(&mut stream, FAILED, &error.to_string()).await?;
+            return Err(error.into());
+        }
         let command = bootstrap.child_command(&std::env::current_exe()?, owner);
         let exit = broker(stream, command).await?;
         if let Some(mut stream) = exit.stream {

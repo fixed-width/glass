@@ -55,6 +55,9 @@ internal refactors, CI, or test-only changes.
   registration for that login instead of failing setup when their graphical launchd domain is unavailable.
   Environment startup and registration repair explicitly start the verified idle worker when macOS
   defers its socket activation during first login, without restarting an active worker.
+  Setup and doctor report unfinished macOS welcome screens instead of Ready while Apple Setup
+  Assistant owns the development desktop. Application work waits for that setup to finish;
+  input verifies that the target app became active before beginning a keyboard or pointer operation.
   Interrupted registration continues with Use existing account and preserves an already prepared account password.
   A fully closed permission-recovery journal can start a lease for a different development account;
   unfinished or invalid recovery evidence is retained and still blocks that change.

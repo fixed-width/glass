@@ -212,12 +212,15 @@ pub fn run_registered_worker(owner: u32, check: bool) -> anyhow::Result<()> {
     if check {
         glass_macos::private_session::attach_for(owner, true)?;
     } else {
-        while !glass_macos::private_session::try_attach_for_onboarding(owner)? {
+        while !glass_macos::private_session::try_attach_for_onboarding(owner)?
+            || glass_macos::private_session::login_setup_pending()?
+        {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
     let facts = crate::macos_setup::Readiness {
         private_session: glass_macos::private_session::require_private().is_ok(),
+        login_setup_pending: glass_macos::private_session::login_setup_pending()?,
         accessibility: glass_macos::accessibility_granted(),
         screen_recording: glass_macos::screen_recording_granted(),
         onboarding_running: false,
@@ -226,7 +229,7 @@ pub fn run_registered_worker(owner: u32, check: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&facts)?);
         return Ok(());
     }
-    if facts.accessibility && facts.screen_recording {
+    if !facts.login_setup_pending && facts.accessibility && facts.screen_recording {
         return Ok(());
     }
     glass_macos::init_main_thread();
@@ -259,9 +262,10 @@ pub fn run_registered_worker(owner: u32, check: bool) -> anyhow::Result<()> {
                 let granted = facts.accessibility && facts.screen_recording;
                 ChecklistUpdate {
                     granted: [facts.accessibility, facts.screen_recording],
-                    message: if granted { "Permissions ready. Use Fast User Switching to return to your normal account, leaving this account logged in.".into() }
+                    message: if facts.login_setup_pending { "Finish macOS's first-login welcome screens, then return to your normal account without logging this account out.".into() }
+                        else if granted { "Permissions ready. Use Fast User Switching to return to your normal account, leaving this account logged in.".into() }
                         else { "Enable the missing permissions. Glass checks automatically; take your time.".into() },
-                    finished: granted && facts.private_session,
+                    finished: granted && facts.private_session && !facts.login_setup_pending,
                 }
             }
             Err(error) => ChecklistUpdate {

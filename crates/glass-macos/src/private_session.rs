@@ -25,6 +25,71 @@ pub fn require_private() -> Result<()> {
     check(unsafe { glass_private_still_private() })
 }
 
+/// The login-done flag can precede completion of macOS's welcome screens.
+pub fn login_setup_pending() -> Result<bool> {
+    crate::ffi::app_kit_init();
+    let mut desktop_started = false;
+    let mut setup_running = false;
+    let mut unknown = false;
+    for app in objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+    {
+        if app.isTerminated() {
+            continue;
+        }
+        let bundle = app.bundleIdentifier().map(|value| value.to_string());
+        let executable = app
+            .executableURL()
+            .and_then(|url| url.path())
+            .map(|value| value.to_string());
+        if app.isTerminated() {
+            continue;
+        }
+        match setup_assistant(bundle.as_deref(), executable.as_deref()) {
+            Some(true) => setup_running = true,
+            None => unknown = true,
+            Some(false) => {}
+        }
+        desktop_started |= bundle.as_deref() == Some("com.apple.dock")
+            && executable.as_deref()
+                == Some("/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock")
+            && app.isFinishedLaunching();
+    }
+    if setup_running {
+        Ok(true)
+    } else if unknown || !desktop_started {
+        Err(GlassError::Backend(
+            "macOS desktop initialization could not be verified; finish the development account's first-login setup and wait for its desktop".into(),
+        ))
+    } else {
+        Ok(false)
+    }
+}
+
+fn setup_assistant(bundle: Option<&str>, executable: Option<&str>) -> Option<bool> {
+    let executable = executable?;
+    let expected_bundle = bundle == Some("com.apple.SetupAssistant");
+    let expected_program = executable
+        == "/System/Library/CoreServices/Setup Assistant.app/Contents/MacOS/Setup Assistant";
+    if expected_bundle || expected_program {
+        (expected_bundle && expected_program).then_some(true)
+    } else {
+        Some(false)
+    }
+}
+
+/// Admit application work only after the private login is usable by ordinary apps.
+pub fn require_application_desktop() -> Result<()> {
+    require_private()?;
+    if login_setup_pending()? {
+        return Err(GlassError::Backend(
+            "finish macOS's first-login setup in the development account, then return to your normal account while leaving it logged in".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Actual owner GUI context, independent of the global ConsoleUser label.
 pub fn owner_desktop_session() -> std::io::Result<u32> {
     unsafe extern "C" {
@@ -787,6 +852,38 @@ mod protection_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    #[test]
+    fn setup_assistant_detection_requires_the_system_executable_and_bundle_identity() {
+        let program =
+            "/System/Library/CoreServices/Setup Assistant.app/Contents/MacOS/Setup Assistant";
+        assert_eq!(
+            setup_assistant(Some("com.apple.SetupAssistant"), Some(program)),
+            Some(true)
+        );
+        for (bundle, executable) in [
+            (None, Some(program)),
+            (Some("com.example.SetupAssistant"), Some(program)),
+            (Some("com.apple.SetupAssistant"), None),
+            (
+                Some("com.apple.SetupAssistant"),
+                Some("/Users/dev/Setup Assistant.app/Contents/MacOS/Setup Assistant"),
+            ),
+        ] {
+            assert_eq!(setup_assistant(bundle, executable), None);
+        }
+        assert_eq!(
+            setup_assistant(None, Some("/Users/dev/target/DevNotes")),
+            Some(false)
+        );
+        assert_eq!(
+            setup_assistant(
+                Some("com.example.editor"),
+                Some("/Applications/Editor.app/Contents/MacOS/Editor")
+            ),
+            Some(false)
+        );
+    }
 
     #[test]
     fn another_users_incomplete_registration_does_not_select_or_validate_our_route() {

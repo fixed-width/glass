@@ -34,7 +34,11 @@ Stop any current Glass application with `glass_stop` before changing its environ
    home is missing, Glass asks macOS to initialise that selected home. Existing homes are retained;
    custom home locations must already be prepared.
 4. When Glass asks, use [Fast User Switching](https://support.apple.com/guide/mac-help/mchlp2439/mac)
-   to log into the development account and finish macOS's first-login setup. Glass checks existing
+   to log into the development account and finish macOS's first-login setup. Complete the macOS
+   welcome screens until the account's desktop appears. A successful account login or existing
+   privacy grants do not mean those screens have finished. Glass reports this remaining step
+   instead of **Ready** while Apple Setup Assistant owns the development desktop.
+   Glass checks existing
    permissions automatically and opens **glass permissions** if a grant is missing. Already allowed
    permissions are reused; when both are allowed, the helper exits without opening that window.
    No Terminal command or second Glass installation is needed in that account. Complete only the

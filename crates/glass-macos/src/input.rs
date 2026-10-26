@@ -196,8 +196,7 @@ pub(crate) fn send_pointer_by(
 /// next one lands (see `glass_core::run_type`'s doc).
 const KEY_TYPE_DWELL: Duration = Duration::from_millis(12);
 
-/// Inject `event` as keyboard CGEvents targeting the app at `pid`, focusing it first (same
-/// best-effort `focus` helper/settle `send_pointer` uses above).
+/// Inject `event` as keyboard CGEvents after verifying activation of the target app.
 pub(crate) fn send_key_by(event: &KeyEvent, pid: i32, deadline: Deadline) -> Result<()> {
     focus_by(pid, deadline)?;
     require_payload_time(deadline)?;
@@ -344,11 +343,8 @@ fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
 /// to whatever the window server currently has focused, unlike X11/Windows where glass warps
 /// the pointer into an app it already knows the geometry of.
 ///
-/// A missing/exited process (`runningApplicationWithProcessIdentifier` returns `None`) is a
-/// hard error, not best-effort: an agent driving a dead app should see
-/// `GlassError::AppExited`, not a keystroke that silently landed somewhere else. A *declined*
-/// activation (`activateWithOptions` returns `false`, e.g. the OS deprioritizes a background-app
-/// request) does not fail the call — the process is confirmed alive and the event still posts.
+/// Verify activation before posting: an accepted request does not establish that the app
+/// became active, and session events otherwise reach whichever app still owns focus.
 ///
 /// `pub(crate)`: also the activation step of `backend::MacosPlatform::window`'s
 /// `WindowOp::Focus` branch, ahead of its `axwindow::ax_raise`/`ax_set_main`.
@@ -357,7 +353,9 @@ pub(crate) fn focus(pid: i32) -> Result<()> {
 }
 
 pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
-    crate::private_session::require_if_attached()?;
+    if crate::private_session::attached() {
+        crate::private_session::require_application_desktop()?;
+    }
     if deadline.remaining().is_some_and(|left| left < FOCUS_SETTLE) {
         return Err(GlassError::deadline_not_started("macOS input focus"));
     }
@@ -369,7 +367,16 @@ pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
         .unwrap_or(FOCUS_SETTLE)
         .min(FOCUS_SETTLE);
     thread::sleep(settle);
-    require_payload_time(deadline)
+    require_payload_time(deadline)?;
+    if app.isTerminated() {
+        return Err(GlassError::AppExited(None));
+    }
+    if !app.isActive() {
+        return Err(GlassError::Backend(
+            "macOS did not activate the target application; no input was sent".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build a mouse CGEvent of `ty` at global `point`, tagged with `button`/`flags`. Does not
