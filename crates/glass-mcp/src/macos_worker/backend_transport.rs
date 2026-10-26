@@ -279,7 +279,10 @@ fn probe(lease: Option<File>, request: u8) -> Result<crate::macos_setup::Readine
         }
         return Err(error("private worker did not return readiness facts"));
     }
-    let readiness = serde_json::from_slice(&bytes).map_err(error)?;
+    let readiness: crate::macos_setup::Readiness = serde_json::from_slice(&bytes).map_err(error)?;
+    if readiness.phase() == crate::macos_setup::Phase::Ready {
+        connection.greeting.require_application()?;
+    }
     drop(connection.stream);
     let worker = glass_macos::private_session::worker_uid();
     let deadline = Deadline::from_millis(8000);
@@ -297,33 +300,82 @@ fn probe(lease: Option<File>, request: u8) -> Result<crate::macos_setup::Readine
     Ok(readiness)
 }
 
+fn stop_owned(
+    stream: &mut UnixStream,
+    owned: &[glass_macos::private_session::work::ProcessOrigin],
+    deadline: Deadline,
+) -> Result<()> {
+    for batch in owned.chunks(64) {
+        let request = TerminationRequest {
+            expires_ns: crate::backend_worker::expires(deadline)?,
+            processes: batch.to_vec(),
+        };
+        send(
+            stream,
+            TERMINATE_OWNED,
+            &serde_json::to_vec(&request).map_err(error)?,
+            deadline,
+            None,
+        )?;
+        let (kind, bytes) = receive(stream, deadline, Some(Duration::from_secs(4)))?;
+        if kind == FAILED {
+            return Err(
+                error(serde_json::from_slice::<String>(&bytes).map_err(error)?).after_dispatch(),
+            );
+        }
+        let retired: Vec<glass_macos::private_session::work::ProcessOrigin> =
+            serde_json::from_slice(&bytes).map_err(error)?;
+        if kind != OWNED_TERMINATED || retired != batch {
+            return Err(
+                error("owned-work cleanup receipt did not match its request").after_dispatch(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn recover_processes(
+    stream: &mut UnixStream,
+    request: &crate::permission_journal::WorkReconciliationRequest<'_>,
+    deadline: Deadline,
+) -> std::io::Result<Vec<glass_macos::private_session::ProcessIdentity>> {
+    stop_owned(stream, request.owned(), deadline).map_err(std::io::Error::other)?;
+    inspect_services(stream, request.unresolved(), deadline)
+}
+
 fn inspect_services(
     stream: &mut UnixStream,
     processes: &[glass_macos::private_session::ProcessIdentity],
     deadline: Deadline,
 ) -> std::io::Result<Vec<glass_macos::private_session::ProcessIdentity>> {
     let mut run = || -> Result<Vec<_>> {
-        if processes.len() > 64 {
+        if processes.len() > 8192 {
             return Err(error(
-                "too many processes for bounded macOS service inspection",
+                "macOS service candidates exceed the account snapshot bound",
             ));
         }
-        send(
-            stream,
-            INSPECT_SERVICES,
-            &serde_json::to_vec(processes).map_err(error)?,
-            deadline,
-            None,
-        )?;
-        let (kind, bytes) = receive(stream, deadline, Some(Duration::from_secs(4)))?;
-        if kind != SYSTEM_SERVICES {
-            return Err(error("macOS service attribution unavailable"));
-        }
-        let services: Vec<super::system_services::SystemService> =
-            serde_json::from_slice(&bytes).map_err(error)?;
         let worker = glass_macos::private_session::worker_uid();
-        super::system_services::validate_report(worker, processes.to_vec(), services, deadline)
-            .map_err(error)
+        let mut retained = Vec::new();
+        for batch in processes.chunks(64) {
+            send(
+                stream,
+                INSPECT_SERVICES,
+                &serde_json::to_vec(batch).map_err(error)?,
+                deadline,
+                None,
+            )?;
+            let (kind, bytes) = receive(stream, deadline, Some(Duration::from_secs(4)))?;
+            if kind != SYSTEM_SERVICES {
+                return Err(error("macOS service attribution unavailable"));
+            }
+            let services: Vec<super::system_services::SystemService> =
+                serde_json::from_slice(&bytes).map_err(error)?;
+            retained.extend(
+                super::system_services::validate_report(worker, batch.to_vec(), services, deadline)
+                    .map_err(error)?,
+            );
+        }
+        Ok(retained)
     };
     run().map_err(std::io::Error::other)
 }
@@ -424,7 +476,7 @@ fn recovery_broker<'a>(
 pub(crate) fn finish_setup_journal(
     journal: &mut crate::permission_journal::PermissionJournal,
     inspect: &mut impl FnMut(
-        &[glass_macos::private_session::ProcessIdentity],
+        &crate::permission_journal::WorkReconciliationRequest<'_>,
         Deadline,
     ) -> std::io::Result<Vec<glass_macos::private_session::ProcessIdentity>>,
     outputs: &mut impl FnMut(
@@ -443,10 +495,13 @@ pub(crate) fn finish_setup_journal(
 pub(crate) fn finish_permission_recovery(worker: u32, binding: String, lease: &File) -> Result<()> {
     let connection = std::cell::RefCell::new(None);
     let result = (|| {
-        let mut inspect = |processes: &[glass_macos::private_session::ProcessIdentity],
+        let mut inspect = |request: &crate::permission_journal::WorkReconciliationRequest<'_>,
                            deadline| {
             let mut connection = connection.borrow_mut();
             let broker = recovery_broker(&mut connection, worker, lease, deadline)?;
+            stop_owned(&mut broker.stream, request.owned(), deadline)
+                .map_err(std::io::Error::other)?;
+            let processes = request.unresolved();
             let candidates: Vec<_> = processes
                 .iter()
                 .copied()
@@ -501,11 +556,7 @@ impl NativeConnection {
             lease,
             greeting,
         } = connect_broker(None)?;
-        if !greeting.private_session {
-            return Err(error(
-                "switch back to your normal account before starting private application work",
-            ));
-        }
+        greeting.require_application()?;
         use sha2::Digest;
         let account = sha2::Sha256::digest(
             std::fs::read(glass_macos::private_session::root_for(owner).join("account.plist"))
@@ -523,8 +574,8 @@ impl NativeConnection {
                     account,
                     Some(greeting.session),
                     Some(greeting.process),
-                    &mut |processes, deadline| {
-                        inspect_services(&mut stream.borrow_mut(), processes, deadline)
+                    &mut |request, deadline| {
+                        recover_processes(&mut stream.borrow_mut(), request, deadline)
                     },
                     &mut |scopes, deadline| {
                         reconcile_outputs(&mut stream.borrow_mut(), scopes, deadline)
@@ -615,6 +666,20 @@ impl NativeConnection {
         {
             return Err(error("private worker did not attest its attachment"));
         }
+        let native = admitted
+            .native_process
+            .ok_or_else(|| error("native worker lifetime was not attested"))?;
+        self.journal
+            .lock()
+            .map_err(|_| error("permission journal is poisoned"))?
+            .observe_work(
+                glass_macos::private_session::work::WorkSnapshot {
+                    roots: vec![native],
+                    uncertain: false,
+                },
+                false,
+            )
+            .map_err(error)?;
         Ok(())
     }
 
@@ -670,8 +735,8 @@ impl NativeConnection {
                     journal.wait_admission_exit(deadline).map_err(error)?;
                 }
                 journal
-                    .wait_idle_with(deadline, &mut |processes, deadline| {
-                        inspect_services(&mut stream.borrow_mut(), processes, deadline)
+                    .wait_idle_with(deadline, &mut |request, deadline| {
+                        recover_processes(&mut stream.borrow_mut(), request, deadline)
                     })
                     .map_err(error)
             },
@@ -681,8 +746,8 @@ impl NativeConnection {
                     .map_err(|_| error("permission journal is poisoned"))?
                     .reconcile_outputs(
                         deadline,
-                        &mut |processes, deadline| {
-                            inspect_services(&mut stream.borrow_mut(), processes, deadline)
+                        &mut |request, deadline| {
+                            recover_processes(&mut stream.borrow_mut(), request, deadline)
                         },
                         &mut |scopes, deadline| {
                             reconcile_outputs(&mut stream.borrow_mut(), scopes, deadline)
@@ -702,8 +767,8 @@ impl NativeConnection {
                 journal
                     .lock()
                     .map_err(|_| error("permission journal is poisoned"))?
-                    .finish_with(deadline, &mut |processes, deadline| {
-                        inspect_services(&mut stream.borrow_mut(), processes, deadline)
+                    .finish_with(deadline, &mut |request, deadline| {
+                        recover_processes(&mut stream.borrow_mut(), request, deadline)
                     })
                     .map_err(error)
             },
@@ -927,6 +992,119 @@ impl Drop for NativeConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_cleanup_batches_bind_receipts_and_preserve_failure() {
+        let owned: Vec<glass_macos::private_session::work::ProcessOrigin> = (1..=65)
+            .map(|pid| {
+                serde_json::from_value(serde_json::json!({
+                    "process": {"pid": pid, "seconds": 1, "microseconds": 0},
+                    "unique": pid + 100, "parent_unique": 99,
+                }))
+                .unwrap()
+            })
+            .collect();
+        for failed in [false, true] {
+            let (mut owner, mut worker) = UnixStream::pair().unwrap();
+            owner.set_nonblocking(true).unwrap();
+            worker.set_nonblocking(true).unwrap();
+            let expected = owned.clone();
+            let server = std::thread::spawn(move || {
+                let deadline = Deadline::from_millis(3000);
+                for (index, batch) in expected.chunks(64).enumerate() {
+                    let (kind, bytes) = receive(&mut worker, deadline, None).unwrap();
+                    assert_eq!(kind, TERMINATE_OWNED);
+                    let request: TerminationRequest = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(request.processes, batch);
+                    assert!(request.expires_ns.is_some());
+                    if failed && index == 1 {
+                        send(
+                            &mut worker,
+                            FAILED,
+                            &serde_json::to_vec("injected lost cleanup confirmation").unwrap(),
+                            deadline,
+                            None,
+                        )
+                        .unwrap();
+                    } else {
+                        send(
+                            &mut worker,
+                            OWNED_TERMINATED,
+                            &serde_json::to_vec(batch).unwrap(),
+                            deadline,
+                            None,
+                        )
+                        .unwrap();
+                    }
+                }
+            });
+            let result = stop_owned(&mut owner, &owned, Deadline::from_millis(3000));
+            if failed {
+                assert_eq!(
+                    result.unwrap_err().bound_dispatch(),
+                    Some(glass_core::BoundDispatch::MayHaveDispatched)
+                );
+            } else {
+                result.unwrap();
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn service_inspection_batches_a_large_snapshot_without_accepting_cross_batch_proofs() {
+        let processes: Vec<glass_macos::private_session::ProcessIdentity> = (1..=130)
+            .map(|pid| {
+                serde_json::from_value(serde_json::json!({
+                    "pid": pid, "seconds": 1, "microseconds": 0,
+                }))
+                .unwrap()
+            })
+            .collect();
+        for invalid_second_batch in [false, true] {
+            let (mut owner, mut worker) = UnixStream::pair().unwrap();
+            owner.set_nonblocking(true).unwrap();
+            worker.set_nonblocking(true).unwrap();
+            let expected = processes.clone();
+            let server = std::thread::spawn(move || {
+                let deadline = Deadline::from_millis(3000);
+                for (index, batch) in expected.chunks(64).enumerate() {
+                    let (kind, bytes) = receive(&mut worker, deadline, None).unwrap();
+                    assert_eq!(kind, INSPECT_SERVICES);
+                    let requested: Vec<glass_macos::private_session::ProcessIdentity> =
+                        serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(requested, batch);
+                    let services = if invalid_second_batch && index == 1 {
+                        vec![super::super::system_services::SystemService {
+                            process: expected[0],
+                            label: "com.apple.example".into(),
+                            kind: super::super::system_services::ServiceKind::IdleAgent,
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    send(
+                        &mut worker,
+                        SYSTEM_SERVICES,
+                        &serde_json::to_vec(&services).unwrap(),
+                        deadline,
+                        None,
+                    )
+                    .unwrap();
+                    if invalid_second_batch && index == 1 {
+                        break;
+                    }
+                }
+            });
+            let result = inspect_services(&mut owner, &processes, Deadline::from_millis(3000));
+            if invalid_second_batch {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_empty());
+            }
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn output_recovery_accepts_only_the_fresh_authority_receipt() {

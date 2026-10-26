@@ -27,7 +27,7 @@ pub fn require_private() -> Result<()> {
 
 /// The login-done flag can precede completion of macOS's welcome screens.
 pub fn login_setup_pending() -> Result<bool> {
-    crate::ffi::app_kit_init();
+    crate::ffi::refresh_applications();
     let mut desktop_started = false;
     let mut setup_running = false;
     let mut unknown = false;
@@ -85,6 +85,11 @@ pub fn require_application_desktop() -> Result<()> {
     if login_setup_pending()? {
         return Err(GlassError::Backend(
             "finish macOS's first-login setup in the development account, then return to your normal account while leaving it logged in".into(),
+        ));
+    }
+    if !owns_pid(crate::ffi::frontmost_pid()? as u32) {
+        return Err(GlassError::Backend(
+            "macOS active application is outside the development account; desktop attachment could not be verified".into(),
         ));
     }
     Ok(())

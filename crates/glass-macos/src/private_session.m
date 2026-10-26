@@ -32,6 +32,26 @@
 #include <dlfcn.h>
 #include <stdio.h>
 
+void glass_macos_refresh_applications(void) {
+    if ([NSThread isMainThread])
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+}
+
+// Process Manager reads current focus without NSRunningApplication's run-loop cache.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+int glass_macos_frontmost_pid(int32_t *out) {
+    ProcessSerialNumber process = {0};
+    pid_t pid = 0;
+    OSStatus status = GetFrontProcess(&process);
+    if (!status) status = GetProcessPID(&process, &pid);
+    if (status) return status;
+    if (pid <= 0) return ESRCH;
+    *out = pid;
+    return 0;
+}
+#pragma clang diagnostic pop
+
 typedef struct {
     uint64_t device, inode, birth_seconds, birth_nanoseconds;
     uint32_t owner;

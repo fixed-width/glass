@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -41,6 +42,8 @@ int main(int argc, char **argv) {
         child = fork();
         if (child < 0) _exit(5);
         if (child > 0) _exit(0);
+    } else if (!strcmp(argv[1], "resist")) {
+        signal(SIGTERM, SIG_IGN);
     } else if (strcmp(argv[1], "single")) _exit(64);
     leaf();
 }

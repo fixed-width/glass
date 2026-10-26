@@ -361,6 +361,7 @@ pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
     }
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .ok_or(GlassError::AppExited(None))?;
+    let lifetime = target_lifetime(pid)?;
     app.activateWithOptions(NSApplicationActivationOptions::empty());
     let settle = deadline
         .remaining()
@@ -368,10 +369,36 @@ pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
         .min(FOCUS_SETTLE);
     thread::sleep(settle);
     require_payload_time(deadline)?;
-    if app.isTerminated() {
+    confirm_focus(
+        lifetime,
+        target_lifetime(pid)?,
+        crate::ffi::frontmost_pid()?,
+    )
+}
+
+fn target_lifetime(pid: i32) -> Result<crate::private_session::work::ProcessOrigin> {
+    let observed = if crate::private_session::attached() {
+        crate::private_session::work::observe(pid as u32, rustix::process::geteuid().as_raw())
+    } else {
+        crate::private_session::work::read_lifetime(pid as u32)
+    };
+    observed.map_err(|error| match error.raw_os_error() {
+        Some(2 | 3) => GlassError::AppExited(None),
+        _ => GlassError::Backend(format!(
+            "macOS input target lifetime could not be verified: {error}"
+        )),
+    })
+}
+
+fn confirm_focus(
+    expected: crate::private_session::work::ProcessOrigin,
+    observed: crate::private_session::work::ProcessOrigin,
+    frontmost: i32,
+) -> Result<()> {
+    if observed != expected {
         return Err(GlassError::AppExited(None));
     }
-    if !app.isActive() {
+    if frontmost != expected.process.pid() as i32 {
         return Err(GlassError::Backend(
             "macOS did not activate the target application; no input was sent".into(),
         ));
@@ -574,6 +601,33 @@ impl ScrollSink for MacScrollSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_confirmation_rejects_a_reused_pid_and_a_different_foreground_app() {
+        let process = serde_json::from_value(serde_json::json!({
+            "pid": 42, "seconds": 1, "microseconds": 0,
+        }))
+        .unwrap();
+        let expected = crate::private_session::work::ProcessOrigin {
+            process,
+            unique: 10,
+            parent_unique: 9,
+        };
+        let mut replacement = expected;
+        replacement.unique = 11;
+        let mut new_birth = expected;
+        new_birth.process = serde_json::from_value(serde_json::json!({
+            "pid": 42, "seconds": 2, "microseconds": 0,
+        }))
+        .unwrap();
+        for (observed, frontmost) in [(replacement, 42), (new_birth, 42), (expected, 43)] {
+            let mut posted = false;
+            let result = confirm_focus(expected, observed, frontmost).map(|()| posted = true);
+            assert!(result.is_err());
+            assert!(!posted);
+        }
+        confirm_focus(expected, expected, 42).unwrap();
+    }
 
     #[test]
     fn macos_input_refuses_a_deadline_shorter_than_focus_settle_before_injection() {

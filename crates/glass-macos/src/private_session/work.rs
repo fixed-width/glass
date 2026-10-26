@@ -1,8 +1,11 @@
 //! Process lifetimes and ancestry for private application work.
 
+use glass_core::Deadline;
+use rustix::process::{Pid, Signal, kill_process};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +42,92 @@ pub fn observe(pid: u32, uid: u32) -> io::Result<ProcessOrigin> {
         return Err(io::Error::other("invalid ownership account"));
     }
     observe_for(pid, uid)
+}
+
+/// Read a lifetime for comparison without asserting process ownership.
+pub fn read_lifetime(pid: u32) -> io::Result<ProcessOrigin> {
+    observe_for(pid, u32::MAX)
+}
+
+/// Stop only the exact lifetimes supplied by the authenticated environment owner.
+pub fn terminate_owned(processes: &[ProcessOrigin], deadline: Deadline) -> io::Result<()> {
+    if !super::attached() || rustix::process::getuid() != rustix::process::geteuid() {
+        return Err(io::Error::other(
+            "owned cleanup requires its attached worker account",
+        ));
+    }
+    let deadline = Deadline::at(
+        deadline
+            .resolve(Instant::now() + Duration::from_millis(800))
+            .0,
+    );
+    stop_lifetimes(processes, rustix::process::geteuid().as_raw(), deadline)
+}
+
+fn stop_lifetimes(processes: &[ProcessOrigin], uid: u32, deadline: Deadline) -> io::Result<()> {
+    if processes.len() > 64 {
+        return Err(io::Error::other("owned cleanup batch exceeds bound"));
+    }
+    let mut seen = BTreeSet::new();
+    for (index, process) in processes.iter().enumerate() {
+        if deadline.has_passed() {
+            return Err(io::Error::other("owned cleanup deadline elapsed"));
+        }
+        process.validate()?;
+        if !seen.insert(process.unique)
+            || processes[..index]
+                .iter()
+                .any(|old| old.process.pid() == process.process.pid())
+        {
+            return Err(io::Error::other("duplicate owned cleanup lifetime"));
+        }
+        if remaining_root(*process, uid)?.is_some() && process.process.pid() == std::process::id() {
+            return Err(io::Error::other("owned cleanup cannot target its broker"));
+        }
+    }
+    let mut signalled = BTreeMap::<u64, Instant>::new();
+    loop {
+        let mut live = false;
+        for process in processes {
+            if deadline.has_passed() {
+                return Err(io::Error::other("owned cleanup deadline elapsed"));
+            }
+            if remaining_root(*process, uid)?.is_none() {
+                continue;
+            }
+            live = true;
+            let (signal, escalate) = match signalled.get(&process.unique) {
+                None => {
+                    let grace = deadline
+                        .remaining()
+                        .unwrap_or(Duration::from_millis(500))
+                        .saturating_sub(Duration::from_millis(50))
+                        .min(Duration::from_millis(500));
+                    (Signal::TERM, Instant::now() + grace)
+                }
+                Some(at) if Instant::now() >= *at => (Signal::KILL, *at),
+                Some(_) => continue,
+            };
+            let pid = Pid::from_raw(process.process.pid() as i32)
+                .ok_or_else(|| io::Error::other("invalid owned PID"))?;
+            match kill_process(pid, signal) {
+                Ok(()) => {
+                    signalled.insert(process.unique, escalate);
+                }
+                Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !live {
+            return Ok(());
+        }
+        std::thread::sleep(
+            deadline
+                .remaining()
+                .unwrap_or(Duration::from_millis(20))
+                .min(Duration::from_millis(20)),
+        );
+    }
 }
 
 fn observe_for(pid: u32, uid: u32) -> io::Result<ProcessOrigin> {
@@ -500,6 +589,57 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture did not exit");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn detached(mode: &str) -> (Fixture, std::process::ChildStdin, ProcessOrigin) {
+        let mut fixture = fixture(mode);
+        let mut line = String::new();
+        BufReader::new(fixture.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let input = fixture.child.stdin.take().unwrap();
+        fixture.child.wait().unwrap();
+        let child = observe(
+            line.trim().parse().unwrap(),
+            rustix::process::geteuid().as_raw(),
+        )
+        .unwrap();
+        (fixture, input, child)
+    }
+
+    #[test]
+    fn exact_owned_cleanup_preserves_unrelated_and_rejects_invalid_batches() {
+        let (_fixture, input, child) = detached("single");
+        let (_other, other_input, unrelated) = detached("single");
+        let uid = rustix::process::geteuid().as_raw();
+        assert!(stop_lifetimes(&[child, child], uid, Deadline::from_millis(800)).is_err());
+        assert!(remaining_root(child, uid).unwrap().is_some());
+        assert!(stop_lifetimes(&[child], uid + 1, Deadline::from_millis(800)).is_err());
+        assert!(remaining_root(child, uid).unwrap().is_some());
+        assert!(stop_lifetimes(&[child], uid, Deadline::from_millis(0)).is_err());
+        let mut retired = child;
+        retired.unique += 1;
+        stop_lifetimes(&[retired], uid, Deadline::from_millis(800)).unwrap();
+        assert!(remaining_root(child, uid).unwrap().is_some());
+        let broker = observe(std::process::id(), uid).unwrap();
+        assert!(stop_lifetimes(&[child, broker], uid, Deadline::from_millis(800)).is_err());
+        assert!(remaining_root(child, uid).unwrap().is_some());
+        stop_lifetimes(&[child], uid, Deadline::from_millis(800)).unwrap();
+        assert!(remaining_root(child, uid).unwrap().is_none());
+        assert!(remaining_root(unrelated, uid).unwrap().is_some());
+        drop(input);
+        drop(other_input);
+        wait_gone(unrelated, uid);
+    }
+
+    #[test]
+    fn exact_owned_cleanup_escalates_without_a_host_inventory() {
+        let (_fixture, input, child) = detached("resist");
+        let uid = rustix::process::geteuid().as_raw();
+        let result = stop_lifetimes(&[child], uid, Deadline::from_millis(800));
+        drop(input);
+        wait_gone(child, uid);
+        result.unwrap();
     }
 
     #[test]

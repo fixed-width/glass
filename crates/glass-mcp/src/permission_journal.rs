@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use glass_core::Deadline;
-use glass_macos::private_session::work::{self, WorkObserver, WorkScope, WorkSnapshot};
+use glass_macos::private_session::work::{
+    self, ProcessOrigin, WorkObserver, WorkScope, WorkSnapshot,
+};
 use glass_macos::private_session::{
     ProcessIdentity, account_processes, boot_identity, session_exists,
 };
@@ -18,8 +20,39 @@ use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
 
 const LIMIT: u64 = 64 * 1024 * 1024;
-type IdleInspector<'a> =
-    dyn FnMut(&[ProcessIdentity], Deadline) -> io::Result<Vec<ProcessIdentity>> + 'a;
+type ProcessRecovery<'a> =
+    dyn FnMut(&WorkReconciliationRequest<'_>, Deadline) -> io::Result<Vec<ProcessIdentity>> + 'a;
+/// Only the journal creates requests carrying authority to stop owned work.
+pub(crate) struct WorkReconciliationRequest<'a> {
+    owned: &'a [ProcessOrigin],
+    unresolved: &'a [ProcessIdentity],
+}
+impl<'a> WorkReconciliationRequest<'a> {
+    fn new(owned: &'a [ProcessOrigin], unresolved: &'a [ProcessIdentity]) -> io::Result<Self> {
+        let mut pids = std::collections::BTreeSet::new();
+        for origin in owned {
+            origin.validate()?;
+            if !pids.insert(origin.process.pid()) {
+                return Err(io::Error::other("duplicate owned process"));
+            }
+        }
+        for process in unresolved {
+            if !pids.insert(process.pid()) {
+                return Err(io::Error::other(
+                    "overlapping or duplicate unresolved process",
+                ));
+            }
+        }
+        Ok(Self { owned, unresolved })
+    }
+    pub(crate) fn owned(&self) -> &[ProcessOrigin] {
+        self.owned
+    }
+    pub(crate) fn unresolved(&self) -> &[ProcessIdentity] {
+        self.unresolved
+    }
+}
+
 type OutputInspector<'a> = dyn FnMut(&[OutputScope], Deadline) -> io::Result<()> + 'a;
 
 #[derive(Default)]
@@ -248,7 +281,7 @@ impl PermissionJournal {
         account: String,
         session: Option<u32>,
         admission: Option<ProcessIdentity>,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
     ) -> io::Result<Self> {
         Self::open_with_outputs(
             root,
@@ -267,7 +300,7 @@ impl PermissionJournal {
         account: String,
         session: Option<u32>,
         admission: Option<ProcessIdentity>,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
         outputs: &mut OutputInspector<'_>,
     ) -> io::Result<Self> {
         let owner = rustix::process::geteuid().as_raw();
@@ -785,7 +818,7 @@ impl PermissionJournal {
     pub(crate) fn wait_idle_with(
         &mut self,
         deadline: Deadline,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
     ) -> io::Result<()> {
         if let Some(scope) = self.header.work.clone()
             && !scope.work.roots.is_empty()
@@ -813,7 +846,7 @@ impl PermissionJournal {
                 if prior_work_gone(&self.header, boot_identity, session_exists)? {
                     return Ok(());
                 }
-                inspect(&unknown, deadline)?
+                inspect(&WorkReconciliationRequest::new(&[], &unknown)?, deadline)?
             };
             if deadline.has_passed() {
                 return Err(io::Error::other("permission recovery deadline elapsed"));
@@ -840,7 +873,7 @@ impl PermissionJournal {
         &mut self,
         scope: &WorkScope,
         deadline: Deadline,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
     ) -> io::Result<()> {
         if self.header.boot != Some(boot_identity()?) {
             return Ok(());
@@ -879,15 +912,16 @@ impl PermissionJournal {
                 .chain(&observed.unresolved)
                 .map(|origin| origin.process)
                 .collect();
-            let idle = if observed.unresolved.is_empty() {
+            let idle = if observed.unresolved.is_empty() && observed.owned.is_empty() {
                 Vec::new()
             } else {
+                let unresolved: Vec<_> = observed
+                    .unresolved
+                    .iter()
+                    .map(|origin| origin.process)
+                    .collect();
                 inspect(
-                    &observed
-                        .unresolved
-                        .iter()
-                        .map(|origin| origin.process)
-                        .collect::<Vec<_>>(),
+                    &WorkReconciliationRequest::new(&observed.owned, &unresolved)?,
                     deadline,
                 )?
             };
@@ -959,7 +993,7 @@ impl PermissionJournal {
     pub(crate) fn reconcile_outputs(
         &mut self,
         deadline: Deadline,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
         repair: &mut OutputInspector<'_>,
     ) -> io::Result<()> {
         if self.outputs.is_empty() {
@@ -1048,7 +1082,7 @@ impl PermissionJournal {
     fn recover_with_outputs(
         &mut self,
         deadline: Deadline,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
         outputs: &mut OutputInspector<'_>,
     ) -> io::Result<()> {
         if deadline.has_passed() {
@@ -1100,7 +1134,7 @@ impl PermissionJournal {
     pub(crate) fn finish_with(
         &mut self,
         deadline: Deadline,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
     ) -> io::Result<()> {
         self.finish_with_outputs(deadline, inspect, &mut |_, _| {
             Err(io::Error::other("output recovery executor is unavailable"))
@@ -1110,7 +1144,7 @@ impl PermissionJournal {
     pub(crate) fn finish_with_outputs(
         &mut self,
         deadline: Deadline,
-        inspect: &mut IdleInspector<'_>,
+        inspect: &mut ProcessRecovery<'_>,
         outputs: &mut OutputInspector<'_>,
     ) -> io::Result<()> {
         self.recover_with_outputs(deadline, inspect, outputs)?;
@@ -1516,6 +1550,7 @@ mod tests {
                 &mut |unknown, deadline| {
                     inspected = true;
                     saw_child |= unknown
+                        .unresolved()
                         .iter()
                         .any(|process| process.matches_pid(child.id()));
                     if deadline.remaining().unwrap_or(Duration::ZERO)
@@ -1526,7 +1561,7 @@ mod tests {
                             "activation delayed",
                         ));
                     }
-                    Ok(unknown.to_vec())
+                    Ok(unknown.unresolved().to_vec())
                 },
                 &mut |_, _| {
                     outputs_called = true;
@@ -1953,8 +1988,8 @@ mod tests {
         journal.admission = Some(admission.process);
         journal
             .wait_owned_work(&scope, Deadline::from_millis(3000), &mut |processes, _| {
-                assert!(!processes.contains(&admission.process));
-                Ok(processes.to_vec())
+                assert!(!processes.unresolved().contains(&admission.process));
+                Ok(processes.unresolved().to_vec())
             })
             .unwrap();
 
@@ -1964,10 +1999,10 @@ mod tests {
             journal
                 .wait_owned_work(&scope, Deadline::from_millis(200), &mut |processes, _| {
                     assert!(
-                        !processes.contains(&admission.process),
+                        !processes.unresolved().contains(&admission.process),
                         "owned work must not be offered for exemption"
                     );
-                    Ok(processes.to_vec())
+                    Ok(processes.unresolved().to_vec())
                 })
                 .is_err(),
             "positive ownership must override admission exclusion"
@@ -1980,12 +2015,87 @@ mod tests {
         assert!(
             journal
                 .wait_owned_work(&scope, Deadline::from_millis(1000), &mut |processes, _| {
-                    saw_actual |= processes.contains(&admission.process);
+                    saw_actual |= processes.unresolved().contains(&admission.process);
                     Err(io::Error::other("do not exempt a reused admission PID"))
                 })
                 .is_err()
         );
         assert!(saw_actual);
+    }
+
+    #[test]
+    fn learned_owned_work_is_durable_before_reclamation_and_then_resampled() {
+        use std::io::{BufRead, BufReader};
+        let root = test_root();
+        let mut journal = journal(root.path());
+        let uid = rustix::process::geteuid().as_raw();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "echo ready; read -r start; /bin/sleep 30 & kid=$!; echo $kid; read -r stop; kill $kid; wait"])
+            .env_clear().stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        let parent = work::observe(child.id(), uid).unwrap();
+        let scope = WorkScope {
+            baseline: work::snapshot(uid)
+                .unwrap()
+                .into_iter()
+                .filter(|origin| *origin != parent)
+                .collect(),
+            work: WorkSnapshot {
+                roots: vec![parent],
+                uncertain: false,
+            },
+            launch_pending: false,
+        };
+        journal.header.worker = uid;
+        journal.header.work = Some(scope.clone());
+        child.stdin.as_mut().unwrap().write_all(b"start\n").unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        let leaf_pid = line.trim().parse::<u32>().unwrap();
+        let leaf = work::observe(leaf_pid, uid).unwrap();
+        let mut reclaimed = false;
+        let failed =
+            journal.wait_owned_work(&scope, Deadline::from_millis(5000), &mut |request, _| {
+                if !reclaimed {
+                    assert!(request.owned().contains(&leaf));
+                    assert!(!request.unresolved().contains(&leaf.process));
+                    let recorded =
+                        std::fs::read_to_string(root.path().join("pending.jsonl")).unwrap();
+                    assert!(
+                        recorded
+                            .lines()
+                            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                            .any(|row| row["kind"] == "WorkObserved"
+                                && row["snapshot"]["roots"]
+                                    .as_array()
+                                    .is_some_and(|roots| roots
+                                        .iter()
+                                        .any(|origin| origin["process"]["pid"] == leaf_pid)))
+                    );
+                    child.stdin.as_mut().unwrap().write_all(b"stop\n").unwrap();
+                    child.wait().unwrap();
+                    reclaimed = true;
+                    return Err(io::Error::other("cleanup reply was lost after termination"));
+                }
+                Ok(request.unresolved().to_vec())
+            });
+        assert!(failed.is_err());
+        assert!(reclaimed);
+        assert!(!journal.closed);
+        let durable = journal.header.work.clone().unwrap();
+        journal
+            .wait_owned_work(&durable, Deadline::from_millis(5000), &mut |request, _| {
+                assert!(request.owned().is_empty());
+                Ok(request.unresolved().to_vec())
+            })
+            .unwrap();
+        child.wait().unwrap();
+        assert!(work::remaining_root(leaf, uid).unwrap().is_none());
     }
 
     #[test]
@@ -2722,7 +2832,7 @@ mod tests {
         let mut inspections = 0;
         let result = journal.wait_idle_with(Deadline::from_millis(500), &mut |unknown, _| {
             inspections += 1;
-            assert!(unknown.contains(&child_origin.process));
+            assert!(unknown.unresolved().contains(&child_origin.process));
             Ok(Vec::new())
         });
         child.stdin.take();

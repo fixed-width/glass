@@ -114,6 +114,31 @@ pub fn init_main_thread() {
     app_kit_init();
 }
 
+pub(crate) fn refresh_applications() {
+    app_kit_init();
+    unsafe extern "C" {
+        fn glass_macos_refresh_applications();
+    }
+    // SAFETY: the helper runs only on the main thread and retains no Rust data.
+    unsafe { glass_macos_refresh_applications() };
+}
+
+pub(crate) fn frontmost_pid() -> Result<i32> {
+    app_kit_init();
+    unsafe extern "C" {
+        fn glass_macos_frontmost_pid(out: *mut i32) -> i32;
+    }
+    let mut pid = 0;
+    // SAFETY: the bridge writes one integer to this live stack slot and retains no pointer.
+    let status = unsafe { glass_macos_frontmost_pid(&mut pid) };
+    if status != 0 {
+        return Err(GlassError::Backend(format!(
+            "macOS active application could not be verified: {status}"
+        )));
+    }
+    Ok(pid)
+}
+
 /// Whether the process initialized AppKit before starting platform threads.
 pub fn main_thread_initialized() -> bool {
     APP_KIT_INIT.is_completed()

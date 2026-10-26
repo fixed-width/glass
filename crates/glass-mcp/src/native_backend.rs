@@ -25,6 +25,28 @@ impl Reply {
     }
 }
 
+fn checked_stop(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (primary, cleanup) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(GlassError::cleanup_failed(
+            "stopping private application",
+            primary,
+            cleanup,
+        )),
+    }
+}
+
+fn finish_transport(primary: anyhow::Result<()>, stopped: Result<()>) -> anyhow::Result<()> {
+    match (primary, stopped) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("native backend cleanup failed: {cleanup}")))
+        }
+    }
+}
+
 pub fn run(owner: u32) -> anyhow::Result<()> {
     glass_macos::private_session::attach_for(owner, false)?;
     glass_macos::private_session::work::begin()?;
@@ -58,61 +80,78 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
                 }
             };
             let mut outputs = outputs::Outputs::new(owner)?;
-            while let Ok(request) = incoming.recv() {
-                let deadline = crate::backend_worker::deadline(request.expires_ns)?;
-                let response = match glass_macos::private_session::require_private() {
-                    Ok(()) => {
-                        if request.version == VERSION
-                            && matches!(&request.operation, Operation::OutputAuthority(_))
-                        {
-                            let Operation::OutputAuthority(scope) = request.operation else {
-                                unreachable!()
-                            };
-                            Response {
+            // Retain the platform across a request panic so its normal teardown still runs.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    while let Ok(request) = incoming.recv() {
+                        let deadline = crate::backend_worker::deadline(request.expires_ns)?;
+                        let response = match glass_macos::private_session::require_private() {
+                            Ok(()) => {
+                                if request.version == VERSION
+                                    && matches!(&request.operation, Operation::OutputAuthority(_))
+                                {
+                                    let Operation::OutputAuthority(scope) = request.operation
+                                    else {
+                                        unreachable!()
+                                    };
+                                    Response {
+                                        version: VERSION,
+                                        id: request.id,
+                                        properties: dispatcher.current_properties(),
+                                        result: outputs
+                                            .register(scope, deadline)
+                                            .map(|()| Value::Unit)
+                                            .map_err(GlassError::before_dispatch),
+                                    }
+                                } else {
+                                    let ready = if request.version == VERSION
+                                        && matches!(&request.operation, Operation::Start(_))
+                                    {
+                                        outputs.before_start(deadline)
+                                    } else {
+                                        Ok(())
+                                    };
+                                    match ready {
+                                        Ok(()) => {
+                                            let mut response = dispatcher.handle(request);
+                                            response.result = outputs::checked(
+                                                response.result,
+                                                outputs.flush(deadline),
+                                            );
+                                            response
+                                        }
+                                        Err(error) => Response {
+                                            version: VERSION,
+                                            id: request.id,
+                                            properties: dispatcher.current_properties(),
+                                            result: Err(error),
+                                        },
+                                    }
+                                }
+                            }
+                            Err(error) => Response {
                                 version: VERSION,
                                 id: request.id,
                                 properties: dispatcher.current_properties(),
-                                result: outputs
-                                    .register(scope, deadline)
-                                    .map(|()| Value::Unit)
-                                    .map_err(GlassError::before_dispatch),
-                            }
-                        } else {
-                            let ready = if request.version == VERSION
-                                && matches!(&request.operation, Operation::Start(_))
-                            {
-                                outputs.before_start(deadline)
-                            } else {
-                                Ok(())
-                            };
-                            match ready {
-                                Ok(()) => {
-                                    let mut response = dispatcher.handle(request);
-                                    response.result =
-                                        outputs::checked(response.result, outputs.flush(deadline));
-                                    response
-                                }
-                                Err(error) => Response {
-                                    version: VERSION,
-                                    id: request.id,
-                                    properties: dispatcher.current_properties(),
-                                    result: Err(error),
-                                },
-                            }
+                                result: Err(
+                                    GlassError::Backend(error.to_string()).before_dispatch()
+                                ),
+                            },
+                        };
+                        if outgoing.send(Reply::new(response)?).is_err() {
+                            break;
                         }
                     }
-                    Err(error) => Response {
-                        version: VERSION,
-                        id: request.id,
-                        properties: dispatcher.current_properties(),
-                        result: Err(GlassError::Backend(error.to_string()).before_dispatch()),
-                    },
-                };
-                if outgoing.send(Reply::new(response)?).is_err() {
-                    break;
-                }
-            }
-            dispatcher.stop(Deadline::from_millis(1500))
+                    Ok(())
+                }))
+                .unwrap_or_else(|_| {
+                    Err(GlassError::Backend(
+                        "native backend request panicked".into(),
+                    ))
+                });
+            let deadline = Deadline::at(std::time::Instant::now() + glass_core::TEARDOWN_BUDGET);
+            let stopped = dispatcher.stop(deadline);
+            checked_stop(result, stopped)
         })?;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
@@ -135,9 +174,25 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(())
     })();
     drop(requests);
-    let stopped: Result<()> = thread
+    let stopped = thread
         .join()
-        .map_err(|_| anyhow::anyhow!("native backend thread panicked"))?;
-    stopped?;
-    result
+        .unwrap_or_else(|_| Err(GlassError::Backend("native backend thread panicked".into())));
+    finish_transport(result, stopped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_and_cleanup_failures_are_both_preserved() {
+        let error = finish_transport(
+            Err(anyhow::anyhow!("request read failed")),
+            Err(GlassError::Backend("child cleanup failed".into())),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("request read failed"));
+        assert!(message.contains("child cleanup failed"));
+    }
 }

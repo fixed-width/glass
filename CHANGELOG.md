@@ -57,7 +57,8 @@ internal refactors, CI, or test-only changes.
   defers its socket activation during first login, without restarting an active worker.
   Setup and doctor report unfinished macOS welcome screens instead of Ready while Apple Setup
   Assistant owns the development desktop. Application work waits for that setup to finish;
-  input verifies that the target app became active before beginning a keyboard or pointer operation.
+  the worker checks desktop readiness before a new workspace permission lease is prepared.
+  Input verifies that the target app became active before beginning a keyboard or pointer operation.
   Interrupted registration continues with Use existing account and preserves an already prepared account password.
   A fully closed permission-recovery journal can start a lease for a different development account;
   unfinished or invalid recovery evidence is retained and still blocks that change.
@@ -74,6 +75,8 @@ internal refactors, CI, or test-only changes.
   declared endpoint remains valid and managed and at least one is active.
   Service verification avoids repeated full-catalog reads while retaining fresh source and
   process checks, reducing recovery work under macOS background scheduling.
+  Larger recovery snapshots use bounded inspection batches under the same cleanup deadline,
+  including when finishing macOS welcome screens starts additional desktop services.
   Idle app-scoped XPC helpers may remain in a verified shared per-user provider's session;
   their live requester, owning job and inherited session must match.
   Opening Glass after enrollment starts or reuses its menu-bar server without reopening setup
@@ -83,7 +86,9 @@ internal refactors, CI, or test-only changes.
   process cleanup succeeds. Incomplete cleanup retains its recovery journal, reports an error
   and blocks new private application work.
   New application leases record build/app process lifetimes and verified descendants, including
-  reparented children. Cleanup retains learned ownership after interruption and checks fresh
+  reparented children. Stop and failed-launch cleanup terminate those owned children when they
+  outlive their parent, rechecking their UID and lifetime before signalling. Unrelated account
+  processes remain untouched. Cleanup retains learned ownership after interruption and checks fresh
   LaunchServices targets against PID reuse. Unattributed new account processes still require
   verified system-service evidence before permissions are fully restored. Protected Apple XPC
   providers and registered system agents with a shared per-user role may remain active as part

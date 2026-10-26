@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const SHIM_OVERRIDE: &str = "GLASS_CLIP_SHIM_DYLIB";
-const PROTOCOL: u32 = 12;
+const PROTOCOL: u32 = 14;
 const MAX_FRAME: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HELLO: u8 = 1;
@@ -33,6 +33,10 @@ const SYSTEM_SERVICES: u8 = 13;
 const RECONCILE_OUTPUT: u8 = 14;
 #[cfg(target_os = "macos")]
 const OUTPUT_RESULT: u8 = 15;
+#[cfg(target_os = "macos")]
+const TERMINATE_OWNED: u8 = 16;
+#[cfg(target_os = "macos")]
+const OWNED_TERMINATED: u8 = 17;
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(60);
 const SETUP_WAIT: Duration = Duration::from_secs(10);
 // App stop plus one bounded output callback drain must fit before forced child termination.
@@ -125,6 +129,16 @@ impl Bootstrap {
 struct Admission {
     version: u32,
     private_attachment_checked: bool,
+    #[cfg(target_os = "macos")]
+    native_process: Option<glass_macos::private_session::work::ProcessOrigin>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminationRequest {
+    expires_ns: Option<u64>,
+    processes: Vec<glass_macos::private_session::work::ProcessOrigin>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +157,24 @@ struct Greeting {
     session: u32,
     process: glass_macos::private_session::ProcessIdentity,
     private_session: bool,
+    application_ready: std::result::Result<(), String>,
+}
+
+#[cfg(target_os = "macos")]
+impl Greeting {
+    fn require_application(&self) -> glass_core::Result<()> {
+        if !self.private_session {
+            return Err(glass_core::GlassError::Backend(
+                "switch back to your normal account before starting private application work"
+                    .into(),
+            )
+            .before_dispatch());
+        }
+        match &self.application_ready {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(glass_core::GlassError::Backend(reason.clone()).before_dispatch()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -234,12 +266,25 @@ where
     };
     let stdin = child.stdin.take().context("worker stdin unavailable")?;
     let mut stdout = child.stdout.take().context("worker stdout unavailable")?;
+    #[cfg(target_os = "macos")]
+    let owned_root = if glass_macos::private_session::attached() {
+        Some(glass_macos::private_session::work::observe(
+            child
+                .id()
+                .context("worker PID unavailable before admission")?,
+            rustix::process::geteuid().as_raw(),
+        )?)
+    } else {
+        None
+    };
     send_json(
         &mut stream,
         ACCEPTED,
         &Admission {
             version: PROTOCOL,
             private_attachment_checked: true,
+            #[cfg(target_os = "macos")]
+            native_process: owned_root,
         },
     )
     .await?;
@@ -370,6 +415,8 @@ mod native {
             session: glass_macos::private_session::session_id()?,
             process: glass_macos::private_session::current_process()?,
             private_session: glass_macos::private_session::require_private().is_ok(),
+            application_ready: glass_macos::private_session::require_application_desktop()
+                .map_err(|error| error.to_string()),
         };
         tokio::time::timeout(SETUP_WAIT, send_json(&mut stream, GREETING, &greeting)).await??;
         let (kind, data) = loop {
@@ -377,6 +424,7 @@ mod native {
                 tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await??;
             match kind {
                 INSPECT_SERVICES => inspect_services(&mut stream, &data).await?,
+                TERMINATE_OWNED => terminate_owned(&mut stream, &data).await?,
                 RECONCILE_OUTPUT => reconcile_output(&mut stream, &data, owner).await?,
                 _ => break (kind, data),
             }
@@ -426,6 +474,7 @@ mod native {
             loop {
                 match tokio::time::timeout(BOOTSTRAP_WAIT, read_frame(&mut stream)).await? {
                     Ok((INSPECT_SERVICES, data)) => inspect_services(&mut stream, &data).await?,
+                    Ok((TERMINATE_OWNED, data)) => terminate_owned(&mut stream, &data).await?,
                     Ok((RECONCILE_OUTPUT, data)) => {
                         reconcile_output(&mut stream, &data, owner).await?
                     }
@@ -437,7 +486,9 @@ mod native {
                         break;
                     }
                     Err(error) => return Err(error),
-                    _ => bail!("only service/output recovery is allowed after backend exit"),
+                    _ => bail!(
+                        "only owned-work, service and output recovery is allowed after backend exit"
+                    ),
                 }
             }
         }
@@ -457,6 +508,22 @@ mod native {
         match result {
             Ok(Ok(services)) => send_json(stream, SYSTEM_SERVICES, &services).await,
             _ => send_json(stream, FAILED, &"macOS service attribution was unavailable").await,
+        }
+    }
+
+    async fn terminate_owned(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
+        let request: TerminationRequest = serde_json::from_slice(bytes)?;
+        let deadline = crate::backend_worker::deadline(request.expires_ns)?;
+        match glass_macos::private_session::work::terminate_owned(&request.processes, deadline) {
+            Ok(()) => send_json(stream, OWNED_TERMINATED, &request.processes).await,
+            Err(error) => {
+                send_json(
+                    stream,
+                    FAILED,
+                    &format!("stopping recorded private work: {error}"),
+                )
+                .await
+            }
         }
     }
 
@@ -549,20 +616,44 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn application_admission_requires_positive_desktop_facts() {
+        let value = serde_json::json!({
+            "version": PROTOCOL, "worker": 505, "session": 11,
+            "process": {"pid": 42, "seconds": 1, "microseconds": 0},
+            "private_session": true, "application_ready": {"Err": "finish macOS welcome"},
+        });
+        let mut greeting: Greeting = serde_json::from_value(value.clone()).unwrap();
+        let error = greeting.require_application().unwrap_err();
+        assert!(error.to_string().contains("finish macOS welcome"));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        greeting.application_ready = Ok(());
+        greeting.require_application().unwrap();
+        greeting.private_session = false;
+        assert!(greeting.require_application().is_err());
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("application_ready");
+        assert!(serde_json::from_value::<Greeting>(missing).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn recovery_rpc_is_refused_while_a_native_child_is_active() {
-        let (mut client, server) = tokio::io::duplex(4096);
-        let command = Command::new("/bin/cat");
-        let handler = tokio::spawn(broker(server, command));
-        assert_eq!(read_frame(&mut client).await.unwrap().0, ACCEPTED);
-        write_frame(&mut client, RECONCILE_OUTPUT, b"{}")
-            .await
-            .unwrap();
-        let (kind, data) = read_frame(&mut client).await.unwrap();
-        assert_eq!(kind, EXIT);
-        let receipt: Receipt = serde_json::from_slice(&data).unwrap();
-        assert!(!receipt.connection_valid);
-        assert!(handler.await.unwrap().unwrap().stream.is_none());
+        for request in [RECONCILE_OUTPUT, TERMINATE_OWNED] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let command = Command::new("/bin/cat");
+            let handler = tokio::spawn(broker(server, command));
+            assert_eq!(read_frame(&mut client).await.unwrap().0, ACCEPTED);
+            write_frame(&mut client, request, b"{}").await.unwrap();
+            let (kind, data) = read_frame(&mut client).await.unwrap();
+            assert_eq!(kind, EXIT);
+            let receipt: Receipt = serde_json::from_slice(&data).unwrap();
+            assert!(!receipt.connection_valid);
+            assert!(handler.await.unwrap().unwrap().stream.is_none());
+        }
     }
 
     #[test]
