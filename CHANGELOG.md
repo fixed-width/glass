@@ -69,6 +69,8 @@ internal refactors, CI, or test-only changes.
   their protected declaration, loaded lifecycle and active service endpoints must match.
   Shared transaction-tracked macOS services may retain inactive sibling endpoints when every
   declared endpoint remains valid and managed and at least one is active.
+  Opening Glass after enrollment starts or reuses its menu-bar server without reopening setup
+  or restarting existing application work. Interrupted setup remains available from Application setup….
   If process cleanup is deferred, Glass first attempts to revoke temporary workspace allows
   within the cleanup deadline. Protective denials and mixed allow/deny records remain until
   process cleanup succeeds. Incomplete cleanup retains its recovery journal, reports an error
@@ -107,7 +109,7 @@ internal refactors, CI, or test-only changes.
   post-reboot startup has been checked with an initialized account and existing grants, through
   Ready and indexed-workspace build/interact/rebuild/stop loops without extra setup. First-time
   onboarding remains under validation; unattended development-desktop startup is not implemented.
-  Reopening Glass resumes explicitly pending setup for the same enabled account. Cancellation and
+  Reopening Application setup resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose
   worker is missing gets a startup check and one repair, rather than another login instruction;
   administrator approval does not consume the worker's startup time.

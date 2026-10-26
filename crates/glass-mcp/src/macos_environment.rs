@@ -6,6 +6,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::launchd::loaded_job_matches;
 use anyhow::{Context, bail, ensure};
 use glass_macos::private_session;
 use rustix::fs::{Mode, OFlags, open, openat};
@@ -572,45 +573,6 @@ fn root_owner() -> anyhow::Result<u32> {
         .parse()?;
     ensure!(owner >= 501, "setup requires an ordinary account owner");
     Ok(owner)
-}
-
-fn loaded_job_matches(output: &str, expected: &[&str]) -> bool {
-    let mut depth = 0usize;
-    let mut program = None;
-    let mut arguments = None;
-    let mut collecting = false;
-    for line in output.lines().map(str::trim) {
-        if line == "}" {
-            if depth == 2 {
-                collecting = false;
-            }
-            let Some(next) = depth.checked_sub(1) else {
-                return false;
-            };
-            depth = next;
-        } else if depth == 1 {
-            if let Some(value) = line.strip_prefix("program = ")
-                && program.replace(value).is_some()
-            {
-                return false;
-            }
-            if line == "arguments = {" {
-                if arguments.replace(Vec::new()).is_some() {
-                    return false;
-                }
-                collecting = true;
-            }
-        } else if depth == 2
-            && collecting
-            && let Some(arguments) = &mut arguments
-        {
-            arguments.push(line);
-        }
-        if line.ends_with(" = {") || line.ends_with(" => {") {
-            depth += 1;
-        }
-    }
-    depth == 0 && program == expected.first().copied() && arguments.as_deref() == Some(expected)
 }
 
 fn stop_registered_worker(target: &str, account: &Enrollment) -> anyhow::Result<()> {

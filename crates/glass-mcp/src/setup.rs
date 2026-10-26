@@ -450,6 +450,78 @@ pub(crate) fn install_launch_agent(
     macos_impl::install_launch_agent(app_bin, addr)
 }
 
+#[cfg(all(target_os = "macos", feature = "network"))]
+pub(crate) fn start_launch_agent(app_bin: &str, addr: &str) -> Result<()> {
+    macos_impl::start_launch_agent(app_bin, addr)
+}
+
+#[cfg(any(all(target_os = "macos", feature = "network"), test))]
+fn start_menu_job(
+    loaded: &str,
+    app_bin: &str,
+    arguments: &[String],
+    start: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    menu_job_pid(loaded, app_bin, arguments)?.map_or_else(start, |_| Ok(()))
+}
+
+#[cfg(any(all(target_os = "macos", feature = "network"), test))]
+fn menu_job_pid(loaded: &str, app_bin: &str, arguments: &[String]) -> anyhow::Result<Option<u32>> {
+    check_menu_arguments(app_bin, arguments)?;
+    anyhow::ensure!(
+        crate::launchd::loaded_job_matches(
+            loaded,
+            &arguments.iter().map(String::as_str).collect::<Vec<_>>()
+        ),
+        "the loaded Glass job differs from its saved launch settings; registration retained"
+    );
+    checked_loaded_agent_pid(loaded)
+}
+
+#[cfg(any(all(target_os = "macos", feature = "network"), test))]
+fn check_menu_arguments(app_bin: &str, arguments: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        arguments.first().map(String::as_str) == Some(app_bin)
+            && arguments.get(1).map(String::as_str) == Some("serve")
+            && arguments.iter().skip(2).any(|arg| arg == "--menubar"),
+        "the saved Glass job is not this installation's menu-bar server; registration retained"
+    );
+    Ok(())
+}
+
+#[cfg(any(all(target_os = "macos", feature = "network"), all(test, unix)))]
+fn publish_launch_agent(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing LaunchAgents directory"))?;
+    let temporary = parent.join(format!(".glass-start-{:032x}", rand::random::<u128>()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        match rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &temporary,
+            rustix::fs::CWD,
+            path,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    })();
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)?;
+    }
+    result
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn verify_private_launch_agent(addr: &str) -> Result<()> {
     macos_impl::verify_private_launch_agent(addr)
@@ -752,19 +824,7 @@ mod macos_impl {
         })
     }
 
-    /// Write the filled LaunchAgent plist to `~/Library/LaunchAgents/tech.fixedwidth.glass.plist`
-    /// (creating it and `~/Library/Logs/GlassMcp/` if needed), (re)load it with `launchctl
-    /// bootstrap gui/<uid>`, and confirm it's actually serving before reporting success.
-    ///
-    /// Returns `Ok(None)` once a bounded TCP connect to `addr` confirms the agent is accepting
-    /// connections; `Ok(Some((label, instruction)))` when the job loaded but isn't serving, so
-    /// the caller can fold it into the same pending / non-zero-exit path a missing grant uses
-    /// (never a false "installed + started"); `Err` for a hard failure — no `HOME`, an
-    /// un-writable plist, a drifted template, or `bootstrap` itself erroring.
-    pub(super) fn install_launch_agent(
-        app_bin: &str,
-        addr: &str,
-    ) -> Result<Option<(&'static str, String)>> {
+    fn launch_agent_contents(app_bin: &str, addr: &str) -> Result<(std::path::PathBuf, String)> {
         let home = home_dir()?;
         let plist_path = super::launch_agent_plist_path(&home);
         // `plist_path`'s parent is always `~/Library/LaunchAgents` (see
@@ -791,7 +851,21 @@ mod macos_impl {
                  drifted; refusing to write a broken plist."
             )));
         }
-        std::fs::write(&plist_path, filled)?;
+        Ok((plist_path, filled))
+    }
+
+    fn write_launch_agent(app_bin: &str, addr: &str) -> Result<std::path::PathBuf> {
+        let (plist_path, contents) = launch_agent_contents(app_bin, addr)?;
+        std::fs::write(&plist_path, contents)?;
+        Ok(plist_path)
+    }
+
+    /// Replace the integration and confirm that its server accepts connections.
+    pub(super) fn install_launch_agent(
+        app_bin: &str,
+        addr: &str,
+    ) -> Result<Option<(&'static str, String)>> {
+        let plist_path = write_launch_agent(app_bin, addr)?;
 
         let uid = self_uid();
         let target = super::launch_agent_target(uid);
@@ -829,6 +903,128 @@ mod macos_impl {
             );
             println!("\n  \u{2717} {instruction}");
             Ok(Some(("LaunchAgent", instruction)))
+        }
+    }
+
+    #[cfg(any(feature = "network", test))]
+    pub(super) fn read_menu_arguments(plist_path: &Path, app_bin: &str) -> Result<Vec<String>> {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::from(
+            rustix::fs::open(
+                plist_path,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?,
+        );
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || ![0, self_uid()].contains(&metadata.uid())
+            || metadata.mode() & 0o022 != 0
+            || metadata.len() > 65536
+        {
+            return Err(GlassError::Backend(
+                "saved Glass job is not a protected regular file; registration retained".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes)?;
+        if bytes.len() > 65536 {
+            return Err(GlassError::Backend(
+                "saved Glass job exceeds its size bound".into(),
+            ));
+        }
+        let saved: plist::Dictionary = plist::from_bytes(&bytes)
+            .map_err(|error| GlassError::Backend(format!("read saved Glass job: {error}")))?;
+        if saved.get("Label").and_then(plist::Value::as_string) != Some("tech.fixedwidth.glass") {
+            return Err(GlassError::Backend("saved Glass job label changed".into()));
+        }
+        if saved
+            .get("Program")
+            .is_some_and(|value| value.as_string() != Some(app_bin))
+        {
+            return Err(GlassError::Backend(
+                "saved Glass program differs from this installation; registration retained".into(),
+            ));
+        }
+        let arguments = saved
+            .get("ProgramArguments")
+            .and_then(plist::Value::as_array)
+            .and_then(|arguments| {
+                arguments
+                    .iter()
+                    .map(|value| value.as_string().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| GlassError::Backend("saved Glass job arguments are invalid".into()))?;
+        super::check_menu_arguments(app_bin, &arguments)
+            .map_err(|error| GlassError::Backend(format!("{error:#}")))?;
+        Ok(arguments)
+    }
+
+    #[cfg(feature = "network")]
+    pub(super) fn start_launch_agent(app_bin: &str, addr: &str) -> Result<()> {
+        let target = super::launch_agent_target(self_uid());
+        let inspect = || {
+            crate::launchd::inspect(&target)
+                .map_err(|error| GlassError::Backend(format!("{error:#}")))
+        };
+        let loaded = inspect()?;
+        let plist_path = super::launch_agent_plist_path(&home_dir()?);
+        if loaded.is_none() && !plist_path.try_exists()? {
+            let (path, contents) = launch_agent_contents(app_bin, addr)?;
+            super::publish_launch_agent(&path, contents.as_bytes())?;
+        }
+        let arguments = read_menu_arguments(&plist_path, app_bin)?;
+        let request = || -> anyhow::Result<()> {
+            super::check_menu_arguments(app_bin, &arguments)?;
+            let mut command = Command::new("/bin/launchctl");
+            if loaded.is_some() {
+                command.args(["kickstart", &target]);
+            } else {
+                command
+                    .arg("bootstrap")
+                    .arg(format!("gui/{}", self_uid()))
+                    .arg(&plist_path);
+            }
+            let result = glass_core::run_bounded(
+                command.env("LC_ALL", "C"),
+                LIVENESS_TIMEOUT,
+                "starting the Glass menu-bar server",
+            )?;
+            anyhow::ensure!(
+                result.status.success(),
+                "launchd did not start the Glass menu: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            );
+            Ok(())
+        };
+        let requested = match &loaded {
+            Some(loaded) => super::start_menu_job(loaded, app_bin, &arguments, request),
+            None => request(),
+        };
+        let deadline = Instant::now() + LIVENESS_TIMEOUT;
+        loop {
+            if let Some(loaded) = inspect()?
+                && super::menu_job_pid(&loaded, app_bin, &arguments)
+                    .map_err(|error| GlassError::Backend(format!("{error:#}")))?
+                    .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(GlassError::Backend(match requested {
+                    Err(error) => format!("{error:#}"),
+                    Ok(()) => {
+                        "the Glass menu-bar server did not start; registration retained".into()
+                    }
+                }));
+            }
+            std::thread::sleep(LIVENESS_POLL_INTERVAL);
         }
     }
 
@@ -1317,6 +1513,174 @@ mod tests {
             "pid = 42\n}",
         ] {
             assert!(checked_loaded_agent_pid(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    fn menu_job(pid: &str, arguments: &[String]) -> String {
+        format!(
+            "gui/501/tech.fixedwidth.glass = {{\n program = {}\n arguments = {{\n{}\n }}\n{pid}\n}}\n",
+            arguments[0],
+            arguments
+                .iter()
+                .map(|arg| format!("  {arg}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    fn menu_arguments() -> Vec<String> {
+        [
+            "/Applications/GlassMcp.app/Contents/MacOS/glass-mcp",
+            "serve",
+            "--http",
+            "--menubar",
+            "--addr",
+            "127.0.0.1:7333",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    #[test]
+    fn opening_a_running_menu_preserves_its_process_and_custom_settings() {
+        let arguments = menu_arguments();
+        start_menu_job(
+            &menu_job(" pid = 42", &arguments),
+            &arguments[0],
+            &arguments,
+            || panic!("opening a running menu must not dispatch a start or restart"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opening_an_idle_menu_requests_one_start() {
+        let arguments = menu_arguments();
+        let mut starts = 0;
+        start_menu_job(&menu_job("", &arguments), &arguments[0], &arguments, || {
+            starts += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(starts, 1);
+    }
+
+    #[test]
+    fn an_invalid_menu_binding_or_pid_never_dispatches_start() {
+        let arguments = menu_arguments();
+        let mut wrong_role = arguments.clone();
+        wrong_role[1] = "macos-worker".into();
+        let mut wrong_settings = arguments.clone();
+        wrong_settings[5] = "127.0.0.1:7444".into();
+        for loaded in [
+            menu_job("", &wrong_role),
+            menu_job("", &wrong_settings),
+            menu_job(" pid = 0", &arguments),
+            menu_job(" pid = unknown", &arguments),
+            menu_job(" pid = 42\n pid = 43", &arguments),
+            menu_job("", &arguments)
+                .trim_end_matches(['}', '\n'])
+                .into(),
+        ] {
+            assert!(
+                start_menu_job(&loaded, &arguments[0], &arguments, || {
+                    panic!("invalid binding must not dispatch a start")
+                })
+                .is_err(),
+                "{loaded}"
+            );
+        }
+        assert!(
+            start_menu_job(
+                &menu_job("", &arguments),
+                "/Applications/Other.app/Contents/MacOS/glass-mcp",
+                &arguments,
+                || { panic!("another installation must not dispatch a start") }
+            )
+            .is_err()
+        );
+        assert!(
+            start_menu_job(
+                &menu_job("", &wrong_role),
+                &arguments[0],
+                &wrong_role,
+                || { panic!("a worker role must not be started as a menu") }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_menu_start_error_is_returned_without_replaying_the_request() {
+        let arguments = menu_arguments();
+        let mut starts = 0;
+        let result = start_menu_job(&menu_job("", &arguments), &arguments[0], &arguments, || {
+            starts += 1;
+            anyhow::bail!("start was refused")
+        });
+        assert_eq!(starts, 1);
+        assert_eq!(result.unwrap_err().to_string(), "start was refused");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn default_menu_settings_never_replace_an_existing_unloaded_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("glass.plist");
+        let saved = "existing custom settings on 127.0.0.1:7333";
+        std::fs::write(&path, saved).unwrap();
+        publish_launch_agent(&path, b"default settings on 127.0.0.1:7300").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_menu_settings_are_published_completely_without_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("glass.plist");
+        publish_launch_agent(&path, b"complete new settings").unwrap();
+        publish_launch_agent(&path, b"different settings").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete new settings");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn unloaded_custom_menu_settings_are_read_without_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("glass.plist");
+        let arguments = menu_arguments();
+        let mut saved = plist::Dictionary::new();
+        saved.insert("Label".into(), "tech.fixedwidth.glass".into());
+        saved.insert(
+            "ProgramArguments".into(),
+            arguments
+                .iter()
+                .cloned()
+                .map(plist::Value::String)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        plist::to_file_xml(&path, &saved).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(
+            macos_impl::read_menu_arguments(&path, &arguments[0]).unwrap(),
+            arguments
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        for (key, value) in [
+            ("Program", "/Applications/Other.app/Contents/MacOS/other"),
+            ("Label", "com.example.other"),
+        ] {
+            let mut changed = saved.clone();
+            changed.insert(key.into(), value.into());
+            plist::to_file_xml(&path, &changed).unwrap();
+            assert!(
+                macos_impl::read_menu_arguments(&path, &arguments[0]).is_err(),
+                "{key}"
+            );
         }
     }
 

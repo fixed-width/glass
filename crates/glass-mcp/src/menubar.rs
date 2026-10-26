@@ -149,16 +149,6 @@ mod macos {
             });
         }
 
-        match crate::macos_environment::has_pending_setup() {
-            Ok(true) => {
-                if let Err(error) = crate::macos_environment::show_setup(&setup_addr) {
-                    eprintln!("glass: interrupted application setup needs attention: {error:#}");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => eprintln!("glass: saved application setup could not be read: {error:#}"),
-        }
-
         // Build the menu bar and block the main thread on the AppKit run loop. The two
         // actionable items reuse glass-mcp's existing, validated helpers (`pbcopy` and the
         // LaunchAgent `kickstart -k`); their errors go loudly to stderr (the menu action

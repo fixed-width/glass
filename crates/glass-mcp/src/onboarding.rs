@@ -18,14 +18,25 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
 #[cfg(target_os = "macos")]
 use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
 
-/// Open account setup, or install the shared-desktop menu-bar agent that handles its own grants.
+/// Open the enrolled menu-bar app, or guide first-time environment setup.
 pub fn run(addr: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        if !matches!(crate::macos_environment::has_pending_setup(), Ok(false)) {
-            return crate::macos_environment::show_setup(addr);
+        match glass_macos::private_session::configured() {
+            Ok(true) => {
+                #[cfg(feature = "network")]
+                {
+                    let exe = std::env::current_exe()?;
+                    return crate::setup::start_launch_agent(&exe.to_string_lossy(), addr)
+                        .map_err(Into::into);
+                }
+                #[cfg(not(feature = "network"))]
+                return crate::macos_environment::show_setup(addr);
+            }
+            Ok(false) => {}
+            Err(_) => return crate::macos_environment::show_setup(addr),
         }
-        if !matches!(glass_macos::private_session::configured(), Ok(false)) {
+        if !matches!(crate::macos_environment::has_pending_setup(), Ok(false)) {
             return crate::macos_environment::show_setup(addr);
         }
         // A. A healthy agent is already serving with both grants held — nothing to onboard.

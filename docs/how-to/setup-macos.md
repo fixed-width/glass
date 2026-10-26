@@ -100,6 +100,10 @@ on your normal desktop. Only one Glass macOS backend can use the enrolled enviro
 Enrollment applies to the normal macOS user who ran setup; other users retain their shared-desktop
 workflow. Each development account belongs to one enrollment. To select another development account,
 unenroll the current one first.
+
+After enrollment, opening Glass starts or reuses its menu-bar app without reopening setup or
+restarting existing agent work. Choose **glass → Application setup…** to check the environment
+or continue interrupted setup. Existing menu-bar integration keeps its saved launch settings.
 An account created through Glass remains assigned to the normal user who created it, including after
 unenrollment; another normal user's setup cannot claim that creation record.
 
@@ -128,8 +132,9 @@ Worker and permission-helper jobs are saved for the account's first graphical lo
 Glass keeps created accounts and homes after a failure; it refuses a different account,
 changed identity or preexisting home instead of overwriting them. A deleted completed account is not
 recreated from its old receipt; select a new name or an existing account.
-If Glass exits during setup, reopening the app or its menu-bar server opens the same setup window.
-For the same enabled enrollment with its permission-helper registration saved, Glass continues
+If Glass exits during setup, reopen **glass → Application setup…** to continue. If no account
+has been enrolled yet, opening Glass returns to setup directly. For the same enabled enrollment
+with its permission-helper registration saved, Glass continues
 worker and permission checks automatically with the saved integration and address. Incomplete
 registration waits for **Use existing account** and any required administrator authentication. An unfinished account creation reopens the secure password
 dialog for the same account; enter the original chosen password. Glass stores only setup metadata,
