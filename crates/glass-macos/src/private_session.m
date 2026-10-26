@@ -23,6 +23,7 @@
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <sys/mount.h>
+#include <sys/attr.h>
 #include <sys/fsgetpath.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
@@ -56,7 +57,20 @@ typedef struct {
     uint64_t device, inode, birth_seconds, birth_nanoseconds;
     uint32_t owner;
     int32_t fsid[2];
+    uuid_t volume_uuid;
 } GlassFileIdentity;
+
+static int volume_uuid(int fd, uuid_t out) {
+    struct attrlist attributes = {0};
+    attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attributes.volattr = ATTR_VOL_INFO | ATTR_VOL_UUID;
+    struct { uint32_t length; uuid_t uuid; } value = {0};
+    if (fgetattrlist(fd, &attributes, &value, sizeof(value), 0)) return errno;
+    uuid_t zero = {0};
+    if (value.length != sizeof(value) || !memcmp(value.uuid, zero, sizeof(zero))) return ENOTSUP;
+    memcpy(out, value.uuid, sizeof(uuid_t));
+    return 0;
+}
 
 int glass_private_file_identity(int fd, GlassFileIdentity *out) {
     struct stat st;
@@ -64,8 +78,8 @@ int glass_private_file_identity(int fd, GlassFileIdentity *out) {
     if (fstat(fd, &st) || fstatfs(fd, &fs)) return errno;
     *out = (GlassFileIdentity){(uint64_t)st.st_dev, st.st_ino,
         (uint64_t)st.st_birthtimespec.tv_sec, (uint64_t)st.st_birthtimespec.tv_nsec,
-        st.st_uid, {fs.f_fsid.val[0], fs.f_fsid.val[1]}};
-    return 0;
+        st.st_uid, {fs.f_fsid.val[0], fs.f_fsid.val[1]}, {0}};
+    return volume_uuid(fd, out->volume_uuid);
 }
 
 int glass_private_file_path(int fd, char *out) {
@@ -79,13 +93,30 @@ int glass_private_resolve_file(const GlassFileIdentity *identity, char *out, siz
     struct statfs *mounts = calloc((size_t)count + 1, sizeof(struct statfs));
     if (!mounts) return ENOMEM;
     int filled = getfsstat(mounts, ((int)sizeof(struct statfs)) * (count + 1), MNT_NOWAIT);
-    bool present = false;
-    for (int index = 0; index < filled; index++)
-        if (mounts[index].f_fsid.val[0] == fsid.val[0] && mounts[index].f_fsid.val[1] == fsid.val[1])
-            present = true;
+    if (filled < 0 || filled >= count + 1) {
+        int failure = filled < 0 ? (errno ? errno : EIO) : EOVERFLOW;
+        free(mounts);
+        return failure;
+    }
+    uuid_t zero = {0};
+    bool persistent = memcmp(identity->volume_uuid, zero, sizeof(zero)) != 0;
+    int matches = 0;
+    for (int index = 0; index < filled; index++) {
+        bool same = false;
+        if (persistent) {
+            int fd = open(mounts[index].f_mntonname, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            uuid_t observed = {0};
+            same = fd >= 0 && volume_uuid(fd, observed) == 0 &&
+                !memcmp(observed, identity->volume_uuid, sizeof(observed));
+            if (fd >= 0) close(fd);
+        } else {
+            same = mounts[index].f_fsid.val[0] == fsid.val[0] && mounts[index].f_fsid.val[1] == fsid.val[1];
+        }
+        if (same) { fsid = mounts[index].f_fsid; matches++; }
+    }
     free(mounts);
-    if (filled < 0) return errno ? errno : EIO;
-    if (!present) return EAGAIN;
+    if (matches > 1) return EOVERFLOW;
+    if (!matches) return EAGAIN;
     return fsgetpath(out, size, &fsid, identity->inode) >= 0 ? 0 : errno;
 }
 

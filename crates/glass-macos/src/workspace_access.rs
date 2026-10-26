@@ -127,7 +127,7 @@ struct Entry {
 }
 
 /// A file identity retained before an ACL mutation, including its birth time.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[repr(C)]
 pub struct FileIdentity {
@@ -137,9 +137,33 @@ pub struct FileIdentity {
     birth_nanoseconds: u64,
     owner: u32,
     fsid: [i32; 2],
+    #[serde(default)]
+    volume_uuid: [u8; 16],
 }
 
+impl PartialEq for FileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_object(other) && self.owner == other.owner
+    }
+}
+impl Eq for FileIdentity {}
+
 impl FileIdentity {
+    fn same_volume(&self, other: &Self) -> bool {
+        match (self.volume_uuid != [0; 16], other.volume_uuid != [0; 16]) {
+            (true, true) => self.volume_uuid == other.volume_uuid,
+            (false, false) => self.device == other.device && self.fsid == other.fsid,
+            _ => false,
+        }
+    }
+
+    fn same_object(&self, other: &Self) -> bool {
+        self.same_volume(other)
+            && self.inode == other.inode
+            && self.birth_seconds == other.birth_seconds
+            && self.birth_nanoseconds == other.birth_nanoseconds
+    }
+
     fn read(file: &File) -> io::Result<Self> {
         unsafe extern "C" {
             fn glass_private_file_identity(fd: c_int, out: *mut FileIdentity) -> c_int;
@@ -1326,9 +1350,55 @@ mod tests {
         sharing.recorder = Some(recorder.clone());
         sharing.search(root.path()).unwrap();
         let mut change = recorder.lock().unwrap().changes[0].clone();
-        change.identity.fsid = [-1, -1];
+        change.identity.volume_uuid[0] ^= 1;
         assert!(change.resolved_file().is_err());
         sharing.restore().unwrap();
+    }
+
+    #[test]
+    fn persistent_identity_recovers_after_mount_number_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(Mutex::new(Recorded::default()));
+        let mut sharing = same_user_sharing();
+        sharing.recorder = Some(recorder.clone());
+        sharing.search(root.path()).unwrap();
+        let mut change = recorder.lock().unwrap().changes[0].clone();
+        assert_ne!(change.identity.volume_uuid, [0; 16]);
+        change.identity.device ^= 1;
+        change.identity.fsid = [-1, -1];
+        assert!(change.resolved_file().unwrap().is_some());
+        change
+            .restore_file(&File::open(root.path()).unwrap())
+            .unwrap();
+        sharing.restore().unwrap();
+    }
+
+    #[test]
+    fn volume_identity_keeps_replacement_and_legacy_boundaries_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let current = FileIdentity::read(&File::open(root.path()).unwrap()).unwrap();
+        let mut remounted = current.clone();
+        remounted.device ^= 1;
+        remounted.fsid = [-1, -1];
+        assert_eq!(current, remounted);
+        let mut other = current.clone();
+        other.volume_uuid[0] ^= 1;
+        assert_ne!(current, other);
+        other = current.clone();
+        other.inode += 1;
+        assert_ne!(current, other);
+        other = current.clone();
+        other.birth_nanoseconds += 1;
+        assert_ne!(current, other);
+        other = current.clone();
+        other.owner += 1;
+        assert_ne!(current, other);
+        let mut legacy = current.clone();
+        legacy.volume_uuid = [0; 16];
+        assert_ne!(current, legacy);
+        let mut legacy_remounted = legacy.clone();
+        legacy_remounted.device ^= 1;
+        assert_ne!(legacy, legacy_remounted);
     }
 
     fn entries(file: &File) -> Vec<Entry> {

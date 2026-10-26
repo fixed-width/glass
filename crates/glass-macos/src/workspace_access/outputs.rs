@@ -360,11 +360,7 @@ fn principal(uid: u32) -> io::Result<[u8; 16]> {
 }
 
 fn same_object(left: &FileIdentity, right: &FileIdentity) -> bool {
-    left.device == right.device
-        && left.inode == right.inode
-        && left.birth_seconds == right.birth_seconds
-        && left.birth_nanoseconds == right.birth_nanoseconds
-        && left.fsid == right.fsid
+    left.same_object(right)
 }
 
 impl OutputAccess {
@@ -545,7 +541,7 @@ impl OutputAccess {
         {
             return Ok(None);
         }
-        if metadata.st_dev as u64 != scope.identity.device {
+        if metadata.st_dev as u64 != parent.metadata()?.dev() {
             return Err(refused("output traversal crossed a filesystem"));
         }
         let flags = OFlags::NOFOLLOW
@@ -909,6 +905,27 @@ mod tests {
             inspection: Vec::new(),
         };
         (access, scope)
+    }
+
+    #[test]
+    fn output_root_and_traversal_survive_mount_number_changes() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("saved"), "data").unwrap();
+        let (access, mut scope) = fixture(&project);
+        scope.identity.device ^= 1;
+        scope.identity.fsid = [-1, -1];
+        access.repair(&scope, Deadline::from_millis(3000)).unwrap();
+        let worker = u32::MAX - 1;
+        let mut controller = OutputScope::capture(&project, worker, &[]).unwrap();
+        controller.identity.device ^= 1;
+        controller.identity.fsid = [-1, -1];
+        for ancestor in &mut controller.inspection {
+            ancestor.identity.device ^= 1;
+            ancestor.identity.fsid = [-1, -1];
+        }
+        controller.validate_owner(worker).unwrap();
     }
 
     fn entries(path: &Path) -> Vec<Entry> {
