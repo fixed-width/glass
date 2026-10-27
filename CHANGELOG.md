@@ -126,8 +126,10 @@ internal refactors, CI, or test-only changes.
   A running desktop is reused without another account password; interrupted access cleanup blocks
   application work until it finishes. First-time privacy consent remains a user action. Guided
   post-reboot startup has been checked with an initialized account and existing grants, through
-  Ready and indexed-workspace build/interact/rebuild/stop loops without extra setup. First-time
-  onboarding remains under validation; unattended development-desktop startup is not implemented.
+  Ready and indexed-workspace build/interact/rebuild/stop loops without extra setup. New-account
+  onboarding through Ready and app interaction has also been checked on the existing test Mac.
+  A clean macOS installation without prior Glass grants has not been tested; unattended
+  development-desktop startup is not implemented.
   Reopening Application setup resumes explicitly pending setup for the same enabled account. Cancellation and
   disable clear that pending request; stale windows cannot restart it. A logged-in account whose
   worker is missing gets a startup check and one repair, rather than another login instruction;

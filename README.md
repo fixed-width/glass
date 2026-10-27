@@ -33,7 +33,9 @@ shared-desktop use while retaining the app, development account and MCP startup 
 Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.
 These runtime checks used an initialized development account and include physical keyboard/mouse
 coexistence, recovery after an interrupted client, and starting its development desktop after a real
-reboot with existing permissions. Guided first-time onboarding remains unqualified. Application setup includes
+reboot with existing permissions. New-account onboarding has also reached Ready and passed ordinary
+app interaction on that Mac. Initial macOS login and any missing privacy grants require user action;
+setup on a clean macOS installation without prior Glass grants has not been tested. Application setup includes
 **Start environment…** for a missing development desktop, using local account credentials and an
 already enabled macOS Screen Sharing service. This guided post-reboot flow and ordinary
 build/interact/rebuild/stop loops in an indexed workspace have been tested without repeating

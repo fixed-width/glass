@@ -34,9 +34,12 @@ permissions, followed by build/interact/rebuild/stop loops in an indexed workspa
 switching, reenrollment or repeated privacy grants. Interrupted-client recovery has also been checked.
 The worker requires the development account's graphical login; starting that desktop remains
 user-assisted. Unattended development-desktop startup is not implemented.
-The guided first-time production-app flow remains under validation. Setup attempts identity-checked
-repair of an idle worker's registration/socket; it preserves running or unbound jobs and reports the
-failure. The [recovery guide](../how-to/setup-macos.md#recover-a-refused-worker-connection) includes
+New-account onboarding through Ready and ordinary private app interaction has also been checked;
+a clean macOS installation without prior Glass grants has not been tested. Setup attempts
+identity-checked repair of an idle worker's registration/socket. Desktop startup can reuse a validated
+waiting worker; registration repair retains and reports a running or unbound job. Active application
+work is left intact, and recovery failures are reported.
+The [recovery guide](../how-to/setup-macos.md#recover-a-refused-worker-connection) includes
 manual reenrollment when automatic repair cannot complete.
 
 For the actual active session, use `glass_capabilities` with `scope: "session"`: each input operation
@@ -173,11 +176,13 @@ process are contained at `default`/`strict`, and `strict` additionally blocks ou
 containment the clipboard is isolated **and working** for an app not built with Apple's hardened
 runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. The opt-in
 [separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
-apps off your desktop using an existing initialized login. This has been tested on an Apple Silicon
+apps off your desktop in a separate graphical login. This has been tested on an Apple Silicon
 Mac mini without a physical monitor connected, including physical keyboard/mouse coexistence.
 The worker requires the development account's graphical login. Guided post-reboot startup and
-indexed-workspace app loops have been tested with existing grants; first-time onboarding remains
-under validation. Unattended development-desktop startup is not implemented. Containment details are in
+indexed-workspace app loops have been tested with existing grants. New-account onboarding through
+Ready and ordinary app interaction has also been checked on that Mac. A clean macOS installation
+without prior Glass grants has not been tested. Initial login and any missing privacy consent
+require user action; unattended development-desktop startup is not implemented. Containment details are in
 [explanation/containment.md](../explanation/containment.md).
 
 ## Status

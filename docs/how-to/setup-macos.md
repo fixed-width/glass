@@ -126,9 +126,11 @@ in the owning MCP client to stop its app, or quit that client's Glass process. T
 in person, switch to the selected account: Glass refuses further private input while it is the console
 account. Return to your normal account before resuming agent work.
 
-The guided account/permission flow and account creation are under development and have not yet been
-tested end to end through the production app. Initial macOS login and privacy consent still require
-user action. If creation is interrupted before password preparation is confirmed, **Create account…**
+The guided flow has been checked with a newly created development account through **Ready** and
+ordinary private app interaction on the test Mac. These checks used an existing macOS installation;
+setup on a clean installation without prior Glass privacy grants has not been tested. Initial macOS
+login and any missing privacy consent require user action. If creation is interrupted before password
+preparation is confirmed, **Create account…**
 with the same name resumes only the record whose identity Glass saved before creation. Supply the
 original chosen password. Once Glass confirms that the account and password are prepared, choose
 **Use existing account** to finish registration without entering that development-account password again.
@@ -156,7 +158,8 @@ using an existing initialized login. Physical keyboard/mouse coexistence has als
 in that retained-login setup.
 The worker requires that account's graphical login. Guided post-reboot startup and subsequent
 build/interact/rebuild/stop loops in an indexed workspace have been checked with existing grants.
-Guided first-time onboarding still needs qualification; unattended startup after a reboot is not implemented.
+New-account onboarding through Ready and subsequent app interaction have also been checked.
+Unattended startup after a reboot is not implemented.
 
 ### Start a stopped development desktop
 
@@ -176,7 +179,7 @@ without requesting its account password. Wait for **Ready** before starting appl
 This preview startup path has been tested after a real reboot with an initialized development
 account and existing permissions, through Ready and ordinary build/interact/rebuild/stop loops
 in an indexed workspace. It required no account switching, reenrollment or repeated privacy grants.
-First-time onboarding remains under validation. It requires **Screen Sharing** to already be enabled
+This startup path requires **Screen Sharing** to already be enabled
 under **System Settings → General → Sharing**. Glass does not enable that
 host-wide service automatically. It connects locally and requests only a separate desktop; an
 unsupported or denied private selection stops with an error. Existing credentials longer than
@@ -435,8 +438,10 @@ journal, and leave other directories intact.
 
 Stop active Glass work, then open **glass → Application setup… → Use existing account**. The coordinator attempts
 identity-checked repair of an idle registered worker and its socket, requesting administrator
-authentication if needed. A running or unbound job is retained and reported. Finish the reported
-work or resolve the registration mismatch before retrying.
+authentication if needed. Registration repair retains and reports a running or unbound job.
+Desktop startup can reuse a validated waiting worker after restoring the normal user's connection
+access. Let pending worker checks finish, stop active Glass work, or resolve the registration mismatch
+before retrying.
 
 If automatic repair still cannot complete, use the following reenrollment sequence from your normal
 account. First remove the registration:
