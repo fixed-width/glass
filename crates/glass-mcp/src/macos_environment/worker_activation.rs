@@ -127,10 +127,15 @@ fn activate_with(
         };
     match state {
         crate::launchd::Inspection::Loaded(loaded) => {
-            ensure!(
-                crate::setup::checked_loaded_agent_pid(&loaded)?.is_none(),
-                "the registered worker is still starting or busy; it was not interrupted"
-            );
+            if crate::setup::checked_loaded_agent_pid(&loaded)?.is_some() {
+                ensure!(
+                    before.is_some(),
+                    "the registered worker is still starting or busy; it was not interrupted"
+                );
+                // Reuse the waiting worker; the owner still verifies its authenticated readiness.
+                normalize_socket(root, account.owner_uid, account.uid)?;
+                return Ok(());
+            }
             stop()?;
         }
         crate::launchd::Inspection::MissingJob => {}
@@ -377,6 +382,58 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn waiting_loaded_worker_keeps_its_socket_and_is_reused_without_interruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        let _listener = listener(&path);
+        let root = File::open(directory.path()).unwrap();
+        let before = socket_identity(&root).unwrap();
+        let account = account();
+        activate_with(
+            &root,
+            &account,
+            binary(),
+            || {
+                Ok(crate::launchd::Inspection::Loaded(loaded(
+                    &account,
+                    Some(123),
+                )))
+            },
+            || panic!("waiting worker stop"),
+            || panic!("waiting worker bootstrap"),
+            || panic!("waiting worker start"),
+        )
+        .unwrap();
+        assert_eq!(socket_identity(&root).unwrap(), before);
+        let _connection = UnixStream::connect(path).unwrap();
+    }
+
+    #[test]
+    fn running_worker_with_an_invalid_socket_is_refused_without_interruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker.sock");
+        std::fs::write(&path, "retained").unwrap();
+        let root = File::open(directory.path()).unwrap();
+        let account = account();
+        assert!(
+            activate_with(
+                &root,
+                &account,
+                binary(),
+                || Ok(crate::launchd::Inspection::Loaded(loaded(
+                    &account,
+                    Some(123)
+                ))),
+                || panic!("invalid socket stop"),
+                || panic!("invalid socket bootstrap"),
+                || panic!("invalid socket start"),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "retained");
     }
 
     #[test]
