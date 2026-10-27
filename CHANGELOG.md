@@ -31,6 +31,8 @@ internal refactors, CI, or test-only changes.
   recovery does not silently broaden file modes or discard protected paths.
   Durable workspace identities use a persistent volume UUID so reboot-time device-number
   changes do not invalidate recovery. Changed volumes, inodes, birth times or owners still refuse.
+  Volume lookup reads metadata without opening unrelated mount roots; a stalled lookup returns
+  an error while keeping permission recovery pending.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
   restores shared-desktop use while keeping the app, development account and MCP startup integration.
   Uninstall also removes startup integration while retaining the account, home and app data.

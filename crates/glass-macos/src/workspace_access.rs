@@ -1,6 +1,7 @@
 //! Scoped ACL additions for a private worker and normal-owner access to its outputs.
 
 pub mod outputs;
+mod resolver;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_int, c_void};
@@ -331,33 +332,12 @@ impl PermissionChange {
     }
 
     fn resolved_file(&self) -> io::Result<Option<File>> {
-        unsafe extern "C" {
-            fn glass_private_resolve_file(
-                identity: *const FileIdentity,
-                out: *mut u8,
-                size: usize,
-            ) -> c_int;
-        }
-        let mut path = [0u8; 4096];
-        // SAFETY: the helper reads the repr(C) identity and writes within this live buffer.
-        let code =
-            unsafe { glass_private_resolve_file(&self.identity, path.as_mut_ptr(), path.len()) };
-        if code == 2 {
+        let Some(path) = resolver::resolve(self.identity.clone()).map_err(lookup_error)? else {
             return Ok(None);
-        }
-        if code != 0 {
-            return Err(lookup_error(io::Error::from_raw_os_error(code)));
-        }
-        let end = path.iter().position(|&byte| byte == 0).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "recovered file path is unterminated",
-            )
-        })?;
-        use std::os::unix::ffi::OsStrExt;
+        };
         let file = File::from(
             open(
-                Path::new(std::ffi::OsStr::from_bytes(&path[..end])),
+                &path,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )
