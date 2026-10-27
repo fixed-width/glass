@@ -5,8 +5,8 @@ use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
-    NSModalPanelRunLoopMode, NSSecureTextField, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSModalPanelRunLoopMode, NSScreen, NSScrollView, NSSecureTextField, NSTextField, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSNotification, NSRunLoop, NSString};
@@ -17,11 +17,70 @@ use crate::onboarding_window::{ButtonTarget, PollTimer};
 
 #[derive(Clone)]
 pub struct SetupProgress {
+    pub account: String,
     pub message: String,
+    pub step: SetupStep,
     pub running: bool,
     pub can_cancel: bool,
     pub start_account: Option<EnvironmentStart>,
     pub resume_creation: Option<ResumeCreation>,
+}
+
+impl SetupProgress {
+    fn display_step(&self, account: &str) -> SetupStep {
+        if self.account == account {
+            self.step
+        } else {
+            SetupStep::Account
+        }
+    }
+
+    fn can_continue(&self, account: &str) -> bool {
+        !self.running
+            && self.account == account
+            && !matches!(self.step, SetupStep::Account | SetupStep::Ready)
+    }
+}
+
+/// The displayed setup step; readiness is still established by the authenticated host checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupStep {
+    Account,
+    SignIn,
+    Permissions,
+    ReturnToOwner,
+    Checking,
+    Ready,
+}
+
+impl SetupStep {
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Account => "Step 1 of 4 — Choose a development account",
+            Self::SignIn => "Step 2 of 4 — Sign in and finish macOS setup",
+            Self::Permissions => "Step 3 of 4 — Allow Glass permissions",
+            Self::ReturnToOwner => "Step 4 of 4 — Return and finish setup",
+            Self::Checking => "Checking setup…",
+            Self::Ready => "Ready — Your agent can use the development desktop",
+        }
+    }
+
+    fn row_title(self, index: usize, title: &str) -> String {
+        let current = match self {
+            Self::Account => Some(0),
+            Self::SignIn => Some(1),
+            Self::Permissions => Some(2),
+            Self::ReturnToOwner => Some(3),
+            Self::Ready => Some(4),
+            Self::Checking => None,
+        };
+        let marker = match current {
+            Some(current) if index < current => "✓ ",
+            Some(current) if index == current => "→ ",
+            _ => "",
+        };
+        format!("{marker}{}. {title}", index + 1)
+    }
 }
 
 pub struct SetupActions {
@@ -103,7 +162,7 @@ fn create_account_dialog(
     alert.setInformativeText(&NSString::from_str(if resuming {
         "Enter the password you originally chose. Glass did not save it. Glass checks the retained account identity and completes unfinished preparation without resetting existing credentials."
     } else {
-        "Glass creates a standard macOS account. Choose its short name and password; you will use them for its first login. Glass does not save the password. The account and its files remain yours when isolation is disabled."
+        "Glass creates a standard macOS account. Choose its short name and password. After creation, sign in to that account manually once and finish macOS's welcome screens and Glass permissions. Then return to your normal account, leaving the development account logged in. Glass does not save the password."
     }));
     alert.addButtonWithTitle(&NSString::from_str(if resuming {
         "Continue setup"
@@ -177,7 +236,7 @@ pub fn choose_environment() -> Result<SetupChoice, String> {
     alert.setMessageText(&NSString::from_str(
         "Where should Glass run development applications?",
     ));
-    alert.setInformativeText(&NSString::from_str("A separate standard macOS account keeps agent applications and input off your desktop. Glass guides its setup. Shared-desktop applications use your current desktop and permissions."));
+    alert.setInformativeText(&NSString::from_str("A separate standard macOS account keeps agent applications and input off your desktop. For a new account, first sign in manually to finish macOS setup and allow Glass permissions. Glass guides each step. Shared-desktop applications use your current desktop and permissions."));
     alert.addButtonWithTitle(&NSString::from_str("Off your desktop…"));
     alert.addButtonWithTitle(&NSString::from_str("On your desktop"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
@@ -234,11 +293,55 @@ fn button(
     button
 }
 
+fn instruction_label(
+    mtm: MainThreadMarker,
+    view: &NSView,
+    text: &str,
+    frame: CGRect,
+) -> Retained<NSTextField> {
+    let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+    label.setFrame(frame);
+    label.setSelectable(true);
+    view.addSubview(&label);
+    label
+}
+
+fn update_label(label: &NSTextField, text: &str) {
+    if label.stringValue().to_string() != text {
+        label.setStringValue(&NSString::from_str(text));
+    }
+}
+
+fn sign_in_instructions(account: &str) -> String {
+    let account = if account.is_empty() {
+        "the development account"
+    } else {
+        account
+    };
+    format!(
+        "For first use, choose Apple menu → Lock Screen, then use Switch User or the account selector to sign in to {account}. Finish all macOS welcome screens until its desktop appears. Use this login-screen route with VNC too. Start environment below is for an account whose first login is already finished."
+    )
+}
+
+fn return_instructions(account: &str) -> String {
+    let account = if account.is_empty() {
+        "the development account"
+    } else {
+        account
+    };
+    format!(
+        "Use Apple menu → Lock Screen to return to your normal account. Leave {account} logged in; do not log it out. Back here, wait if Glass is checking. If checking is paused, choose Continue setup. Start agent work only after Ready."
+    )
+}
+
 /// Show setup without terminating an existing menu-bar server when the window closes.
 pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("Glass setup must run on the AppKit thread")?;
     let app = NSApplication::sharedApplication(mtm);
-    let frame = rect(0.0, 0.0, 580.0, 410.0);
+    let height = NSScreen::mainScreen(mtm)
+        .map(|screen| (screen.visibleFrame().size.height - 64.0).clamp(460.0, 760.0))
+        .unwrap_or(760.0);
+    let frame = rect(0.0, 0.0, 720.0, height);
     // SAFETY: fresh NSWindow allocation with valid content rectangle and style.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -254,69 +357,155 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.setTitle(&NSString::from_str("Glass application setup"));
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
-    let introduction = NSTextField::wrappingLabelWithString(
-        &NSString::from_str(
-            "Keep development applications off your desktop using a separate standard macOS account. Glass handles its worker and checks readiness automatically.",
-        ),
+    let heading = instruction_label(
         mtm,
+        &view,
+        SetupStep::Account.heading(),
+        rect(24.0, height - 44.0, 672.0, 28.0),
     );
-    introduction.setFrame(rect(24.0, 327.0, 532.0, 60.0));
-    view.addSubview(&introduction);
-    let existing_label = NSTextField::labelWithString(
-        &NSString::from_str("Or use an existing standard macOS account:"),
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        rect(0.0, 108.0, 720.0, height - 164.0),
+    );
+    scroll.setHasVerticalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    scroll.setDrawsBackground(false);
+    let document = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
+    instruction_label(
         mtm,
+        &document,
+        "Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; login and permission waits have no time limit.",
+        rect(24.0, 576.0, 672.0, 60.0),
     );
-    existing_label.setFrame(rect(24.0, 246.0, 532.0, 24.0));
-    view.addSubview(&existing_label);
-    let account =
-        NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(24.0, 216.0, 310.0, 28.0));
-    account.setPlaceholderString(Some(&NSString::from_str("Development account name")));
-    account.setStringValue(&NSString::from_str(&actions.account));
-    view.addSubview(&account);
-    let status = NSTextField::wrappingLabelWithString(
-        &NSString::from_str(
-            "Create a development account here, or enter the short name of an existing standard account. Your credentials stay on this Mac.",
-        ),
+    let titles = [
+        ("Choose or create an account here", 550.0),
+        ("Sign in manually and finish macOS setup", 474.0),
+        ("Allow Glass permissions in that account", 366.0),
+        ("Return to your normal account and finish", 276.0),
+    ];
+    let step_labels: Vec<_> = titles
+        .iter()
+        .enumerate()
+        .map(|(index, (title, y))| {
+            instruction_label(
+                mtm,
+                &document,
+                &SetupStep::Account.row_title(index, title),
+                rect(24.0, *y, 672.0, 22.0),
+            )
+        })
+        .collect();
+    let sign_in = instruction_label(
         mtm,
+        &document,
+        &sign_in_instructions(&actions.account),
+        rect(24.0, 394.0, 672.0, 74.0),
     );
-    status.setFrame(rect(24.0, 78.0, 532.0, 116.0));
-    view.addSubview(&status);
+    instruction_label(
+        mtm,
+        &document,
+        "Glass opens its permission window there if needed. Allow Accessibility first, then Screen Recording, using Request… and System Settings → Privacy & Security. Wait until Glass confirms both permissions. Existing grants are reused; an absent permission window alone does not mean setup is finished.",
+        rect(24.0, 304.0, 672.0, 56.0),
+    );
+    let returning = instruction_label(
+        mtm,
+        &document,
+        &return_instructions(&actions.account),
+        rect(24.0, 210.0, 672.0, 60.0),
+    );
+    instruction_label(
+        mtm,
+        &document,
+        "What to do now",
+        rect(24.0, 174.0, 672.0, 22.0),
+    );
+    let status = instruction_label(
+        mtm,
+        &document,
+        "Create an account, or enter an existing account's short name and choose Use existing account.",
+        rect(24.0, 26.0, 672.0, 140.0),
+    );
+    scroll.setDocumentView(Some(&document));
+    view.addSubview(&scroll);
 
-    let account_field = account.clone();
-    let start_account = Rc::new(std::cell::RefCell::new(None::<EnvironmentStart>));
-    let start_choice = start_account.clone();
+    let account =
+        NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(244.0, 510.0, 240.0, 28.0));
+    account.setPlaceholderString(Some(&NSString::from_str("Existing account short name")));
+    account.setStringValue(&NSString::from_str(&actions.account));
+    document.addSubview(&account);
+    instruction_label(mtm, &document, "or", rect(216.0, 512.0, 22.0, 22.0));
+    let poll: Rc<dyn Fn() -> SetupProgress> = Rc::from(actions.poll);
+    let on_begin: Rc<dyn Fn(String)> = Rc::from(actions.on_begin);
+    let begin_field = account.clone();
+    let begin_action = on_begin.clone();
     let begin_target = ButtonTarget::new(
         mtm,
         Box::new(move || {
-            let name = account_field.stringValue().to_string();
-            let start = start_choice
-                .borrow()
-                .as_ref()
-                .filter(|account| account.name == name)
-                .cloned();
-            if let Some(start) = start {
-                if !start.needs_password {
-                    (actions.on_start)(StartAccount {
-                        name,
-                        password: None,
-                    });
-                    return;
-                }
-                if let Some(request) = start_account_dialog(mtm, &name) {
-                    (actions.on_start)(request);
-                }
-            } else {
-                (actions.on_begin)(name);
-            }
+            let name = begin_field.stringValue().to_string();
+            begin_action(name);
         }),
     );
     let begin = button(
         mtm,
         "Use existing account",
-        rect(340.0, 214.0, 216.0, 32.0),
+        rect(496.0, 508.0, 200.0, 32.0),
         &begin_target,
     );
-    view.addSubview(&begin);
+    document.addSubview(&begin);
+
+    let continue_field = account.clone();
+    let continue_poll = poll.clone();
+    let continue_target = ButtonTarget::new(
+        mtm,
+        Box::new(move || {
+            let name = continue_field.stringValue().to_string();
+            if continue_poll().can_continue(&name) {
+                on_begin(name);
+            }
+        }),
+    );
+    let continue_button = button(
+        mtm,
+        "Continue setup",
+        rect(24.0, 64.0, 180.0, 32.0),
+        &continue_target,
+    );
+    view.addSubview(&continue_button);
+
+    let start_account = Rc::new(std::cell::RefCell::new(None::<EnvironmentStart>));
+    let start_choice = start_account.clone();
+    let start_field = account.clone();
+    let start_target = ButtonTarget::new(
+        mtm,
+        Box::new(move || {
+            let name = start_field.stringValue().to_string();
+            let Some(start) = start_choice
+                .borrow()
+                .as_ref()
+                .filter(|account| account.name == name)
+                .cloned()
+            else {
+                return;
+            };
+            if !start.needs_password {
+                (actions.on_start)(StartAccount {
+                    name,
+                    password: None,
+                });
+            } else if let Some(request) = start_account_dialog(mtm, &name) {
+                (actions.on_start)(request);
+            }
+        }),
+    );
+    let start_button = button(
+        mtm,
+        "Start environment…",
+        rect(218.0, 64.0, 230.0, 32.0),
+        &start_target,
+    );
+    start_button.setEnabled(false);
+    view.addSubview(&start_button);
+
     let create_field = account.clone();
     let resume_creation = Rc::new(std::cell::RefCell::new(actions.resume_creation));
     let automatic_creation = resume_creation.borrow().is_some();
@@ -346,15 +535,15 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let create = button(
         mtm,
         "Create account…",
-        rect(24.0, 282.0, 210.0, 36.0),
+        rect(24.0, 508.0, 180.0, 32.0),
         &create_target,
     );
-    view.addSubview(&create);
+    document.addSubview(&create);
     let disable_target = ButtonTarget::new(mtm, actions.on_disable);
     let disable = button(
         mtm,
         "Disable isolation",
-        rect(24.0, 24.0, 180.0, 32.0),
+        rect(24.0, 20.0, 180.0, 32.0),
         &disable_target,
     );
     view.addSubview(&disable);
@@ -369,41 +558,55 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
             }
         }),
     );
-    let close = button(mtm, "Close", rect(426.0, 24.0, 130.0, 32.0), &close_target);
+    let close = button(mtm, "Close", rect(556.0, 20.0, 140.0, 32.0), &close_target);
     view.addSubview(&close);
 
-    let timer = PollTimer::new(
-        mtm,
-        Box::new(move || {
-            let progress = (actions.poll)();
-            status.setStringValue(&NSString::from_str(&progress.message));
-            let starting = progress
-                .start_account
-                .as_ref()
-                .is_some_and(|start| start.name == account.stringValue().to_string());
-            *start_account.borrow_mut() = progress.start_account;
-            *resume_creation.borrow_mut() = progress.resume_creation;
-            begin.setTitle(&NSString::from_str(if starting {
-                "Start environment…"
+    let refresh: Rc<dyn Fn()> = Rc::new(move || {
+        let progress = poll();
+        let name = account.stringValue().to_string();
+        let matches = progress.account == name;
+        let step = progress.display_step(&name);
+        update_label(&heading, step.heading());
+        for (index, (label, (title, _))) in step_labels.iter().zip(titles.iter()).enumerate() {
+            update_label(label, &step.row_title(index, title));
+        }
+        update_label(&sign_in, &sign_in_instructions(&name));
+        update_label(&returning, &return_instructions(&name));
+        if matches {
+            update_label(&status, &progress.message);
+        } else {
+            update_label(
+                &status,
+                "The account name changed. Choose Use existing account to check it, or Create account… to create a new one.",
+            );
+        }
+        let starting = progress
+            .start_account
+            .as_ref()
+            .is_some_and(|start| start.name == name);
+        let can_continue = progress.can_continue(&name);
+        *start_account.borrow_mut() = progress.start_account;
+        *resume_creation.borrow_mut() = progress.resume_creation;
+        start_button.setEnabled(!progress.running && starting);
+        continue_button.setEnabled(can_continue);
+        begin.setEnabled(!progress.running);
+        create.setEnabled(!progress.running);
+        disable.setEnabled(!progress.running);
+        account.setEnabled(!progress.running);
+        close.setEnabled(!progress.running || progress.can_cancel);
+        close.setTitle(&NSString::from_str(if progress.running {
+            if progress.can_cancel {
+                "Cancel setup"
             } else {
-                "Use existing account"
-            }));
-            begin.setEnabled(!progress.running);
-            create.setEnabled(!progress.running);
-            disable.setEnabled(!progress.running);
-            account.setEnabled(!progress.running);
-            close.setEnabled(!progress.running || progress.can_cancel);
-            close.setTitle(&NSString::from_str(if progress.running {
-                if progress.can_cancel {
-                    "Cancel setup"
-                } else {
-                    "Finishing…"
-                }
-            } else {
-                "Close"
-            }));
-        }),
-    );
+                "Finishing…"
+            }
+        } else {
+            "Close"
+        }));
+    });
+    refresh();
+    let on_tick = refresh.clone();
+    let timer = PollTimer::new(mtm, Box::new(move || on_tick()));
     // SAFETY: this timer is retained and invalidated on the same main run loop after the modal loop.
     unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer.timer, NSModalPanelRunLoopMode) };
     // SAFETY: NSObject initialization follows installation of the retained close policy.
@@ -413,10 +616,15 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.setContentView(Some(&view));
     window.center();
     window.makeKeyAndOrderFront(None);
+    document.scrollPoint(CGPoint {
+        x: 0.0,
+        y: (650.0 - scroll.frame().size.height).max(0.0),
+    });
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
     let continue_setup = if let Some(resume) = actions.on_resume {
         resume();
+        refresh();
         true
     } else if automatic_creation {
         create_action()
@@ -430,10 +638,36 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     drop((
         timer,
         begin_target,
+        continue_target,
+        start_target,
         create_target,
         disable_target,
         close_target,
         delegate,
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_selection_cannot_rebind_another_accounts_ready_state() {
+        let mut progress = SetupProgress {
+            account: "account_a".into(),
+            message: String::new(),
+            step: SetupStep::SignIn,
+            running: true,
+            can_cancel: true,
+            start_account: None,
+            resume_creation: None,
+        };
+        assert!(!progress.can_continue("account_b"));
+        progress.running = false;
+        progress.step = SetupStep::Ready;
+        assert_eq!(progress.display_step("account_b"), SetupStep::Account);
+        assert!(!progress.can_continue("account_b"));
+        assert_eq!(progress.display_step("account_a"), SetupStep::Ready);
+    }
 }

@@ -262,9 +262,9 @@ pub fn run_registered_worker(owner: u32, check: bool) -> anyhow::Result<()> {
                 let granted = facts.accessibility && facts.screen_recording;
                 ChecklistUpdate {
                     granted: [facts.accessibility, facts.screen_recording],
-                    message: if facts.login_setup_pending { "Finish macOS's first-login welcome screens, then return to your normal account without logging this account out.".into() }
-                        else if granted { "Permissions ready. Use Fast User Switching to return to your normal account, leaving this account logged in.".into() }
-                        else { "Enable the missing permissions. Glass checks automatically; take your time.".into() },
+                    message: if facts.login_setup_pending { "Finish all macOS welcome screens until this account's desktop appears. Then allow Glass permissions here. Return to your normal account using Lock Screen, leaving this account logged in.".into() }
+                        else if granted { "Permissions ready. Choose Apple menu → Lock Screen and sign in to your normal account. Leave this development account logged in. Return to Glass application setup and choose Continue setup if checking is paused.".into() }
+                        else { "Allow the missing permissions in System Settings → Privacy & Security. When both are allowed, use Lock Screen to return to your normal account, leaving this account logged in. Glass checks automatically; there is no time limit.".into() },
                     finished: granted && facts.private_session && !facts.login_setup_pending,
                 }
             }

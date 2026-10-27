@@ -264,10 +264,13 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
 }
 
 #[derive(Debug)]
-pub(super) struct EnvironmentMissing;
+pub(super) struct EnvironmentMissing(pub(super) Phase);
 impl std::fmt::Display for EnvironmentMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the development desktop needs starting; choose Start environment in Glass application setup")
+        match self.0 {
+            Phase::StartupCleanupRequired => f.write_str("a previous desktop startup needs cleanup; choose Start environment in Glass application setup"),
+            _ => f.write_str("the development desktop is not running; sign in manually for first use, or choose Start environment in Glass application setup for an initialized account"),
+        }
     }
 }
 impl std::error::Error for EnvironmentMissing {}
@@ -301,25 +304,27 @@ fn wait_registered(
             current,
             Phase::LoginRequired | Phase::StartupCleanupRequired
         ) {
-            return Err(EnvironmentMissing.into());
+            progress(Progress::for_phase(&current, name));
+            return Err(EnvironmentMissing(current).into());
         }
 
         if current != Phase::Ready && previous.as_ref() != Some(&current) {
-            progress(Progress::waiting(current.message(name)));
+            progress(Progress::for_phase(&current, name));
             previous = Some(current.clone());
         }
         let cancelled_now = cancelled.load(Ordering::Relaxed);
         match coordinator.next(&current, cancelled_now) {
             Decision::Finish => {
-                progress(Progress::applying(
-                    "Verifying workspace recovery and MCP integration…",
-                ));
+                progress(
+                    Progress::applying("Verifying workspace recovery and MCP integration…")
+                        .at(glass_macos::setup_window::SetupStep::ReturnToOwner),
+                );
                 ensure!(
                     !cancelled.load(Ordering::Relaxed),
                     "setup cancelled; completed registration and grants retained"
                 );
                 finish()?;
-                progress(Progress::waiting(Phase::Ready.message(name)));
+                progress(Progress::for_phase(&Phase::Ready, name));
                 return Ok(());
             }
             Decision::Stop => {

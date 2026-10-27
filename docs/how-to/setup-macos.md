@@ -33,8 +33,9 @@ Stop any current Glass application with `glass_stop` before changing its environ
    helper from the same installed app. If the account's standard `/Users/NAME`
    home is missing, Glass asks macOS to initialise that selected home. Existing homes are retained;
    custom home locations must already be prepared.
-4. When Glass asks, use [Fast User Switching](https://support.apple.com/guide/mac-help/mchlp2439/mac)
-   to log into the development account and finish macOS's first-login setup. Complete the macOS
+4. Follow the wizard's manual sign-in step: choose **Apple menu → Lock Screen**, then use
+   **Switch User** or the login screen's account selector to sign into the development account.
+   Use this login-screen route with VNC too. Finish macOS's first-login setup. Complete the macOS
    welcome screens until the account's desktop appears. A successful account login or existing
    privacy grants do not mean those screens have finished. Glass reports this remaining step
    instead of **Ready** while Apple Setup Assistant owns the development desktop.
@@ -53,10 +54,10 @@ Stop any current Glass application with `glass_stop` before changing its environ
    If Glass is missing from a list, use **+** to add `/Applications/GlassMcp.app`. Choose **Quit & Reopen**
    if macOS offers it. Glass checks grants in fresh processes automatically. These waits have no user
    deadline; the **Re-check** button remains available for a failed check.
-5. When the permission window says it is ready, switch back to your normal account, **leaving the
-   development account logged in**. If no permission window appeared, return to your normal account
+5. When the permission window says it is ready, choose **Apple menu → Lock Screen** again and sign
+   back into your normal account, **leaving the development account logged in**. If no permission window appeared, return to your normal account
    and check **Application setup…**; an absent window alone does not establish readiness.
-   Glass continues setup automatically, checks workspace recovery
+   Return to the setup wizard and choose **Continue setup** if checking is paused. Glass checks workspace recovery
    and verifies the actual worker's readiness before reporting **Ready**. Registration repair may
    request administrator authentication. A failed repair stops with its cause and retains completed
    registration and grants; **Use existing account** retries the outstanding work. **Cancel setup** stops waiting and

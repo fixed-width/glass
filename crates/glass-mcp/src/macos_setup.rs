@@ -138,6 +138,20 @@ impl Readiness {
 }
 
 impl Phase {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn setup_step(&self) -> Option<glass_macos::setup_window::SetupStep> {
+        use glass_macos::setup_window::SetupStep;
+        match self {
+            Self::LoginRequired | Self::LoginSetupRequired | Self::WorkerStarting => {
+                Some(SetupStep::SignIn)
+            }
+            Self::PermissionsRequired { .. } => Some(SetupStep::Permissions),
+            Self::ReturnToOwner | Self::FinishingPermissions => Some(SetupStep::ReturnToOwner),
+            Self::Ready => Some(SetupStep::Ready),
+            Self::StartupCleanupRequired | Self::Busy | Self::RepairRequired(_) => None,
+        }
+    }
+
     pub(crate) fn unavailable_worker(
         socket_missing: bool,
         login_complete: Result<bool, String>,
@@ -156,10 +170,10 @@ impl Phase {
     pub(crate) fn message(&self, account: &str) -> String {
         match self {
             Self::LoginRequired => format!(
-                "The development desktop for {account} is not running. Choose Start environment… in Glass application setup; enter credentials only in its local secure dialog."
+                "For a new account, choose Apple menu → Lock Screen and sign in to {account} manually. Finish macOS's welcome screens and any Glass permission steps. Then return to your normal account without logging {account} out and choose Continue setup. If its first login is already finished, Start environment… can start its desktop here."
             ),
             Self::LoginSetupRequired => format!(
-                "macOS first-login setup is still open in {account}. Switch to that account and finish the macOS welcome screens, then return here without logging it out. No Glass reinstallation or repeated permission grants are needed."
+                "Sign in to {account} manually from Apple menu → Lock Screen. Finish all macOS welcome screens until its desktop appears, then complete any Glass permission steps there. Return to your normal account while leaving {account} logged in. Take your time; these steps are not timed."
             ),
             Self::StartupCleanupRequired => "A previous desktop startup needs its temporary access cleaned up. Choose Start environment… in Glass; an already running desktop is reused without authenticating again.".into(),
             Self::WorkerStarting => format!(
@@ -172,10 +186,16 @@ impl Phase {
                     (false, true) => "Screen Recording",
                     (false, false) => "the requested permissions",
                 };
-                format!("Switch to {account} and grant Glass {permissions} in the Glass permission window. Glass will check again automatically; there is no time limit.")
+                let settings = match (accessibility, screen_recording) {
+                    (true, true) => "Use System Settings → Privacy & Security: allow Accessibility first, then Screen Recording (or Screen & System Audio Recording).",
+                    (true, false) => "Use System Settings → Privacy & Security → Accessibility.",
+                    (false, true) => "Use System Settings → Privacy & Security → Screen Recording (or Screen & System Audio Recording).",
+                    (false, false) => "Follow the permission window's instructions.",
+                };
+                format!("In {account}, allow Glass {permissions}. {settings} Then use Lock Screen to return to your normal account, leaving {account} logged in. There is no time limit.")
             }
             Self::ReturnToOwner => format!(
-                "Glass has its permissions. Switch back to your normal account without logging {account} out. Setup will finish automatically."
+                "Glass has its permissions. Choose Apple menu → Lock Screen and sign back in to your normal account. Leave {account} logged in. Return to this window; if checking has paused, choose Continue setup. Glass verifies its connection before showing Ready."
             ),
             Self::FinishingPermissions => "Permissions confirmed. Waiting for the permission window to finish before checking workspace recovery…".into(),
             Self::Ready => format!("{account} ready; apps use its private desktop through the normal MCP tools"),
@@ -204,6 +224,7 @@ pub(crate) struct Coordinator {
 #[cfg(target_os = "macos")]
 pub(crate) struct Progress {
     pub message: String,
+    pub step: Option<glass_macos::setup_window::SetupStep>,
     pub can_cancel: bool,
     pub pending_id: Option<String>,
 }
@@ -213,6 +234,7 @@ impl Progress {
     pub(crate) fn applying(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            step: None,
             can_cancel: false,
             pending_id: None,
         }
@@ -220,9 +242,21 @@ impl Progress {
     pub(crate) fn waiting(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            step: None,
             can_cancel: true,
             pending_id: None,
         }
+    }
+
+    pub(crate) fn at(mut self, step: glass_macos::setup_window::SetupStep) -> Self {
+        self.step = Some(step);
+        self
+    }
+
+    pub(crate) fn for_phase(phase: &Phase, account: &str) -> Self {
+        let mut progress = Self::waiting(phase.message(account));
+        progress.step = phase.setup_step();
+        progress
     }
 }
 
@@ -788,6 +822,11 @@ mod tests {
                         onboarding_running: false,
                     };
                     assert_eq!(facts.phase(), Phase::LoginSetupRequired);
+                    #[cfg(target_os = "macos")]
+                    assert_eq!(
+                        facts.phase().setup_step(),
+                        Some(glass_macos::setup_window::SetupStep::SignIn)
+                    );
                     assert_eq!(
                         Coordinator::new(true).next(&facts.phase(), false),
                         Decision::Wait
@@ -803,6 +842,33 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn guide_completion_follows_verified_readiness_and_preserves_unknown_progress() {
+        use glass_macos::setup_window::SetupStep;
+        assert_eq!(Phase::Ready.setup_step(), Some(SetupStep::Ready));
+        assert_eq!(
+            Phase::ReturnToOwner.setup_step(),
+            Some(SetupStep::ReturnToOwner)
+        );
+        assert_eq!(
+            Phase::PermissionsRequired {
+                accessibility: true,
+                screen_recording: false,
+                helper_running: true
+            }
+            .setup_step(),
+            Some(SetupStep::Permissions)
+        );
+        for phase in [
+            Phase::Busy,
+            Phase::StartupCleanupRequired,
+            Phase::RepairRequired("unconfirmed connection".into()),
+        ] {
+            assert_eq!(phase.setup_step(), None);
         }
     }
 }

@@ -1178,7 +1178,7 @@ pub(crate) fn has_pending_setup() -> anyhow::Result<bool> {
 
 /// The app and CLI use the same enrollment, consent and readiness coordinator.
 pub fn show_setup(addr: &str) -> anyhow::Result<()> {
-    use glass_macos::setup_window::{ResumeCreation, SetupActions, SetupProgress};
+    use glass_macos::setup_window::{ResumeCreation, SetupActions, SetupProgress, SetupStep};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1283,7 +1283,13 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         )
     };
     let state = Arc::new(Mutex::new(SetupProgress {
+        account: account.clone(),
         message,
+        step: if account.is_empty() {
+            SetupStep::Account
+        } else {
+            SetupStep::Checking
+        },
         running: false,
         can_cancel: true,
         start_account: None,
@@ -1321,7 +1327,13 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     return;
                 }
             };
+            state.account = name.clone();
             state.running = true;
+            state.step = if create.is_some() {
+                SetupStep::Account
+            } else {
+                SetupStep::Checking
+            };
             state.start_account = None;
             state.can_cancel = false;
             state.message =
@@ -1359,6 +1371,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                                 pending.remember(id);
                             }
                             state.message = progress.message;
+                            if let Some(step) = progress.step {
+                                state.step = step;
+                            }
                             state.can_cancel = progress.can_cancel;
                         }
                     },
@@ -1377,6 +1392,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 if let Ok(mut state) = state.lock() {
                     if result.is_ok() {
                         state.resume_creation = None;
+                        state.step = SetupStep::Ready;
                     }
                     state.running = false;
                     state.can_cancel = true;
@@ -1386,9 +1402,17 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                         Err(error) if error.is::<crate::macos_account::MissingAccount>() => error.to_string(),
                         Err(error) if error.is::<guided::EnvironmentMissing>() => {
                             state.start_account = desktop_start::choice(&name).ok();
-                            format!("The development desktop for {name} is not running. Choose Start environment… to start it here; Glass reuses existing registration and permissions.")
+                            if let Some(missing) = error.downcast_ref::<guided::EnvironmentMissing>() {
+                                if let Some(step) = missing.0.setup_step() {
+                                    state.step = step;
+                                }
+                                missing.0.message(&name)
+                            } else {
+                                error.to_string()
+                            }
                         }
                         Err(error) if error.is::<guided::AccountCreationIncomplete>() => {
+                            state.step = SetupStep::Account;
                             match account_creation::completed_identity(rustix::process::getuid().as_raw(), &name) {
                                 Ok(Some(_)) => format!("{error:#}. The account and password are prepared. Choose Use existing account to finish registration; you do not need to enter the development-account password again."),
                                 Ok(None) => format!("{error:#}. Completed account data and grants are retained. Choose Create account… with the same name and original chosen password to resume."),
@@ -1429,7 +1453,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         if state.running {
             return;
         }
+        state.account = request.name.clone();
         state.running = true;
+        state.step = SetupStep::Checking;
         state.can_cancel = false;
         state.start_account = None;
         state.message = "Starting the development desktop. Complete or cancel macOS approval locally; there is no deadline.".into();
@@ -1452,6 +1478,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 |progress| {
                     if let Ok(mut state) = state.lock() {
                         state.message = progress.message;
+                        if let Some(step) = progress.step {
+                            state.step = step;
+                        }
                         state.can_cancel = progress.can_cancel;
                     }
                 },
@@ -1466,6 +1495,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                         state.resume_creation = None;
                     }
                     state.message = progress.message;
+                    if let Some(step) = progress.step {
+                        state.step = step;
+                    }
                     state.can_cancel = progress.can_cancel;
                 }
             };
@@ -1509,6 +1541,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             if let Ok(mut state) = state.lock() {
                 if result.is_ok() {
                     state.resume_creation = None;
+                    state.step = SetupStep::Ready;
                 }
                 state.running = false;
                 state.can_cancel = true;
@@ -1542,6 +1575,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 if let Ok(mut state) = diagnostic_state.lock() {
                     state.running = false;
                     state.can_cancel = true;
+                    if let Some(step) = phase.as_ref().ok().and_then(|phase| phase.setup_step()) {
+                        state.step = step;
+                    }
                     state.start_account = phase
                         .as_ref()
                         .ok()
@@ -1641,6 +1677,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.can_cancel = true;
                     if result.is_ok() {
                         state.resume_creation = None;
+                        state.step = SetupStep::Account;
                     }
                     state.message = match result {
                         Ok(()) => match restart_error {
@@ -1654,7 +1691,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
-            message: "Setup state is unavailable. Close this window and open application setup again.".into(), running: false, can_cancel: true, start_account: None, resume_creation: None,
+            message: "Setup state is unavailable. Close this window and open application setup again.".into(), account: String::new(), step: SetupStep::Checking, running: false, can_cancel: true, start_account: None, resume_creation: None,
         })
         }),
         can_close: Box::new(move || {
