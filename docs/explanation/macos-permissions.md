@@ -5,7 +5,7 @@ grants are recorded shapes how glass is packaged and run on the Mac. Understandi
 *why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
 compatible updates can retain existing grants.
 
-glass needs two grants in the account where its backend runs:
+Glass needs two grants that must be effective in the process running its backend:
 
 - **Screen Recording** — to capture the screen.
 - **Accessibility** — to manage windows and inject input.
@@ -58,6 +58,11 @@ consent and the user's return without a user deadline, then checks live worker r
 pending workspace recovery. The
 [account setup guide](../how-to/setup-macos.md#apps-off-your-desktop-preview) gives the full sequence,
 including verification and MCP-client configuration.
+
+Accessibility and Screen Recording approvals for the same signed app are system-wide and reused
+across accounts. A new development account does not require a duplicate approval. Complete its
+macOS welcome screens once, then log out and return to the normal account; **Start environment…**
+can start that initialized desktop again. Missing grants can be approved from the normal account.
 
 The MCP server in your ordinary account continues handling tools, audit records, traces and other backends;
 its own TCC snapshot does not describe the private worker's permissions. Setup checks the worker,

@@ -170,10 +170,10 @@ impl Phase {
     pub(crate) fn message(&self, account: &str) -> String {
         match self {
             Self::LoginRequired => format!(
-                "For a new account, choose Apple menu → Lock Screen and sign in to {account} manually. Finish macOS's welcome screens and any Glass permission steps. Then return to your normal account without logging {account} out and choose Continue setup. If its first login is already finished, Start environment… can start its desktop here."
+                "For a new account, choose Apple menu → Lock Screen and sign in to {account} manually. Finish all macOS welcome screens until its desktop appears. Then choose Apple menu → Log Out and sign back in to your normal account. Your first-login visit is complete; choose Start environment… here. If its first login is already finished, Start environment… can start its desktop here."
             ),
             Self::LoginSetupRequired => format!(
-                "Sign in to {account} manually from Apple menu → Lock Screen. Finish all macOS welcome screens until its desktop appears, then complete any Glass permission steps there. Return to your normal account while leaving {account} logged in. Take your time; these steps are not timed."
+                "Sign in to {account} manually from Apple menu → Lock Screen. Finish all macOS welcome screens until its desktop appears. Then choose Apple menu → Log Out and sign back in to your normal account. Choose Start environment… here to start its private desktop. Take your time; these steps are not timed."
             ),
             Self::StartupCleanupRequired => "A previous desktop startup needs its temporary access cleaned up. Choose Start environment… in Glass; an already running desktop is reused without authenticating again.".into(),
             Self::WorkerStarting => format!(
@@ -190,12 +190,12 @@ impl Phase {
                     (true, true) => "Use System Settings → Privacy & Security: allow Accessibility first, then Screen Recording (or Screen & System Audio Recording).",
                     (true, false) => "Use System Settings → Privacy & Security → Accessibility.",
                     (false, true) => "Use System Settings → Privacy & Security → Screen Recording (or Screen & System Audio Recording).",
-                    (false, false) => "Follow the permission window's instructions.",
+                    (false, false) => "Check Glass in System Settings → Privacy & Security.",
                 };
-                format!("In {account}, allow Glass {permissions}. {settings} Then use Lock Screen to return to your normal account, leaving {account} logged in. There is no time limit.")
+                format!("In your normal account, allow the missing Glass {permissions}. {settings} Existing grants are reused; you do not need to approve them separately in {account}. If Glass is missing from a list, use + to add /Applications/GlassMcp.app. Glass checks its worker automatically. There is no time limit.")
             }
             Self::ReturnToOwner => format!(
-                "Glass has its permissions. Choose Apple menu → Lock Screen and sign back in to your normal account. Leave {account} logged in. Return to this window; if checking has paused, choose Continue setup. Glass verifies its connection before showing Ready."
+                "Glass has its permissions. After finishing macOS welcome screens in {account}, you can choose Apple menu → Log Out and sign back in to your normal account. Choose Start environment… here if its desktop is stopped. If checking has paused with its desktop running, choose Continue setup. Wait for Ready."
             ),
             Self::FinishingPermissions => "Permissions confirmed. Waiting for the permission window to finish before checking workspace recovery…".into(),
             Self::Ready => format!("{account} ready; apps use its private desktop through the normal MCP tools"),

@@ -36,9 +36,9 @@ internal refactors, CI, or test-only changes.
   Starting an initialized account reuses its waiting worker and restores the normal user's
   connection access after logout/login instead of reporting that worker as busy.
   Application setup keeps a numbered first-use guide visible: create or choose the account,
-  sign in manually to finish macOS welcome screens, allow Glass permissions there, then return
-  to the normal account and continue to verified Ready. Starting an initialized environment is
-  a separate action, and the permission window explains how to return without logging out.
+  sign in manually to finish macOS welcome screens, log out and return to the normal account,
+  then choose Start environment and wait for verified Ready. Existing Glass permissions are reused
+  across accounts; missing grants can be approved from the normal account.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
   restores shared-desktop use while keeping the app, development account and MCP startup integration.
   Uninstall also removes startup integration while retaining the account, home and app data.

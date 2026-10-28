@@ -1397,7 +1397,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.running = false;
                     state.can_cancel = true;
                     state.message = match result {
-                        Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Keep the development account logged in; routine app runs need no account switching.".into(),
+                        Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Glass keeps its private desktop running between app runs. After logout, Start environment can start it again; routine app runs need no account switching.".into(),
                         Err(error) if error.is::<crate::macos_setup::pending::Superseded>() => "This saved setup was cancelled or replaced. This window did not restart it. Close this window; begin a new setup explicitly if needed.".into(),
                         Err(error) if error.is::<crate::macos_account::MissingAccount>() => error.to_string(),
                         Err(error) if error.is::<guided::EnvironmentMissing>() => {

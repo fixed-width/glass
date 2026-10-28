@@ -39,25 +39,19 @@ Stop any current Glass application with `glass_stop` before changing its environ
    welcome screens until the account's desktop appears. A successful account login or existing
    privacy grants do not mean those screens have finished. Glass reports this remaining step
    instead of **Ready** while Apple Setup Assistant owns the development desktop.
-   Glass checks existing
-   permissions automatically and opens **glass permissions** if a grant is missing. Already allowed
-   permissions are reused; when both are allowed, the helper exits without opening that window.
-   No Terminal command or second Glass installation is needed in that account. Complete only the
-   missing grants, in this order:
-
-   - Click **Request…** for **Accessibility**, then enable Glass in **System Settings → Privacy &
-     Security → Accessibility**. [Apple's Accessibility instructions](https://support.apple.com/guide/mac-help/mh43185/mac).
-   - Click **Request…** for **Screen Recording**, then enable Glass under **Privacy & Security →
-     Screen Recording**, called **Screen & System Audio Recording** on newer versions.
-     [Apple's recording instructions](https://support.apple.com/guide/mac-help/mchld6aa7d23/mac).
-
-   If Glass is missing from a list, use **+** to add `/Applications/GlassMcp.app`. Choose **Quit & Reopen**
-   if macOS offers it. Glass checks grants in fresh processes automatically. These waits have no user
-   deadline; the **Re-check** button remains available for a failed check.
-5. When the permission window says it is ready, choose **Apple menu → Lock Screen** again and sign
-   back into your normal account, **leaving the development account logged in**. If no permission window appeared, return to your normal account
-   and check **Application setup…**; an absent window alone does not establish readiness.
-   Return to the setup wizard and choose **Continue setup** if checking is paused. Glass checks workspace recovery
+   Your work in the development account is now complete. No Glass instructions or permission
+   window needs to appear there. Choose **Apple menu → Log Out**, then sign back in to your normal
+   account. You do not need to keep the development account logged in after this first visit.
+5. Back in **glass → Application setup…**, choose **Start environment…** for the selected account.
+   Enter its password locally and complete any separate macOS administrator prompt. Glass starts
+   its private desktop without switching your visible desktop. Wait for **Ready**.
+   Accessibility and Screen Recording approvals for the same signed Glass app are reused across
+   accounts. If Glass reports a missing grant, complete only that grant from your normal account
+   under **System Settings → Privacy & Security → Accessibility** or **Screen & System Audio
+   Recording** (called **Screen Recording** on older versions). If Glass is absent from a list,
+   use **+** to add `/Applications/GlassMcp.app`. No second installation or Terminal command is
+   needed. Glass checks the actual worker's permissions in fresh processes automatically.
+   Choose **Continue setup** if checking is paused with the development desktop running. Glass checks workspace recovery
    and verifies the actual worker's readiness before reporting **Ready**. Registration repair may
    request administrator authentication. A failed repair stops with its cause and retains completed
    registration and grants; **Use existing account** retries the outstanding work. **Cancel setup** stops waiting and
@@ -164,8 +158,9 @@ Unattended startup after a reboot is not implemented.
 
 ### Start a stopped development desktop
 
-Keep the development account logged in between ordinary application runs. Stopping an application
-does not log that account out. When its desktop is missing, open **glass → Application setup…**
+Glass keeps the development desktop running between ordinary application runs. Stopping an application
+does not log that account out. You can log out after completing the manual first-login screens;
+**Start environment…** starts the initialized desktop again. When its desktop is missing, open **glass → Application setup…**
 in your normal account and choose **Start environment…** for the enrolled account.
 
 Stop ends Glass-owned app and build processes and restores temporary workspace permissions.
@@ -185,7 +180,8 @@ under **System Settings → General → Sharing**. Glass does not enable that
 host-wide service automatically. It connects locally and requests only a separate desktop; an
 unsupported or denied private selection stops with an error. Existing credentials longer than
 63 UTF-8 bytes are not supported by this startup protocol and are never truncated or reset.
-First-time macOS setup and privacy consent may still require signing into that account directly.
+First-time macOS welcome screens require one manual sign-in to that account. You can log out
+after completing them; approve any missing Glass privacy grants from your normal account.
 
 If startup is interrupted, open setup and explicitly choose **Start environment…** again. Glass
 first finishes recorded temporary Screen Sharing access cleanup without an account password. If

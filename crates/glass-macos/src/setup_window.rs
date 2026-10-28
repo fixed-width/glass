@@ -58,8 +58,8 @@ impl SetupStep {
         match self {
             Self::Account => "Step 1 of 4 — Choose a development account",
             Self::SignIn => "Step 2 of 4 — Sign in and finish macOS setup",
-            Self::Permissions => "Step 3 of 4 — Allow Glass permissions",
-            Self::ReturnToOwner => "Step 4 of 4 — Return and finish setup",
+            Self::Permissions => "Step 4 of 4 — Finish setup in your normal account",
+            Self::ReturnToOwner => "Step 3 of 4 — Log out and return to your normal account",
             Self::Checking => "Checking setup…",
             Self::Ready => "Ready — Your agent can use the development desktop",
         }
@@ -69,8 +69,8 @@ impl SetupStep {
         let current = match self {
             Self::Account => Some(0),
             Self::SignIn => Some(1),
-            Self::Permissions => Some(2),
-            Self::ReturnToOwner => Some(3),
+            Self::Permissions => Some(3),
+            Self::ReturnToOwner => Some(2),
             Self::Ready => Some(4),
             Self::Checking => None,
         };
@@ -162,7 +162,7 @@ fn create_account_dialog(
     alert.setInformativeText(&NSString::from_str(if resuming {
         "Enter the password you originally chose. Glass did not save it. Glass checks the retained account identity and completes unfinished preparation without resetting existing credentials."
     } else {
-        "Glass creates a standard macOS account. Choose its short name and password. After creation, sign in to that account manually once and finish macOS's welcome screens and Glass permissions. Then return to your normal account, leaving the development account logged in. Glass does not save the password."
+        "Glass creates a standard macOS account. Choose its short name and password. After creation, sign in to that account manually once and finish macOS's welcome screens until its desktop appears. Then log out of that account and return to your normal account. Choose Start environment here to start its private desktop. Glass does not save the password."
     }));
     alert.addButtonWithTitle(&NSString::from_str(if resuming {
         "Continue setup"
@@ -236,7 +236,7 @@ pub fn choose_environment() -> Result<SetupChoice, String> {
     alert.setMessageText(&NSString::from_str(
         "Where should Glass run development applications?",
     ));
-    alert.setInformativeText(&NSString::from_str("A separate standard macOS account keeps agent applications and input off your desktop. For a new account, first sign in manually to finish macOS setup and allow Glass permissions. Glass guides each step. Shared-desktop applications use your current desktop and permissions."));
+    alert.setInformativeText(&NSString::from_str("A separate standard macOS account keeps agent applications and input off your desktop. For a new account, sign in manually once to finish macOS setup, then log out and return to your normal account. Start its environment from Glass; existing Glass permissions are reused. Shared-desktop applications use your current desktop and permissions."));
     alert.addButtonWithTitle(&NSString::from_str("Off your desktop…"));
     alert.addButtonWithTitle(&NSString::from_str("On your desktop"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
@@ -319,18 +319,18 @@ fn sign_in_instructions(account: &str) -> String {
         account
     };
     format!(
-        "For first use, choose Apple menu → Lock Screen, then use Switch User or the account selector to sign in to {account}. Finish all macOS welcome screens until its desktop appears. Use this login-screen route with VNC too. Start environment below is for an account whose first login is already finished."
+        "For first use, choose Apple menu → Lock Screen, then use Switch User or the account selector to sign in to {account}. Finish all macOS welcome screens until its desktop appears. That completes your work in this account. Use this login-screen route with VNC too."
     )
 }
 
-fn return_instructions(account: &str) -> String {
+fn start_instructions(account: &str) -> String {
     let account = if account.is_empty() {
         "the development account"
     } else {
         account
     };
     format!(
-        "Use Apple menu → Lock Screen to return to your normal account. Leave {account} logged in; do not log it out. Back here, wait if Glass is checking. If checking is paused, choose Continue setup. Start agent work only after Ready."
+        "Back in your normal account, choose Start environment… for {account} and enter its password locally. Complete any separate administrator prompt. Existing Glass permissions are reused; resolve any missing permissions here only if Glass asks. Wait for Ready before agent work."
     )
 }
 
@@ -374,14 +374,14 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     instruction_label(
         mtm,
         &document,
-        "Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; login and permission waits have no time limit.",
+        "Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; authentication and setup waits have no time limit.",
         rect(24.0, 576.0, 672.0, 60.0),
     );
     let titles = [
         ("Choose or create an account here", 550.0),
         ("Sign in manually and finish macOS setup", 474.0),
-        ("Allow Glass permissions in that account", 366.0),
-        ("Return to your normal account and finish", 276.0),
+        ("Log out and return to your normal account", 366.0),
+        ("Start the environment here", 276.0),
     ];
     let step_labels: Vec<_> = titles
         .iter()
@@ -404,13 +404,13 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     instruction_label(
         mtm,
         &document,
-        "Glass opens its permission window there if needed. Allow Accessibility first, then Screen Recording, using Request… and System Settings → Privacy & Security. Wait until Glass confirms both permissions. Existing grants are reused; an absent permission window alone does not mean setup is finished.",
+        "Choose Apple menu → Log Out in the development account, then sign back in to your normal account. No Glass window or permission checklist needs to appear in the development account.",
         rect(24.0, 304.0, 672.0, 56.0),
     );
     let returning = instruction_label(
         mtm,
         &document,
-        &return_instructions(&actions.account),
+        &start_instructions(&actions.account),
         rect(24.0, 210.0, 672.0, 60.0),
     );
     instruction_label(
@@ -571,7 +571,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
             update_label(label, &step.row_title(index, title));
         }
         update_label(&sign_in, &sign_in_instructions(&name));
-        update_label(&returning, &return_instructions(&name));
+        update_label(&returning, &start_instructions(&name));
         if matches {
             update_label(&status, &progress.message);
         } else {
