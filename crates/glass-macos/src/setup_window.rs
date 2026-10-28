@@ -36,8 +36,34 @@ impl SetupProgress {
         }
     }
 
-    fn can_create(&self) -> bool {
+    fn display_message(&self, edited_account: &str) -> String {
+        if self.account == edited_account {
+            return self.message.clone();
+        }
+        let context = if self.account.is_empty() {
+            "Current setup".to_owned()
+        } else {
+            format!("Setup for {}", self.account)
+        };
+        let guidance = if self.creation_blocker.is_some() {
+            "Changing the name does not change enrollment. Resolve the enrolled setup above before selecting another account."
+        } else {
+            "The selected name changed. Choose Use existing account to check it, or Create account… to create a new one."
+        };
+        format!("{context}: {}\n\n{guidance}", self.message)
+    }
+
+    /// Whether the wizard may open account creation.
+    pub fn can_create(&self) -> bool {
         !self.running && self.creation_blocker.is_none()
+    }
+
+    /// Clear account-dependent actions only after successful enrollment removal.
+    pub fn isolation_disabled(&mut self) {
+        self.creation_blocker = None;
+        self.start_account = None;
+        self.resume_creation = None;
+        self.step = SetupStep::Account;
     }
 
     fn can_continue(&self, account: &str) -> bool {
@@ -573,7 +599,6 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let refresh: Rc<dyn Fn()> = Rc::new(move || {
         let progress = poll();
         let name = account.stringValue().to_string();
-        let matches = progress.account == name;
         let step = progress.display_step(&name);
         update_label(&heading, step.heading());
         update_label(&setup_notice, progress.creation_blocker.as_deref().unwrap_or("Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; authentication and setup waits have no time limit."));
@@ -582,14 +607,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         }
         update_label(&sign_in, &sign_in_instructions(&name));
         update_label(&returning, &start_instructions(&name));
-        if matches {
-            update_label(&status, &progress.message);
-        } else {
-            update_label(
-                &status,
-                "The account name changed. Choose Use existing account to check it, or Create account… to create a new one.",
-            );
-        }
+        update_label(&status, &progress.display_message(&name));
         let starting = progress
             .start_account
             .as_ref()
@@ -664,6 +682,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editing_selection_preserves_disable_failure_and_its_enrolled_account() {
+        let progress = SetupProgress {
+            creation_blocker: Some("account_a is enrolled".into()),
+            account: "account_a".into(),
+            message: "Could not disable isolation: graphical domain is unavailable".into(),
+            step: SetupStep::Account,
+            running: false,
+            can_cancel: true,
+            start_account: None,
+            resume_creation: None,
+        };
+        let message = progress.display_message("account_b");
+        assert!(message.contains("Setup for account_a"));
+        assert!(message.contains("Could not disable isolation: graphical domain is unavailable"));
+        assert!(!message.contains("Create account…"));
+        assert!(!progress.can_create());
+        assert!(!progress.can_continue("account_b"));
+    }
+
+    #[test]
     fn enrolled_account_blocks_password_dialog_even_after_editing_selection() {
         let mut progress = SetupProgress {
             creation_blocker: Some("account_a is enrolled. Disable isolation first.".into()),
@@ -678,7 +716,7 @@ mod tests {
         assert!(!progress.can_create());
         assert_eq!(progress.display_step("account_b"), SetupStep::Account);
         assert!(!progress.can_create());
-        progress.creation_blocker = None;
+        progress.isolation_disabled();
         assert!(progress.can_create());
         progress.running = true;
         assert!(!progress.can_create());

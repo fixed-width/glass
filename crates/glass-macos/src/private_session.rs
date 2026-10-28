@@ -214,6 +214,33 @@ pub fn account_processes(uid: u32) -> std::io::Result<Vec<ProcessIdentity>> {
     Ok(processes)
 }
 
+/// Check a pinned live process against the enrolled worker's code requirement.
+pub fn process_matches_requirement(
+    uid: u32,
+    process: &ProcessIdentity,
+    requirement: &[u8],
+) -> std::io::Result<bool> {
+    unsafe extern "C" {
+        fn glass_private_process_requirement(
+            process: *const ProcessIdentity,
+            uid: u32,
+            requirement: *const u8,
+            length: usize,
+        ) -> i32;
+    }
+    if requirement.is_empty() || requirement.len() > 65536 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    // SAFETY: both borrowed inputs remain valid throughout the native, read-only identity check.
+    match unsafe {
+        glass_private_process_requirement(process, uid, requirement.as_ptr(), requirement.len())
+    } {
+        0 => Ok(false),
+        1 => Ok(true),
+        code => Err(std::io::Error::from_raw_os_error(-code)),
+    }
+}
+
 /// Installed enrollment directory; this is service state, never application eligibility.
 pub const ROOT: &str = "/Library/Application Support/Glass";
 

@@ -596,6 +596,39 @@ static bool process_matches(const GlassProcessIdentity *process, uint32_t uid) {
         (uint64_t)info.kp_proc.p_starttime.tv_usec == process->microseconds;
 }
 
+int glass_private_process_requirement(const GlassProcessIdentity *process, uint32_t uid, const uint8_t *bytes, size_t length) {
+    @autoreleasepool {
+        if (!process || !bytes || uid < 501 || !process_matches(process, uid)) return -ESRCH;
+        if (!length || length > 65536) return -EINVAL;
+        struct {
+            uint8_t uuid[16];
+            uint64_t unique, parent_unique;
+            int32_t version, original_parent_version;
+            uint64_t reserved[2];
+        } before = {0}, after = {0};
+        _Static_assert(sizeof(before) == 56, "process exec identity ABI");
+        if (proc_pidinfo((int)process->pid, 17, 1, &before, sizeof(before)) != sizeof(before) || !before.unique) return -EACCES;
+        NSData *expression = [NSData dataWithBytes:bytes length:length];
+        SecCodeRef code = NULL;
+        SecRequirementRef requirement = NULL;
+        OSStatus status = SecRequirementCreateWithData((__bridge CFDataRef)expression, 0, &requirement);
+        if (!status) {
+            NSDictionary *attributes = @{(__bridge NSString *)kSecGuestAttributePid: @(process->pid)};
+            status = SecCodeCopyGuestWithAttributes(NULL, (__bridge CFDictionaryRef)attributes, 0, &code);
+        }
+        if (!status) status = SecCodeCheckValidity(code, kSecCSStrictValidate, requirement);
+        if (requirement) CFRelease(requirement);
+        if (code) CFRelease(code);
+        if (!process_matches(process, uid)) return -ESRCH;
+        if (proc_pidinfo((int)process->pid, 17, 1, &after, sizeof(after)) != sizeof(after) ||
+            before.unique != after.unique || before.version != after.version ||
+            memcmp(before.uuid, after.uuid, sizeof(before.uuid))) return -EAGAIN;
+        if (!status) return 1;
+        if (status == errSecCSReqFailed || status == errSecCSUnsigned) return 0;
+        return -EACCES;
+    }
+}
+
 int glass_apple_server_identity(uint32_t pid, GlassProcessIdentity *out) {
     @autoreleasepool {
         struct kinfo_proc info = {0};

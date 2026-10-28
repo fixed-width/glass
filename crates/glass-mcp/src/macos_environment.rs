@@ -1117,6 +1117,7 @@ mod account_creation;
 mod desktop_start;
 mod guided;
 mod worker_activation;
+mod worker_removal;
 
 /// Internal privileged startup role; the account password never appears in arguments.
 pub fn start_environment(endpoint: &Path) -> anyhow::Result<()> {
@@ -1687,10 +1688,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.running = false;
                     state.can_cancel = true;
                     if result.is_ok() {
-                        state.creation_blocker = None;
-                        state.start_account = None;
-                        state.resume_creation = None;
-                        state.step = SetupStep::Account;
+                        state.isolation_disabled();
                     }
                     state.message = match result {
                         Ok(()) => match restart_error {
@@ -1883,6 +1881,8 @@ fn remove_onboarding(
     binary: &Path,
     root: &File,
     agents: &File,
+    inspect: &mut impl FnMut(&str, &Enrollment, &File) -> anyhow::Result<Option<String>>,
+    stop: &mut impl FnMut(&str, &Enrollment) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let recorded = stored_file(root, ONBOARD_JOB)?;
     let installed = stored_file(agents, ONBOARD_JOB)?;
@@ -1896,7 +1896,7 @@ fn remove_onboarding(
         "permission onboarding belongs to another installation; enrollment retained"
     );
     let target = format!("gui/{}/{ONBOARD_LABEL}", account.uid);
-    let loaded_job = crate::launchd::inspect(&target)?;
+    let loaded_job = inspect(&target, account, root)?;
     let loaded = loaded_job.is_some();
     ensure!(
         !loaded || installed.is_some(),
@@ -1914,8 +1914,12 @@ fn remove_onboarding(
             ),
             "loaded permission helper changed; registration retained"
         );
-        stop_registered_worker(&target, account)?;
+        stop(&target, account)?;
     }
+    ensure!(
+        inspect(&target, account, root)?.is_none(),
+        "permission helper restarted during removal; registration retained"
+    );
     if installed.is_some() {
         rustix::fs::unlinkat(agents, ONBOARD_JOB, rustix::fs::AtFlags::empty())?;
         agents.sync_all()?;
@@ -2020,6 +2024,69 @@ fn leave_account_using(non_interactive: bool, system_dialog: bool) -> anyhow::Re
     Ok(())
 }
 
+fn remove_registered_jobs_with(
+    root: &File,
+    agents: &File,
+    account: &Enrollment,
+    binary: &Path,
+    legacy_owned: bool,
+    mut inspect: impl FnMut(&str, &Enrollment, &File) -> anyhow::Result<Option<String>>,
+    mut stop: impl FnMut(&str, &Enrollment) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let expected = job(account, binary)?;
+    let legacy = if legacy_owned {
+        legacy_job(account, binary)?
+    } else {
+        expected.clone()
+    };
+    let registered_file = accepts_job(agents, &expected, &legacy)?;
+    let target = format!("gui/{}/{LABEL}", account.uid);
+    let loaded_job = inspect(&target, account, root)?;
+    let loaded = loaded_job.is_some();
+    ensure!(
+        registered_file || !loaded,
+        "worker job is loaded but its registered file is missing; refusing unbound cleanup"
+    );
+    if let Some(loaded_job) = loaded_job {
+        let binary = binary.to_string_lossy();
+        let owner = account.owner_uid.to_string();
+        ensure!(
+            loaded_job_matches(&loaded_job, &[&binary, "macos-worker", &owner])
+                || (legacy_owned && loaded_job_matches(&loaded_job, &[&binary, "macos-worker"])),
+            "loaded worker belongs to another installation; registration retained"
+        );
+    }
+    // A failed cleanup must leave clients on the disabled private route.
+    if !same_file(root, "disabled", b"Glass account registration removed\n")? {
+        create_file(root, "disabled", b"Glass account registration removed\n")?;
+    }
+    remove_onboarding(account, binary, root, agents, &mut inspect, &mut stop)?;
+    unregister_worker(root, account, || {
+        if loaded {
+            stop(&target, account)?;
+        }
+        ensure!(
+            inspect(&target, account, root)?.is_none(),
+            "worker restarted during removal; registration retained"
+        );
+        Ok(())
+    })?;
+    if registered_file {
+        rustix::fs::unlinkat(agents, JOB, rustix::fs::AtFlags::empty())?;
+        agents.sync_all()?;
+    }
+    ensure!(
+        inspect(&target, account, root)?.is_none(),
+        "worker restarted before enrollment removal"
+    );
+    let onboarding_target = format!("gui/{}/{ONBOARD_LABEL}", account.uid);
+    ensure!(
+        inspect(&onboarding_target, account, root)?.is_none(),
+        "permission helper restarted before enrollment removal"
+    );
+    Ok(())
+}
+
 /// Remove only the registered agent; retain the user's account, home, grants and app data.
 pub fn remove_registration() -> anyhow::Result<()> {
     let owner = root_owner()?;
@@ -2085,45 +2152,15 @@ pub fn remove_registration() -> anyhow::Result<()> {
             .join(ACCOUNT)
             .try_exists()?
             && private_session::legacy_owner()? == owner;
-        let expected = job(&account, &binary)?;
-        let legacy = if legacy_owned {
-            legacy_job(&account, &binary)?
-        } else {
-            expected.clone()
-        };
-        let registered_file = accepts_job(&agents, &expected, &legacy)?;
-        let target = format!("gui/{}/{LABEL}", account.uid);
-        let loaded_job = crate::launchd::inspect(&target)?;
-        let loaded = loaded_job.is_some();
-        ensure!(
-            registered_file || !loaded,
-            "worker job is loaded but its registered file is missing; refusing unbound cleanup"
-        );
-        if let Some(loaded_job) = loaded_job {
-            let binary = binary.to_string_lossy();
-            let owner = account.owner_uid.to_string();
-            ensure!(
-                loaded_job_matches(&loaded_job, &[&binary, "macos-worker", &owner])
-                    || (legacy_owned
-                        && loaded_job_matches(&loaded_job, &[&binary, "macos-worker"])),
-                "loaded worker belongs to another installation; registration retained"
-            );
-        }
-        // A failed cleanup must leave clients on the disabled private route.
-        if !same_file(&root, "disabled", b"Glass account registration removed\n")? {
-            create_file(&root, "disabled", b"Glass account registration removed\n")?;
-        }
-        remove_onboarding(&account, &binary, &root, &agents)?;
-        unregister_worker(&root, &account, || {
-            if loaded {
-                stop_registered_worker(&target, &account)?;
-            }
-            Ok(())
-        })?;
-        if registered_file {
-            rustix::fs::unlinkat(&agents, JOB, rustix::fs::AtFlags::empty())?;
-            agents.sync_all()?;
-        }
+        remove_registered_jobs_with(
+            &root,
+            &agents,
+            &account,
+            &binary,
+            legacy_owned,
+            worker_removal::inspect,
+            stop_registered_worker,
+        )?;
         if root_path == Path::new(private_session::ROOT) {
             for name in ["worker.requirement", "disabled"] {
                 match rustix::fs::unlinkat(&root, name, rustix::fs::AtFlags::empty()) {

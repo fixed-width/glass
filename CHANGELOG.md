@@ -41,6 +41,9 @@ internal refactors, CI, or test-only changes.
   across accounts; missing grants can be approved from the normal account.
   The wizard identifies an existing enrollment and requires Disable isolation before opening
   another account-creation dialog. A rejected creation leaves saved setup progress untouched.
+  Disabling isolation and uninstalling handle a logged-out development account after independently
+  checking that Glass jobs and processes are absent. Other macOS services and the account are kept.
+  Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
   restores shared-desktop use while keeping the app, development account and MCP startup integration.
   Uninstall also removes startup integration while retaining the account, home and app data.

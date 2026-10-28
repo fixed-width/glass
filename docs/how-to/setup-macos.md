@@ -213,6 +213,11 @@ HTTP/menu-bar startup integration remain. Restart existing Glass MCP servers bef
 shared-desktop work. The normal account needs its usual Accessibility and Screen Recording grants.
 `--non-interactive` requires existing administrator authorization and fails instead of prompting.
 
+The development account can be logged out when you disable isolation or uninstall. Glass checks
+that its own jobs and processes are gone before removing registration; macOS background services
+and the account are retained. Setup failures stay visible even if you edited the account-name field.
+The menu's **Uninstall glass…** action shows a dialog if cleanup fails.
+
 A failure before worker and permission cleanup completes retains your enrollment and reports the
 problem. Glass does not silently move work onto your desktop. Another user's enrollment is unaffected.
 

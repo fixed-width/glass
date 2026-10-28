@@ -197,12 +197,17 @@ mod macos {
                      down now. To finish removing it, drag GlassMcp.app to the Trash.",
                         "Uninstall",
                     );
-                    if clicked == "Uninstall" {
-                        // Best-effort: a menu action has no further error surface, so log loudly to
-                        // stderr rather than crash the action if bootout/plist-removal fails. On
-                        // success this process is terminated as part of the uninstall.
-                        if let Err(e) = crate::run_uninstall() {
-                            eprintln!("glass: menu 'Uninstall glass' failed: {e}");
+                    if clicked == "Uninstall"
+                        && let Err(e) = crate::run_uninstall()
+                    {
+                        eprintln!("glass: menu 'Uninstall glass' failed: {e:#}");
+                        if let Err(dialog) = glass_macos::menubar::show_error(
+                            "Glass could not finish uninstalling",
+                            &format!(
+                                "{e:#}\n\nUninstall did not complete. Glass is still running. Your accounts and files were kept."
+                            ),
+                        ) {
+                            eprintln!("glass: could not display uninstall failure: {dialog}");
                         }
                     }
                 }),

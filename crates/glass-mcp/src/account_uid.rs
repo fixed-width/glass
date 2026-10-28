@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 const MAX_LISTING: usize = 8 * 1024 * 1024;
 const UID_END: u32 = 60000;
 
-fn system_listing(command: &mut Command, timeout: Duration) -> anyhow::Result<String> {
+pub(crate) fn system_listing(command: &mut Command, timeout: Duration) -> anyhow::Result<String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -56,7 +56,7 @@ fn system_listing(command: &mut Command, timeout: Duration) -> anyhow::Result<St
     String::from_utf8(bytes).context("existing launchd domain listing is not UTF-8")
 }
 
-fn parse_domains(listing: &str) -> anyhow::Result<BTreeSet<u32>> {
+fn parse_domain_targets(listing: &str) -> anyhow::Result<BTreeSet<(String, u32)>> {
     ensure!(
         listing.len() <= MAX_LISTING,
         "existing launchd domain listing exceeded its bound"
@@ -73,11 +73,10 @@ fn parse_domains(listing: &str) -> anyhow::Result<BTreeSet<u32>> {
         sections.next().is_none(),
         "ambiguous launchd subdomain listing"
     );
-    let mut users = BTreeSet::new();
     let mut domains = BTreeSet::new();
     for line in listing[start + header.len()..].lines() {
         if line == "\t}" {
-            return Ok(users);
+            return Ok(domains);
         }
         let entry = line
             .strip_prefix("\t\t")
@@ -91,18 +90,33 @@ fn parse_domains(listing: &str) -> anyhow::Result<BTreeSet<u32>> {
         );
         let id: u32 = id.parse().context("invalid launchd subdomain identity")?;
         ensure!(
-            domains.insert((kind, id)) && domains.len() <= 65536,
+            domains.insert((kind.to_owned(), id)) && domains.len() <= 65536,
             "duplicate or excessive launchd subdomains"
         );
         match kind {
-            "user" | "gui" => {
-                users.insert(id);
-            }
-            "pid" | "login" | "session" => {}
+            "user" | "gui" | "pid" | "login" | "session" => {}
             _ => bail!("unrecognized launchd subdomain kind"),
         }
     }
     bail!("incomplete launchd subdomain listing")
+}
+
+fn parse_domains(listing: &str) -> anyhow::Result<BTreeSet<u32>> {
+    Ok(parse_domain_targets(listing)?
+        .into_iter()
+        .filter_map(|(kind, id)| matches!(kind.as_str(), "user" | "gui").then_some(id))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn existing_domain_targets() -> anyhow::Result<BTreeSet<(String, u32)>> {
+    let listing = system_listing(
+        Command::new("/bin/launchctl")
+            .args(["print", "system"])
+            .env("LC_ALL", "C"),
+        Duration::from_secs(10),
+    )?;
+    parse_domain_targets(&listing)
 }
 
 #[cfg(target_os = "macos")]

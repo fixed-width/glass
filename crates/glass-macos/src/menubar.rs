@@ -25,7 +25,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
     NSVariableStatusItemLength,
 };
 use objc2_foundation::NSString;
@@ -150,6 +150,21 @@ fn action_item(
     }
     item.setEnabled(true);
     item
+}
+
+/// Present a menu operation failure while keeping Glass running for recovery.
+pub fn show_error(title: &str, detail: &str) -> Result<()> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        GlassError::Backend("menu errors must be displayed on the AppKit thread".into())
+    })?;
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(detail));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    alert.runModal();
+    Ok(())
 }
 
 /// Run the menu-bar app: install the status item + menu and block the main thread on the
