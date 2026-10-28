@@ -115,20 +115,19 @@ pub(crate) fn grant_row_widgets() -> Vec<GrantRow> {
         GrantRow {
             label: ax_label,
             granted: ax_granted,
-            // "Request…" just *requests* the grant: macOS shows its own consent prompt —
-            // which carries an "Open System Settings" button that navigates to the pane — and
-            // lists GlassMcp.app there. We deliberately do NOT also `open_pane`: forcing Settings
-            // open fought the system's own prompt (it opened even when the user hadn't chosen to).
-            // Let the system prompt take the user there.
+            on_request: Box::new(glass_macos::request_accessibility),
             on_open_settings: Box::new(|| {
-                glass_macos::request_accessibility();
+                glass_macos::open_pane(glass_macos::accessibility_pane_url())
+                    .map_err(|error| error.to_string())
             }),
         },
         GrantRow {
             label: sr_label,
             granted: sr_granted,
+            on_request: Box::new(glass_macos::request_screen_recording),
             on_open_settings: Box::new(|| {
-                glass_macos::request_screen_recording();
+                glass_macos::open_pane(glass_macos::screen_recording_pane_url())
+                    .map_err(|error| error.to_string())
             }),
         },
     ]

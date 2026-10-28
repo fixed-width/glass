@@ -44,6 +44,8 @@ internal refactors, CI, or test-only changes.
   Disabling isolation and uninstalling handle a logged-out development account after independently
   checking that Glass jobs and processes are absent. Other macOS services and the account are kept.
   Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
+  The permission checklist shows request results and separate Open Settings actions for cases
+  where macOS does not show another consent prompt. Settings failures remain visible during checks.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
   restores shared-desktop use while keeping the app, development account and MCP startup integration.
   Uninstall also removes startup integration while retaining the account, home and app data.

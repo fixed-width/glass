@@ -484,20 +484,22 @@ macOS opens it without a Gatekeeper detour, and first-run is a double-click:
 
 1. **Download** the `.dmg` from Releases and open it.
 2. **Drag `GlassMcp.app` to `/Applications`.**
-3. **Double-click `GlassMcp.app`.** A **permission checklist window** appears, listing **Accessibility**
-   and **Screen Recording**, each with a ✓/○ status and its own **Request…** button.
-4. Click **Request…** for each permission, **one at a time**. macOS raises its own consent prompt,
-   whose **Open System Settings** button navigates to that permission's pane under **System Settings →
-   Privacy & Security**. Because the app is asking for *itself*, `GlassMcp.app` is already listed there
-   — no manual `＋`-add needed. glass deliberately does not force the pane open itself, which fought
-   the system's own prompt. Granting **Screen Recording needs `GlassMcp.app` to restart** — macOS
-   offers **Quit & Reopen** — and that restart is expected, not an error. If you grant the two
-   out of order, or a grant made elsewhere doesn't show up, click **Re-check**. Grants are **one-time**:
-   keyed to the app's signed identity, they survive restarts and updates (see
-   [the permission model](../explanation/macos-permissions.md)).
-5. Once both are granted, glass relaunches into its ready state — the checklist doesn't reappear, and
-   the **`glass ●`** menu bar shows instead. Along the way it **installs its LaunchAgent** (so it keeps
-   serving across logins and restarts).
+3. **Double-click `GlassMcp.app`.** If the environment choice appears, select **On your desktop**
+   for shared-desktop use. Glass sets up its login integration and opens **glass permissions** when
+   a grant is missing. Existing permissions are reused.
+4. Complete **Accessibility** first, then **Screen Recording**, one at a time. **Request…** asks
+   macOS for consent. Finish any native prompt and grant Glass access in System Settings, then
+   close System Settings and return to the Glass checklist.
+   If Request does not show a prompt, click **Open Settings…** on that permission's row. Enable
+   Glass under **Privacy & Security → Accessibility** or **Screen & System Audio Recording**
+   (**Screen Recording** on older macOS). If Glass is absent, use **+** to add
+   `/Applications/GlassMcp.app`. The checklist reports when access is still pending or Settings
+   could not be opened; it does not assume that requesting permission granted it.
+5. After granting the missing permissions, choose **Re-check**. This restarts Glass to read the
+   updated grants. If macOS offers **Quit & Reopen** for Screen Recording, choose it instead.
+   Once both grants are available, the checklist is replaced by the **glass ●** menu bar.
+   Closing the Glass checklist itself quits that instance; reopen `GlassMcp.app` to continue.
+   Compatible signed updates reuse existing grants (see [the permission model](../explanation/macos-permissions.md)).
 
 That's the whole setup. The MCP endpoint is `http://127.0.0.1:7300/` — head to
 [Connect your agent](connect-an-agent.md#over-http).

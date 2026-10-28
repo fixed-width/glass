@@ -2,7 +2,7 @@
 //! TCC permission glass needs, driven on the main-thread AppKit run loop. Like
 //! [`crate::menubar`], this module owns *only* the AppKit surface — the host (`glass-mcp`)
 //! supplies each row's label + current grant snapshot and boxed callbacks for the
-//! actionable buttons ("Request…" per row, "Re-check" in the footer), so this crate
+//! actionable buttons ("Request…" and "Open Settings…" per row, "Re-check" in the footer), so this crate
 //! stays free of glass-mcp's permission-probing / relaunch logic and every AppKit `unsafe`
 //! stays confined here.
 //!
@@ -19,7 +19,7 @@
 //!
 //! ## Actions
 //!
-//! Each row's "Request…" button and the footer "Re-check" button are wired to a tiny
+//! Each row action and the footer "Re-check" button are wired to a tiny
 //! per-button [`ButtonTarget`] (an `objc2` `define_class!` object holding one boxed closure),
 //! all responding to the same `fire:` selector — one instance per button, so no selector/tag
 //! dispatch is needed. A [`WindowDelegate`] terminates the process on `windowWillClose:` so
@@ -37,20 +37,17 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSNotification, NSString, NSTimer};
 
-/// One permission's row: the human label, its current grant snapshot (drives the status
-/// glyph), and the action that requests the permission's grant (macOS then shows its own
-/// consent prompt). `on_open_settings` is a boxed callback so this crate never has to know
-/// *how* the grant is requested (glass-mcp's `request_*` calls).
+/// One permission's observed state and its explicit user actions.
 pub struct GrantRow {
-    /// The permission's display name (e.g. `"Screen Recording"`).
+    /// The permission's display name.
     pub label: &'static str,
-    /// Whether the permission is currently granted — snapshot taken by the host just before
-    /// building the window. Drives the ✓ / ○ status glyph; never re-read here.
+    /// The grant snapshot from this process launch.
     pub granted: bool,
-    /// "Request…" — request this permission's grant. macOS shows its own consent prompt in
-    /// response (whose "Open System Settings" button navigates to the pane); this callback
-    /// does not open Settings itself. Invoked on the main thread.
-    pub on_open_settings: Box<dyn Fn()>,
+    /// Request native consent and report whether access is currently available.
+    /// A false result does not establish whether macOS displayed a prompt.
+    pub on_request: Box<dyn Fn() -> bool>,
+    /// Open this permission's Settings pane only when the user chooses that action.
+    pub on_open_settings: Box<dyn Fn() -> Result<(), String>>,
 }
 
 /// What the host asks the checklist window to show and do: one [`GrantRow`] per permission
@@ -181,8 +178,7 @@ impl WindowDelegate {
 // Fixed-frame layout (points): rows are placed with plain frames, computed top-down and
 // converted to AppKit's bottom-left origin by `rect`.
 //
-// These constants are eyeballed, not measured against a real render.
-const WIDTH: f64 = 480.0;
+const WIDTH: f64 = 640.0;
 const H_MARGIN: f64 = 24.0;
 const V_MARGIN: f64 = 20.0;
 const INSTRUCTION_H: f64 = 72.0;
@@ -194,9 +190,12 @@ const GLYPH_GAP: f64 = 8.0;
 const LABEL_BUTTON_GAP: f64 = 12.0;
 const BUTTON_W: f64 = 130.0;
 const FOOTER_H: f64 = 32.0;
+const ACTION_H: f64 = 96.0;
+const ACTION_GAP: f64 = 8.0;
 
 const CONTENT_W: f64 = WIDTH - 2.0 * H_MARGIN;
-const LABEL_W: f64 = CONTENT_W - GLYPH_W - GLYPH_GAP - LABEL_BUTTON_GAP - BUTTON_W;
+const LABEL_W: f64 =
+    CONTENT_W - GLYPH_W - GLYPH_GAP - LABEL_BUTTON_GAP - BUTTON_W * 2.0 - ACTION_GAP;
 
 /// Height of the row list (or one line in the defensive empty-`rows` case). Shared by
 /// [`content_height`] (total window height) and the footer's top offset in [`run_checklist`]
@@ -213,7 +212,15 @@ fn body_height(n_rows: usize) -> f64 {
 /// Total content height, driven by how many rows there are (or one line in the defensive
 /// empty-`rows` case).
 fn content_height(n_rows: usize) -> f64 {
-    V_MARGIN + INSTRUCTION_H + SECTION_GAP + body_height(n_rows) + SECTION_GAP + FOOTER_H + V_MARGIN
+    V_MARGIN
+        + INSTRUCTION_H
+        + SECTION_GAP
+        + body_height(n_rows)
+        + SECTION_GAP
+        + ACTION_H
+        + SECTION_GAP
+        + FOOTER_H
+        + V_MARGIN
 }
 
 /// Converts a top-down `(x, top, w, h)` box into an AppKit bottom-left-origin [`CGRect`]
@@ -302,7 +309,7 @@ pub fn run_checklist_with_poll(
     // system font is large.
     let instruction = NSTextField::wrappingLabelWithString(
         &NSString::from_str(
-            "glass needs these macOS permissions to drive apps. Grant each, then re-check.",
+            "Allow Accessibility first, then Screen Recording. Request asks macOS for consent. If no prompt appears, choose Open Settings… for that permission. After granting access, choose Re-check or macOS’s Quit & Reopen.",
         ),
         mtm,
     );
@@ -317,9 +324,19 @@ pub fn run_checklist_with_poll(
 
     let body_top = V_MARGIN + INSTRUCTION_H + SECTION_GAP;
 
+    let action_top = body_top + body_height(n_rows) + SECTION_GAP;
+    let action_status = NSTextField::wrappingLabelWithString(
+        &NSString::from_str(
+            "Complete only missing permissions. Opening Settings does not grant access automatically.",
+        ),
+        mtm,
+    );
+    action_status.setFrame(rect(content_h, H_MARGIN, action_top, CONTENT_W, ACTION_H));
+    container.addSubview(&action_status);
+
     // Every per-button target lives here for the whole run loop (`fire:` targets are weak
     // references — see the module doc).
-    let mut button_targets: Vec<Retained<ButtonTarget>> = Vec::with_capacity(rows.len() + 1);
+    let mut button_targets: Vec<Retained<ButtonTarget>> = Vec::with_capacity(rows.len() * 2 + 1);
     let mut row_controls = Vec::new();
 
     if rows.is_empty() {
@@ -348,7 +365,24 @@ pub fn run_checklist_with_poll(
             container.addSubview(&name);
 
             // "Request…" button → this row's boxed action, via its own target.
-            let target = ButtonTarget::new(mtm, row.on_open_settings);
+            let label = row.label;
+            let request_status = action_status.clone();
+            let target = ButtonTarget::new(
+                mtm,
+                Box::new(move || {
+                    let available = (row.on_request)();
+                    let message = if available {
+                        format!(
+                            "{label} is available to this process. After finishing any remaining permission, choose Re-check."
+                        )
+                    } else {
+                        format!(
+                            "{label} is not available to this process yet. Finish any macOS consent prompt. If no prompt appears, choose Open Settings… on this row and enable Glass, then return here and choose Re-check."
+                        )
+                    };
+                    request_status.setStringValue(&NSString::from_str(&message));
+                }),
+            );
             // SAFETY: `buttonWithTitle:target:action:` is `unsafe` because the target must
             // respond to the action selector — `target` is a live `ButtonTarget` (kept in
             // `button_targets` for the whole run loop) that implements `fire:`, and
@@ -362,15 +396,50 @@ pub fn run_checklist_with_poll(
                 )
             };
             button.setFrame(rect(content_h, button_x, row_top, BUTTON_W, ROW_H));
+            button.setEnabled(!row.granted);
             container.addSubview(&button);
-            row_controls.push((glyph_label, button));
             button_targets.push(target);
+            let settings_status = action_status.clone();
+            let settings_target = ButtonTarget::new(
+                mtm,
+                Box::new(move || {
+                    let message = match (row.on_open_settings)() {
+                        Ok(()) => format!(
+                            "In System Settings → Privacy & Security, enable Glass for {label}. If Glass is absent, use + to add /Applications/GlassMcp.app. Return here and choose Re-check after granting the missing permissions."
+                        ),
+                        Err(error) => format!(
+                            "Could not open Settings for {label}: {error}. Open System Settings → Privacy & Security manually, enable Glass, then choose Re-check."
+                        ),
+                    };
+                    settings_status.setStringValue(&NSString::from_str(&message));
+                }),
+            );
+            // SAFETY: the retained target implements fire: and outlives the control.
+            let settings = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("Open Settings…"),
+                    Some(&settings_target),
+                    Some(sel!(fire:)),
+                    mtm,
+                )
+            };
+            settings.setFrame(rect(
+                content_h,
+                button_x + BUTTON_W + ACTION_GAP,
+                row_top,
+                BUTTON_W,
+                ROW_H,
+            ));
+            settings.setEnabled(!row.granted);
+            container.addSubview(&settings);
+            row_controls.push((glyph_label, button, settings));
+            button_targets.push(settings_target);
         }
     }
 
     // Footer "Re-check" button (right-aligned), below the body. The body is a single
     // "ready"/empty line when there are no rows, otherwise the `n_rows` checklist rows.
-    let footer_top = body_top + body_height(n_rows) + SECTION_GAP;
+    let footer_top = action_top + ACTION_H + SECTION_GAP;
     let recheck_target = ButtonTarget::new(mtm, on_recheck);
     // SAFETY: identical contract to the per-row buttons above — `recheck_target` is a live
     // `ButtonTarget` implementing `fire:`, kept alive in `button_targets` across the run
@@ -418,13 +487,16 @@ pub fn run_checklist_with_poll(
             Box::new(move || {
                 if let Some(update) = poll() {
                     instruction.setStringValue(&NSString::from_str(&update.message));
-                    for ((glyph, button), granted) in row_controls.iter().zip(update.granted) {
+                    for ((glyph, button, settings), granted) in
+                        row_controls.iter().zip(update.granted)
+                    {
                         glyph.setStringValue(&NSString::from_str(if granted {
                             "✓"
                         } else {
                             "○"
                         }));
                         button.setEnabled(!granted);
+                        settings.setEnabled(!granted);
                     }
                     if update.finished {
                         window.close();
