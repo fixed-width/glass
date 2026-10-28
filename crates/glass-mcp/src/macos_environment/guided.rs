@@ -152,6 +152,7 @@ pub(super) fn diagnostic_phase() -> anyhow::Result<Phase> {
 }
 
 pub(super) struct Options<'a> {
+    pub inline_permissions: bool,
     pub name: &'a str,
     pub create: Option<crate::macos_account::Password>,
     pub non_interactive: bool,
@@ -166,6 +167,7 @@ pub(super) struct Options<'a> {
 pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> anyhow::Result<()> {
     let _setup = lock_setup()?;
     let Options {
+        inline_permissions,
         name,
         create,
         non_interactive,
@@ -254,6 +256,7 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
     })();
     registered?;
     wait_registered(
+        inline_permissions,
         name,
         non_interactive,
         system_dialog,
@@ -284,10 +287,11 @@ pub(super) fn continue_existing(
     mut progress: impl FnMut(Progress),
 ) -> anyhow::Result<()> {
     let _setup = lock_setup()?;
-    wait_registered(name, false, true, cancelled, &mut progress, || Ok(()))
+    wait_registered(true, name, false, true, cancelled, &mut progress, || Ok(()))
 }
 
 fn wait_registered(
+    inline_permissions: bool,
     name: &str,
     non_interactive: bool,
     system_dialog: bool,
@@ -312,15 +316,24 @@ fn wait_registered(
         }
 
         if current != Phase::Ready && previous.as_ref() != Some(&current) {
-            progress(Progress::for_phase(&current, name));
+            let mut update = Progress::for_phase(&current, name);
+            if inline_permissions {
+                update.message = current.wizard_message(name);
+            }
+            progress(update);
             previous = Some(current.clone());
         }
         let cancelled_now = cancelled.load(Ordering::Relaxed);
-        match coordinator.next(&current, cancelled_now) {
+        let decision = if inline_permissions {
+            coordinator.next_inline(&current, cancelled_now)
+        } else {
+            coordinator.next(&current, cancelled_now)
+        };
+        match decision {
             Decision::Finish => {
                 progress(
                     Progress::applying("Verifying workspace recovery and MCP integration…")
-                        .at(glass_macos::setup_window::SetupStep::ReturnToOwner),
+                        .at(glass_macos::setup_window::SetupStep::Checking),
                 );
                 ensure!(
                     !cancelled.load(Ordering::Relaxed),

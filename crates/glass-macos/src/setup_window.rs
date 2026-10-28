@@ -17,6 +17,7 @@ use crate::onboarding_window::{ButtonTarget, PollTimer};
 
 #[derive(Clone)]
 pub struct SetupProgress {
+    pub permission_grants: Option<[bool; 2]>,
     pub creation_blocker: Option<String>,
     pub account: String,
     pub message: String,
@@ -60,6 +61,7 @@ impl SetupProgress {
 
     /// Clear account-dependent actions only after successful enrollment removal.
     pub fn isolation_disabled(&mut self) {
+        self.permission_grants = None;
         self.creation_blocker = None;
         self.start_account = None;
         self.resume_creation = None;
@@ -115,6 +117,7 @@ impl SetupStep {
 }
 
 pub struct SetupActions {
+    pub permission_rows: Vec<crate::onboarding_window::GrantRow>,
     pub account: String,
     pub on_resume: Option<Box<dyn FnOnce()>>,
     pub resume_creation: Option<ResumeCreation>,
@@ -456,7 +459,21 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         "Create an account, or enter an existing account's short name and choose Use existing account.",
         rect(24.0, 26.0, 672.0, 140.0),
     );
-    scroll.setDocumentView(Some(&document));
+    let permission_controls = Rc::new(crate::onboarding_window::GrantControls::new(
+        mtm,
+        actions.permission_rows,
+        672.0,
+        "Return to this step; Glass checks automatically while setup is running. Otherwise choose Continue setup. If macOS offers Quit & Reopen, choose Later so this wizard stays open.",
+    ));
+    let permission_height = permission_controls.height + 16.0;
+    permission_controls
+        .view
+        .setFrameOrigin(CGPoint { x: 24.0, y: 8.0 });
+    permission_controls.view.setHidden(true);
+    let combined = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
+    combined.addSubview(&document);
+    combined.addSubview(&permission_controls.view);
+    scroll.setDocumentView(Some(&combined));
     view.addSubview(&scroll);
 
     let account =
@@ -596,11 +613,43 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let close = button(mtm, "Close", rect(556.0, 20.0, 140.0, 32.0), &close_target);
     view.addSubview(&close);
 
+    let permission_document = document.clone();
+    let permission_combined = combined.clone();
+    let initial_permissions = permission_controls.view.clone();
     let refresh: Rc<dyn Fn()> = Rc::new(move || {
         let progress = poll();
         let name = account.stringValue().to_string();
         let step = progress.display_step(&name);
         update_label(&heading, step.heading());
+        let permissions_visible = progress.account == name
+            && step == SetupStep::Permissions
+            && progress.permission_grants.is_some();
+        let entering_permissions = permissions_visible && permission_controls.view.isHidden();
+        permission_controls.update(
+            progress.permission_grants.unwrap_or([false, false]),
+            permissions_visible && progress.can_cancel,
+        );
+        permission_controls.view.setHidden(!permissions_visible);
+        status.setFrame(rect(
+            24.0,
+            26.0,
+            672.0,
+            if permissions_visible { 72.0 } else { 140.0 },
+        ));
+        let offset = if permissions_visible {
+            permission_height
+        } else {
+            0.0
+        };
+        permission_combined.setFrameSize(CGSize {
+            width: 720.0,
+            height: 650.0 + offset,
+        });
+        permission_document.setFrameOrigin(CGPoint { x: 0.0, y: offset });
+        if entering_permissions {
+            permission_combined.scrollPoint(CGPoint { x: 0.0, y: 0.0 });
+        }
+
         update_label(&setup_notice, progress.creation_blocker.as_deref().unwrap_or("Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; authentication and setup waits have no time limit."));
         for (index, (label, (title, _))) in step_labels.iter().zip(titles.iter()).enumerate() {
             update_label(label, &step.row_title(index, title));
@@ -645,9 +694,13 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.setContentView(Some(&view));
     window.center();
     window.makeKeyAndOrderFront(None);
-    document.scrollPoint(CGPoint {
+    combined.scrollPoint(CGPoint {
         x: 0.0,
-        y: (650.0 - scroll.frame().size.height).max(0.0),
+        y: if initial_permissions.isHidden() {
+            (650.0 - scroll.frame().size.height).max(0.0)
+        } else {
+            0.0
+        },
     });
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
@@ -684,6 +737,7 @@ mod tests {
     #[test]
     fn editing_selection_preserves_disable_failure_and_its_enrolled_account() {
         let progress = SetupProgress {
+            permission_grants: None,
             creation_blocker: Some("account_a is enrolled".into()),
             account: "account_a".into(),
             message: "Could not disable isolation: graphical domain is unavailable".into(),
@@ -704,6 +758,7 @@ mod tests {
     #[test]
     fn enrolled_account_blocks_password_dialog_even_after_editing_selection() {
         let mut progress = SetupProgress {
+            permission_grants: None,
             creation_blocker: Some("account_a is enrolled. Disable isolation first.".into()),
             account: "account_a".into(),
             message: String::new(),
@@ -725,6 +780,7 @@ mod tests {
     #[test]
     fn rejected_selection_cannot_rebind_another_accounts_ready_state() {
         let mut progress = SetupProgress {
+            permission_grants: None,
             creation_blocker: None,
             account: "account_a".into(),
             message: String::new(),

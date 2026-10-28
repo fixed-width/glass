@@ -1145,6 +1145,7 @@ pub fn setup(
 ) -> anyhow::Result<()> {
     guided::run(
         guided::Options {
+            inline_permissions: false,
             name,
             create: None,
             non_interactive,
@@ -1285,6 +1286,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         )
     };
     let state = Arc::new(Mutex::new(SetupProgress {
+        permission_grants: None,
         creation_blocker,
         account: account.clone(),
         message,
@@ -1363,6 +1365,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             std::thread::spawn(move || {
                 let result = guided::run(
                     guided::Options {
+                        inline_permissions: true,
                         name: &name,
                         create,
                         non_interactive: false,
@@ -1381,6 +1384,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                                 pending.remember(id);
                             }
                             state.message = progress.message;
+                            state.permission_grants = progress.permission_grants;
                             if let Some(step) = progress.step {
                                 state.step = step;
                             }
@@ -1401,6 +1405,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 }
                 let creation_blocker = account_creation::creation_blocker();
                 if let Ok(mut state) = state.lock() {
+                    if result.is_err() {
+                        state.permission_grants = None;
+                    }
                     state.creation_blocker = creation_blocker;
                     if result.is_ok() {
                         state.resume_creation = None;
@@ -1490,6 +1497,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 |progress| {
                     if let Ok(mut state) = state.lock() {
                         state.message = progress.message;
+                        state.permission_grants = progress.permission_grants;
                         if let Some(step) = progress.step {
                             state.step = step;
                         }
@@ -1507,6 +1515,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                         state.resume_creation = None;
                     }
                     state.message = progress.message;
+                    state.permission_grants = progress.permission_grants;
                     if let Some(step) = progress.step {
                         state.step = step;
                     }
@@ -1524,6 +1533,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     let addr = saved.addr.clone();
                     guided::run(
                         guided::Options {
+                            inline_permissions: true,
                             name: &name,
                             create: None,
                             non_interactive: false,
@@ -1587,6 +1597,10 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 if let Ok(mut state) = diagnostic_state.lock() {
                     state.running = false;
                     state.can_cancel = true;
+                    state.permission_grants = phase
+                        .as_ref()
+                        .ok()
+                        .and_then(|phase| phase.permission_grants());
                     if let Some(step) = phase.as_ref().ok().and_then(|phase| phase.setup_step()) {
                         state.step = step;
                     }
@@ -1602,7 +1616,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                         })
                         .and_then(|_| desktop_start::choice(&name).ok());
                     state.message = match phase {
-                        Ok(phase) => phase.message(&name),
+                        Ok(phase) => phase.wizard_message(&name),
                         Err(error) => format!("Desktop status needs attention: {error:#}"),
                     };
                 }
@@ -1610,6 +1624,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }
     }
     let actions = SetupActions {
+        permission_rows: crate::onboarding::grant_row_widgets(),
         account,
         resume_creation,
         on_resume: automatic.map(|saved| {
@@ -1702,6 +1717,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
+            permission_grants: None,
             creation_blocker: Some("Setup state is unavailable. Reopen application setup before creating an account.".into()),
             message: "Setup state is unavailable. Close this window and open application setup again.".into(), account: String::new(), step: SetupStep::Checking, running: false, can_cancel: true, start_account: None, resume_creation: None,
         })

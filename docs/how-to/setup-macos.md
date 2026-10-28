@@ -48,12 +48,14 @@ Stop any current Glass application with `glass_stop` before changing its environ
 5. Back in **glass → Application setup…**, choose **Start environment…** for the selected account.
    Enter its password locally and complete any separate macOS administrator prompt. Glass starts
    its private desktop without switching your visible desktop. Wait for **Ready**.
-   Accessibility and Screen Recording approvals for the same signed Glass app are reused across
-   accounts. If Glass reports a missing grant, complete only that grant from your normal account
-   under **System Settings → Privacy & Security → Accessibility** or **Screen & System Audio
-   Recording** (called **Screen Recording** on older versions). If Glass is absent from a list,
-   use **+** to add `/Applications/GlassMcp.app`. No second installation or Terminal command is
-   needed. Glass checks the actual worker's permissions in fresh processes automatically.
+   If permissions are missing, this same numbered step shows their status and **Request…** /
+   **Open Settings…** buttons. Request asks macOS for consent; Open Settings goes directly to that
+   permission's pane. Approve only missing grants from your normal account, then return to this
+   wizard. Keep it open: while setup is checking, fresh worker checks detect grants and continue
+   automatically. If checking is paused, choose **Continue setup**.
+   If macOS offers **Quit & Reopen**, choose **Later** during this wizard; its permission checks use
+   fresh workers, so the wizard does not need to restart. The same signed app reuses approvals across
+   accounts. If Glass is absent from the Settings list, add `/Applications/GlassMcp.app` with **+**.
    Choose **Continue setup** if checking is paused with the development desktop running. Glass checks workspace recovery
    and verifies the actual worker's readiness before reporting **Ready**. Registration repair may
    request administrator authentication. A failed repair stops with its cause and retains completed

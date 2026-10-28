@@ -146,9 +146,31 @@ impl Phase {
                 Some(SetupStep::SignIn)
             }
             Self::PermissionsRequired { .. } => Some(SetupStep::Permissions),
-            Self::ReturnToOwner | Self::FinishingPermissions => Some(SetupStep::ReturnToOwner),
+            Self::ReturnToOwner => Some(SetupStep::ReturnToOwner),
+            Self::FinishingPermissions => Some(SetupStep::Checking),
             Self::Ready => Some(SetupStep::Ready),
             Self::StartupCleanupRequired | Self::Busy | Self::RepairRequired(_) => None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn wizard_message(&self, account: &str) -> String {
+        if matches!(self, Self::PermissionsRequired { .. }) {
+            "Allow the missing permissions using the controls in this step. Open Settings goes directly to the matching permission pane. Keep this wizard open. While setup is checking, grant updates continue automatically; if checking is paused, choose Continue setup. If macOS offers Quit & Reopen, choose Later.".into()
+        } else {
+            self.message(account)
+        }
+    }
+
+    pub(crate) fn permission_grants(&self) -> Option<[bool; 2]> {
+        match self {
+            Self::PermissionsRequired {
+                accessibility,
+                screen_recording,
+                ..
+            } => Some([!accessibility, !screen_recording]),
+            Self::Ready | Self::ReturnToOwner | Self::FinishingPermissions => Some([true, true]),
+            _ => None,
         }
     }
 
@@ -197,7 +219,7 @@ impl Phase {
             Self::ReturnToOwner => format!(
                 "Glass has its permissions. After finishing macOS welcome screens in {account}, you can choose Apple menu → Log Out and sign back in to your normal account. Choose Start environment… here if its desktop is stopped. If checking has paused with its desktop running, choose Continue setup. Wait for Ready."
             ),
-            Self::FinishingPermissions => "Permissions confirmed. Waiting for the permission window to finish before checking workspace recovery…".into(),
+            Self::FinishingPermissions => "Permissions confirmed. Finishing permission checks before workspace recovery…".into(),
             Self::Ready => format!("{account} ready; apps use its private desktop through the normal MCP tools"),
             Self::Busy => "The Glass environment is in use. Let the current check finish or stop application work, then retry. Setup has not interrupted it.".into(),
             Self::RepairRequired(reason) => format!("Glass setup needs attention: {reason}"),
@@ -223,6 +245,7 @@ pub(crate) struct Coordinator {
 
 #[cfg(target_os = "macos")]
 pub(crate) struct Progress {
+    pub permission_grants: Option<[bool; 2]>,
     pub message: String,
     pub step: Option<glass_macos::setup_window::SetupStep>,
     pub can_cancel: bool,
@@ -233,6 +256,7 @@ pub(crate) struct Progress {
 impl Progress {
     pub(crate) fn applying(message: impl Into<String>) -> Self {
         Self {
+            permission_grants: None,
             message: message.into(),
             step: None,
             can_cancel: false,
@@ -241,6 +265,7 @@ impl Progress {
     }
     pub(crate) fn waiting(message: impl Into<String>) -> Self {
         Self {
+            permission_grants: None,
             message: message.into(),
             step: None,
             can_cancel: true,
@@ -256,6 +281,7 @@ impl Progress {
     pub(crate) fn for_phase(phase: &Phase, account: &str) -> Self {
         let mut progress = Self::waiting(phase.message(account));
         progress.step = phase.setup_step();
+        progress.permission_grants = phase.permission_grants();
         progress
     }
 }
@@ -274,11 +300,25 @@ impl Coordinator {
         self.next_at(phase, cancelled, std::time::Instant::now())
     }
 
+    pub(crate) fn next_inline(&mut self, phase: &Phase, cancelled: bool) -> Decision {
+        self.next_at_presented(phase, cancelled, std::time::Instant::now(), true)
+    }
+
     pub(crate) fn repair_completed(&mut self) {
         self.worker_wait = None;
     }
 
     fn next_at(&mut self, phase: &Phase, cancelled: bool, now: std::time::Instant) -> Decision {
+        self.next_at_presented(phase, cancelled, now, false)
+    }
+
+    fn next_at_presented(
+        &mut self,
+        phase: &Phase,
+        cancelled: bool,
+        now: std::time::Instant,
+        inline: bool,
+    ) -> Decision {
         if cancelled {
             return Decision::Stop;
         }
@@ -289,6 +329,7 @@ impl Coordinator {
             Phase::Ready => Decision::Finish,
             Phase::Busy => Decision::Stop,
             _ if !self.interactive => Decision::Stop,
+            Phase::PermissionsRequired { .. } if inline => Decision::Wait,
             Phase::WorkerStarting => {
                 let started = self.worker_wait.get_or_insert(now);
                 if now.saturating_duration_since(*started) < std::time::Duration::from_secs(10) {
@@ -726,6 +767,59 @@ mod tests {
                 .message("dev")
                 .contains("connection refused")
         );
+    }
+
+    #[test]
+    fn inline_wait_preserves_startup_grace_without_opening_another_window() {
+        let mut coordinator = Coordinator::new(true);
+        let permission = Phase::PermissionsRequired {
+            accessibility: false,
+            screen_recording: true,
+            helper_running: false,
+        };
+        let start = std::time::Instant::now();
+        assert_eq!(
+            coordinator.next_at_presented(&Phase::WorkerStarting, false, start, true),
+            Decision::Wait
+        );
+        for _ in 0..3 {
+            assert_eq!(coordinator.next_inline(&permission, false), Decision::Wait);
+        }
+        assert_eq!(
+            coordinator.next_at_presented(
+                &Phase::WorkerStarting,
+                false,
+                start + std::time::Duration::from_secs(30),
+                true
+            ),
+            Decision::Wait
+        );
+        assert_eq!(coordinator.next_inline(&permission, true), Decision::Stop);
+        assert_eq!(
+            coordinator.next_inline(&Phase::Ready, false),
+            Decision::Finish
+        );
+    }
+
+    #[test]
+    fn permission_controls_receive_granted_facts_instead_of_missing_flags() {
+        for accessibility in [false, true] {
+            for screen_recording in [false, true] {
+                let phase = Readiness {
+                    private_session: true,
+                    login_setup_pending: false,
+                    accessibility,
+                    screen_recording,
+                    onboarding_running: false,
+                }
+                .phase();
+                assert_eq!(
+                    phase.permission_grants(),
+                    Some([accessibility, screen_recording])
+                );
+            }
+        }
+        assert_eq!(Phase::LoginRequired.permission_grants(), None);
     }
 
     #[test]

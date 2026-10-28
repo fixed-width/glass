@@ -44,6 +44,9 @@ internal refactors, CI, or test-only changes.
   Disabling isolation and uninstalling handle a logged-out development account after independently
   checking that Glass jobs and processes are absent. Other macOS services and the account are kept.
   Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
+  Missing-permission controls and live grant status are embedded in the numbered Application setup
+  step. Users can request consent or open the exact Settings pane without closing the wizard or
+  switching to a separate Glass window. Fresh worker checks advance the same wizard to Ready.
   The permission checklist shows request results and separate Open Settings actions for cases
   where macOS does not show another consent prompt. Settings failures remain visible during checks.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
