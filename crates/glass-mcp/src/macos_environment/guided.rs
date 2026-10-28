@@ -197,6 +197,9 @@ pub(super) fn run(options: Options<'_>, mut progress: impl FnMut(Progress)) -> a
             return Err(pending::Superseded.into());
         }
     }
+    if create.is_some() {
+        account_creation::check_creation_target(name)?;
+    }
     let identity = if create.is_some() {
         account_creation::completed_identity(rustix::process::getuid().as_raw(), name)?
     } else {

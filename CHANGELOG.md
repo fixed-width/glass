@@ -39,6 +39,8 @@ internal refactors, CI, or test-only changes.
   sign in manually to finish macOS welcome screens, log out and return to the normal account,
   then choose Start environment and wait for verified Ready. Existing Glass permissions are reused
   across accounts; missing grants can be approved from the normal account.
+  The wizard identifies an existing enrollment and requires Disable isolation before opening
+  another account-creation dialog. A rejected creation leaves saved setup progress untouched.
   Enrollment applies per normal user. `status` and `doctor` recognize enrollment; `glass-mcp unenroll`
   restores shared-desktop use while keeping the app, development account and MCP startup integration.
   Uninstall also removes startup integration while retaining the account, home and app data.

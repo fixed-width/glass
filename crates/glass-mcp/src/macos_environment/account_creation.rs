@@ -137,6 +137,35 @@ fn finish_exchange(
     }
 }
 
+pub(super) fn creation_blocker() -> Option<String> {
+    let current = (|| -> anyhow::Result<Option<String>> {
+        if !owner_root()?.join(ACCOUNT).try_exists()? {
+            return Ok(None);
+        }
+        let name = read_enrollment()?.name;
+        Ok(Some(format!(
+            "{name} is already enrolled. To create another development account, choose Disable isolation first. The existing account and its files will be kept. Reinstalling Glass keeps enrollment."
+        )))
+    })();
+    match current {
+        Ok(blocker) => blocker,
+        Err(error) => Some(format!(
+            "Existing enrollment needs attention: {error:#}. Resolve it before creating another account; existing files are retained."
+        )),
+    }
+}
+
+pub(super) fn check_creation_target(name: &str) -> anyhow::Result<()> {
+    if owner_root()?.join(ACCOUNT).try_exists()? {
+        let enrolled = read_enrollment()?.name;
+        ensure!(
+            enrolled == name,
+            "{enrolled} is already enrolled. Choose Disable isolation before creating another development account. The existing account and its files will be kept."
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn create(name: &str, password: &Password, system_dialog: bool) -> anyhow::Result<()> {
     validate_name(name)?;
     let owner = rustix::process::getuid().as_raw();
@@ -144,12 +173,7 @@ pub(super) fn create(name: &str, password: &Password, system_dialog: bool) -> an
         owner >= 501 && rustix::process::geteuid().as_raw() == owner,
         "create the development account from your normal account"
     );
-    if owner_root()?.join(ACCOUNT).try_exists()? {
-        ensure!(
-            read_enrollment()?.name == name,
-            "a different development account is enrolled; disable it before creating another"
-        );
-    }
+    check_creation_target(name)?;
     let creation_root = Path::new(private_session::ROOT).join("account-creation");
     if !creation_root.join(format!("{name}.plist")).try_exists()? {
         glass_macos::account_setup::require_unused_name(name).map_err(anyhow::Error::msg)?;

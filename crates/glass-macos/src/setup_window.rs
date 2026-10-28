@@ -17,6 +17,7 @@ use crate::onboarding_window::{ButtonTarget, PollTimer};
 
 #[derive(Clone)]
 pub struct SetupProgress {
+    pub creation_blocker: Option<String>,
     pub account: String,
     pub message: String,
     pub step: SetupStep,
@@ -33,6 +34,10 @@ impl SetupProgress {
         } else {
             SetupStep::Account
         }
+    }
+
+    fn can_create(&self) -> bool {
+        !self.running && self.creation_blocker.is_none()
     }
 
     fn can_continue(&self, account: &str) -> bool {
@@ -371,7 +376,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     scroll.setAutohidesScrollers(true);
     scroll.setDrawsBackground(false);
     let document = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
-    instruction_label(
+    let setup_notice = instruction_label(
         mtm,
         &document,
         "Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; authentication and setup waits have no time limit.",
@@ -510,7 +515,11 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let resume_creation = Rc::new(std::cell::RefCell::new(actions.resume_creation));
     let automatic_creation = resume_creation.borrow().is_some();
     let create_resume = resume_creation.clone();
+    let create_poll = poll.clone();
     let create_action: Rc<dyn Fn() -> bool> = Rc::new(move || {
+        if !create_poll().can_create() {
+            return false;
+        }
         let name = create_field.stringValue().to_string();
         let resume = create_resume.borrow().clone();
         if let Some(request) = create_account_dialog(
@@ -567,6 +576,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         let matches = progress.account == name;
         let step = progress.display_step(&name);
         update_label(&heading, step.heading());
+        update_label(&setup_notice, progress.creation_blocker.as_deref().unwrap_or("Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; authentication and setup waits have no time limit."));
         for (index, (label, (title, _))) in step_labels.iter().zip(titles.iter()).enumerate() {
             update_label(label, &step.row_title(index, title));
         }
@@ -585,12 +595,13 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
             .as_ref()
             .is_some_and(|start| start.name == name);
         let can_continue = progress.can_continue(&name);
+        let can_create = progress.can_create();
         *start_account.borrow_mut() = progress.start_account;
         *resume_creation.borrow_mut() = progress.resume_creation;
         start_button.setEnabled(!progress.running && starting);
         continue_button.setEnabled(can_continue);
         begin.setEnabled(!progress.running);
-        create.setEnabled(!progress.running);
+        create.setEnabled(can_create);
         disable.setEnabled(!progress.running);
         account.setEnabled(!progress.running);
         close.setEnabled(!progress.running || progress.can_cancel);
@@ -653,8 +664,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enrolled_account_blocks_password_dialog_even_after_editing_selection() {
+        let mut progress = SetupProgress {
+            creation_blocker: Some("account_a is enrolled. Disable isolation first.".into()),
+            account: "account_a".into(),
+            message: String::new(),
+            step: SetupStep::Ready,
+            running: false,
+            can_cancel: true,
+            start_account: None,
+            resume_creation: None,
+        };
+        assert!(!progress.can_create());
+        assert_eq!(progress.display_step("account_b"), SetupStep::Account);
+        assert!(!progress.can_create());
+        progress.creation_blocker = None;
+        assert!(progress.can_create());
+        progress.running = true;
+        assert!(!progress.can_create());
+    }
+
+    #[test]
     fn rejected_selection_cannot_rebind_another_accounts_ready_state() {
         let mut progress = SetupProgress {
+            creation_blocker: None,
             account: "account_a".into(),
             message: String::new(),
             step: SetupStep::SignIn,

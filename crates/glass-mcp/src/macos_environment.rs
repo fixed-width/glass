@@ -1237,6 +1237,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         saved.as_ref().map(|saved| saved.name.as_str()),
         creation.as_ref().ok().and_then(|receipt| receipt.as_ref()),
     );
+    let creation_blocker = account_creation::creation_blocker();
     let message = if let Some(Err(error)) = existing {
         format!(
             "Existing setup needs attention: {error:#}. Enter the development account name to check it. Glass will preserve unverified registration files."
@@ -1283,6 +1284,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         )
     };
     let state = Arc::new(Mutex::new(SetupProgress {
+        creation_blocker,
         account: account.clone(),
         message,
         step: if account.is_empty() {
@@ -1318,6 +1320,13 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 Err(_) => return,
             };
             if state.running {
+                return;
+            }
+            if create.is_some()
+                && let Err(error) = account_creation::check_creation_target(&name)
+            {
+                state.creation_blocker = Some(error.to_string());
+                state.message = error.to_string();
                 return;
             }
             let previous = match begin_pending.lock() {
@@ -1389,7 +1398,9 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     let details: String = format!("{error:#}").chars().take(8192).collect();
                     eprintln!("glass: application setup failed: {details}");
                 }
+                let creation_blocker = account_creation::creation_blocker();
                 if let Ok(mut state) = state.lock() {
+                    state.creation_blocker = creation_blocker;
                     if result.is_ok() {
                         state.resume_creation = None;
                         state.step = SetupStep::Ready;
@@ -1676,6 +1687,8 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.running = false;
                     state.can_cancel = true;
                     if result.is_ok() {
+                        state.creation_blocker = None;
+                        state.start_account = None;
                         state.resume_creation = None;
                         state.step = SetupStep::Account;
                     }
@@ -1691,6 +1704,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
+            creation_blocker: Some("Setup state is unavailable. Reopen application setup before creating an account.".into()),
             message: "Setup state is unavailable. Close this window and open application setup again.".into(), account: String::new(), step: SetupStep::Checking, running: false, can_cancel: true, start_account: None, resume_creation: None,
         })
         }),

@@ -25,6 +25,9 @@ Stop any current Glass application with `glass_stop` before changing its environ
    **Glass development (NAME)**, with your chosen short name in parentheses.
    Earlier installations can leave account-creation history after uninstall; this does not enroll that
    account again or select it for a fresh setup.
+   If another account is enrolled, the wizard shows its name and disables **Create account…**.
+   Choose **Disable isolation** first to change accounts; this keeps the existing account and files.
+   Reinstalling Glass retains enrollment.
    To reuse an existing standard account, enter its short name under **Or use an existing standard
    macOS account** and click **Use existing account**. Existing
    names may contain 1–64 ASCII letters, digits or underscores. Glass never resets an existing account's password.
