@@ -163,6 +163,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSView",
     "NSScreen",
     "NSScrollView",
+    "NSBox",
+    "NSColor",
+    "NSFont",
     "NSMenu",
     "NSMenuItem",
     # The first-run permission checklist window (`onboarding_window.rs`): `NSWindow` (the

@@ -260,7 +260,7 @@ pub(crate) fn text_height(label: &NSTextField, width: f64) -> f64 {
                 + 4.0
         })
         .unwrap_or(40.0)
-        .clamp(24.0, 140.0)
+        .max(24.0)
 }
 
 /// Permission controls shared by the checklist and the current setup-wizard step.

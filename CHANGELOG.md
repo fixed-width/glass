@@ -43,7 +43,8 @@ internal refactors, CI, or test-only changes.
   Disabling isolation and uninstalling handle a logged-out development account after independently
   checking that Glass jobs and processes are absent. Other macOS services and the account are kept.
   Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
-  The current action appears above the reference guide, with text sized to its contents.
+  Live status appears inside the accented active step, with text sized to its contents.
+  Checking keeps the previous step highlighted; the guide no longer duplicates status at the top.
   App-wide permission controls stay visible inside step 4 regardless of account selection or
   setup phase, below its instructions and above step 5; redundant
   permission-action guidance is omitted while Settings errors remain visible.

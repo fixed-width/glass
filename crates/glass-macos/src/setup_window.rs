@@ -4,9 +4,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton,
-    NSModalPanelRunLoopMode, NSScreen, NSScrollView, NSSecureTextField, NSTextField, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBox, NSBoxType,
+    NSButton, NSColor, NSFont, NSModalPanelRunLoopMode, NSScreen, NSScrollView, NSSecureTextField,
+    NSTextField, NSTitlePosition, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSNotification, NSRunLoop, NSString};
@@ -116,6 +116,17 @@ impl SetupStep {
         }
     }
 
+    fn active_index(self) -> Option<usize> {
+        match self {
+            Self::Account => Some(0),
+            Self::SignIn => Some(1),
+            Self::ReturnToOwner => Some(2),
+            Self::Permissions => Some(3),
+            Self::StartEnvironment | Self::Ready => Some(4),
+            Self::Checking => None,
+        }
+    }
+
     fn row_title(self, index: usize, title: &str) -> String {
         let current = match self {
             Self::Account => Some(0),
@@ -132,6 +143,53 @@ impl SetupStep {
             _ => "",
         };
         format!("{marker}{}. {title}", index + 1)
+    }
+}
+
+struct InlineStatusLayout {
+    permission_space: f64,
+    status_space: f64,
+    status_anchor: f64,
+}
+
+impl InlineStatusLayout {
+    fn new(active: usize, controls_height: f64, status_height: f64) -> Self {
+        let permission_space = controls_height + 18.0;
+        let content_bottom = [404.0, 290.0, 200.0, 130.0, 0.0][active];
+        Self {
+            permission_space,
+            status_space: status_height + 12.0,
+            status_anchor: content_bottom - 6.0 + if active < 3 { permission_space } else { 0.0 },
+        }
+    }
+
+    fn status_shift(&self, y: f64) -> f64 {
+        if y >= self.status_anchor {
+            self.status_space
+        } else {
+            0.0
+        }
+    }
+
+    fn guide_y(&self, y: f64) -> f64 {
+        let y = y + if y >= 124.0 {
+            self.permission_space
+        } else {
+            0.0
+        };
+        y + self.status_shift(y) + 12.0
+    }
+
+    fn controls_y(&self) -> f64 {
+        130.0 + self.status_shift(130.0) + 12.0
+    }
+
+    fn status_y(&self) -> f64 {
+        self.status_anchor + 20.0
+    }
+
+    fn height(&self) -> f64 {
+        558.0 + self.permission_space + self.status_space
     }
 }
 
@@ -396,20 +454,23 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.setTitle(&NSString::from_str("Glass application setup"));
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
-    let heading = instruction_label(
-        mtm,
-        &view,
-        SetupStep::Account.heading(),
-        rect(24.0, height - 44.0, 672.0, 28.0),
-    );
     let scroll = NSScrollView::initWithFrame(
         NSScrollView::alloc(mtm),
-        rect(0.0, 108.0, 720.0, height - 164.0),
+        rect(0.0, 108.0, 720.0, height - 120.0),
     );
     scroll.setHasVerticalScroller(true);
     scroll.setAutohidesScrollers(true);
     scroll.setDrawsBackground(false);
     let document = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
+    let highlight = NSBox::initWithFrame(NSBox::alloc(mtm), rect(12.0, 0.0, 696.0, 100.0));
+    highlight.setBoxType(NSBoxType::Custom);
+    highlight.setTitlePosition(NSTitlePosition::NoTitle);
+    highlight.setBorderWidth(1.0);
+    highlight.setCornerRadius(6.0);
+    highlight.setTransparent(false);
+    highlight.setBorderColor(&NSColor::controlAccentColor());
+    highlight.setFillColor(&NSColor::controlAccentColor().colorWithAlphaComponent(0.05));
+    document.addSubview(&highlight);
     let setup_notice = instruction_label(
         mtm,
         &document,
@@ -459,12 +520,6 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         &start_instructions(&actions.account),
         rect(24.0, 104.0, 672.0, 88.0),
     );
-    let current_label = instruction_label(
-        mtm,
-        &document,
-        "What to do now",
-        rect(24.0, 174.0, 672.0, 22.0),
-    );
     let status = instruction_label(
         mtm,
         &document,
@@ -485,13 +540,8 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     permission_controls
         .view
         .setFrameOrigin(CGPoint { x: 24.0, y: 8.0 });
-    let combined = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
-    combined.addSubview(&document);
-    current_label.removeFromSuperview();
     status.removeFromSuperview();
-    combined.addSubview(&current_label);
-    combined.addSubview(&status);
-    scroll.setDocumentView(Some(&combined));
+    scroll.setDocumentView(Some(&document));
     view.addSubview(&scroll);
 
     let account =
@@ -631,8 +681,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let close = button(mtm, "Close", rect(556.0, 20.0, 140.0, 32.0), &close_target);
     view.addSubview(&close);
 
-    // The long guide follows the live task; its old status area is no longer a spacer.
-    for child in document.subviews() {
+    for child in document.subviews().into_iter().skip(1) {
         let frame = child.frame();
         child.setFrameOrigin(CGPoint {
             x: frame.origin.x,
@@ -646,85 +695,100 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let guide_frames: Vec<_> = document
         .subviews()
         .into_iter()
+        .skip(1)
         .map(|child| {
             let frame = child.frame();
             (child, frame)
         })
         .collect();
     document.addSubview(&permission_controls.view);
-    let permission_document = document.clone();
-    let permission_combined = combined.clone();
+    document.addSubview(&status);
+    let refresh_document = document.clone();
+    let refresh_highlight = highlight.clone();
     let refresh_scroll = scroll.clone();
+    let active_step = std::cell::Cell::new(0);
+    let last_active = std::cell::Cell::new(None::<usize>);
     let refresh: Rc<dyn Fn()> = Rc::new(move || {
         let progress = poll();
         let name = account.stringValue().to_string();
         let step = progress.display_step(&name);
-        update_label(&heading, step.heading());
+        let active = step.active_index().unwrap_or(active_step.get());
+        active_step.set(active);
+        let changed_step = last_active.replace(Some(active)) != Some(active);
+        let visible = refresh_document.visibleRect();
+        let visible_top = visible.origin.y + visible.size.height;
+        let at_top = visible_top >= refresh_document.frame().size.height - 1.0;
+        let old_frame = refresh_highlight.frame();
+        let follows_active =
+            (visible_top - old_frame.origin.y - old_frame.size.height - 8.0).abs() < 2.0;
         let (grants, unconfirmed) = progress.permission_display(initial_permission_grants);
-        let visible = permission_combined.visibleRect();
-        let at_top =
-            visible.origin.y + visible.size.height >= permission_combined.frame().size.height - 1.0;
         permission_controls.update(grants, progress.can_cancel);
         if unconfirmed {
             permission_controls.show_unconfirmed(progress.can_cancel);
         }
         update_label(&status, &progress.display_message(&name));
-        let status_height = crate::onboarding_window::text_height(&status, 672.0);
-        let controls_height = permission_controls.layout();
-        let permission_space = controls_height + 18.0;
-        // Insert controls between step 4's instructions and step 5, inside the guide.
+        let status_height = crate::onboarding_window::text_height(&status, 656.0);
+        let layout = InlineStatusLayout::new(active, permission_controls.layout(), status_height);
         for (child, frame) in &guide_frames {
-            let shift = if frame.origin.y >= 124.0 {
-                permission_space
-            } else {
-                0.0
-            };
             child.setFrameOrigin(CGPoint {
                 x: frame.origin.x,
-                y: frame.origin.y + shift,
+                y: layout.guide_y(frame.origin.y),
             });
         }
-        let guide_height = 546.0 + permission_space;
-        permission_document.setFrameSize(CGSize {
+        permission_controls.view.setFrameOrigin(CGPoint {
+            x: 24.0,
+            y: layout.controls_y(),
+        });
+        status.setFrame(rect(40.0, layout.status_y(), 656.0, status_height));
+        refresh_document.setFrameSize(CGSize {
             width: 720.0,
-            height: guide_height,
+            height: layout.height().max(refresh_scroll.frame().size.height),
         });
-        permission_controls
-            .view
-            .setFrameOrigin(CGPoint { x: 24.0, y: 130.0 });
-        let task_height = 22.0 + 6.0 + status_height + 12.0;
-        let guide_offset =
-            (refresh_scroll.frame().size.height - guide_height - task_height).max(0.0);
-        let total = guide_height + task_height + guide_offset;
-        permission_combined.setFrameSize(CGSize {
-            width: 720.0,
-            height: total,
-        });
-        permission_document.setFrameOrigin(CGPoint {
-            x: 0.0,
-            y: guide_offset,
-        });
-        current_label.setFrame(rect(24.0, total - 22.0, 672.0, 22.0));
-        status.setFrame(rect(
-            24.0,
-            total - 28.0 - status_height,
-            672.0,
-            status_height,
-        ));
-        if at_top {
-            permission_combined.scrollPoint(CGPoint {
+        let title = step_labels[active].frame();
+        let top = title.origin.y + title.size.height + if active == 0 { 2.0 } else { 6.0 };
+        let bottom = layout.status_y() - 6.0;
+        let active_frame = rect(12.0, bottom, 696.0, top - bottom);
+        refresh_highlight.setFrame(active_frame);
+        refresh_highlight.setTitle(&NSString::from_str(step.heading()));
+        let viewport_height = refresh_scroll.frame().size.height;
+        let scroll_top = if changed_step {
+            Some(if active == 0 {
+                refresh_document.frame().size.height
+            } else {
+                top + 8.0
+            })
+        } else if at_top {
+            Some(refresh_document.frame().size.height)
+        } else if follows_active {
+            Some(top + 8.0)
+        } else {
+            None
+        };
+        if let Some(top) = scroll_top {
+            refresh_document.scrollPoint(CGPoint {
                 x: 0.0,
-                y: (total - refresh_scroll.frame().size.height).max(0.0),
+                y: (top - viewport_height).max(0.0),
             });
         }
 
         update_label(&setup_notice, progress.creation_blocker.as_deref().unwrap_or("Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual login for macOS setup. Follow these steps in order; authentication and setup waits have no time limit."));
         for (index, (label, (title, _))) in step_labels.iter().zip(titles.iter()).enumerate() {
             update_label(label, &step.row_title(index, title));
+            let font = if index == active {
+                NSFont::boldSystemFontOfSize(14.0)
+            } else {
+                NSFont::systemFontOfSize(13.0)
+            };
+            let color = if index == active {
+                NSColor::controlAccentColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            label.setFont(Some(&font));
+            label.setTextColor(Some(&color));
         }
         update_label(&sign_in, &sign_in_instructions(&name));
         update_label(&returning, &start_instructions(&name));
-        update_label(&status, &progress.display_message(&name));
         let starting = progress
             .start_account
             .as_ref()
@@ -762,10 +826,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.setContentView(Some(&view));
     window.center();
     window.makeKeyAndOrderFront(None);
-    combined.scrollPoint(CGPoint {
-        x: 0.0,
-        y: (combined.frame().size.height - scroll.frame().size.height).max(0.0),
-    });
+    refresh();
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
     let continue_setup = if let Some(resume) = actions.on_resume {
@@ -797,6 +858,31 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_status_and_global_permission_controls_do_not_overlap_steps() {
+        for active in 0..5 {
+            for controls_height in [60.0, 180.0] {
+                for status_height in [24.0, 140.0, 400.0] {
+                    let layout = InlineStatusLayout::new(active, controls_height, status_height);
+                    let body_bottom = if active == 3 {
+                        layout.controls_y()
+                    } else {
+                        layout.guide_y([404.0, 290.0, 200.0, 130.0, 0.0][active])
+                    };
+                    assert!(layout.status_y() + status_height < body_bottom);
+                    assert!(layout.status_y() > 6.0);
+                    if active < 4 {
+                        let next_title = [370.0, 262.0, 172.0, 96.0][active];
+                        assert!(layout.status_y() > layout.guide_y(next_title) + 22.0);
+                    }
+                    assert!(layout.controls_y() + controls_height < layout.guide_y(124.0));
+                    assert!(layout.controls_y() > layout.guide_y(96.0) + 22.0);
+                    assert!(layout.guide_y(472.0) + 60.0 < layout.height());
+                }
+            }
+        }
+    }
 
     #[test]
     fn failed_permission_refresh_is_visible_without_erasing_setup_status() {
