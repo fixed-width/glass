@@ -44,7 +44,8 @@ internal refactors, CI, or test-only changes.
   checking that Glass jobs and processes are absent. Other macOS services and the account are kept.
   Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
   The current action appears above the reference guide, with text sized to its contents.
-  Permission controls stay inside step 4, below its instructions and above step 5; redundant
+  App-wide permission controls stay visible inside step 4 regardless of account selection or
+  setup phase, below its instructions and above step 5; redundant
   permission-action guidance is omitted while Settings errors remain visible.
   Each missing permission has one Open Settings action; first-click native
   registration is internal, and every click opens the matching pane.

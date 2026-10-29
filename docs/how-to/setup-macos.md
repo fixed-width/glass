@@ -51,7 +51,8 @@ Stop any current Glass application with `glass_stop` before changing its environ
    The wizard's permission step checks app-wide approvals in fresh normal-account Glass processes,
    independently of whether the development desktop is running. Approve missing access in step 4;
    step 5 starts the environment and verifies its live worker before Ready.
-   If permissions are missing, this same numbered step shows their status and one **Open Settings…** button per permission. Each click opens that
+   Step 4 always shows app-wide permission status and one **Open Settings…** button per permission,
+   independently of the selected account or current step. Each click opens that
    exact pane; the first click also requests native registration and may show macOS consent. Approve only missing grants from your normal account, then return to this
    wizard. Keep it open: while setup is checking, fresh worker checks detect grants and continue
    automatically. If checking is paused, choose **Continue setup**.

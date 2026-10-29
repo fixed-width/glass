@@ -1631,19 +1631,16 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     let permission_cancelled = cancelled.clone();
     std::thread::spawn(move || {
         while !permission_cancelled.load(Ordering::Relaxed) {
-            let selected = permission_state.lock().ok().and_then(|state| {
-                (!state.running
-                    && state.can_cancel
-                    && (state.start_account.is_some() || state.step == SetupStep::Permissions))
-                    .then(|| state.account.clone())
-            });
-            if let Some(account) = selected {
+            let check_permissions = permission_state
+                .lock()
+                .map(|state| !state.running && state.can_cancel)
+                .unwrap_or(false);
+            if check_permissions {
                 let result = crate::onboarding::fresh_permission_state();
                 if let Ok(mut state) = permission_state.lock()
                     && !permission_cancelled.load(Ordering::Relaxed)
                     && !state.running
-                    && state.account == account
-                    && (state.start_account.is_some() || state.step == SetupStep::Permissions)
+                    && state.can_cancel
                 {
                     match result {
                         Ok(grants) => {

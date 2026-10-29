@@ -77,17 +77,11 @@ impl SetupProgress {
         self.step = SetupStep::Account;
     }
 
-    fn permission_display(&self, account: &str, initial: [bool; 2]) -> ([bool; 2], bool, bool) {
-        let grants = self.permission_grants.unwrap_or(initial);
-        let before_start = self
-            .start_account
-            .as_ref()
-            .is_some_and(|start| start.name == account);
-        let visible = self.account == account
-            && ((self.display_step(account) == SetupStep::Permissions
-                && (self.permission_grants.is_some() || self.permission_check_error.is_some()))
-                || before_start);
-        (grants, visible, self.permission_grants.is_none())
+    fn permission_display(&self, initial: [bool; 2]) -> ([bool; 2], bool) {
+        (
+            self.permission_grants.unwrap_or(initial),
+            self.permission_grants.is_none(),
+        )
     }
 
     fn can_continue(&self, account: &str) -> bool {
@@ -372,7 +366,7 @@ fn update_label(label: &NSTextField, text: &str) {
 }
 
 fn sign_in_instructions(_account: &str) -> String {
-    "Select Apple menu -> \"Lock screen\" (do not fully log out of your main account), then log in to the developer account. Proceed through all of the macOS first-use welcome screens, until its desktop is available. No further actions are required in the developer account.".into()
+    "Select Apple menu → \"Lock screen\" (do not fully log out of your main account), then log in to the developer account. Proceed through all of the macOS first-use welcome screens, until its desktop is available. No further actions are required in the developer account.".into()
 }
 
 fn start_instructions(_account: &str) -> String {
@@ -456,7 +450,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     instruction_label(
         mtm,
         &document,
-        "Use Open Settings for each missing permission. Approve GlassMcp, then proceed to step 5. Glass checks approvals here automatically; ? means a check is pending. Existing permissions are reused.",
+        "Select \"Open Settings\" for each missing permission. Approve GlassMcp, then proceed to step 5. Glass checks approvals here automatically; ? means a check is pending.",
         rect(24.0, 228.0, 672.0, 40.0),
     );
     let returning = instruction_label(
@@ -491,7 +485,6 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     permission_controls
         .view
         .setFrameOrigin(CGPoint { x: 24.0, y: 8.0 });
-    permission_controls.view.setHidden(true);
     let combined = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
     combined.addSubview(&document);
     current_label.removeFromSuperview();
@@ -667,28 +660,18 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         let name = account.stringValue().to_string();
         let step = progress.display_step(&name);
         update_label(&heading, step.heading());
-        let (grants, permissions_visible, unconfirmed) =
-            progress.permission_display(&name, initial_permission_grants);
+        let (grants, unconfirmed) = progress.permission_display(initial_permission_grants);
         let visible = permission_combined.visibleRect();
         let at_top =
             visible.origin.y + visible.size.height >= permission_combined.frame().size.height - 1.0;
-        permission_controls.update(grants, permissions_visible && progress.can_cancel);
-        if permissions_visible && unconfirmed {
+        permission_controls.update(grants, progress.can_cancel);
+        if unconfirmed {
             permission_controls.show_unconfirmed(progress.can_cancel);
         }
-        permission_controls.view.setHidden(!permissions_visible);
         update_label(&status, &progress.display_message(&name));
         let status_height = crate::onboarding_window::text_height(&status, 672.0);
-        let controls_height = if permissions_visible {
-            permission_controls.layout()
-        } else {
-            0.0
-        };
-        let permission_space = if permissions_visible {
-            controls_height + 18.0
-        } else {
-            0.0
-        };
+        let controls_height = permission_controls.layout();
+        let permission_space = controls_height + 18.0;
         // Insert controls between step 4's instructions and step 5, inside the guide.
         for (child, frame) in &guide_frames {
             let shift = if frame.origin.y >= 124.0 {
@@ -837,7 +820,7 @@ mod tests {
             message.contains("probe timed out")
                 && message.contains("Start the initialized desktop")
         );
-        assert!(progress.permission_display("account_a", [false, false]).2);
+        assert!(progress.permission_display([false, false]).1);
         assert!(
             progress
                 .display_message("account_b")
@@ -846,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_environment_exposes_unconfirmed_permissions_before_start() {
+    fn app_permissions_do_not_depend_on_account_selection_or_setup_phase() {
         let mut progress = SetupProgress {
             permission_check_error: None,
             permission_grants: None,
@@ -863,14 +846,20 @@ mod tests {
             resume_creation: None,
         };
         assert_eq!(
-            progress.permission_display("account_a", [true, false]),
-            ([true, false], true, true)
+            progress.permission_display([true, false]),
+            ([true, false], true)
         );
-        assert!(!progress.permission_display("account_b", [false, false]).1);
+        progress.account = "account_b".into();
+        progress.start_account = None;
+        progress.step = SetupStep::Ready;
+        assert_eq!(
+            progress.permission_display([true, false]),
+            ([true, false], true)
+        );
         progress.permission_grants = Some([true, true]);
         assert_eq!(
-            progress.permission_display("account_a", [false, false]),
-            ([true, true], true, false)
+            progress.permission_display([false, false]),
+            ([true, true], false)
         );
         assert!(
             !SetupStep::StartEnvironment
