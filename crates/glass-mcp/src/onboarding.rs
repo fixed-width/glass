@@ -222,7 +222,7 @@ pub fn run_worker() -> anyhow::Result<()> {
     glass_macos::private_session::attach(true)?;
     if glass_macos::accessibility_granted() && glass_macos::screen_recording_granted() {
         eprintln!(
-            "glass: permissions ready; return to your normal account; Start environment can restart this desktop after logout"
+            "glass: permissions ready; return to your normal account; Start Environment can restart this desktop after logout"
         );
         return Ok(());
     }
@@ -293,8 +293,8 @@ pub fn run_registered_worker(owner: u32, check: bool) -> anyhow::Result<()> {
                 let granted = facts.accessibility && facts.screen_recording;
                 ChecklistUpdate {
                     granted: [facts.accessibility, facts.screen_recording],
-                    message: if facts.login_setup_pending { "Finish all macOS welcome screens until this account's desktop appears. Then log out and return to your normal account. Start environment in Glass starts this desktop when needed.".into() }
-                        else if granted { "Permissions ready. You can log out and return to your normal account. In Glass application setup, choose Start environment if this desktop is stopped, or Continue setup if checking is paused.".into() }
+                    message: if facts.login_setup_pending { "Finish all macOS welcome screens until this account's desktop appears. Then log out and return to your normal account. Start Environment in Glass starts this desktop when needed.".into() }
+                        else if granted { "Permissions ready. You can log out and return to your normal account. In Glass application setup, choose Start Environment if this desktop is stopped, or Continue setup if checking is paused.".into() }
                         else { "Glass permissions can be approved from your normal account in System Settings → Privacy & Security. Existing grants are reused across accounts. Return there after completing macOS welcome screens; you can log out of this account. Glass checks automatically; there is no time limit.".into() },
                     finished: granted && facts.private_session && !facts.login_setup_pending,
                 }

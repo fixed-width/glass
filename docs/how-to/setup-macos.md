@@ -36,16 +36,16 @@ Stop any current Glass application with `glass_stop` before changing its environ
    helper from the same installed app. If the account's standard `/Users/NAME`
    home is missing, Glass asks macOS to initialise that selected home. Existing homes are retained;
    custom home locations must already be prepared.
-4. Follow the wizard's manual sign-in step: choose **Apple menu → Lock Screen**, then use
-   **Switch User** or the login screen's account selector to sign into the development account.
+4. Follow the wizard's manual login step: choose **Apple menu → Lock Screen**, then use
+   **Switch User** or the login screen's account selector to log in to the development account.
    Use this login-screen route with VNC too. Finish macOS's first-login setup. Complete the macOS
    welcome screens until the account's desktop appears. A successful account login or existing
    privacy grants do not mean those screens have finished. Glass reports this remaining step
    instead of **Ready** while Apple Setup Assistant owns the development desktop.
    Your work in the development account is now complete. No Glass instructions or permission
-   window needs to appear there. Choose **Apple menu → Log Out**, then sign back in to your normal
+   window needs to appear there. Choose **Apple menu → Log Out**, then log back in to your normal
    account. You do not need to keep the development account logged in after this first visit.
-5. Back in **glass → Application setup…**, choose **Start environment…** for the selected account.
+5. Back in **glass → Application setup…**, choose **Start Environment…** for the selected account.
    Enter its password locally and complete any separate macOS administrator prompt. Glass starts
    its private desktop without switching your visible desktop. Wait for **Ready**.
    The wizard's permission step checks app-wide approvals in fresh normal-account Glass processes,
@@ -167,8 +167,8 @@ Unattended startup after a reboot is not implemented.
 
 Glass keeps the development desktop running between ordinary application runs. Stopping an application
 does not log that account out. You can log out after completing the manual first-login screens;
-**Start environment…** starts the initialized desktop again. When its desktop is missing, open **glass → Application setup…**
-in your normal account and choose **Start environment…** for the enrolled account.
+**Start Environment…** starts the initialized desktop again. When its desktop is missing, open **glass → Application setup…**
+in your normal account and choose **Start Environment…** for the enrolled account.
 
 Stop ends Glass-owned app and build processes and restores temporary workspace permissions.
 Verified shared macOS services remain part of the development desktop; requests already sent
@@ -187,12 +187,12 @@ under **System Settings → General → Sharing**. Glass does not enable that
 host-wide service automatically. It connects locally and requests only a separate desktop; an
 unsupported or denied private selection stops with an error. Existing credentials longer than
 63 UTF-8 bytes are not supported by this startup protocol and are never truncated or reset.
-First-time macOS welcome screens require one manual sign-in to that account. You can log out
+First-time macOS welcome screens require one manual login to that account. You can log out
 after completing them; approve any missing Glass privacy grants from your normal account.
 
-If startup is interrupted, open setup and explicitly choose **Start environment…** again. Glass
+If startup is interrupted, open setup and explicitly choose **Start Environment…** again. Glass
 first finishes recorded temporary Screen Sharing access cleanup without an account password. If
-the desktop is still missing afterward, choose **Start environment…** once more for a fresh login
+the desktop is still missing afterward, choose **Start Environment…** once more for a fresh login
 request. Glass never repeats authentication automatically and preserves pre-existing access.
 If interruption made ownership of an access entry uncertain, Glass retains it and the recovery
 record. Review that account under **Screen Sharing → Allow access for**, remove its entry if

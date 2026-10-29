@@ -1132,7 +1132,7 @@ pub fn prepare_account(name: &str, endpoint: &Path) -> anyhow::Result<()> {
 pub(crate) fn application_lease() -> anyhow::Result<crate::macos_setup::Lease> {
     ensure!(
         !desktop_start::pending(rustix::process::getuid().as_raw())?,
-        "Glass desktop startup or temporary-access cleanup needs attention; open application setup and choose Start environment"
+        "Glass desktop startup or temporary-access cleanup needs attention; open application setup and choose Start Environment"
     );
     guided::environment_lease(crate::macos_setup::LeaseKind::Application)
 }
@@ -1418,7 +1418,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     state.running = false;
                     state.can_cancel = true;
                     state.message = match result {
-                        Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Glass keeps its private desktop running between app runs. After logout, Start environment can start it again; routine app runs need no account switching.".into(),
+                        Ok(()) => "Ready. Your MCP client can use the normal Glass endpoint. Glass keeps its private desktop running between app runs. After logout, Start Environment can start it again; routine app runs need no account switching.".into(),
                         Err(error) if error.is::<crate::macos_setup::pending::Superseded>() => "This saved setup was cancelled or replaced. This window did not restart it. Close this window; begin a new setup explicitly if needed.".into(),
                         Err(error) if error.is::<crate::macos_account::MissingAccount>() => error.to_string(),
                         Err(error) if error.is::<guided::EnvironmentMissing>() => {
@@ -1494,7 +1494,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                 || {
                     password
                         .take()
-                        .context("the desktop is now missing; choose Start environment again to enter its password")
+                        .context("the desktop is now missing; choose Start Environment again to enter its password")
                 },
                 |progress| {
                     if let Ok(mut state) = state.lock() {
@@ -1580,10 +1580,10 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                         "{name} ready. Your existing MCP endpoint can run applications in its separate desktop."
                     ),
                     Err(error) if cleaned && error.is::<guided::EnvironmentMissing>() => format!(
-                        "Previous temporary access cleanup finished. The desktop for {name} is not running. Choose Start environment… to start it with a fresh local password; no authentication was replayed."
+                        "Previous temporary access cleanup finished. The desktop for {name} is not running. Choose Start Environment… to start it with a fresh local password; no authentication was replayed."
                     ),
                     Err(error) => format!(
-                        "Desktop startup needs attention: {error:#}. Account, password and files retained; retry only by choosing Start environment… explicitly."
+                        "Desktop startup needs attention: {error:#}. Account, password and files retained; retry only by choosing Start Environment… explicitly."
                     ),
                 };
             }

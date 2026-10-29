@@ -276,12 +276,7 @@ pub(crate) struct GrantControls {
 }
 
 impl GrantControls {
-    pub(crate) fn new(
-        mtm: MainThreadMarker,
-        rows: Vec<GrantRow>,
-        width: f64,
-        completion: &'static str,
-    ) -> Self {
+    pub(crate) fn new(mtm: MainThreadMarker, rows: Vec<GrantRow>, width: f64) -> Self {
         let rows_height = body_height(rows.len());
         let height = rows_height + SECTION_GAP + ACTION_H;
         let view = NSView::initWithFrame(NSView::alloc(mtm), rect(height, 0.0, 0.0, width, height));
@@ -290,12 +285,7 @@ impl GrantControls {
             rect(height, 0.0, 0.0, width, rows_height),
         );
         view.addSubview(&rows_view);
-        let status = NSTextField::wrappingLabelWithString(
-            &NSString::from_str(
-                "Open Settings goes directly to each permission pane. macOS may ask for consent.",
-            ),
-            mtm,
-        );
+        let status = NSTextField::wrappingLabelWithString(&NSString::from_str(""), mtm);
         status.setFrame(rect(
             height,
             0.0,
@@ -332,9 +322,9 @@ impl GrantControls {
                 Box::new(move || {
                     // Registration may prompt; the explicit action always requests the Settings pane.
                     let message = match action.open() {
-                        Ok(()) => format!("Enable Glass for {label} in this pane. {completion}"),
+                        Ok(()) => String::new(),
                         Err(error) => {
-                            format!("Could not open {label} Settings: {error}. {completion}")
+                            format!("Could not open {label} Settings: {error}")
                         }
                     };
                     feedback.setStringValue(&NSString::from_str(&message));
@@ -368,7 +358,13 @@ impl GrantControls {
     }
 
     pub(crate) fn layout(&self) -> f64 {
-        let status_height = text_height(&self.status, self.width);
+        let has_error = !self.status.stringValue().to_string().is_empty();
+        let status_height = if has_error {
+            text_height(&self.status, self.width)
+        } else {
+            0.0
+        };
+        let status_gap = if has_error { SECTION_GAP } else { 0.0 };
         self.status.setFrame(CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize {
@@ -378,9 +374,9 @@ impl GrantControls {
         });
         self.rows_view.setFrameOrigin(CGPoint {
             x: 0.0,
-            y: status_height + SECTION_GAP,
+            y: status_height + status_gap,
         });
-        let height = self.rows_height + SECTION_GAP + status_height;
+        let height = self.rows_height + status_gap + status_height;
         self.view.setFrameSize(CGSize {
             width: self.width,
             height,
@@ -489,12 +485,7 @@ pub fn run_checklist_with_poll(
 
     let body_top = V_MARGIN + INSTRUCTION_H + SECTION_GAP;
 
-    let controls = std::rc::Rc::new(GrantControls::new(
-        mtm,
-        rows,
-        CONTENT_W,
-        "Return here and choose Re-check after granting the missing permissions.",
-    ));
+    let controls = std::rc::Rc::new(GrantControls::new(mtm, rows, CONTENT_W));
     controls.view.setFrameOrigin(CGPoint {
         x: H_MARGIN,
         y: content_h - body_top - controls.height,

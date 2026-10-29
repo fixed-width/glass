@@ -274,8 +274,8 @@ pub(super) struct EnvironmentMissing(pub(super) Phase);
 impl std::fmt::Display for EnvironmentMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            Phase::StartupCleanupRequired => f.write_str("a previous desktop startup needs cleanup; choose Start environment in Glass application setup"),
-            _ => f.write_str("the development desktop is not running; sign in manually for first use, or choose Start environment in Glass application setup for an initialized account"),
+            Phase::StartupCleanupRequired => f.write_str("a previous desktop startup needs cleanup; choose Start Environment in Glass application setup"),
+            _ => f.write_str("the development desktop is not running; log in manually for first use, or choose Start Environment in Glass application setup for an initialized account"),
         }
     }
 }

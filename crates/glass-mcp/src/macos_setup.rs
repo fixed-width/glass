@@ -193,12 +193,12 @@ impl Phase {
     pub(crate) fn message(&self, account: &str) -> String {
         match self {
             Self::LoginRequired => format!(
-                "Finish {account}'s first manual login (step 2), then sign out and return here (step 3). If already finished, approve missing permissions (step 4) and choose Start environment… (step 5)."
+                "Finish {account}'s first manual login (step 2), then log out and return here (step 3). If already finished, approve missing permissions (step 4) and choose Start Environment… (step 5)."
             ),
             Self::LoginSetupRequired => format!(
-                "Sign in to {account} manually from Apple menu → Lock Screen. Finish all macOS welcome screens until its desktop appears. Then choose Apple menu → Log Out and sign back in to your normal account. Choose Start environment… here to start its private desktop. Take your time; these steps are not timed."
+                "Log in to {account} manually from Apple menu → Lock Screen. Finish all macOS welcome screens until its desktop appears. Then choose Apple menu → Log Out and log back in to your normal account. Choose Start Environment… here to start its private desktop. Take your time; these steps are not timed."
             ),
-            Self::StartupCleanupRequired => "A previous desktop startup needs its temporary access cleaned up. Choose Start environment… in Glass; an already running desktop is reused without authenticating again.".into(),
+            Self::StartupCleanupRequired => "A previous desktop startup needs its temporary access cleaned up. Choose Start Environment… in Glass; an already running desktop is reused without authenticating again.".into(),
             Self::WorkerStarting => format!(
                 "{account} is logged in. Waiting for its Glass worker to start; registration will be checked automatically if it does not appear."
             ),
@@ -218,7 +218,7 @@ impl Phase {
                 format!("In your normal account, allow the missing Glass {permissions}. {settings} Existing grants are reused; you do not need to approve them separately in {account}. If Glass is missing from a list, use + to add /Applications/GlassMcp.app. Glass checks its worker automatically. There is no time limit.")
             }
             Self::ReturnToOwner => format!(
-                "Glass has its permissions. After finishing macOS welcome screens in {account}, you can choose Apple menu → Log Out and sign back in to your normal account. Choose Start environment… here if its desktop is stopped. If checking has paused with its desktop running, choose Continue setup. Wait for Ready."
+                "Glass has its permissions. After finishing macOS welcome screens in {account}, you can choose Apple menu → Log Out and log back in to your normal account. Choose Start Environment… here if its desktop is stopped. If checking has paused with its desktop running, choose Continue setup. Wait for Ready."
             ),
             Self::FinishingPermissions => "Permissions confirmed. Finishing permission checks before workspace recovery…".into(),
             Self::Ready => format!("{account} ready; apps use its private desktop through the normal MCP tools"),
