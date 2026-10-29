@@ -166,6 +166,7 @@ internal refactors, CI, or test-only changes.
 - Windows accessibility snapshots fetch properties in bulk while preserving node, depth, and sibling limits.
 
 ### Fixed
+- macOS clipboard support no longer mistakes `runtime` in a development application path or identifier for a hardened-runtime signing flag.
 - macOS build output is captured in application logs instead of reaching the MCP transport; build failures return bounded compiler diagnostics as untrusted application output, separately from the error status.
 - Starting a different backend now preserves the current session when its stop fails, so unresolved application cleanup cannot be silently discarded.
 - Linux, macOS and Windows build commands now receive the `env` values passed to `glass_start`, matching Android and iOS and allowing requested compiler and dependency settings to apply to both build and launch.
