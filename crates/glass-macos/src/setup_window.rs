@@ -447,7 +447,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         &start_instructions(&actions.account),
         rect(24.0, 210.0, 672.0, 60.0),
     );
-    instruction_label(
+    let current_label = instruction_label(
         mtm,
         &document,
         "What to do now",
@@ -465,13 +465,16 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         672.0,
         "Return to this step; Glass checks automatically while setup is running. Otherwise choose Continue setup. If macOS offers Quit & Reopen, choose Later so this wizard stays open.",
     ));
-    let permission_height = permission_controls.height + 16.0;
     permission_controls
         .view
         .setFrameOrigin(CGPoint { x: 24.0, y: 8.0 });
     permission_controls.view.setHidden(true);
     let combined = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 720.0, 650.0));
     combined.addSubview(&document);
+    current_label.removeFromSuperview();
+    status.removeFromSuperview();
+    combined.addSubview(&current_label);
+    combined.addSubview(&status);
     combined.addSubview(&permission_controls.view);
     scroll.setDocumentView(Some(&combined));
     view.addSubview(&scroll);
@@ -613,9 +616,21 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let close = button(mtm, "Close", rect(556.0, 20.0, 140.0, 32.0), &close_target);
     view.addSubview(&close);
 
+    // The long guide follows the live task; its old status area is no longer a spacer.
+    for child in document.subviews() {
+        let frame = child.frame();
+        child.setFrameOrigin(CGPoint {
+            x: frame.origin.x,
+            y: frame.origin.y - 210.0,
+        });
+    }
+    document.setFrameSize(CGSize {
+        width: 720.0,
+        height: 440.0,
+    });
     let permission_document = document.clone();
     let permission_combined = combined.clone();
-    let initial_permissions = permission_controls.view.clone();
+    let refresh_scroll = scroll.clone();
     let refresh: Rc<dyn Fn()> = Rc::new(move || {
         let progress = poll();
         let name = account.stringValue().to_string();
@@ -624,30 +639,57 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         let permissions_visible = progress.account == name
             && step == SetupStep::Permissions
             && progress.permission_grants.is_some();
-        let entering_permissions = permissions_visible && permission_controls.view.isHidden();
+        let visible = permission_combined.visibleRect();
+        let at_top =
+            visible.origin.y + visible.size.height >= permission_combined.frame().size.height - 1.0;
         permission_controls.update(
             progress.permission_grants.unwrap_or([false, false]),
             permissions_visible && progress.can_cancel,
         );
         permission_controls.view.setHidden(!permissions_visible);
-        status.setFrame(rect(
-            24.0,
-            26.0,
-            672.0,
-            if permissions_visible { 72.0 } else { 140.0 },
-        ));
-        let offset = if permissions_visible {
-            permission_height
+        update_label(&status, &progress.display_message(&name));
+        let status_height = crate::onboarding_window::text_height(&status, 672.0)
+            .min(if permissions_visible { 64.0 } else { 140.0 });
+        let controls_height = if permissions_visible {
+            permission_controls.layout()
         } else {
             0.0
         };
+        let task_height = 22.0
+            + 6.0
+            + status_height
+            + if permissions_visible {
+                8.0 + controls_height
+            } else {
+                0.0
+            }
+            + 12.0;
+        let guide_offset = (refresh_scroll.frame().size.height - 440.0 - task_height).max(0.0);
+        let total = 440.0 + task_height + guide_offset;
         permission_combined.setFrameSize(CGSize {
             width: 720.0,
-            height: 650.0 + offset,
+            height: total,
         });
-        permission_document.setFrameOrigin(CGPoint { x: 0.0, y: offset });
-        if entering_permissions {
-            permission_combined.scrollPoint(CGPoint { x: 0.0, y: 0.0 });
+        permission_document.setFrameOrigin(CGPoint {
+            x: 0.0,
+            y: guide_offset,
+        });
+        current_label.setFrame(rect(24.0, total - 22.0, 672.0, 22.0));
+        status.setFrame(rect(
+            24.0,
+            total - 28.0 - status_height,
+            672.0,
+            status_height,
+        ));
+        permission_controls.view.setFrameOrigin(CGPoint {
+            x: 24.0,
+            y: guide_offset + 452.0,
+        });
+        if at_top {
+            permission_combined.scrollPoint(CGPoint {
+                x: 0.0,
+                y: (total - refresh_scroll.frame().size.height).max(0.0),
+            });
         }
 
         update_label(&setup_notice, progress.creation_blocker.as_deref().unwrap_or("Start here in your normal account. A separate macOS account keeps agent applications off your desktop. A new account needs one manual sign-in for macOS setup. Follow these steps in order; authentication and setup waits have no time limit."));
@@ -696,11 +738,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     window.makeKeyAndOrderFront(None);
     combined.scrollPoint(CGPoint {
         x: 0.0,
-        y: if initial_permissions.isHidden() {
-            (650.0 - scroll.frame().size.height).max(0.0)
-        } else {
-            0.0
-        },
+        y: (combined.frame().size.height - scroll.frame().size.height).max(0.0),
     });
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);

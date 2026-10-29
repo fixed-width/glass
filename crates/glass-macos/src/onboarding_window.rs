@@ -43,11 +43,25 @@ pub struct GrantRow {
     pub label: &'static str,
     /// The grant snapshot from this process launch.
     pub granted: bool,
-    /// Request native consent and report whether access is currently available.
-    /// A false result does not establish whether macOS displayed a prompt.
+    /// Register the permission on the first explicit Settings action.
+    /// Its return value does not establish whether macOS displayed a prompt.
     pub on_request: Box<dyn Fn() -> bool>,
     /// Open this permission's Settings pane only when the user chooses that action.
     pub on_open_settings: Box<dyn Fn() -> Result<(), String>>,
+}
+
+struct SettingsAction {
+    row: GrantRow,
+    registered: std::cell::Cell<bool>,
+}
+
+impl SettingsAction {
+    fn open(&self) -> Result<(), String> {
+        if !self.registered.replace(true) {
+            let _ = (self.row.on_request)();
+        }
+        (self.row.on_open_settings)()
+    }
 }
 
 /// What the host asks the checklist window to show and do: one [`GrantRow`] per permission
@@ -191,7 +205,6 @@ const LABEL_BUTTON_GAP: f64 = 12.0;
 const BUTTON_W: f64 = 130.0;
 const FOOTER_H: f64 = 32.0;
 const ACTION_H: f64 = 96.0;
-const ACTION_GAP: f64 = 8.0;
 
 const CONTENT_W: f64 = WIDTH - 2.0 * H_MARGIN;
 
@@ -236,15 +249,29 @@ fn rect(content_h: f64, x: f64, top: f64, w: f64, h: f64) -> CGRect {
     }
 }
 
+/// Measure wrapping text instead of reserving an empty fixed-height block.
+pub(crate) fn text_height(label: &NSTextField, width: f64) -> f64 {
+    label
+        .cell()
+        .map(|cell| {
+            cell.cellSizeForBounds(rect(4096.0, 0.0, 0.0, width, 4096.0))
+                .height
+                .ceil()
+                + 4.0
+        })
+        .unwrap_or(40.0)
+        .clamp(24.0, 140.0)
+}
+
 /// Permission controls shared by the checklist and the current setup-wizard step.
 pub(crate) struct GrantControls {
     pub(crate) view: Retained<NSView>,
     pub(crate) height: f64,
-    rows: Vec<(
-        Retained<NSTextField>,
-        Retained<NSButton>,
-        Retained<NSButton>,
-    )>,
+    rows_view: Retained<NSView>,
+    status: Retained<NSTextField>,
+    width: f64,
+    rows_height: f64,
+    rows: Vec<(Retained<NSTextField>, Retained<NSButton>)>,
     _targets: Vec<Retained<ButtonTarget>>,
 }
 
@@ -255,137 +282,115 @@ impl GrantControls {
         width: f64,
         completion: &'static str,
     ) -> Self {
-        let n_rows = rows.len();
-        let height = body_height(n_rows) + SECTION_GAP + ACTION_H;
-        let label_width =
-            width - GLYPH_W - GLYPH_GAP - LABEL_BUTTON_GAP - BUTTON_W * 2.0 - ACTION_GAP;
+        let rows_height = body_height(rows.len());
+        let height = rows_height + SECTION_GAP + ACTION_H;
         let view = NSView::initWithFrame(NSView::alloc(mtm), rect(height, 0.0, 0.0, width, height));
-        let action_top = 0.0 + body_height(n_rows) + SECTION_GAP;
-        let action_status = NSTextField::wrappingLabelWithString(
+        let rows_view = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            rect(height, 0.0, 0.0, width, rows_height),
+        );
+        view.addSubview(&rows_view);
+        let status = NSTextField::wrappingLabelWithString(
             &NSString::from_str(
-                "Complete only missing permissions. Opening Settings does not grant access automatically.",
+                "Open Settings goes directly to each permission pane. macOS may ask for consent.",
             ),
             mtm,
         );
-        action_status.setFrame(rect(height, 0.0, action_top, width, ACTION_H));
-        view.addSubview(&action_status);
-
-        // Every per-button target lives here for the whole run loop (`fire:` targets are weak
-        // references — see the module doc).
-        let mut button_targets: Vec<Retained<ButtonTarget>> =
-            Vec::with_capacity(rows.len() * 2 + 1);
-        let mut row_controls = Vec::new();
-
-        if rows.is_empty() {
-            // Defensive: the host only opens this window when a permission is missing, so an empty
-            // row set means it shouldn't have opened it at all — show a line rather than a blank
-            // checklist.
-            let ready = NSTextField::labelWithString(
-                &NSString::from_str("No permissions to configure."),
+        status.setFrame(rect(
+            height,
+            0.0,
+            rows_height + SECTION_GAP,
+            width,
+            ACTION_H,
+        ));
+        view.addSubview(&status);
+        let label_x = GLYPH_W + GLYPH_GAP;
+        let button_x = width - BUTTON_W;
+        let label_width = button_x - label_x - LABEL_BUTTON_GAP;
+        let mut controls = Vec::new();
+        let mut targets = Vec::new();
+        for (index, row) in rows.into_iter().enumerate() {
+            let top = index as f64 * (ROW_H + ROW_GAP);
+            let glyph = NSTextField::labelWithString(
+                &NSString::from_str(if row.granted { "✓" } else { "○" }),
                 mtm,
             );
-            ready.setFrame(rect(height, 0.0, 0.0, width, ROW_H));
-            view.addSubview(&ready);
-        } else {
-            let label_x = 0.0 + GLYPH_W + GLYPH_GAP;
-            let button_x = label_x + label_width + LABEL_BUTTON_GAP;
-            for (i, row) in rows.into_iter().enumerate() {
-                let row_top = 0.0 + i as f64 * (ROW_H + ROW_GAP);
-
-                // Status glyph: ✓ when granted, ○ when not.
-                let glyph = if row.granted { "✓" } else { "○" };
-                let glyph_label = NSTextField::labelWithString(&NSString::from_str(glyph), mtm);
-                glyph_label.setFrame(rect(height, 0.0, row_top, GLYPH_W, ROW_H));
-                view.addSubview(&glyph_label);
-
-                // Permission name.
-                let name = NSTextField::labelWithString(&NSString::from_str(row.label), mtm);
-                name.setFrame(rect(height, label_x, row_top, label_width, ROW_H));
-                view.addSubview(&name);
-
-                // "Request…" button → this row's boxed action, via its own target.
-                let label = row.label;
-                let request_status = action_status.clone();
-                let target = ButtonTarget::new(
+            glyph.setFrame(rect(rows_height, 0.0, top, GLYPH_W, ROW_H));
+            rows_view.addSubview(&glyph);
+            let name = NSTextField::labelWithString(&NSString::from_str(row.label), mtm);
+            name.setFrame(rect(rows_height, label_x, top, label_width, ROW_H));
+            rows_view.addSubview(&name);
+            let feedback = status.clone();
+            let label = row.label;
+            let granted = row.granted;
+            let action = SettingsAction {
+                row,
+                registered: std::cell::Cell::new(false),
+            };
+            let target = ButtonTarget::new(
+                mtm,
+                Box::new(move || {
+                    // Registration may prompt; the explicit action always requests the Settings pane.
+                    let message = match action.open() {
+                        Ok(()) => format!("Enable Glass for {label} in this pane. {completion}"),
+                        Err(error) => {
+                            format!("Could not open {label} Settings: {error}. {completion}")
+                        }
+                    };
+                    feedback.setStringValue(&NSString::from_str(&message));
+                }),
+            );
+            // SAFETY: the retained target implements fire: and outlives this control.
+            let settings = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("Open Settings…"),
+                    Some(&target),
+                    Some(sel!(fire:)),
                     mtm,
-                    Box::new(move || {
-                        let available = (row.on_request)();
-                        let message = if available {
-                            format!("{label} is available to this process. {completion}")
-                        } else {
-                            format!(
-                                "{label} is not available to this process yet. Finish any macOS consent prompt. If no prompt appears, choose Open Settings… on this row and enable Glass. {completion}"
-                            )
-                        };
-                        request_status.setStringValue(&NSString::from_str(&message));
-                    }),
-                );
-                // SAFETY: `buttonWithTitle:target:action:` is `unsafe` because the target must
-                // respond to the action selector — `target` is a live `ButtonTarget` (kept in
-                // `button_targets` for the whole run loop) that implements `fire:`, and
-                // `sel!(fire:)` is exactly that selector. The title is a valid `NSString`.
-                let button = unsafe {
-                    NSButton::buttonWithTitle_target_action(
-                        &NSString::from_str("Request…"),
-                        Some(&target),
-                        Some(sel!(fire:)),
-                        mtm,
-                    )
-                };
-                button.setFrame(rect(height, button_x, row_top, BUTTON_W, ROW_H));
-                button.setEnabled(!row.granted);
-                view.addSubview(&button);
-                button_targets.push(target);
-                let settings_status = action_status.clone();
-                let settings_target = ButtonTarget::new(
-                    mtm,
-                    Box::new(move || {
-                        let message = match (row.on_open_settings)() {
-                            Ok(()) => format!(
-                                "In System Settings → Privacy & Security, enable Glass for {label}. If Glass is absent, use + to add /Applications/GlassMcp.app. {completion}"
-                            ),
-                            Err(error) => format!(
-                                "Could not open Settings for {label}: {error}. Open System Settings → Privacy & Security manually, enable Glass, {completion}"
-                            ),
-                        };
-                        settings_status.setStringValue(&NSString::from_str(&message));
-                    }),
-                );
-                // SAFETY: the retained target implements fire: and outlives the control.
-                let settings = unsafe {
-                    NSButton::buttonWithTitle_target_action(
-                        &NSString::from_str("Open Settings…"),
-                        Some(&settings_target),
-                        Some(sel!(fire:)),
-                        mtm,
-                    )
-                };
-                settings.setFrame(rect(
-                    height,
-                    button_x + BUTTON_W + ACTION_GAP,
-                    row_top,
-                    BUTTON_W,
-                    ROW_H,
-                ));
-                settings.setEnabled(!row.granted);
-                view.addSubview(&settings);
-                row_controls.push((glyph_label, button, settings));
-                button_targets.push(settings_target);
-            }
+                )
+            };
+            settings.setFrame(rect(rows_height, button_x, top, BUTTON_W, ROW_H));
+            settings.setEnabled(!granted);
+            rows_view.addSubview(&settings);
+            controls.push((glyph, settings));
+            targets.push(target);
         }
-
         Self {
             view,
             height,
-            rows: row_controls,
-            _targets: button_targets,
+            rows_view,
+            status,
+            width,
+            rows_height,
+            rows: controls,
+            _targets: targets,
         }
     }
 
+    pub(crate) fn layout(&self) -> f64 {
+        let status_height = text_height(&self.status, self.width);
+        self.status.setFrame(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: self.width,
+                height: status_height,
+            },
+        });
+        self.rows_view.setFrameOrigin(CGPoint {
+            x: 0.0,
+            y: status_height + SECTION_GAP,
+        });
+        let height = self.rows_height + SECTION_GAP + status_height;
+        self.view.setFrameSize(CGSize {
+            width: self.width,
+            height,
+        });
+        height
+    }
+
     pub(crate) fn update(&self, granted: [bool; 2], enabled: bool) {
-        for ((glyph, request, settings), granted) in self.rows.iter().zip(granted) {
+        for ((glyph, settings), granted) in self.rows.iter().zip(granted) {
             glyph.setStringValue(&NSString::from_str(if granted { "✓" } else { "○" }));
-            request.setEnabled(enabled && !granted);
             settings.setEnabled(enabled && !granted);
         }
     }
@@ -462,7 +467,7 @@ pub fn run_checklist_with_poll(
     // system font is large.
     let instruction = NSTextField::wrappingLabelWithString(
         &NSString::from_str(
-            "Allow Accessibility first, then Screen Recording. Request asks macOS for consent. If no prompt appears, choose Open Settings… for that permission. After granting access, choose Re-check or macOS’s Quit & Reopen.",
+            "Allow Accessibility first, then Screen Recording. Open Settings goes directly to the permission pane and may ask macOS for consent. After granting access, choose Re-check or macOS’s Quit & Reopen.",
         ),
         mtm,
     );
@@ -562,4 +567,69 @@ pub fn run_checklist_with_poll(
     // objects alive right up to here.
     drop((window, container, delegate, controls, recheck_target));
     Ok(())
+}
+
+#[cfg(test)]
+mod settings_action_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[test]
+    fn every_click_opens_settings_without_repeating_native_registration() {
+        for available in [false, true] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let register = events.clone();
+            let open = events.clone();
+            let action = SettingsAction {
+                row: GrantRow {
+                    label: "Screen Recording",
+                    granted: false,
+                    on_request: Box::new(move || {
+                        register.borrow_mut().push("register");
+                        available
+                    }),
+                    on_open_settings: Box::new(move || {
+                        open.borrow_mut().push("open");
+                        Ok(())
+                    }),
+                },
+                registered: Cell::new(false),
+            };
+            action.open().unwrap();
+            action.open().unwrap();
+            assert_eq!(*events.borrow(), ["register", "open", "open"]);
+        }
+    }
+
+    #[test]
+    fn failed_pane_open_is_retryable_without_another_consent_request() {
+        let registrations = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let register = registrations.clone();
+        let open = calls.clone();
+        let action = SettingsAction {
+            row: GrantRow {
+                label: "Accessibility",
+                granted: false,
+                on_request: Box::new(move || {
+                    register.set(register.get() + 1);
+                    false
+                }),
+                on_open_settings: Box::new(move || {
+                    let first = open.get() == 0;
+                    open.set(open.get() + 1);
+                    if first {
+                        Err("pane unavailable".into())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            },
+            registered: Cell::new(false),
+        };
+        assert_eq!(action.open(), Err("pane unavailable".into()));
+        action.open().unwrap();
+        assert_eq!((registrations.get(), calls.get()), (1, 2));
+    }
 }

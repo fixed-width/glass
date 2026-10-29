@@ -1269,7 +1269,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
     } else if let Ok(Some(receipt)) = &creation {
         if receipt.created && receipt.password_set {
             format!(
-                "A previous Glass setup created {}. Uninstall keeps development accounts and their files. Create a new account above, or enter an existing account's short name to reuse it.",
+                "A previous Glass setup created {}. Uninstall keeps development accounts and their files. Choose Create account… for a new account, or enter an existing account's short name to reuse it.",
                 receipt.name
             )
         } else {

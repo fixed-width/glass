@@ -18,7 +18,7 @@ Stop any current Glass application with `glass_stop` before changing its environ
 1. Install the signed, hardened `GlassMcp.app` in `/Applications`. Use that one app for both your
    normal account and the development account. This signing requirement applies to Glass.
 2. Open Glass. On first run, choose **Off your desktop…**; if the menu-bar app is already running,
-   choose **glass → Application setup…**. Choose **Create account…** at the top of the window to create a dedicated **Standard**
+   choose **glass → Application setup…**. Choose **Create account…** to create a dedicated **Standard**
    account: enter its short name and a new password twice. The default name is `glassdev`; new names
    start with an ASCII letter and use at most 64 letters, digits or underscores. Glass does not save
    the password. You will use it for the account's first login; its display name is
@@ -48,9 +48,8 @@ Stop any current Glass application with `glass_stop` before changing its environ
 5. Back in **glass → Application setup…**, choose **Start environment…** for the selected account.
    Enter its password locally and complete any separate macOS administrator prompt. Glass starts
    its private desktop without switching your visible desktop. Wait for **Ready**.
-   If permissions are missing, this same numbered step shows their status and **Request…** /
-   **Open Settings…** buttons. Request asks macOS for consent; Open Settings goes directly to that
-   permission's pane. Approve only missing grants from your normal account, then return to this
+   If permissions are missing, this same numbered step shows their status and one **Open Settings…** button per permission. Each click opens that
+   exact pane; the first click also requests native registration and may show macOS consent. Approve only missing grants from your normal account, then return to this
    wizard. Keep it open: while setup is checking, fresh worker checks detect grants and continue
    automatically. If checking is paused, choose **Continue setup**.
    If macOS offers **Quit & Reopen**, choose **Later** during this wizard; its permission checks use
@@ -489,14 +488,11 @@ macOS opens it without a Gatekeeper detour, and first-run is a double-click:
 3. **Double-click `GlassMcp.app`.** If the environment choice appears, select **On your desktop**
    for shared-desktop use. Glass sets up its login integration and opens **glass permissions** when
    a grant is missing. Existing permissions are reused.
-4. Complete **Accessibility** first, then **Screen Recording**, one at a time. **Request…** asks
-   macOS for consent. Finish any native prompt and grant Glass access in System Settings, then
-   close System Settings and return to the Glass checklist.
-   If Request does not show a prompt, click **Open Settings…** on that permission's row. Enable
-   Glass under **Privacy & Security → Accessibility** or **Screen & System Audio Recording**
-   (**Screen Recording** on older macOS). If Glass is absent, use **+** to add
-   `/Applications/GlassMcp.app`. The checklist reports when access is still pending or Settings
-   could not be opened; it does not assume that requesting permission granted it.
+4. Complete **Accessibility** first, then **Screen Recording**, using **Open Settings…** on each
+   missing permission. Each button opens its exact Settings pane. The first click also requests
+   native registration so Glass can appear in the list; macOS may show a consent prompt.
+   Enable Glass, close Settings, and return to the checklist. If Glass is absent, use **+** to add
+   `/Applications/GlassMcp.app`. Already allowed permissions need no further action.
 5. After granting the missing permissions, choose **Re-check**. This restarts Glass to read the
    updated grants. If macOS offers **Quit & Reopen** for Screen Recording, choose it instead.
    Once both grants are available, the checklist is replaced by the **glass ●** menu bar.
