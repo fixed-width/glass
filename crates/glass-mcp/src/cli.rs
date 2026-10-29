@@ -63,6 +63,9 @@ pub enum Command {
     },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
+    MacosPermissionState,
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
     MacosUnenroll,
     #[cfg(target_os = "macos")]
     #[command(hide = true)]

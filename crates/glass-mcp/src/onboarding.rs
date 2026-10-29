@@ -94,6 +94,38 @@ fn grant_rows(accessibility: bool, screen_recording: bool) -> [(&'static str, bo
     ]
 }
 
+/// Internal read-only role: a new process observes application-wide grants without a backend.
+#[cfg(target_os = "macos")]
+pub fn print_permission_state() -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&[
+            glass_macos::accessibility_granted(),
+            glass_macos::screen_recording_granted(),
+        ])?
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn fresh_permission_state() -> anyhow::Result<[bool; 2]> {
+    let output = glass_core::run_bounded(
+        std::process::Command::new(std::env::current_exe()?).arg("macos-permission-state"),
+        std::time::Duration::from_secs(5),
+        "checking Glass permissions",
+    )?;
+    decode_permission_state(output.status.success(), &output.stdout)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_permission_state(success: bool, bytes: &[u8]) -> anyhow::Result<[bool; 2]> {
+    anyhow::ensure!(
+        success && bytes.len() <= 128,
+        "fresh Glass permission check failed"
+    );
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 /// Build the checklist's row widgets from this launch's TCC grant snapshot: one [`GrantRow`]
 /// per permission, each carrying its live snapshot and the "Request…" closure that requests
 /// the grant. Shared with the menu-bar self-onboard fallback, which reuses the *identical* row
@@ -315,6 +347,25 @@ fn fresh_worker_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_snapshot_requires_a_successful_bounded_boolean_pair() {
+        assert_eq!(
+            decode_permission_state(true, b"[true,false]").unwrap(),
+            [true, false]
+        );
+        for bytes in [
+            b"[true]".as_slice(),
+            b"[true,false,true]",
+            b"{\"ready\":true}",
+            b"[1,0]",
+            b"not-json",
+        ] {
+            assert!(decode_permission_state(true, bytes).is_err());
+        }
+        assert!(decode_permission_state(false, b"[true,true]").is_err());
+        assert!(decode_permission_state(true, &[b' '; 129]).is_err());
+    }
 
     #[test]
     fn grant_rows_orders_accessibility_before_screen_recording() {

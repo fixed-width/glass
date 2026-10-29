@@ -17,6 +17,7 @@ use crate::onboarding_window::{ButtonTarget, PollTimer};
 
 #[derive(Clone)]
 pub struct SetupProgress {
+    pub permission_check_error: Option<String>,
     pub permission_grants: Option<[bool; 2]>,
     pub creation_blocker: Option<String>,
     pub account: String,
@@ -38,8 +39,15 @@ impl SetupProgress {
     }
 
     fn display_message(&self, edited_account: &str) -> String {
+        let message = match &self.permission_check_error {
+            Some(error) => format!(
+                "Permission check failed: {error}. Retrying automatically.\n\n{}",
+                self.message
+            ),
+            None => self.message.clone(),
+        };
         if self.account == edited_account {
-            return self.message.clone();
+            return message;
         }
         let context = if self.account.is_empty() {
             "Current setup".to_owned()
@@ -51,7 +59,7 @@ impl SetupProgress {
         } else {
             "The selected name changed. Choose Use existing account to check it, or Create account… to create a new one."
         };
-        format!("{context}: {}\n\n{guidance}", self.message)
+        format!("{context}: {message}\n\n{guidance}")
     }
 
     /// Whether the wizard may open account creation.
@@ -61,11 +69,25 @@ impl SetupProgress {
 
     /// Clear account-dependent actions only after successful enrollment removal.
     pub fn isolation_disabled(&mut self) {
+        self.permission_check_error = None;
         self.permission_grants = None;
         self.creation_blocker = None;
         self.start_account = None;
         self.resume_creation = None;
         self.step = SetupStep::Account;
+    }
+
+    fn permission_display(&self, account: &str, initial: [bool; 2]) -> ([bool; 2], bool, bool) {
+        let grants = self.permission_grants.unwrap_or(initial);
+        let before_start = self
+            .start_account
+            .as_ref()
+            .is_some_and(|start| start.name == account);
+        let visible = self.account == account
+            && ((self.display_step(account) == SetupStep::Permissions
+                && (self.permission_grants.is_some() || self.permission_check_error.is_some()))
+                || before_start);
+        (grants, visible, self.permission_grants.is_none())
     }
 
     fn can_continue(&self, account: &str) -> bool {
@@ -82,6 +104,7 @@ pub enum SetupStep {
     SignIn,
     Permissions,
     ReturnToOwner,
+    StartEnvironment,
     Checking,
     Ready,
 }
@@ -89,10 +112,11 @@ pub enum SetupStep {
 impl SetupStep {
     fn heading(self) -> &'static str {
         match self {
-            Self::Account => "Step 1 of 4 — Choose a development account",
-            Self::SignIn => "Step 2 of 4 — Sign in and finish macOS setup",
-            Self::Permissions => "Step 4 of 4 — Finish setup in your normal account",
-            Self::ReturnToOwner => "Step 3 of 4 — Log out and return to your normal account",
+            Self::Account => "Step 1 of 5 — Choose a development account",
+            Self::SignIn => "Step 2 of 5 — Sign in manually and finish macOS setup",
+            Self::Permissions => "Step 4 of 5 — Allow Glass permissions",
+            Self::ReturnToOwner => "Step 3 of 5 — Sign out and return to your main account",
+            Self::StartEnvironment => "Step 5 of 5 — Start the environment here",
             Self::Checking => "Checking setup…",
             Self::Ready => "Ready — Your agent can use the development desktop",
         }
@@ -104,11 +128,12 @@ impl SetupStep {
             Self::SignIn => Some(1),
             Self::Permissions => Some(3),
             Self::ReturnToOwner => Some(2),
-            Self::Ready => Some(4),
+            Self::StartEnvironment => Some(4),
+            Self::Ready => Some(5),
             Self::Checking => None,
         };
         let marker = match current {
-            Some(current) if index < current => "✓ ",
+            Some(current) if index < current && self != Self::StartEnvironment => "✓ ",
             Some(current) if index == current => "→ ",
             _ => "",
         };
@@ -270,7 +295,7 @@ pub fn choose_environment() -> Result<SetupChoice, String> {
     alert.setMessageText(&NSString::from_str(
         "Where should Glass run development applications?",
     ));
-    alert.setInformativeText(&NSString::from_str("A separate standard macOS account keeps agent applications and input off your desktop. For a new account, sign in manually once to finish macOS setup, then log out and return to your normal account. Start its environment from Glass; existing Glass permissions are reused. Shared-desktop applications use your current desktop and permissions."));
+    alert.setInformativeText(&NSString::from_str("A separate standard macOS account keeps application windows off your desktop, and prevents interference with your cursor and clipboard. A wizard will walk you through the setup steps."));
     alert.addButtonWithTitle(&NSString::from_str("Off your desktop…"));
     alert.addButtonWithTitle(&NSString::from_str("On your desktop"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
@@ -346,26 +371,12 @@ fn update_label(label: &NSTextField, text: &str) {
     }
 }
 
-fn sign_in_instructions(account: &str) -> String {
-    let account = if account.is_empty() {
-        "the development account"
-    } else {
-        account
-    };
-    format!(
-        "For first use, choose Apple menu → Lock Screen, then use Switch User or the account selector to sign in to {account}. Finish all macOS welcome screens until its desktop appears. That completes your work in this account. Use this login-screen route with VNC too."
-    )
+fn sign_in_instructions(_account: &str) -> String {
+    "Select Apple menu -> \"Lock screen\" (do not fully sign out of your main account), then sign in to the developer account. Proceed through all of the macOS first-use welcome screens, until its desktop is available. No further actions are required in the developer account.".into()
 }
 
-fn start_instructions(account: &str) -> String {
-    let account = if account.is_empty() {
-        "the development account"
-    } else {
-        account
-    };
-    format!(
-        "Back in your normal account, choose Start environment… for {account} and enter its password locally. Complete any separate administrator prompt. Existing Glass permissions are reused; resolve any missing permissions here only if Glass asks. Wait for Ready before agent work."
-    )
+fn start_instructions(_account: &str) -> String {
+    "In this window, select \"Start environment...\" and enter the development account's password. Complete any administrator prompt that appears. Once this window shows Ready status, setup is complete. You will need to \"Start environment...\" after any reboot.".into()
 }
 
 /// Show setup without terminating an existing menu-bar server when the window closes.
@@ -414,8 +425,9 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     let titles = [
         ("Choose or create an account here", 550.0),
         ("Sign in manually and finish macOS setup", 474.0),
-        ("Log out and return to your normal account", 366.0),
-        ("Start the environment here", 276.0),
+        ("Sign out and return to your main account", 366.0),
+        ("Allow Glass permissions in your main account", 276.0),
+        ("Start the environment here", 200.0),
     ];
     let step_labels: Vec<_> = titles
         .iter()
@@ -438,14 +450,20 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     instruction_label(
         mtm,
         &document,
-        "Choose Apple menu → Log Out in the development account, then sign back in to your normal account. No Glass window or permission checklist needs to appear in the development account.",
+        "Sign out of the developer account (you can fully sign out), then sign back in to your main account.",
         rect(24.0, 304.0, 672.0, 56.0),
+    );
+    instruction_label(
+        mtm,
+        &document,
+        "Use Open Settings for each missing permission. Approve Glass, then proceed to step 5. Glass checks approvals here automatically; ? means a check is pending. Existing permissions are reused.",
+        rect(24.0, 228.0, 672.0, 40.0),
     );
     let returning = instruction_label(
         mtm,
         &document,
         &start_instructions(&actions.account),
-        rect(24.0, 210.0, 672.0, 60.0),
+        rect(24.0, 104.0, 672.0, 88.0),
     );
     let current_label = instruction_label(
         mtm,
@@ -459,11 +477,17 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         "Create an account, or enter an existing account's short name and choose Use existing account.",
         rect(24.0, 26.0, 672.0, 140.0),
     );
+    let initial_permission_grants = std::array::from_fn(|index| {
+        actions
+            .permission_rows
+            .get(index)
+            .is_some_and(|row| row.granted)
+    });
     let permission_controls = Rc::new(crate::onboarding_window::GrantControls::new(
         mtm,
         actions.permission_rows,
         672.0,
-        "Return to this step; Glass checks automatically while setup is running. Otherwise choose Continue setup. If macOS offers Quit & Reopen, choose Later so this wizard stays open.",
+        "Approvals are checked here automatically. After approval, choose Start environment if the desktop is stopped. Otherwise checks continue while setup runs, or choose Continue setup if paused. Choose Later if macOS offers Quit & Reopen.",
     ));
     permission_controls
         .view
@@ -621,12 +645,12 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         let frame = child.frame();
         child.setFrameOrigin(CGPoint {
             x: frame.origin.x,
-            y: frame.origin.y - 210.0,
+            y: frame.origin.y - 104.0,
         });
     }
     document.setFrameSize(CGSize {
         width: 720.0,
-        height: 440.0,
+        height: 546.0,
     });
     let permission_document = document.clone();
     let permission_combined = combined.clone();
@@ -636,20 +660,18 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         let name = account.stringValue().to_string();
         let step = progress.display_step(&name);
         update_label(&heading, step.heading());
-        let permissions_visible = progress.account == name
-            && step == SetupStep::Permissions
-            && progress.permission_grants.is_some();
+        let (grants, permissions_visible, unconfirmed) =
+            progress.permission_display(&name, initial_permission_grants);
         let visible = permission_combined.visibleRect();
         let at_top =
             visible.origin.y + visible.size.height >= permission_combined.frame().size.height - 1.0;
-        permission_controls.update(
-            progress.permission_grants.unwrap_or([false, false]),
-            permissions_visible && progress.can_cancel,
-        );
+        permission_controls.update(grants, permissions_visible && progress.can_cancel);
+        if permissions_visible && unconfirmed {
+            permission_controls.show_unconfirmed(progress.can_cancel);
+        }
         permission_controls.view.setHidden(!permissions_visible);
         update_label(&status, &progress.display_message(&name));
-        let status_height = crate::onboarding_window::text_height(&status, 672.0)
-            .min(if permissions_visible { 64.0 } else { 140.0 });
+        let status_height = crate::onboarding_window::text_height(&status, 672.0);
         let controls_height = if permissions_visible {
             permission_controls.layout()
         } else {
@@ -664,8 +686,8 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
                 0.0
             }
             + 12.0;
-        let guide_offset = (refresh_scroll.frame().size.height - 440.0 - task_height).max(0.0);
-        let total = 440.0 + task_height + guide_offset;
+        let guide_offset = (refresh_scroll.frame().size.height - 546.0 - task_height).max(0.0);
+        let total = 546.0 + task_height + guide_offset;
         permission_combined.setFrameSize(CGSize {
             width: 720.0,
             height: total,
@@ -683,7 +705,7 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         ));
         permission_controls.view.setFrameOrigin(CGPoint {
             x: 24.0,
-            y: guide_offset + 452.0,
+            y: guide_offset + 558.0,
         });
         if at_top {
             permission_combined.scrollPoint(CGPoint {
@@ -773,8 +795,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_permission_refresh_is_visible_without_erasing_setup_status() {
+        let progress = SetupProgress {
+            permission_check_error: Some("probe timed out".into()),
+            permission_grants: None,
+            creation_blocker: None,
+            account: "account_a".into(),
+            message: "Start the initialized desktop".into(),
+            step: SetupStep::SignIn,
+            running: false,
+            can_cancel: true,
+            start_account: Some(EnvironmentStart {
+                name: "account_a".into(),
+                needs_password: true,
+            }),
+            resume_creation: None,
+        };
+        let message = progress.display_message("account_a");
+        assert!(
+            message.contains("probe timed out")
+                && message.contains("Start the initialized desktop")
+        );
+        assert!(progress.permission_display("account_a", [false, false]).2);
+        assert!(
+            progress
+                .display_message("account_b")
+                .contains("probe timed out")
+        );
+    }
+
+    #[test]
+    fn stopped_environment_exposes_unconfirmed_permissions_before_start() {
+        let mut progress = SetupProgress {
+            permission_check_error: None,
+            permission_grants: None,
+            creation_blocker: Some("enrolled".into()),
+            account: "account_a".into(),
+            message: String::new(),
+            step: SetupStep::SignIn,
+            running: false,
+            can_cancel: true,
+            start_account: Some(EnvironmentStart {
+                name: "account_a".into(),
+                needs_password: true,
+            }),
+            resume_creation: None,
+        };
+        assert_eq!(
+            progress.permission_display("account_a", [true, false]),
+            ([true, false], true, true)
+        );
+        assert!(!progress.permission_display("account_b", [false, false]).1);
+        progress.permission_grants = Some([true, true]);
+        assert_eq!(
+            progress.permission_display("account_a", [false, false]),
+            ([true, true], true, false)
+        );
+        assert!(
+            !SetupStep::StartEnvironment
+                .row_title(3, "Permissions")
+                .contains('✓')
+        );
+        assert!(SetupStep::Ready.row_title(4, "Start").contains('✓'));
+    }
+
+    #[test]
     fn editing_selection_preserves_disable_failure_and_its_enrolled_account() {
         let progress = SetupProgress {
+            permission_check_error: None,
             permission_grants: None,
             creation_blocker: Some("account_a is enrolled".into()),
             account: "account_a".into(),
@@ -796,6 +884,7 @@ mod tests {
     #[test]
     fn enrolled_account_blocks_password_dialog_even_after_editing_selection() {
         let mut progress = SetupProgress {
+            permission_check_error: None,
             permission_grants: None,
             creation_blocker: Some("account_a is enrolled. Disable isolation first.".into()),
             account: "account_a".into(),
@@ -818,6 +907,7 @@ mod tests {
     #[test]
     fn rejected_selection_cannot_rebind_another_accounts_ready_state() {
         let mut progress = SetupProgress {
+            permission_check_error: None,
             permission_grants: None,
             creation_blocker: None,
             account: "account_a".into(),

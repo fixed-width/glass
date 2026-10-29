@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::MacosOnboarding { owner, check }) => {
             return onboarding::run_registered_worker(owner, check);
         }
+        Some(Command::MacosPermissionState) => return onboarding::print_permission_state(),
         Some(Command::MacosUnenroll) => return glass_mcp::macos_environment::remove_registration(),
         Some(Command::MacosPrepareAccount { account, endpoint }) => {
             return glass_mcp::macos_environment::prepare_account(&account, &endpoint);
@@ -59,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
             | Command::NativeBackend { .. }
             | Command::MacosEnroll { .. }
             | Command::MacosOnboarding { .. }
+            | Command::MacosPermissionState
             | Command::MacosUnenroll
             | Command::MacosPrepareAccount { .. }
             | Command::MacosStartEnvironment { .. },

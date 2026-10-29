@@ -388,6 +388,13 @@ impl GrantControls {
         height
     }
 
+    pub(crate) fn show_unconfirmed(&self, enabled: bool) {
+        for (glyph, settings) in &self.rows {
+            glyph.setStringValue(&NSString::from_str("?"));
+            settings.setEnabled(enabled);
+        }
+    }
+
     pub(crate) fn update(&self, granted: [bool; 2], enabled: bool) {
         for ((glyph, settings), granted) in self.rows.iter().zip(granted) {
             glyph.setStringValue(&NSString::from_str(if granted { "✓" } else { "○" }));

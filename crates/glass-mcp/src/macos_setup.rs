@@ -142,14 +142,15 @@ impl Phase {
     pub(crate) fn setup_step(&self) -> Option<glass_macos::setup_window::SetupStep> {
         use glass_macos::setup_window::SetupStep;
         match self {
-            Self::LoginRequired | Self::LoginSetupRequired | Self::WorkerStarting => {
-                Some(SetupStep::SignIn)
-            }
+            Self::LoginRequired | Self::LoginSetupRequired => Some(SetupStep::SignIn),
             Self::PermissionsRequired { .. } => Some(SetupStep::Permissions),
             Self::ReturnToOwner => Some(SetupStep::ReturnToOwner),
             Self::FinishingPermissions => Some(SetupStep::Checking),
             Self::Ready => Some(SetupStep::Ready),
-            Self::StartupCleanupRequired | Self::Busy | Self::RepairRequired(_) => None,
+            Self::WorkerStarting
+            | Self::StartupCleanupRequired
+            | Self::Busy
+            | Self::RepairRequired(_) => None,
         }
     }
 
@@ -192,7 +193,7 @@ impl Phase {
     pub(crate) fn message(&self, account: &str) -> String {
         match self {
             Self::LoginRequired => format!(
-                "For a new account, choose Apple menu → Lock Screen and sign in to {account} manually. Finish all macOS welcome screens until its desktop appears. Then choose Apple menu → Log Out and sign back in to your normal account. Your first-login visit is complete; choose Start environment… here. If its first login is already finished, Start environment… can start its desktop here."
+                "Finish {account}'s first manual login (step 2), then sign out and return here (step 3). If already finished, approve missing permissions (step 4) and choose Start environment… (step 5)."
             ),
             Self::LoginSetupRequired => format!(
                 "Sign in to {account} manually from Apple menu → Lock Screen. Finish all macOS welcome screens until its desktop appears. Then choose Apple menu → Log Out and sign back in to your normal account. Choose Start environment… here to start its private desktop. Take your time; these steps are not timed."

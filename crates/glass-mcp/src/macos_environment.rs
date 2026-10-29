@@ -1286,6 +1286,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         )
     };
     let state = Arc::new(Mutex::new(SetupProgress {
+        permission_check_error: None,
         permission_grants: None,
         creation_blocker,
         account: account.clone(),
@@ -1385,6 +1386,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                             }
                             state.message = progress.message;
                             state.permission_grants = progress.permission_grants;
+                            state.permission_check_error = None;
                             if let Some(step) = progress.step {
                                 state.step = step;
                             }
@@ -1474,7 +1476,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }
         state.account = request.name.clone();
         state.running = true;
-        state.step = SetupStep::Checking;
+        state.step = SetupStep::StartEnvironment;
         state.can_cancel = false;
         state.start_account = None;
         state.message = "Starting the development desktop. Complete or cancel macOS approval locally; there is no deadline.".into();
@@ -1498,6 +1500,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     if let Ok(mut state) = state.lock() {
                         state.message = progress.message;
                         state.permission_grants = progress.permission_grants;
+                        state.permission_check_error = None;
                         if let Some(step) = progress.step {
                             state.step = step;
                         }
@@ -1516,6 +1519,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
                     }
                     state.message = progress.message;
                     state.permission_grants = progress.permission_grants;
+                    state.permission_check_error = None;
                     if let Some(step) = progress.step {
                         state.step = step;
                     }
@@ -1623,6 +1627,40 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
             });
         }
     }
+    let permission_state = state.clone();
+    let permission_cancelled = cancelled.clone();
+    std::thread::spawn(move || {
+        while !permission_cancelled.load(Ordering::Relaxed) {
+            let selected = permission_state.lock().ok().and_then(|state| {
+                (!state.running
+                    && state.can_cancel
+                    && (state.start_account.is_some() || state.step == SetupStep::Permissions))
+                    .then(|| state.account.clone())
+            });
+            if let Some(account) = selected {
+                let result = crate::onboarding::fresh_permission_state();
+                if let Ok(mut state) = permission_state.lock()
+                    && !permission_cancelled.load(Ordering::Relaxed)
+                    && !state.running
+                    && state.account == account
+                    && (state.start_account.is_some() || state.step == SetupStep::Permissions)
+                {
+                    match result {
+                        Ok(grants) => {
+                            state.permission_grants = Some(grants);
+                            state.permission_check_error = None;
+                        }
+                        Err(error) => {
+                            state.permission_grants = None;
+                            state.permission_check_error =
+                                Some(error.to_string().chars().take(160).collect());
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
     let actions = SetupActions {
         permission_rows: crate::onboarding::grant_row_widgets(),
         account,
@@ -1717,6 +1755,7 @@ pub fn show_setup(addr: &str) -> anyhow::Result<()> {
         }),
         poll: Box::new(move || {
             state.lock().map(|state| state.clone()).unwrap_or(SetupProgress {
+            permission_check_error: None,
             permission_grants: None,
             creation_blocker: Some("Setup state is unavailable. Reopen application setup before creating an account.".into()),
             message: "Setup state is unavailable. Close this window and open application setup again.".into(), account: String::new(), step: SetupStep::Checking, running: false, can_cancel: true, start_account: None, resume_creation: None,

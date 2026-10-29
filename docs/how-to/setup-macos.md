@@ -48,6 +48,9 @@ Stop any current Glass application with `glass_stop` before changing its environ
 5. Back in **glass → Application setup…**, choose **Start environment…** for the selected account.
    Enter its password locally and complete any separate macOS administrator prompt. Glass starts
    its private desktop without switching your visible desktop. Wait for **Ready**.
+   The wizard's permission step checks app-wide approvals in fresh normal-account Glass processes,
+   independently of whether the development desktop is running. Approve missing access in step 4;
+   step 5 starts the environment and verifies its live worker before Ready.
    If permissions are missing, this same numbered step shows their status and one **Open Settings…** button per permission. Each click opens that
    exact pane; the first click also requests native registration and may show macOS consent. Approve only missing grants from your normal account, then return to this
    wizard. Keep it open: while setup is checking, fresh worker checks detect grants and continue

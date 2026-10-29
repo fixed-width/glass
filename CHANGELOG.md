@@ -35,10 +35,9 @@ internal refactors, CI, or test-only changes.
   an error while keeping permission recovery pending.
   Starting an initialized account reuses its waiting worker and restores the normal user's
   connection access after logout/login instead of reporting that worker as busy.
-  Application setup keeps a numbered first-use guide visible: create or choose the account,
-  sign in manually to finish macOS welcome screens, log out and return to the normal account,
-  then choose Start environment and wait for verified Ready. Existing Glass permissions are reused
-  across accounts; missing grants can be approved from the normal account.
+  Application setup keeps a five-step guide visible: choose the account, finish its manual first
+  macOS login, sign out and return to the main account, allow missing permissions, then start the
+  environment. The wizard explains that Start environment is needed after each reboot.
   The wizard identifies an existing enrollment and requires Disable isolation before opening
   another account-creation dialog. A rejected creation leaves saved setup progress untouched.
   Disabling isolation and uninstalling handle a logged-out development account after independently

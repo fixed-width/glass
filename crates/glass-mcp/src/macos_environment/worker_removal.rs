@@ -465,6 +465,7 @@ mod tests {
             .unwrap();
             let mut calls = 0;
             let mut progress = SetupProgress {
+                permission_check_error: None,
                 permission_grants: None,
                 creation_blocker: Some("enrolled account".into()),
                 account: account.name.clone(),
