@@ -43,8 +43,9 @@ internal refactors, CI, or test-only changes.
   Disabling isolation and uninstalling handle a logged-out development account after independently
   checking that Glass jobs and processes are absent. Other macOS services and the account are kept.
   Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
-  The current action and live permission controls appear above the reference guide, with text
-  sized to its contents. Each missing permission has one Open Settings action; first-click native
+  The current action appears above the reference guide, with text sized to its contents.
+  Permission controls stay inside step 4, below its instructions and above step 5.
+  Each missing permission has one Open Settings action; first-click native
   registration is internal, and every click opens the matching pane.
   Missing-permission controls and live grant status are embedded in the numbered Application setup
   step. Users can request consent or open the exact Settings pane without closing the wizard or

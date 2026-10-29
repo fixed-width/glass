@@ -499,7 +499,6 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
     status.removeFromSuperview();
     combined.addSubview(&current_label);
     combined.addSubview(&status);
-    combined.addSubview(&permission_controls.view);
     scroll.setDocumentView(Some(&combined));
     view.addSubview(&scroll);
 
@@ -652,6 +651,15 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         width: 720.0,
         height: 546.0,
     });
+    let guide_frames: Vec<_> = document
+        .subviews()
+        .into_iter()
+        .map(|child| {
+            let frame = child.frame();
+            (child, frame)
+        })
+        .collect();
+    document.addSubview(&permission_controls.view);
     let permission_document = document.clone();
     let permission_combined = combined.clone();
     let refresh_scroll = scroll.clone();
@@ -677,17 +685,35 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         } else {
             0.0
         };
-        let task_height = 22.0
-            + 6.0
-            + status_height
-            + if permissions_visible {
-                8.0 + controls_height
+        let permission_space = if permissions_visible {
+            controls_height + 18.0
+        } else {
+            0.0
+        };
+        // Insert controls between step 4's instructions and step 5, inside the guide.
+        for (child, frame) in &guide_frames {
+            let shift = if frame.origin.y >= 124.0 {
+                permission_space
             } else {
                 0.0
-            }
-            + 12.0;
-        let guide_offset = (refresh_scroll.frame().size.height - 546.0 - task_height).max(0.0);
-        let total = 546.0 + task_height + guide_offset;
+            };
+            child.setFrameOrigin(CGPoint {
+                x: frame.origin.x,
+                y: frame.origin.y + shift,
+            });
+        }
+        let guide_height = 546.0 + permission_space;
+        permission_document.setFrameSize(CGSize {
+            width: 720.0,
+            height: guide_height,
+        });
+        permission_controls
+            .view
+            .setFrameOrigin(CGPoint { x: 24.0, y: 130.0 });
+        let task_height = 22.0 + 6.0 + status_height + 12.0;
+        let guide_offset =
+            (refresh_scroll.frame().size.height - guide_height - task_height).max(0.0);
+        let total = guide_height + task_height + guide_offset;
         permission_combined.setFrameSize(CGSize {
             width: 720.0,
             height: total,
@@ -703,10 +729,6 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
             672.0,
             status_height,
         ));
-        permission_controls.view.setFrameOrigin(CGPoint {
-            x: 24.0,
-            y: guide_offset + 558.0,
-        });
         if at_top {
             permission_combined.scrollPoint(CGPoint {
                 x: 0.0,
