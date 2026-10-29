@@ -45,6 +45,7 @@ internal refactors, CI, or test-only changes.
   Setup errors remain visible after editing the selected name, and uninstall failures open a dialog.
   Live status appears inside the accented active step, with text sized to its contents.
   Checking keeps the previous step highlighted; the guide no longer duplicates status at the top.
+  Step 2 explains separately that accounts with desktop access can skip to step 4.
   App-wide permission controls stay visible inside step 4 regardless of account selection or
   setup phase, below its instructions and above step 5; redundant
   permission-action guidance is omitted while Settings errors remain visible.

@@ -147,19 +147,24 @@ impl SetupStep {
 }
 
 struct InlineStatusLayout {
+    login_space: f64,
     permission_space: f64,
     status_space: f64,
     status_anchor: f64,
 }
 
 impl InlineStatusLayout {
-    fn new(active: usize, controls_height: f64, status_height: f64) -> Self {
+    fn new(active: usize, controls_height: f64, status_height: f64, login_height: f64) -> Self {
+        let login_space = (login_height - 74.0).max(0.0);
         let permission_space = controls_height + 18.0;
         let content_bottom = [404.0, 290.0, 200.0, 130.0, 0.0][active];
         Self {
+            login_space,
             permission_space,
             status_space: status_height + 12.0,
-            status_anchor: content_bottom - 6.0 + if active < 3 { permission_space } else { 0.0 },
+            status_anchor: content_bottom - 6.0
+                + if active == 0 { login_space } else { 0.0 }
+                + if active < 3 { permission_space } else { 0.0 },
         }
     }
 
@@ -172,6 +177,7 @@ impl InlineStatusLayout {
     }
 
     fn guide_y(&self, y: f64) -> f64 {
+        let y = y + if y > 290.0 { self.login_space } else { 0.0 };
         let y = y + if y >= 124.0 {
             self.permission_space
         } else {
@@ -189,7 +195,7 @@ impl InlineStatusLayout {
     }
 
     fn height(&self) -> f64 {
-        558.0 + self.permission_space + self.status_space
+        558.0 + self.login_space + self.permission_space + self.status_space
     }
 }
 
@@ -424,7 +430,7 @@ fn update_label(label: &NSTextField, text: &str) {
 }
 
 fn sign_in_instructions(_account: &str) -> String {
-    "Select Apple menu → \"Lock screen\" (do not fully log out of your main account), then log in to the developer account. Proceed through all of the macOS first-use welcome screens, until its desktop is available. No further actions are required in the developer account.".into()
+    "Skip to step 4 if the development account already has desktop access.\n\nSelect Apple menu → \"Lock screen\" (do not fully log out of your main account), then log in to the developer account. Proceed through all of the macOS first-use welcome screens, until its desktop is available. No further actions are required in the developer account.".into()
 }
 
 fn start_instructions(_account: &str) -> String {
@@ -728,13 +734,23 @@ pub fn run_setup(actions: SetupActions) -> Result<(), String> {
         }
         update_label(&status, &progress.display_message(&name));
         let status_height = crate::onboarding_window::text_height(&status, 656.0);
-        let layout = InlineStatusLayout::new(active, permission_controls.layout(), status_height);
+        let login_height = crate::onboarding_window::text_height(&sign_in, 672.0).max(74.0);
+        let layout = InlineStatusLayout::new(
+            active,
+            permission_controls.layout(),
+            status_height,
+            login_height,
+        );
         for (child, frame) in &guide_frames {
             child.setFrameOrigin(CGPoint {
                 x: frame.origin.x,
                 y: layout.guide_y(frame.origin.y),
             });
         }
+        sign_in.setFrameSize(CGSize {
+            width: 672.0,
+            height: login_height,
+        });
         permission_controls.view.setFrameOrigin(CGPoint {
             x: 24.0,
             y: layout.controls_y(),
@@ -864,7 +880,8 @@ mod tests {
         for active in 0..5 {
             for controls_height in [60.0, 180.0] {
                 for status_height in [24.0, 140.0, 400.0] {
-                    let layout = InlineStatusLayout::new(active, controls_height, status_height);
+                    let layout =
+                        InlineStatusLayout::new(active, controls_height, status_height, 120.0);
                     let body_bottom = if active == 3 {
                         layout.controls_y()
                     } else {
