@@ -20,6 +20,7 @@ way it does? The explanations.
 - [Linux](how-to/setup-linux.md) — X11 and Wayland
 - [Windows](how-to/setup-windows.md)
 - [macOS](how-to/setup-macos.md)
+- [Audit and manually manage macOS account setup](how-to/audit-macos-account-setup.md)
 - [Android](how-to/setup-android.md) — an AVD emulator, from any host
 - [iOS](how-to/setup-ios.md) — the Simulator, macOS host only
 
@@ -52,6 +53,7 @@ way it does? The explanations.
 - [Stability and versioning](reference/stability.md) — the semver promise: what's covered from 1.0
 - [Environment variables](reference/environment.md) — every `GLASS_*` variable
 - [CLI](reference/cli.md) — `glass-mcp` subcommands
+- [macOS administrator access](reference/macos-administrator-access.md) — privileged commands, password handling and on-disk records
 - [Platform support](reference/platforms.md) — the capability matrix and system requirements
 - [Accessibility roles by platform](reference/a11y-roles.md) — which roles each backend can produce
 - [Audit log](reference/audit-log.md) — the JSONL record schema and redaction

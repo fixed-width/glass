@@ -7,6 +7,10 @@ running an unreleased checkout build from source instead — see
 
 ## Apps off your desktop (preview)
 
+Before approving administrator access, see the [command and password-handling reference](../reference/macos-administrator-access.md).
+For inspection commands and account creation/login through macOS itself, see
+[Audit and manually manage macOS account setup](audit-macos-account-setup.md).
+
 This setup keeps development apps in a separate standard account in the same macOS installation.
 The ordinary MCP server stays in your account. Its macOS backend owns an on-demand worker in the
 selected account; Android and iOS continue through their existing backends. Use the same

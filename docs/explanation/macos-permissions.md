@@ -27,13 +27,13 @@ grant is keyed to never changes.
 `launchd` its parent instead — giving glass its own grantable, responsible process. That is the whole
 reason macOS glass runs as a LaunchAgent rather than a binary you `ssh` in and start.
 
-## Grants are read at launch
+## Fresh checks after permission changes
 
-Both permissions are effectively **snapshotted when the process starts**. A grant enabled while glass
-is already running is not visible to it until it restarts — Screen Recording binds its capability at
-process start, and the Accessibility trust check is cached. This is why granting a permission is always
-followed by a relaunch or a kickstart, and why the onboarding flow is built around relaunching rather
-than live-polling.
+A long-lived process can have a stale permission view, especially for Screen Recording. Separate-account
+setup checks changes in fresh signed Glass processes and verifies the actual worker before Ready.
+The normal account's Application setup window can therefore stay open while access is granted;
+it does not require quitting that window or repeating approval in the development account.
+The shared-desktop checklist can still use Re-check/relaunch to obtain a fresh process view.
 
 ## How the packaging follows from the model
 
@@ -52,16 +52,16 @@ The step-by-step for each path is in the setup and build guides:
 
 With `setup --account ACCOUNT`, the grant-bearing worker runs as a LaunchAgent in that account's
 real Aqua login. The app's **Application setup…** window and CLI share the same coordinator. Enrollment
-registers a permission helper from that one Glass bundle; it opens **glass permissions** in the
-development account and reads grant changes in fresh Glass processes. The coordinator waits for
-consent and the user's return without a user deadline, then checks live worker readiness and any
-pending workspace recovery. The
+registers a permission helper from that one Glass bundle. The GUI keeps consent controls in the normal
+account's **Application setup…** window and reads changes through fresh Glass checks. The coordinator
+waits for the manual macOS login/return and any required consent without a user deadline, then checks
+live worker readiness and pending workspace recovery. The
 [account setup guide](../how-to/setup-macos.md#apps-off-your-desktop-preview) gives the full sequence,
 including verification and MCP-client configuration.
 
 Accessibility and Screen Recording approvals for the same signed app are system-wide and reused
 across accounts. A new development account does not require a duplicate approval. Complete its
-macOS welcome screens once, then log out and return to the normal account; **Start environment…**
+macOS welcome screens once, then log out and return to the normal account; **Start Environment…**
 can start that initialized desktop again. Missing grants can be approved from the normal account.
 
 The MCP server in your ordinary account continues handling tools, audit records, traces and other backends;
@@ -88,3 +88,11 @@ Interrupted permission recovery checks recorded process births, the machine's bo
 previous private login's lifetime. A surviving process or a retained login session can conservatively
 defer recovery. Glass preserves the journal and reports the incomplete cleanup rather than restoring
 access while earlier work may still be running.
+
+## Administrator authorisation and manual control
+
+Privacy grants are separate from the root authorisation used for account creation, registration,
+desktop startup and enrollment removal. The [administrator-access reference](../reference/macos-administrator-access.md)
+shows the actual elevation wrappers, compiled operations, password handling and persistent records.
+The [manual audit/setup guide](../how-to/audit-macos-account-setup.md) covers inspection and the
+macOS account-creation/login route that avoids entering the development-account password in Glass.
