@@ -144,7 +144,7 @@ jobs:
 
   macos:
     name: macOS (build · clippy · test)
-    runs-on: macos-14   # arm64 hosted runner
+    runs-on: macos-15   # arm64 hosted runner
     # This is the only place cfg(target_os = "macos") code gets built + linted + tested — the
     # Linux job can't compile it. The capture/input/windows/a11y/bundle_launch integration
     # targets are harness = false and hard-fail without a granted, WindowServer-connected TCC
@@ -201,7 +201,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [macos-14, xcode-27]
+        image: [macos-15, xcode-27]
         context: [direct, system]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
