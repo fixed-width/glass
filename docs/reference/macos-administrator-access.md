@@ -71,6 +71,11 @@ of account creation or registration.
 | Start Environment or finish interrupted startup cleanup | `macos-start-environment` | Reads the current enrollment, restores pending temporary access, checks the local Apple desktop service, and starts/reuses the selected desktop. It can temporarily add that account to the existing Screen Sharing access group and removes its confirmed temporary addition afterwards. It can activate the registered Glass worker. | `run`, `privileged`, `restore_record` in [desktop_start.rs](../../crates/glass-mcp/src/macos_environment/desktop_start.rs); `glass_desktop_access` in [account_setup.m](../../crates/glass-macos/src/account_setup.m) |
 | Disable isolation, unenroll, or remove account integration during uninstall | `macos-unenroll` | Removes verified Glass jobs and enrollment after checking ownership and active work. Pending application/workspace recovery runs before privileged registration removal; pending startup access is restored during removal. The development account, home, app data and privacy grants are retained. | `leave_account_using`, `remove_registration` in [macos_environment.rs](../../crates/glass-mcp/src/macos_environment.rs); [worker_removal.rs](../../crates/glass-mcp/src/macos_environment/worker_removal.rs) |
 
+Root is used for local account-database changes, registration inside another user's home and
+root-owned state, cross-user job management, and the current startup implementation's service
+identity/access checks. Those checks remain part of an authorised transaction even when an existing
+record or access grant can be reused. This does not mean ordinary build commands need root.
+
 Opening or resuming setup can require registration repair; an administrator request therefore does
 not necessarily mean a new account is being created. Removal of the normal user's own HTTP
 LaunchAgent is separate from privileged development-account registration removal. Removing the
