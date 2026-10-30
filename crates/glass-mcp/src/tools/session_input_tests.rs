@@ -42,8 +42,8 @@ fn assert_operation_refusal(value: &serde_json::Value) {
 #[test]
 fn admission_projection_preserves_stronger_dispatch_evidence() {
     let error = glass_core::GlassError::UnsupportedOperation {
-        operation: "test operation",
-        reason: "no qualified route",
+        operation: "test operation".into(),
+        reason: "no qualified route".into(),
     }
     .before_dispatch()
     .after_dispatch();
@@ -62,8 +62,8 @@ fn operation_refusals_keep_their_reason_after_the_sequence_deadline() {
     };
     let refused = || {
         glass_core::GlassError::UnsupportedOperation {
-            operation: "keyboard or text input",
-            reason: "no qualified text route",
+            operation: "keyboard or text input".into(),
+            reason: "no qualified text route".into(),
         }
         .before_dispatch()
     };

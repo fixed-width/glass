@@ -6,10 +6,11 @@
 //! backend's `capabilities()` literal then fails to compile until it supplies that field,
 //! so no backend can silently omit a capability.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// Backend-owned input routing. This is not a caller-selected session option.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputRoute {
     SharedDesktop,
     Isolated,
@@ -17,7 +18,7 @@ pub enum InputRoute {
 }
 
 /// Whether admitted input can affect the host user's pointer or foreground application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopInterference {
     None,
@@ -25,13 +26,13 @@ pub enum DesktopInterference {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputOperationCapability {
     #[serde(flatten)]
     pub support: CapabilityStatus,
     pub desktop_interference: DesktopInterference,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub restriction: Option<&'static str>,
+    pub restriction: Option<Cow<'static, str>>,
 }
 
 impl InputOperationCapability {
@@ -44,7 +45,7 @@ impl InputOperationCapability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputCapabilities {
     pub click: InputOperationCapability,
     pub scroll: InputOperationCapability,
@@ -82,10 +83,10 @@ impl InputCapabilities {
             }
         }
         self.click.restriction = Some(
-            "coordinate left click only: count 1, no modifiers; semantic and ID clicks are unsupported",
+            "coordinate left click only: count 1, no modifiers; semantic and ID clicks are unsupported".into(),
         );
         self.scroll.restriction = Some(
-            "coordinate vertical wheel scroll only: dx 0, no modifiers; scroll_to_element is unsupported",
+            "coordinate vertical wheel scroll only: dx 0, no modifiers; scroll_to_element is unsupported".into(),
         );
         self.text = InputOperationCapability::new(
             CapabilityStatus::unsupported(Some(
@@ -96,14 +97,14 @@ impl InputCapabilities {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCapabilities {
     pub backend: String,
     pub input: InputCapabilities,
 }
 
 /// Whether an operation can be performed right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Support {
     /// Works right now.
@@ -117,16 +118,22 @@ pub enum Support {
 }
 
 /// One capability's status plus an optional human note (what's missing / why).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityStatus {
     pub status: Support,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<&'static str>,
+    pub note: Option<Cow<'static, str>>,
 }
 
 impl CapabilityStatus {
     pub const fn new(status: Support, note: Option<&'static str>) -> Self {
-        Self { status, note }
+        Self {
+            status,
+            note: match note {
+                Some(note) => Some(Cow::Borrowed(note)),
+                None => None,
+            },
+        }
     }
     pub const fn supported() -> Self {
         Self::new(Support::Supported, None)
@@ -143,7 +150,7 @@ impl CapabilityStatus {
 }
 
 /// One status per capability. Serializes to a JSON object keyed by field name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMap {
     /// Pointer + keyboard injection (glass_type/click/key/drag/scroll/move/do).
     pub input: CapabilityStatus,
@@ -164,13 +171,13 @@ impl CapabilityMap {
             clipboard,
             accessibility,
             window_move_resize,
-        } = *self;
+        } = self;
         [
-            ("input", input),
-            ("multi_touch", multi_touch),
-            ("clipboard", clipboard),
-            ("accessibility", accessibility),
-            ("window_move_resize", window_move_resize),
+            ("input", input.clone()),
+            ("multi_touch", multi_touch.clone()),
+            ("clipboard", clipboard.clone()),
+            ("accessibility", accessibility.clone()),
+            ("window_move_resize", window_move_resize.clone()),
         ]
     }
 }

@@ -35,6 +35,7 @@
 # either the bundle id or the identity produces a new Designated Requirement and
 # starts the grant over.
 set -euo pipefail
+umask 022
 
 usage() {
   cat >&2 <<'EOF'

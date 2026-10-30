@@ -82,6 +82,11 @@ staples it via `xcrun notarytool` + `stapler`, and uploads
 Release. Both carry `../README-macos.md` as `README.md` beside the bundle — never inside
 it, which would break the signature.
 
+`make-dmg.sh` preserves signed app contents and the stapled ticket while removing inherited
+ACLs and making the staged bundle readable and traversable by other macOS accounts. It does
+not modify its input bundle. Run `bash scripts/test-macos-packaging.sh` to check a signed
+bundle copied from private build directories without launching a GUI or requesting privacy grants.
+
 The job **skips cleanly** (no failure) until these repository secrets are set, so releases
 still publish the Linux/Windows artifacts before macOS signing is available:
 
@@ -107,3 +112,12 @@ a partial configuration will run and fail at the first missing value rather than
 brand icon). `build-app.sh` installs it into `GlassMcp.app/Contents/Resources` and
 `Info.plist`'s `CFBundleIconFile` (`AppIcon`) names it, so Finder/Dock show the mark.
 Regenerate after editing the SVG: `python3 packaging/macos/make-appicon.py` (needs Pillow).
+
+## Separate-account setup preview
+
+The same signed bundle contains the ordinary MCP server and its internal macOS backend worker.
+After installation, `glass-mcp setup --account ACCOUNT --no-launchagent` registers only the latter
+in an existing standard account; `--launchagent` additionally installs the existing owner-side
+HTTP/menu-bar server. No extra helper binary, relay, application registry or alternate tool API is
+required. Follow [the account setup guide](../../docs/how-to/setup-macos.md#apps-off-your-desktop-preview)
+for grants, login reuse, stop/uninstall behavior and current qualification limits.

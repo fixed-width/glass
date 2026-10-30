@@ -56,7 +56,7 @@ mod untrusted;
 pub(crate) mod update;
 
 use anyhow::Context;
-use glass_core::{Backend, BaselineStore, Glass, GlassError, Platform, Result};
+use glass_core::{Backend, BaselineStore, Glass, GlassError, Result};
 #[cfg(target_os = "linux")]
 use glass_wayland::WaylandPlatform;
 #[cfg(target_os = "linux")]
@@ -72,6 +72,14 @@ compile_error!(
      mirroring the linux/windows/macos backends) plus its make_platform + doctor arms"
 );
 
+#[cfg(target_os = "macos")]
+fn shared_desktop_restart_required() -> GlassError {
+    GlassError::Backend(
+        "shared-desktop use requires restarting this Glass MCP server after unenrollment".into(),
+    )
+    .before_dispatch()
+}
+
 /// Construct a backend by name. The only place that knows the concrete backends;
 /// passed to `Glass` as a factory so the backend is built per `glass_start`.
 pub fn make_platform(
@@ -81,6 +89,23 @@ pub fn make_platform(
     a11y: &glass_android::A11yServiceRegistry,
     #[cfg(target_os = "macos")] sim_registry: &glass_ios::SimulatorRegistry,
 ) -> Result<Backend> {
+    #[cfg(target_os = "macos")]
+    if backend == "macos" {
+        let lease = macos_environment::application_lease()
+            .map_err(|error| GlassError::Backend(error.to_string()).before_dispatch())?;
+        if glass_macos::private_session::configured()? {
+            return remote_backend::backend(
+                macos_worker::backend_transport::NativeConnection::connect(lease)?,
+            );
+        }
+        if !glass_macos::main_thread_initialized() {
+            return Err(shared_desktop_restart_required());
+        }
+        return Ok(Backend {
+            platform: Box::new(glass_macos::MacosPlatform::new()?.with_environment_lease(lease)),
+            accessibility: Some(Box::new(glass_a11y_macos::MacosA11y::new())),
+        });
+    }
     #[cfg(target_os = "macos")]
     if backend == "ios" {
         let platform = glass_ios::IosPlatform::from_env(sim_registry)?;
@@ -108,45 +133,43 @@ pub fn make_platform(
             accessibility: Some(accessibility),
         });
     }
-    let platform: Box<dyn Platform + Send> = match backend {
-        #[cfg(target_os = "linux")]
-        "wayland" => Box::new(WaylandPlatform::new()?),
-        #[cfg(target_os = "linux")]
-        "x11" => Box::new(X11Platform::from_env()?),
-        #[cfg(windows)]
-        "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
-        #[cfg(target_os = "macos")]
-        "macos" => Box::new(glass_macos::MacosPlatform::new()?),
-        other => {
-            #[cfg(target_os = "linux")]
-            let valid = "\"x11\", \"wayland\", or \"android\"";
-            #[cfg(windows)]
-            let valid = "\"windows\" or \"android\"";
-            #[cfg(target_os = "macos")]
-            let valid = "\"macos\", \"android\", or \"ios\"";
-            return Err(GlassError::Backend(format!(
-                "unknown backend {other:?}; use {valid}"
-            )));
-        }
-    };
-    // Accessibility is per-OS: AT-SPI on Linux (serving both display backends), UI Automation
-    // on Windows, AXUIElement on macOS. Each reader is attached unconditionally, with no
-    // silent fallback — a reader-specific failure (an unreachable AT-SPI bus, a missing macOS
-    // Accessibility grant) surfaces as `AccessibilityUnavailable` or `PermissionDenied` at
-    // call time, not here.
-    #[cfg(windows)]
-    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-        Some(Box::new(glass_a11y_windows::WindowsA11y::new()));
-    #[cfg(target_os = "linux")]
-    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-        Some(Box::new(glass_a11y_linux::LinuxA11y::new()));
     #[cfg(target_os = "macos")]
-    let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
-        Some(Box::new(glass_a11y_macos::MacosA11y::new()));
-    Ok(Backend {
-        platform,
-        accessibility,
-    })
+    {
+        Err(GlassError::Backend(format!(
+            "unknown backend {backend:?}; use \"macos\", \"android\", or \"ios\""
+        )))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let platform: Box<dyn glass_core::Platform + Send> = match backend {
+            #[cfg(target_os = "linux")]
+            "wayland" => Box::new(WaylandPlatform::new()?),
+            #[cfg(target_os = "linux")]
+            "x11" => Box::new(X11Platform::from_env()?),
+            #[cfg(windows)]
+            "windows" => Box::new(glass_windows::WindowsPlatform::new()?),
+            other => {
+                #[cfg(target_os = "linux")]
+                let valid = "\"x11\", \"wayland\", or \"android\"";
+                #[cfg(windows)]
+                let valid = "\"windows\" or \"android\"";
+                return Err(GlassError::Backend(format!(
+                    "unknown backend {other:?}; use {valid}"
+                )));
+            }
+        };
+        // Each reader attaches unconditionally; unavailable accessibility surfaces at call time.
+        #[cfg(windows)]
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(glass_a11y_windows::WindowsA11y::new()));
+        #[cfg(target_os = "linux")]
+        let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> =
+            Some(Box::new(glass_a11y_linux::LinuxA11y::new()));
+        Ok(Backend {
+            platform,
+            accessibility,
+        })
+    }
 }
 
 /// The canonical list of backend names glass accepts. Single source of truth: the
@@ -243,6 +266,7 @@ pub async fn run_update(
 /// the `.app` is a Finder action the user does by hand.
 #[cfg(target_os = "macos")]
 pub fn run_uninstall() -> anyhow::Result<()> {
+    macos_environment::uninstall()?;
     setup::uninstall_launch_agent()?;
     println!("glass no longer starts at login. To remove the app, drag GlassMcp.app to the Trash.");
     Ok(())
@@ -280,9 +304,9 @@ pub fn run_debug_grants() -> anyhow::Result<()> {
 
 /// Spike/diagnostic (`debug-checklist`): show the onboarding permission-checklist window so its
 /// rendering + the per-row "Request…" and "Re-check" buttons can be smoke-tested on-box
-/// without building `GlassMcp.app`. Rows reflect the REAL grant snapshot; "Request…" opens
-/// the actual System Settings pane (so you can confirm the panes open); "Re-check" only prints
-/// (a real relaunch belongs to the onboarder, not this harness).
+/// without building `GlassMcp.app`. Rows reflect real grant snapshots; Request only simulates
+/// consent so a terminal-launched harness never requests grants for its parent. Open Settings
+/// opens the actual pane, and Re-check only prints. Production consent belongs to the signed app.
 #[cfg(target_os = "macos")]
 pub fn run_debug_checklist() -> anyhow::Result<()> {
     use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
@@ -291,17 +315,25 @@ pub fn run_debug_checklist() -> anyhow::Result<()> {
             GrantRow {
                 label: "Accessibility",
                 granted: glass_macos::accessibility_granted(),
+                on_request: Box::new(|| {
+                    eprintln!("[debug-checklist] Request simulated; no consent requested");
+                    glass_macos::accessibility_granted()
+                }),
                 on_open_settings: Box::new(|| {
-                    eprintln!("[debug-checklist] Request: Accessibility");
-                    let _ = glass_macos::open_pane(glass_macos::accessibility_pane_url());
+                    glass_macos::open_pane(glass_macos::accessibility_pane_url())
+                        .map_err(|error| error.to_string())
                 }),
             },
             GrantRow {
                 label: "Screen Recording",
                 granted: glass_macos::screen_recording_granted(),
+                on_request: Box::new(|| {
+                    eprintln!("[debug-checklist] Request simulated; no consent requested");
+                    glass_macos::screen_recording_granted()
+                }),
                 on_open_settings: Box::new(|| {
-                    eprintln!("[debug-checklist] Request: Screen Recording");
-                    let _ = glass_macos::open_pane(glass_macos::screen_recording_pane_url());
+                    glass_macos::open_pane(glass_macos::screen_recording_pane_url())
+                        .map_err(|error| error.to_string())
                 }),
             },
         ],
@@ -381,7 +413,12 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     // actually drive `xcrun simctl`. `#[cfg]` on a closure's captured argument isn't
     // stable, so the closure itself is defined once per branch instead.
     #[cfg(target_os = "macos")]
+    let started_enrolled = !matches!(glass_macos::private_session::configured(), Ok(false));
+    #[cfg(target_os = "macos")]
     let platform_factory: glass_core::PlatformFactory = Box::new(move |b| {
+        if b == "macos" && started_enrolled && !glass_macos::private_session::configured()? {
+            return Err(shared_desktop_restart_required());
+        }
         make_platform(
             b,
             &reg_factory,
@@ -858,3 +895,27 @@ mod tests {
         }
     }
 }
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod backend_worker;
+#[cfg(target_os = "macos")]
+pub mod macos_worker;
+#[cfg(target_os = "macos")]
+pub mod native_backend;
+#[cfg(target_os = "macos")]
+mod permission_journal;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod remote_backend;
+#[cfg(target_os = "macos")]
+mod workspace_permissions;
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod account_uid;
+#[cfg(any(target_os = "macos", test))]
+mod launchd;
+#[cfg(any(target_os = "macos", test))]
+mod macos_account;
+#[cfg(target_os = "macos")]
+pub mod macos_environment;
+#[cfg(any(target_os = "macos", test))]
+mod macos_setup;

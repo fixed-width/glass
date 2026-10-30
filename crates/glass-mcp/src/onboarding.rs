@@ -1,28 +1,7 @@
-//! Double-click first-run for GlassMcp.app. Launched by LaunchServices with no subcommand
-//! (see `main.rs`'s launch routing), the app is its own TCC responsible process, so the grant
-//! requests it raises attribute to GlassMcp.app itself (a terminal spawning `setup` would key
-//! the grant to the terminal instead).
+//! First-run application setup and grant-bearing account onboarding.
 //!
-//! The flow ([`run`]) has three outcomes, cheapest first:
-//!
-//! - **A. Already running.** A healthy LaunchAgent is already serving with both grants held —
-//!   a returning user. Nothing to onboard: don't re-request grants or reinstall over a working
-//!   agent, just exit.
-//! - **B. Ready to install.** Both grants are held in *this launch's* TCC snapshot, but no agent
-//!   is serving yet. Install + start the menu-bar LaunchAgent (the fresh process that will read
-//!   the grants and serve), then exit — the LaunchAgent, not this onboarder, becomes the running
-//!   server.
-//! - **C. Show the checklist.** At least one grant is missing. Show the permission-checklist
-//!   window ([`glass_macos::run_checklist`]): one row per permission with its live snapshot, a
-//!   "Request…" button that requests that permission (macOS shows its own consent prompt, which
-//!   adds GlassMcp.app to its Privacy pane and carries an "Open System Settings" button that
-//!   navigates there), and a "Re-check" button that relaunches a *fresh* process. TCC grants are
-//!   cached per-process at launch, so re-reading them requires a new process — the relaunched
-//!   instance re-enters this flow and, once both grants read granted, lands in outcome B.
-//!
-//! Client-agnostic: the checklist only guides the grants; per-client MCP wiring is documented,
-//! not assumed. macOS-only — there is no LaunchServices double-click hand-off to onboard
-//! anywhere else.
+//! The normal app preserves an existing shared-desktop setup and offers account setup on first run.
+//! The development account's permission helper has an explicit launchd role in the same bundle.
 
 /// The address [`run`] binds the onboarded LaunchAgent to when the caller has no more specific
 /// preference — a LaunchServices double-click never passes one. Not feature-gated (unlike
@@ -39,14 +18,27 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
 #[cfg(target_os = "macos")]
 use glass_macos::onboarding_window::{ChecklistActions, GrantRow, run_checklist};
 
-/// Onboarding entry — see the module doc for the full A/B/C flow. Short-circuit if a healthy
-/// agent is already serving with both grants (A); otherwise, if both grants are held in this
-/// launch's snapshot, install + start the LaunchAgent and exit (B); otherwise show the
-/// permission checklist (C). macOS-only — an error off macOS, since the double-click hand-off
-/// only exists there.
+/// Open the enrolled menu-bar app, or guide first-time environment setup.
 pub fn run(addr: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
+        match glass_macos::private_session::configured() {
+            Ok(true) => {
+                #[cfg(feature = "network")]
+                {
+                    let exe = std::env::current_exe()?;
+                    return crate::setup::start_launch_agent(&exe.to_string_lossy(), addr)
+                        .map_err(Into::into);
+                }
+                #[cfg(not(feature = "network"))]
+                return crate::macos_environment::show_setup(addr);
+            }
+            Ok(false) => {}
+            Err(_) => return crate::macos_environment::show_setup(addr),
+        }
+        if !matches!(crate::macos_environment::has_pending_setup(), Ok(false)) {
+            return crate::macos_environment::show_setup(addr);
+        }
         // A. A healthy agent is already serving with both grants held — nothing to onboard.
         //    Don't re-request grants (would pop dialogs for nothing) or reinstall over a working
         //    agent.
@@ -54,40 +46,31 @@ pub fn run(addr: &str) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        // B. Both grants held in THIS launch's snapshot, but nothing serving yet — install +
-        //    start the menu-bar LaunchAgent (the fresh process that re-reads the grants and
-        //    serves), then exit. Because a double-clicked .app is its own TCC responsible
-        //    process, the LaunchAgent it installs inherits the same grant identity.
         if glass_macos::accessibility_granted() && glass_macos::screen_recording_granted() {
             let exe = std::env::current_exe()?;
             if let Some((label, instruction)) =
                 crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
             {
-                // The job loaded but isn't serving yet (e.g. a port clash). This double-clicked
-                // onboarder has no dialog surface, so surface the actionable instruction to
-                // stderr (captured in the app's unified/Console log) rather than exit silently
-                // implying success. `label` names the LaunchAgent job.
-                eprintln!(
-                    "glass onboarding: LaunchAgent {label} installed but isn't serving yet: \
-                     {instruction}"
-                );
+                eprintln!("glass: {label}: {instruction}");
             }
             return Ok(());
         }
 
-        // C. At least one grant is missing — show the checklist so the user can grant each and
-        //    re-check. `on_recheck` is assembled here, not inside `grant_row_widgets`, because
-        //    only the onboarder's recheck should relaunch-and-exit(0) (see `relaunch`); the
-        //    menu-bar self-onboard fallback reuses the row widgets but wires its own
-        //    `on_recheck` (`restart_launch_agent()`) since it runs inside the already-serving
-        //    process and must not exit it.
-        let app = crate::setup::app_bundle_path(&std::env::current_exe().unwrap_or_default());
-        let actions = ChecklistActions {
-            rows: grant_row_widgets(),
-            on_recheck: Box::new(move || relaunch(&app)),
-        };
-        run_checklist(actions).map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
+        match glass_macos::setup_window::choose_environment().map_err(anyhow::Error::msg)? {
+            glass_macos::setup_window::SetupChoice::SeparateAccount => {
+                crate::macos_environment::show_setup(addr)
+            }
+            glass_macos::setup_window::SetupChoice::Cancel => Ok(()),
+            glass_macos::setup_window::SetupChoice::SharedDesktop => {
+                let exe = std::env::current_exe()?;
+                if let Some((label, instruction)) =
+                    crate::setup::install_launch_agent(&exe.to_string_lossy(), addr)?
+                {
+                    eprintln!("glass: {label}: {instruction}");
+                }
+                Ok(())
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -111,6 +94,38 @@ fn grant_rows(accessibility: bool, screen_recording: bool) -> [(&'static str, bo
     ]
 }
 
+/// Internal read-only role: a new process observes application-wide grants without a backend.
+#[cfg(target_os = "macos")]
+pub fn print_permission_state() -> anyhow::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&[
+            glass_macos::accessibility_granted(),
+            glass_macos::screen_recording_granted(),
+        ])?
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn fresh_permission_state() -> anyhow::Result<[bool; 2]> {
+    let output = glass_core::run_bounded(
+        std::process::Command::new(std::env::current_exe()?).arg("macos-permission-state"),
+        std::time::Duration::from_secs(5),
+        "checking Glass permissions",
+    )?;
+    decode_permission_state(output.status.success(), &output.stdout)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_permission_state(success: bool, bytes: &[u8]) -> anyhow::Result<[bool; 2]> {
+    anyhow::ensure!(
+        success && bytes.len() <= 128,
+        "fresh Glass permission check failed"
+    );
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 /// Build the checklist's row widgets from this launch's TCC grant snapshot: one [`GrantRow`]
 /// per permission, each carrying its live snapshot and the "Request…" closure that requests
 /// the grant. Shared with the menu-bar self-onboard fallback, which reuses the *identical* row
@@ -132,20 +147,19 @@ pub(crate) fn grant_row_widgets() -> Vec<GrantRow> {
         GrantRow {
             label: ax_label,
             granted: ax_granted,
-            // "Request…" just *requests* the grant: macOS shows its own consent prompt —
-            // which carries an "Open System Settings" button that navigates to the pane — and
-            // lists GlassMcp.app there. We deliberately do NOT also `open_pane`: forcing Settings
-            // open fought the system's own prompt (it opened even when the user hadn't chosen to).
-            // Let the system prompt take the user there.
+            on_request: Box::new(glass_macos::request_accessibility),
             on_open_settings: Box::new(|| {
-                glass_macos::request_accessibility();
+                glass_macos::open_pane(glass_macos::accessibility_pane_url())
+                    .map_err(|error| error.to_string())
             }),
         },
         GrantRow {
             label: sr_label,
             granted: sr_granted,
+            on_request: Box::new(glass_macos::request_screen_recording),
             on_open_settings: Box::new(|| {
-                glass_macos::request_screen_recording();
+                glass_macos::open_pane(glass_macos::screen_recording_pane_url())
+                    .map_err(|error| error.to_string())
             }),
         },
     ]
@@ -202,9 +216,156 @@ pub(crate) fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Grant-bearing onboarding in the selected account's real login.
+#[cfg(target_os = "macos")]
+pub fn run_worker() -> anyhow::Result<()> {
+    glass_macos::private_session::attach(true)?;
+    if glass_macos::accessibility_granted() && glass_macos::screen_recording_granted() {
+        eprintln!(
+            "glass: permissions ready; return to your normal account; Start Environment can restart this desktop after logout"
+        );
+        return Ok(());
+    }
+    let app = crate::setup::app_bundle_path(&std::env::current_exe()?);
+    run_checklist(ChecklistActions {
+        rows: grant_row_widgets(),
+        on_recheck: Box::new(move || relaunch(&app)),
+    })
+    .map_err(|error| anyhow::anyhow!(error))
+}
+
+/// Explicit launchd entry; does not rely on Finder's no-argument launch classification.
+#[cfg(target_os = "macos")]
+pub fn run_registered_worker(owner: u32, check: bool) -> anyhow::Result<()> {
+    use glass_macos::onboarding_window::{ChecklistUpdate, run_checklist_with_poll};
+    use std::sync::{Arc, Mutex};
+
+    if check {
+        glass_macos::private_session::attach_for(owner, true)?;
+    } else {
+        while !glass_macos::private_session::try_attach_for_onboarding(owner)?
+            || glass_macos::private_session::login_setup_pending()?
+        {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    let facts = crate::macos_setup::Readiness {
+        private_session: glass_macos::private_session::require_private().is_ok(),
+        login_setup_pending: glass_macos::private_session::login_setup_pending()?,
+        accessibility: glass_macos::accessibility_granted(),
+        screen_recording: glass_macos::screen_recording_granted(),
+        onboarding_running: false,
+    };
+    if check {
+        println!("{}", serde_json::to_string(&facts)?);
+        return Ok(());
+    }
+    if !facts.login_setup_pending && facts.accessibility && facts.screen_recording {
+        return Ok(());
+    }
+    glass_macos::init_main_thread();
+    let latest = Arc::new(Mutex::new(None));
+    let output = latest.clone();
+    let binary = std::env::current_exe()?;
+    std::thread::spawn(move || {
+        loop {
+            let result = fresh_worker_readiness(&binary, owner);
+            if let Ok(mut output) = output.lock() {
+                *output = Some(result);
+            } else {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    });
+    run_checklist_with_poll(ChecklistActions {
+        rows: grant_row_widgets(),
+        on_recheck: Box::new(|| {
+            let target = format!("gui/{}/tech.fixedwidth.glass.onboarding", rustix::process::getuid().as_raw());
+            if let Err(error) = std::process::Command::new("/bin/launchctl").args(["kickstart", "-k", &target]).spawn() {
+                eprintln!("glass: could not restart permission onboarding: {error}");
+            }
+        }),
+    }, Some(Box::new(move || {
+        let result = latest.lock().ok()?.take()?;
+        Some(match result {
+            Ok(facts) => {
+                let granted = facts.accessibility && facts.screen_recording;
+                ChecklistUpdate {
+                    granted: [facts.accessibility, facts.screen_recording],
+                    message: if facts.login_setup_pending { "Finish all macOS welcome screens until this account's desktop appears. Then log out and return to your normal account. Start Environment in Glass starts this desktop when needed.".into() }
+                        else if granted { "Permissions ready. You can log out and return to your normal account. In Glass application setup, choose Start Environment if this desktop is stopped, or Continue setup if checking is paused.".into() }
+                        else { "Glass permissions can be approved from your normal account in System Settings → Privacy & Security. Existing grants are reused across accounts. Return there after completing macOS welcome screens; you can log out of this account. Glass checks automatically; there is no time limit.".into() },
+                    finished: granted && facts.private_session && !facts.login_setup_pending,
+                }
+            }
+            Err(error) => ChecklistUpdate {
+                granted: [facts.accessibility, facts.screen_recording],
+                message: format!("Could not check permissions: {error}. You can retry with Re-check."),
+                finished: false,
+            },
+        })
+    }))).map_err(anyhow::Error::msg)
+}
+
+#[cfg(target_os = "macos")]
+fn fresh_worker_readiness(
+    binary: &std::path::Path,
+    owner: u32,
+) -> anyhow::Result<crate::macos_setup::Readiness> {
+    use anyhow::Context;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(binary)
+        .args(["macos-onboarding", &owner.to_string(), "--check"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(status.success(), "fresh permission check failed");
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .context("permission check stdout unavailable")?
+                .take(4096)
+                .read_to_end(&mut bytes)?;
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            anyhow::bail!("fresh permission check timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_snapshot_requires_a_successful_bounded_boolean_pair() {
+        assert_eq!(
+            decode_permission_state(true, b"[true,false]").unwrap(),
+            [true, false]
+        );
+        for bytes in [
+            b"[true]".as_slice(),
+            b"[true,false,true]",
+            b"{\"ready\":true}",
+            b"[1,0]",
+            b"not-json",
+        ] {
+            assert!(decode_permission_state(true, bytes).is_err());
+        }
+        assert!(decode_permission_state(false, b"[true,true]").is_err());
+        assert!(decode_permission_state(true, &[b' '; 129]).is_err());
+    }
 
     #[test]
     fn grant_rows_orders_accessibility_before_screen_recording() {

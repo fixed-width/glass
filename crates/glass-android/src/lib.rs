@@ -64,7 +64,7 @@ fn capabilities_with(agent: bool, a11y_apk: bool) -> CapabilityMap {
                 "adb input only; set GLASS_ANDROID_AGENT_JAR for high-fidelity input",
             )
         },
-        multi_touch: agent_gated,
+        multi_touch: agent_gated.clone(),
         clipboard: agent_gated,
         accessibility: if a11y_apk {
             CapabilityStatus::supported()
@@ -84,7 +84,7 @@ pub(crate) fn unsupported_window_move_resize() -> glass_core::GlassError {
     glass_core::GlassError::unsupported(
         "window_move_resize",
         BACKEND,
-        capabilities().window_move_resize.note,
+        capabilities().window_move_resize.note.as_deref(),
     )
 }
 

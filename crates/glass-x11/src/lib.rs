@@ -61,7 +61,7 @@ const MULTI_TOUCH: CapabilityStatus = CapabilityStatus::unsupported(None);
 /// The `Unsupported` error this backend returns for a multi-touch gesture — one source
 /// for the call site (`send_pointer`'s `Gesture` arm) and its test.
 pub(crate) fn unsupported_multi_touch() -> glass_core::GlassError {
-    glass_core::GlassError::unsupported("multi_touch", BACKEND, MULTI_TOUCH.note)
+    glass_core::GlassError::unsupported("multi_touch", BACKEND, MULTI_TOUCH.note.as_deref())
 }
 
 #[cfg(test)]

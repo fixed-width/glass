@@ -2,7 +2,7 @@
 //! CGEvent mouse + keyboard injection: `send_pointer` maps each window-relative PIXEL
 //! coordinate to a global Quartz POINT via `coords::pixel_to_global_point`, raises the
 //! target app (focus-before-inject), then posts `Move`/`Click`/`Drag`/`Scroll` as CGEvents
-//! through the HID event tap. `Gesture` (Android multi-touch) is `Unsupported` — see
+//! through the caller's login-session event tap. `Gesture` (Android multi-touch) is `Unsupported` — see
 //! `glass_core::platform::PointerEvent`'s doc. `send_key` does the same focus-before-inject,
 //! then posts `KeyEvent::Text`/`Chord` as keyboard CGEvents.
 //!
@@ -77,30 +77,32 @@ pub(crate) fn send_pointer_by(
         return Err(GlassError::unsupported(
             "multi_touch",
             crate::BACKEND,
-            crate::MULTI_TOUCH.note,
+            crate::MULTI_TOUCH.note.as_deref(),
         ));
     }
     focus_by(pid, deadline)?;
     require_payload_time(deadline)?;
 
-    // Passing `None` here is a documented-valid `CGEventCreateMouseEvent`/
-    // `CGEventCreateScrollWheelEvent2` argument (falls back to the combined session state),
-    // so a `None` source (state-allocation failure — not observed in practice) degrades
-    // gracefully rather than erroring the whole call.
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+    // Private workers keep synthetic state separate from the hardware state.
+    let source = CGEventSource::new(if crate::private_session::attached() {
+        CGEventSourceStateID::Private
+    } else {
+        CGEventSourceStateID::HIDSystemState
+    })
+    .ok_or_else(|| GlassError::Backend("private CGEvent source allocation failed".into()))?;
     let to_point = |x: i32, y: i32| to_cgpoint(x, y, scale, origin_pt);
 
     match *event {
         PointerEvent::Move { x, y } => {
             require_payload_time(deadline)?;
             let ev = mouse_event(
-                source.as_deref(),
+                Some(&source),
                 CGEventType::MouseMoved,
                 to_point(x, y),
                 CGMouseButton::Left,
                 CGEventFlags::empty(),
             )?;
-            post(&ev);
+            post(&ev)?;
             require_payload_time(deadline)?;
         }
         PointerEvent::Click {
@@ -119,8 +121,8 @@ pub(crate) fn send_pointer_by(
                 deadline,
                 count,
                 |ordinal| {
-                    let down = mouse_event(source.as_deref(), down_ty, point, cg_button, flags)?;
-                    let up = mouse_event(source.as_deref(), up_ty, point, cg_button, flags)?;
+                    let down = mouse_event(Some(&source), down_ty, point, cg_button, flags)?;
+                    let up = mouse_event(Some(&source), up_ty, point, cg_button, flags)?;
                     for event in [&down, &up] {
                         CGEvent::set_integer_value_field(
                             Some(event),
@@ -145,7 +147,7 @@ pub(crate) fn send_pointer_by(
         } => {
             let gesture = DragGesture::plan((from_x, from_y), (to_x, to_y), duration_ms);
             let mut sink = MacDragSink {
-                source: source.as_deref(),
+                source: Some(&source),
                 scale,
                 origin_pt,
                 button,
@@ -162,7 +164,7 @@ pub(crate) fn send_pointer_by(
             ref modifiers,
         } => {
             let mut sink = MacScrollSink {
-                source: source.as_deref(),
+                source: Some(&source),
                 point: to_point(x, y),
                 dx,
                 dy,
@@ -182,7 +184,7 @@ pub(crate) fn send_pointer_by(
             return Err(GlassError::unsupported(
                 "multi_touch",
                 crate::BACKEND,
-                crate::capabilities().multi_touch.note,
+                crate::capabilities().multi_touch.note.as_deref(),
             ));
         }
     }
@@ -194,24 +196,27 @@ pub(crate) fn send_pointer_by(
 /// next one lands (see `glass_core::run_type`'s doc).
 const KEY_TYPE_DWELL: Duration = Duration::from_millis(12);
 
-/// Inject `event` as keyboard CGEvents targeting the app at `pid`, focusing it first (same
-/// best-effort `focus` helper/settle `send_pointer` uses above).
+/// Inject `event` as keyboard CGEvents after verifying activation of the target app.
 pub(crate) fn send_key_by(event: &KeyEvent, pid: i32, deadline: Deadline) -> Result<()> {
     focus_by(pid, deadline)?;
     require_payload_time(deadline)?;
 
-    // See `send_pointer`'s doc for why a `None` source is a documented-valid, gracefully
-    // degrading `CGEventCreateKeyboardEvent` argument rather than an error.
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+    // Match the pointer source for this process’s input route.
+    let source = CGEventSource::new(if crate::private_session::attached() {
+        CGEventSourceStateID::Private
+    } else {
+        CGEventSourceStateID::HIDSystemState
+    })
+    .ok_or_else(|| GlassError::Backend("private CGEvent source allocation failed".into()))?;
 
     match event {
         KeyEvent::Text(s) => {
             let mut sink = MacTypeSink {
-                source: source.as_deref(),
+                source: Some(&source),
             };
             after_focus(run_text_input_by(&mut sink, s, KEY_TYPE_DWELL, deadline))
         }
-        KeyEvent::Chord(s) => send_chord_by(s, source.as_deref(), deadline),
+        KeyEvent::Chord(s) => send_chord_by(s, Some(&source), deadline),
     }
 }
 
@@ -264,8 +269,8 @@ struct MacTypeSink<'a> {
 impl TypeSink for MacTypeSink<'_> {
     fn character(&mut self, c: char) -> Result<()> {
         let (down, up) = typed_key_events(self.source, c)?;
-        post(&down);
-        post(&up);
+        post(&down)?;
+        post(&up)?;
         Ok(())
     }
 }
@@ -318,7 +323,7 @@ impl ChordSink for MacChordSink<'_> {
 
     fn key(&mut self, down: bool) -> Result<()> {
         let event = keyboard_event(self.source, self.keycode, down, self.flags)?;
-        post(&event);
+        post(&event)?;
         Ok(())
     }
 }
@@ -334,15 +339,12 @@ fn resolve_chord_key(token: &str) -> Option<(u16, bool)> {
     keymap::keycode_for_keyname(token).map(|code| (code, false))
 }
 
-/// Raise `pid`'s app before injecting input — macOS delivers CGEvents posted at the HID tap
+/// Raise `pid`'s app before injecting input — macOS delivers CGEvents posted at the session tap
 /// to whatever the window server currently has focused, unlike X11/Windows where glass warps
 /// the pointer into an app it already knows the geometry of.
 ///
-/// A missing/exited process (`runningApplicationWithProcessIdentifier` returns `None`) is a
-/// hard error, not best-effort: an agent driving a dead app should see
-/// `GlassError::AppExited`, not a keystroke that silently landed somewhere else. A *declined*
-/// activation (`activateWithOptions` returns `false`, e.g. the OS deprioritizes a background-app
-/// request) does not fail the call — the process is confirmed alive and the event still posts.
+/// Verify activation before posting: an accepted request does not establish that the app
+/// became active, and session events otherwise reach whichever app still owns focus.
 ///
 /// `pub(crate)`: also the activation step of `backend::MacosPlatform::window`'s
 /// `WindowOp::Focus` branch, ahead of its `axwindow::ax_raise`/`ax_set_main`.
@@ -351,18 +353,57 @@ pub(crate) fn focus(pid: i32) -> Result<()> {
 }
 
 pub(crate) fn focus_by(pid: i32, deadline: Deadline) -> Result<()> {
+    if crate::private_session::attached() {
+        crate::private_session::require_application_desktop()?;
+    }
     if deadline.remaining().is_some_and(|left| left < FOCUS_SETTLE) {
         return Err(GlassError::deadline_not_started("macOS input focus"));
     }
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .ok_or(GlassError::AppExited(None))?;
+    let lifetime = target_lifetime(pid)?;
     app.activateWithOptions(NSApplicationActivationOptions::empty());
     let settle = deadline
         .remaining()
         .unwrap_or(FOCUS_SETTLE)
         .min(FOCUS_SETTLE);
     thread::sleep(settle);
-    require_payload_time(deadline)
+    require_payload_time(deadline)?;
+    confirm_focus(
+        lifetime,
+        target_lifetime(pid)?,
+        crate::ffi::frontmost_pid()?,
+    )
+}
+
+fn target_lifetime(pid: i32) -> Result<crate::private_session::work::ProcessOrigin> {
+    let observed = if crate::private_session::attached() {
+        crate::private_session::work::observe(pid as u32, rustix::process::geteuid().as_raw())
+    } else {
+        crate::private_session::work::read_lifetime(pid as u32)
+    };
+    observed.map_err(|error| match error.raw_os_error() {
+        Some(2 | 3) => GlassError::AppExited(None),
+        _ => GlassError::Backend(format!(
+            "macOS input target lifetime could not be verified: {error}"
+        )),
+    })
+}
+
+fn confirm_focus(
+    expected: crate::private_session::work::ProcessOrigin,
+    observed: crate::private_session::work::ProcessOrigin,
+    frontmost: i32,
+) -> Result<()> {
+    if observed != expected {
+        return Err(GlassError::AppExited(None));
+    }
+    if frontmost != expected.process.pid() as i32 {
+        return Err(GlassError::Backend(
+            "macOS did not activate the target application; no input was sent".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build a mouse CGEvent of `ty` at global `point`, tagged with `button`/`flags`. Does not
@@ -381,9 +422,16 @@ fn mouse_event(
     Ok(ev)
 }
 
-/// Post `ev` at the HID event tap — every posted event in this module goes through here.
-fn post(ev: &CGEvent) {
-    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
+/// Post `ev` into the caller's login session — every posted event in this module goes through here.
+fn post(ev: &CGEvent) -> Result<()> {
+    crate::private_session::require_if_attached()?;
+    let tap = if crate::private_session::attached() {
+        CGEventTapLocation::SessionEventTap
+    } else {
+        CGEventTapLocation::HIDEventTap
+    };
+    CGEvent::post(tap, Some(ev));
+    Ok(())
 }
 
 /// Map `button` to the `CGMouseButton` `CGEventCreateMouseEvent` expects.
@@ -463,7 +511,7 @@ impl DragSink for MacDragSink<'_> {
             to_cg_button(self.button),
             self.flags,
         )?;
-        post(&ev);
+        post(&ev)?;
         Ok(())
     }
     fn move_to(&mut self, x: i32, y: i32) -> Result<()> {
@@ -475,7 +523,7 @@ impl DragSink for MacDragSink<'_> {
             to_cg_button(self.button),
             self.flags,
         )?;
-        post(&ev);
+        post(&ev)?;
         Ok(())
     }
     fn button(&mut self, down: bool) -> Result<()> {
@@ -488,7 +536,7 @@ impl DragSink for MacDragSink<'_> {
             self.flags,
         )?;
         CGEvent::set_integer_value_field(Some(&ev), CGEventField::MouseEventClickState, 1);
-        post(&ev);
+        post(&ev)?;
         Ok(())
     }
     fn modifiers(&mut self, _down: bool) -> Result<()> {
@@ -525,7 +573,7 @@ impl ScrollSink for MacScrollSink<'_> {
                     CGMouseButton::Left,
                     self.flags,
                 )?;
-                post(&mv);
+                post(&mv)?;
                 Ok(())
             },
             || {
@@ -553,6 +601,33 @@ impl ScrollSink for MacScrollSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_confirmation_rejects_a_reused_pid_and_a_different_foreground_app() {
+        let process = serde_json::from_value(serde_json::json!({
+            "pid": 42, "seconds": 1, "microseconds": 0,
+        }))
+        .unwrap();
+        let expected = crate::private_session::work::ProcessOrigin {
+            process,
+            unique: 10,
+            parent_unique: 9,
+        };
+        let mut replacement = expected;
+        replacement.unique = 11;
+        let mut new_birth = expected;
+        new_birth.process = serde_json::from_value(serde_json::json!({
+            "pid": 42, "seconds": 2, "microseconds": 0,
+        }))
+        .unwrap();
+        for (observed, frontmost) in [(replacement, 42), (new_birth, 42), (expected, 43)] {
+            let mut posted = false;
+            let result = confirm_focus(expected, observed, frontmost).map(|()| posted = true);
+            assert!(result.is_err());
+            assert!(!posted);
+        }
+        confirm_focus(expected, expected, 42).unwrap();
+    }
 
     #[test]
     fn macos_input_refuses_a_deadline_shorter_than_focus_settle_before_injection() {

@@ -12,15 +12,35 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
 | Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
-| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | – shared desktop |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | – shared desktop |
+| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
 
 Input without desktop interference means the agent's pointer and keyboard stay separate from yours.
 It is already provided by owned Linux displays, the Android emulator and the iOS Simulator, using
 the normal tools without extra input configuration. An explicitly attached X11 display has no
-Glass-owned isolation guarantee. Native Windows/macOS input can change focus or move your pointer;
+Glass-owned isolation guarantee. Native Windows and unenrolled macOS input can change focus or move your pointer;
 a virtual monitor alone does not isolate input. Running Glass and its target inside a VM provides a
 separate desktop, but the native backend cannot attest isolation from the VM host.
+
+macOS also has [separate-account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview)
+in preview, using a retained real login in the same OS. The app's **Application setup…** window guides
+account creation, enrollment and permissions from one Glass installation. Enrollment applies per normal user and
+`glass-mcp unenroll` restores that user's shared-desktop route. It routes the normal tools to the account,
+with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
+development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
+using an existing initialized login, including simultaneous physical keyboard/mouse use.
+**Start environment…** has been tested after a real reboot with an initialized account and existing
+permissions, followed by build/interact/rebuild/stop loops in an indexed workspace without account
+switching, reenrollment or repeated privacy grants. Interrupted-client recovery has also been checked.
+The worker requires the development account's graphical login; starting that desktop remains
+user-assisted. Unattended development-desktop startup is not implemented.
+New-account onboarding through Ready and ordinary private app interaction has also been checked;
+a clean macOS installation without prior Glass grants has not been tested. Setup attempts
+identity-checked repair of an idle worker's registration/socket. Desktop startup can reuse a validated
+waiting worker; registration repair retains and reports a running or unbound job. Active application
+work is left intact, and recovery failures are reported.
+The [recovery guide](../how-to/setup-macos.md#recover-a-refused-worker-connection) includes
+manual reenrollment when automatic repair cannot complete.
 
 For the actual active session, use `glass_capabilities` with `scope: "session"`: each input operation
 reports its support and `desktop_interference: "none" | "possible" | "unknown"`. `none` describes
@@ -154,8 +174,15 @@ leave occlusion unproven.
 capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem and
 process are contained at `default`/`strict`, and `strict` additionally blocks outbound network. Under
 containment the clipboard is isolated **and working** for an app not built with Apple's hardened
-runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. Display isolation (the
-app fully off your desktop) is planned. Details in
+runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. The opt-in
+[separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
+apps off your desktop in a separate graphical login. This has been tested on an Apple Silicon
+Mac mini without a physical monitor connected, including physical keyboard/mouse coexistence.
+The worker requires the development account's graphical login. Guided post-reboot startup and
+indexed-workspace app loops have been tested with existing grants. New-account onboarding through
+Ready and ordinary app interaction has also been checked on that Mac. A clean macOS installation
+without prior Glass grants has not been tested. Initial login and any missing privacy consent
+require user action; unattended development-desktop startup is not implemented. Containment details are in
 [explanation/containment.md](../explanation/containment.md).
 
 ## Status

@@ -65,7 +65,9 @@ mod macos {
         // in place — `launchctl kickstart -k` via `restart_launch_agent` — NOT the onboarder's
         // `open -n` relaunch (`relaunch` `exit(0)`s the caller, which here would kill the running
         // server). Once the restarted job reads both grants, it skips this branch and serves.
-        if !(glass_macos::accessibility_granted() && glass_macos::screen_recording_granted()) {
+        if matches!(glass_macos::private_session::configured(), Ok(false))
+            && !(glass_macos::accessibility_granted() && glass_macos::screen_recording_granted())
+        {
             let actions = ChecklistActions {
                 rows: crate::onboarding::grant_row_widgets(),
                 on_recheck: Box::new(|| {
@@ -86,6 +88,7 @@ mod macos {
         serve::check_exposure(&cfg)?;
 
         let endpoint = format!("http://{}/", cfg.addr);
+        let setup_addr = cfg.addr.to_string();
 
         // Bind synchronously with `std::net` (no async context needed for the bind itself),
         // then hand the socket to tokio. `AddrInUse` is surfaced *in the menu* rather than
@@ -99,7 +102,6 @@ mod macos {
             Err(e) => return Err(anyhow::anyhow!("binding {}: {e}", cfg.addr)),
         };
 
-        let trace_enabled = cfg.trace.is_some() && listener.is_some();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
@@ -152,7 +154,7 @@ mod macos {
         // LaunchAgent `kickstart -k`); their errors go loudly to stderr (the menu action
         // has no dialog surface), matching onboarding's best-effort osascript fallback.
         let endpoint_for_copy = endpoint;
-        let on_quit: Option<Box<dyn Fn()>> = trace_enabled.then(|| {
+        let on_quit: Option<Box<dyn Fn()>> = Some({
             Box::new(move || {
                 shutdown.cancel();
                 let _ = finished_rx
@@ -180,6 +182,11 @@ mod macos {
                         eprintln!("glass: menu 'Restart' failed: {e}");
                     }
                 }),
+                on_setup: Box::new(move || {
+                    if let Err(error) = crate::macos_environment::show_setup(&setup_addr) {
+                        eprintln!("glass: application setup failed: {error:#}");
+                    }
+                }),
                 on_uninstall: Box::new(|| {
                     // Confirm first, defaulting to Cancel so a stray click/Return never uninstalls.
                     // `uninstall_launch_agent` boots out (SIGTERM) this very process, so a dialog
@@ -190,12 +197,17 @@ mod macos {
                      down now. To finish removing it, drag GlassMcp.app to the Trash.",
                         "Uninstall",
                     );
-                    if clicked == "Uninstall" {
-                        // Best-effort: a menu action has no further error surface, so log loudly to
-                        // stderr rather than crash the action if bootout/plist-removal fails. On
-                        // success this process is terminated as part of the uninstall.
-                        if let Err(e) = crate::setup::uninstall_launch_agent() {
-                            eprintln!("glass: menu 'Uninstall glass' failed: {e}");
+                    if clicked == "Uninstall"
+                        && let Err(e) = crate::run_uninstall()
+                    {
+                        eprintln!("glass: menu 'Uninstall glass' failed: {e:#}");
+                        if let Err(dialog) = glass_macos::menubar::show_error(
+                            "Glass could not finish uninstalling",
+                            &format!(
+                                "{e:#}\n\nUninstall did not complete. Glass is still running. Your accounts and files were kept."
+                            ),
+                        ) {
+                            eprintln!("glass: could not display uninstall failure: {dialog}");
                         }
                     }
                 }),

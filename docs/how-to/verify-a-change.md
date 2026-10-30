@@ -70,6 +70,10 @@ cargo clippy --target x86_64-apple-darwin --workspace --lib --locked -- -D warni
 This compiles the `cfg(target_os = "macos")` modules for real — a type error inside one fails the
 command from Linux.
 
+The private-session bridge is Objective-C and compiles only on a Mac. Cross-host metadata checks
+still check its Rust declarations and callers, but do not compile or validate the native bridge.
+Use a native macOS build and tests for changes to `private_session.m` or its ABI.
+
 - **`--lib` is what makes it work, and it is not the same reason the macOS CI job uses `--lib`.**
   Here it is because `--lib` does not build dev-dependencies: `--all-targets` pulls `criterion`,
   which depends unconditionally on `alloca`, whose build script compiles C — and cross-compiling

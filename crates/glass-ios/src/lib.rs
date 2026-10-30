@@ -140,7 +140,7 @@ mod capability_tests {
         let c = capabilities_with(true);
         assert_eq!(c.clipboard.status, Support::Supported);
         assert_eq!(
-            c.clipboard.note,
+            c.clipboard.note.as_deref(),
             Some("paste needs on-screen consent (Allow Paste)")
         );
         assert_eq!(c.window_move_resize.status, Support::Unsupported);
@@ -169,7 +169,7 @@ mod unsupported_message_tests {
         let msg = glass_core::GlassError::unsupported(
             "window_move_resize",
             crate::BACKEND,
-            crate::capabilities().window_move_resize.note,
+            crate::capabilities().window_move_resize.note.as_deref(),
         )
         .to_string();
         assert!(msg.contains("ios backend"), "{msg}");

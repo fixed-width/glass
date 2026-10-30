@@ -57,14 +57,16 @@ through `simctl` without opening the Simulator app, so the app it drives never a
 
 On **Windows**, isolation is weaker. There is one interactive desktop, and even a virtual-display
 driver only adds a monitor to *that* desktop rather than walling the app off — for full isolation you
-run glass inside a VM. On **macOS**, glass drives the real Aqua session today.
+run glass inside a VM. On **macOS**, shared-desktop setup drives the current Aqua session. The
+[account setup preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) routes the same tools
+to a separate account’s retained Aqua login in the same OS.
 
 ## Input while you use your desktop
 
 The normal click, scroll and typing tools already leave your desktop alone when their input goes
 into an owned Linux display, Android emulator or iOS Simulator. The target can acquire focus and
 move its pointer inside that environment without changing your host pointer or foreground app.
-Native macOS and Windows input currently uses your interactive desktop and can interfere with it.
+Unenrolled macOS and native Windows input use your interactive desktop and can interfere with it.
 macOS's existing Accessibility grant authorizes that control; it does not establish input isolation.
 
 `glass_capabilities` with `scope: "session"` reports ordinary click, scroll and text support alongside

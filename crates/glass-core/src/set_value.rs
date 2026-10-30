@@ -494,7 +494,7 @@ mod tests {
                     observed: obs,
                     why: got_why,
                 }) => assert_eq!(
-                    (got_id, req.as_str(), obs.as_deref(), got_why),
+                    (got_id, req.as_str(), obs.as_deref(), got_why.as_deref()),
                     (id, requested, observed, why)
                 ),
                 other => panic!("expected a not-applied verdict, got {other:?}"),

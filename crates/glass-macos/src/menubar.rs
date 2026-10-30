@@ -25,7 +25,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar,
     NSVariableStatusItemLength,
 };
 use objc2_foundation::NSString;
@@ -52,6 +52,8 @@ pub struct MenuBarActions {
     /// puts any "finish in the Finder" guidance in that confirmation; this crate only invokes
     /// the callback.
     pub on_uninstall: Box<dyn Fn()>,
+    /// Open application environment setup without stopping the MCP server.
+    pub on_setup: Box<dyn Fn()>,
 }
 
 /// The boxed callbacks, stored in [`MenuTarget`]'s instance variables. Not `Send`/`Sync`, and
@@ -61,6 +63,7 @@ struct Ivars {
     on_copy: Box<dyn Fn()>,
     on_restart: Box<dyn Fn()>,
     on_uninstall: Box<dyn Fn()>,
+    on_setup: Box<dyn Fn()>,
     on_quit: Option<Box<dyn Fn()>>,
 }
 
@@ -78,6 +81,10 @@ define_class!(
     struct MenuTarget;
 
     impl MenuTarget {
+        #[unsafe(method(applicationSetup:))]
+        fn application_setup(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_setup)();
+        }
         #[unsafe(method(copyEndpoint:))]
         fn copy_endpoint(&self, _sender: Option<&AnyObject>) {
             (self.ivars().on_copy)();
@@ -145,6 +152,21 @@ fn action_item(
     item
 }
 
+/// Present a menu operation failure while keeping Glass running for recovery.
+pub fn show_error(title: &str, detail: &str) -> Result<()> {
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        GlassError::Backend("menu errors must be displayed on the AppKit thread".into())
+    })?;
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(detail));
+    alert.addButtonWithTitle(&NSString::from_str("OK"));
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    alert.runModal();
+    Ok(())
+}
+
 /// Run the menu-bar app: install the status item + menu and block the main thread on the
 /// AppKit run loop. Returns only if the run loop stops without the process exiting (a user
 /// "Quit glass" terminates the process directly via `terminate:`).
@@ -180,6 +202,7 @@ pub fn run_with_quit(actions: MenuBarActions, on_quit: Option<Box<dyn Fn()>>) ->
             on_copy: actions.on_copy,
             on_restart: actions.on_restart,
             on_uninstall: actions.on_uninstall,
+            on_setup: actions.on_setup,
             on_quit,
         },
     );
@@ -203,6 +226,13 @@ pub fn run_with_quit(actions: MenuBarActions, on_quit: Option<Box<dyn Fn()>>) ->
     menu.addItem(&copy_item);
     let restart_item = action_item(mtm, "Restart", sel!(restart:), "", Some(&target));
     menu.addItem(&restart_item);
+    menu.addItem(&action_item(
+        mtm,
+        "Application setup…",
+        sel!(applicationSetup:),
+        "",
+        Some(&target),
+    ));
 
     let sep2 = NSMenuItem::separatorItem(mtm);
     menu.addItem(&sep2);

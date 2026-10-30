@@ -2,7 +2,7 @@
 //! TCC permission glass needs, driven on the main-thread AppKit run loop. Like
 //! [`crate::menubar`], this module owns *only* the AppKit surface — the host (`glass-mcp`)
 //! supplies each row's label + current grant snapshot and boxed callbacks for the
-//! actionable buttons ("Request…" per row, "Re-check" in the footer), so this crate
+//! actionable buttons ("Request…" and "Open Settings…" per row, "Re-check" in the footer), so this crate
 //! stays free of glass-mcp's permission-probing / relaunch logic and every AppKit `unsafe`
 //! stays confined here.
 //!
@@ -19,7 +19,7 @@
 //!
 //! ## Actions
 //!
-//! Each row's "Request…" button and the footer "Re-check" button are wired to a tiny
+//! Each row action and the footer "Re-check" button are wired to a tiny
 //! per-button [`ButtonTarget`] (an `objc2` `define_class!` object holding one boxed closure),
 //! all responding to the same `fire:` selector — one instance per button, so no selector/tag
 //! dispatch is needed. A [`WindowDelegate`] terminates the process on `windowWillClose:` so
@@ -35,22 +35,33 @@ use objc2_app_kit::{
     NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSNotification, NSString};
+use objc2_foundation::{NSNotification, NSString, NSTimer};
 
-/// One permission's row: the human label, its current grant snapshot (drives the status
-/// glyph), and the action that requests the permission's grant (macOS then shows its own
-/// consent prompt). `on_open_settings` is a boxed callback so this crate never has to know
-/// *how* the grant is requested (glass-mcp's `request_*` calls).
+/// One permission's observed state and its explicit user actions.
 pub struct GrantRow {
-    /// The permission's display name (e.g. `"Screen Recording"`).
+    /// The permission's display name.
     pub label: &'static str,
-    /// Whether the permission is currently granted — snapshot taken by the host just before
-    /// building the window. Drives the ✓ / ○ status glyph; never re-read here.
+    /// The grant snapshot from this process launch.
     pub granted: bool,
-    /// "Request…" — request this permission's grant. macOS shows its own consent prompt in
-    /// response (whose "Open System Settings" button navigates to the pane); this callback
-    /// does not open Settings itself. Invoked on the main thread.
-    pub on_open_settings: Box<dyn Fn()>,
+    /// Register the permission on the first explicit Settings action.
+    /// Its return value does not establish whether macOS displayed a prompt.
+    pub on_request: Box<dyn Fn() -> bool>,
+    /// Open this permission's Settings pane only when the user chooses that action.
+    pub on_open_settings: Box<dyn Fn() -> Result<(), String>>,
+}
+
+struct SettingsAction {
+    row: GrantRow,
+    registered: std::cell::Cell<bool>,
+}
+
+impl SettingsAction {
+    fn open(&self) -> Result<(), String> {
+        if !self.registered.replace(true) {
+            let _ = (self.row.on_request)();
+        }
+        (self.row.on_open_settings)()
+    }
 }
 
 /// What the host asks the checklist window to show and do: one [`GrantRow`] per permission
@@ -70,7 +81,7 @@ pub struct ChecklistActions {
 /// `Send`/`Sync`, and it needn't be: `ButtonTarget` is `MainThreadOnly`, so the object —
 /// and thus this closure — only ever runs on the main thread (button actions dispatch on
 /// the main run loop).
-struct ButtonIvars {
+pub(crate) struct ButtonIvars {
     on_fire: Box<dyn Fn()>,
 }
 
@@ -85,7 +96,7 @@ define_class!(
     #[thread_kind = MainThreadOnly]
     #[name = "GlassOnboardingButtonTarget"]
     #[ivars = ButtonIvars]
-    struct ButtonTarget;
+    pub(crate) struct ButtonTarget;
 
     impl ButtonTarget {
         #[unsafe(method(fire:))]
@@ -98,11 +109,49 @@ define_class!(
 );
 
 impl ButtonTarget {
-    fn new(mtm: MainThreadMarker, on_fire: Box<dyn Fn()>) -> Retained<Self> {
+    pub(crate) fn new(mtm: MainThreadMarker, on_fire: Box<dyn Fn()>) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ButtonIvars { on_fire });
         // SAFETY: `NSObject`'s `init` takes no arguments and returns the initialized
         // instance; `this` is a freshly-allocated `ButtonTarget` with its ivar set.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Fresh permission facts supplied by the host without blocking the AppKit thread.
+pub struct ChecklistUpdate {
+    pub granted: [bool; 2],
+    pub message: String,
+    pub finished: bool,
+}
+
+pub(crate) struct PollTimer {
+    pub(crate) timer: Retained<NSTimer>,
+    _target: Retained<ButtonTarget>,
+}
+
+impl PollTimer {
+    pub(crate) fn new(mtm: MainThreadMarker, on_tick: Box<dyn Fn()>) -> Self {
+        let target = ButtonTarget::new(mtm, on_tick);
+        // SAFETY: target implements fire:, remains retained, and the timer stays on this main run loop.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                1.0,
+                &target,
+                sel!(fire:),
+                None,
+                true,
+            )
+        };
+        Self {
+            timer,
+            _target: target,
+        }
+    }
+}
+
+impl Drop for PollTimer {
+    fn drop(&mut self) {
+        self.timer.invalidate();
     }
 }
 
@@ -143,11 +192,10 @@ impl WindowDelegate {
 // Fixed-frame layout (points): rows are placed with plain frames, computed top-down and
 // converted to AppKit's bottom-left origin by `rect`.
 //
-// These constants are eyeballed, not measured against a real render.
-const WIDTH: f64 = 480.0;
+const WIDTH: f64 = 640.0;
 const H_MARGIN: f64 = 24.0;
 const V_MARGIN: f64 = 20.0;
-const INSTRUCTION_H: f64 = 40.0;
+const INSTRUCTION_H: f64 = 72.0;
 const SECTION_GAP: f64 = 16.0;
 const ROW_H: f64 = 28.0;
 const ROW_GAP: f64 = 10.0;
@@ -156,9 +204,9 @@ const GLYPH_GAP: f64 = 8.0;
 const LABEL_BUTTON_GAP: f64 = 12.0;
 const BUTTON_W: f64 = 130.0;
 const FOOTER_H: f64 = 32.0;
+const ACTION_H: f64 = 96.0;
 
 const CONTENT_W: f64 = WIDTH - 2.0 * H_MARGIN;
-const LABEL_W: f64 = CONTENT_W - GLYPH_W - GLYPH_GAP - LABEL_BUTTON_GAP - BUTTON_W;
 
 /// Height of the row list (or one line in the defensive empty-`rows` case). Shared by
 /// [`content_height`] (total window height) and the footer's top offset in [`run_checklist`]
@@ -175,7 +223,15 @@ fn body_height(n_rows: usize) -> f64 {
 /// Total content height, driven by how many rows there are (or one line in the defensive
 /// empty-`rows` case).
 fn content_height(n_rows: usize) -> f64 {
-    V_MARGIN + INSTRUCTION_H + SECTION_GAP + body_height(n_rows) + SECTION_GAP + FOOTER_H + V_MARGIN
+    V_MARGIN
+        + INSTRUCTION_H
+        + SECTION_GAP
+        + body_height(n_rows)
+        + SECTION_GAP
+        + ACTION_H
+        + SECTION_GAP
+        + FOOTER_H
+        + V_MARGIN
 }
 
 /// Converts a top-down `(x, top, w, h)` box into an AppKit bottom-left-origin [`CGRect`]
@@ -193,6 +249,156 @@ fn rect(content_h: f64, x: f64, top: f64, w: f64, h: f64) -> CGRect {
     }
 }
 
+/// Measure wrapping text instead of reserving an empty fixed-height block.
+pub(crate) fn text_height(label: &NSTextField, width: f64) -> f64 {
+    label
+        .cell()
+        .map(|cell| {
+            cell.cellSizeForBounds(rect(4096.0, 0.0, 0.0, width, 4096.0))
+                .height
+                .ceil()
+                + 4.0
+        })
+        .unwrap_or(40.0)
+        .max(24.0)
+}
+
+/// Permission controls shared by the checklist and the current setup-wizard step.
+pub(crate) struct GrantControls {
+    pub(crate) view: Retained<NSView>,
+    pub(crate) height: f64,
+    rows_view: Retained<NSView>,
+    status: Retained<NSTextField>,
+    width: f64,
+    rows_height: f64,
+    rows: Vec<(Retained<NSTextField>, Retained<NSButton>)>,
+    _targets: Vec<Retained<ButtonTarget>>,
+}
+
+impl GrantControls {
+    pub(crate) fn new(mtm: MainThreadMarker, rows: Vec<GrantRow>, width: f64) -> Self {
+        let rows_height = body_height(rows.len());
+        let height = rows_height + SECTION_GAP + ACTION_H;
+        let view = NSView::initWithFrame(NSView::alloc(mtm), rect(height, 0.0, 0.0, width, height));
+        let rows_view = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            rect(height, 0.0, 0.0, width, rows_height),
+        );
+        view.addSubview(&rows_view);
+        let status = NSTextField::wrappingLabelWithString(&NSString::from_str(""), mtm);
+        status.setFrame(rect(
+            height,
+            0.0,
+            rows_height + SECTION_GAP,
+            width,
+            ACTION_H,
+        ));
+        view.addSubview(&status);
+        let label_x = GLYPH_W + GLYPH_GAP;
+        let button_x = width - BUTTON_W;
+        let label_width = button_x - label_x - LABEL_BUTTON_GAP;
+        let mut controls = Vec::new();
+        let mut targets = Vec::new();
+        for (index, row) in rows.into_iter().enumerate() {
+            let top = index as f64 * (ROW_H + ROW_GAP);
+            let glyph = NSTextField::labelWithString(
+                &NSString::from_str(if row.granted { "✓" } else { "○" }),
+                mtm,
+            );
+            glyph.setFrame(rect(rows_height, 0.0, top, GLYPH_W, ROW_H));
+            rows_view.addSubview(&glyph);
+            let name = NSTextField::labelWithString(&NSString::from_str(row.label), mtm);
+            name.setFrame(rect(rows_height, label_x, top, label_width, ROW_H));
+            rows_view.addSubview(&name);
+            let feedback = status.clone();
+            let label = row.label;
+            let granted = row.granted;
+            let action = SettingsAction {
+                row,
+                registered: std::cell::Cell::new(false),
+            };
+            let target = ButtonTarget::new(
+                mtm,
+                Box::new(move || {
+                    // Registration may prompt; the explicit action always requests the Settings pane.
+                    let message = match action.open() {
+                        Ok(()) => String::new(),
+                        Err(error) => {
+                            format!("Could not open {label} Settings: {error}")
+                        }
+                    };
+                    feedback.setStringValue(&NSString::from_str(&message));
+                }),
+            );
+            // SAFETY: the retained target implements fire: and outlives this control.
+            let settings = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("Open Settings…"),
+                    Some(&target),
+                    Some(sel!(fire:)),
+                    mtm,
+                )
+            };
+            settings.setFrame(rect(rows_height, button_x, top, BUTTON_W, ROW_H));
+            settings.setEnabled(!granted);
+            rows_view.addSubview(&settings);
+            controls.push((glyph, settings));
+            targets.push(target);
+        }
+        Self {
+            view,
+            height,
+            rows_view,
+            status,
+            width,
+            rows_height,
+            rows: controls,
+            _targets: targets,
+        }
+    }
+
+    pub(crate) fn layout(&self) -> f64 {
+        let has_error = !self.status.stringValue().to_string().is_empty();
+        let status_height = if has_error {
+            text_height(&self.status, self.width)
+        } else {
+            0.0
+        };
+        let status_gap = if has_error { SECTION_GAP } else { 0.0 };
+        self.status.setFrame(CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize {
+                width: self.width,
+                height: status_height,
+            },
+        });
+        self.rows_view.setFrameOrigin(CGPoint {
+            x: 0.0,
+            y: status_height + status_gap,
+        });
+        let height = self.rows_height + status_gap + status_height;
+        self.view.setFrameSize(CGSize {
+            width: self.width,
+            height,
+        });
+        height
+    }
+
+    pub(crate) fn show_unconfirmed(&self, enabled: bool) {
+        for (glyph, settings) in &self.rows {
+            glyph.setStringValue(&NSString::from_str("?"));
+            settings.setEnabled(enabled);
+        }
+    }
+
+    pub(crate) fn update(&self, granted: [bool; 2], enabled: bool) {
+        for ((glyph, settings), granted) in self.rows.iter().zip(granted) {
+            glyph.setStringValue(&NSString::from_str(if granted { "✓" } else { "○" }));
+            settings.setEnabled(enabled && !granted);
+        }
+    }
+}
+
 /// Show the permission checklist window and run the AppKit loop until the window closes or
 /// the process terminates (either via a row/re-check action that relaunches-and-exits, or
 /// via the window's close button → [`WindowDelegate::window_will_close`] → `terminate:`).
@@ -204,6 +410,14 @@ fn rect(content_h: f64, x: f64, top: f64, w: f64, h: f64) -> CGRect {
 /// Returns `Err` only for the one precondition this crate can enforce off a real AppKit run
 /// loop: being called off the main thread.
 pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
+    run_checklist_with_poll(actions, None)
+}
+
+/// Run the checklist with optional fresh-process permission updates.
+pub fn run_checklist_with_poll(
+    actions: ChecklistActions,
+    poll: Option<Box<dyn Fn() -> Option<ChecklistUpdate>>>,
+) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         "the onboarding checklist window must start on the main thread".to_string()
     })?;
@@ -256,7 +470,7 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     // system font is large.
     let instruction = NSTextField::wrappingLabelWithString(
         &NSString::from_str(
-            "glass needs these macOS permissions to drive apps. Grant each, then re-check.",
+            "Allow Accessibility first, then Screen Recording. Open Settings goes directly to the permission pane and may ask macOS for consent. After granting access, choose Re-check or macOS’s Quit & Reopen.",
         ),
         mtm,
     );
@@ -271,58 +485,17 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
 
     let body_top = V_MARGIN + INSTRUCTION_H + SECTION_GAP;
 
-    // Every per-button target lives here for the whole run loop (`fire:` targets are weak
-    // references — see the module doc).
-    let mut button_targets: Vec<Retained<ButtonTarget>> = Vec::with_capacity(rows.len() + 1);
-
-    if rows.is_empty() {
-        // Defensive: the host only opens this window when a permission is missing, so an empty
-        // row set means it shouldn't have opened it at all — show a line rather than a blank
-        // checklist.
-        let ready =
-            NSTextField::labelWithString(&NSString::from_str("No permissions to configure."), mtm);
-        ready.setFrame(rect(content_h, H_MARGIN, body_top, CONTENT_W, ROW_H));
-        container.addSubview(&ready);
-    } else {
-        let label_x = H_MARGIN + GLYPH_W + GLYPH_GAP;
-        let button_x = label_x + LABEL_W + LABEL_BUTTON_GAP;
-        for (i, row) in rows.into_iter().enumerate() {
-            let row_top = body_top + i as f64 * (ROW_H + ROW_GAP);
-
-            // Status glyph: ✓ when granted, ○ when not.
-            let glyph = if row.granted { "✓" } else { "○" };
-            let glyph_label = NSTextField::labelWithString(&NSString::from_str(glyph), mtm);
-            glyph_label.setFrame(rect(content_h, H_MARGIN, row_top, GLYPH_W, ROW_H));
-            container.addSubview(&glyph_label);
-
-            // Permission name.
-            let name = NSTextField::labelWithString(&NSString::from_str(row.label), mtm);
-            name.setFrame(rect(content_h, label_x, row_top, LABEL_W, ROW_H));
-            container.addSubview(&name);
-
-            // "Request…" button → this row's boxed action, via its own target.
-            let target = ButtonTarget::new(mtm, row.on_open_settings);
-            // SAFETY: `buttonWithTitle:target:action:` is `unsafe` because the target must
-            // respond to the action selector — `target` is a live `ButtonTarget` (kept in
-            // `button_targets` for the whole run loop) that implements `fire:`, and
-            // `sel!(fire:)` is exactly that selector. The title is a valid `NSString`.
-            let button = unsafe {
-                NSButton::buttonWithTitle_target_action(
-                    &NSString::from_str("Request…"),
-                    Some(&target),
-                    Some(sel!(fire:)),
-                    mtm,
-                )
-            };
-            button.setFrame(rect(content_h, button_x, row_top, BUTTON_W, ROW_H));
-            container.addSubview(&button);
-            button_targets.push(target);
-        }
-    }
+    let controls = std::rc::Rc::new(GrantControls::new(mtm, rows, CONTENT_W));
+    controls.view.setFrameOrigin(CGPoint {
+        x: H_MARGIN,
+        y: content_h - body_top - controls.height,
+    });
+    container.addSubview(&controls.view);
+    let action_top = body_top + body_height(n_rows) + SECTION_GAP;
 
     // Footer "Re-check" button (right-aligned), below the body. The body is a single
     // "ready"/empty line when there are no rows, otherwise the `n_rows` checklist rows.
-    let footer_top = body_top + body_height(n_rows) + SECTION_GAP;
+    let footer_top = action_top + ACTION_H + SECTION_GAP;
     let recheck_target = ButtonTarget::new(mtm, on_recheck);
     // SAFETY: identical contract to the per-row buttons above — `recheck_target` is a live
     // `ButtonTarget` implementing `fire:`, kept alive in `button_targets` across the run
@@ -343,7 +516,6 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
         FOOTER_H,
     ));
     container.addSubview(&recheck);
-    button_targets.push(recheck_target);
 
     window.setContentView(Some(&container));
 
@@ -362,6 +534,24 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     app.activateIgnoringOtherApps(true);
     window.orderFrontRegardless();
 
+    let timer = poll.map(|poll| {
+        let instruction = instruction.clone();
+        let window = window.clone();
+        let controls = controls.clone();
+        PollTimer::new(
+            mtm,
+            Box::new(move || {
+                if let Some(update) = poll() {
+                    instruction.setStringValue(&NSString::from_str(&update.message));
+                    controls.update(update.granted, true);
+                    if update.finished {
+                        window.close();
+                    }
+                }
+            }),
+        )
+    });
+
     // Block the main thread on the AppKit event loop. `window`, `container`, `delegate`, and
     // every `ButtonTarget` must outlive this call (`setTarget:`/`setDelegate:` hold only weak
     // references), so they stay bound until after `run` returns.
@@ -369,9 +559,75 @@ pub fn run_checklist(actions: ChecklistActions) -> Result<(), String> {
     // None of the rendering is checkable off a real WindowServer/AppKit run loop — the darwin
     // build only proves it compiles.
     app.run();
+    drop(timer);
 
     // Reached only if the run loop stops without the process exiting. Keep the AppKit
     // objects alive right up to here.
-    drop((window, container, delegate, button_targets));
+    drop((window, container, delegate, controls, recheck_target));
     Ok(())
+}
+
+#[cfg(test)]
+mod settings_action_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[test]
+    fn every_click_opens_settings_without_repeating_native_registration() {
+        for available in [false, true] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let register = events.clone();
+            let open = events.clone();
+            let action = SettingsAction {
+                row: GrantRow {
+                    label: "Screen Recording",
+                    granted: false,
+                    on_request: Box::new(move || {
+                        register.borrow_mut().push("register");
+                        available
+                    }),
+                    on_open_settings: Box::new(move || {
+                        open.borrow_mut().push("open");
+                        Ok(())
+                    }),
+                },
+                registered: Cell::new(false),
+            };
+            action.open().unwrap();
+            action.open().unwrap();
+            assert_eq!(*events.borrow(), ["register", "open", "open"]);
+        }
+    }
+
+    #[test]
+    fn failed_pane_open_is_retryable_without_another_consent_request() {
+        let registrations = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let register = registrations.clone();
+        let open = calls.clone();
+        let action = SettingsAction {
+            row: GrantRow {
+                label: "Accessibility",
+                granted: false,
+                on_request: Box::new(move || {
+                    register.set(register.get() + 1);
+                    false
+                }),
+                on_open_settings: Box::new(move || {
+                    let first = open.get() == 0;
+                    open.set(open.get() + 1);
+                    if first {
+                        Err("pane unavailable".into())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            },
+            registered: Cell::new(false),
+        };
+        assert_eq!(action.open(), Err("pane unavailable".into()));
+        action.open().unwrap();
+        assert_eq!((registrations.get(), calls.get()), (1, 2));
+    }
 }

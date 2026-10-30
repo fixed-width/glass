@@ -66,9 +66,8 @@ pub(crate) struct ClipLaunch {
 /// any unrecognized/garbled output). Injectable iff either:
 /// - the report contains `code object is not signed at all` (unsigned — codesign exits
 ///   non-zero for this, so the status isn't gated for this specific marker), OR
-/// - codesign SUCCEEDED and there is a `flags=` line that does NOT mention `runtime` (an
-///   adhoc/linker-signed or otherwise non-hardened binary; a hardened-runtime binary's flags
-///   line contains `runtime`).
+/// - codesign SUCCEEDED and exactly one CodeDirectory flags field lacks the hardened-runtime
+///   bit (0x10000). Executable paths and identifiers do not establish runtime protection.
 ///
 /// Everything else — an I/O/parse failure, a non-zero exit without the "not signed" marker, or
 /// output with no `flags=` line — is treated as non-injectable, so "couldn't determine" never
@@ -82,7 +81,22 @@ fn injectable_from_codesign_report(stderr: &str, status_success: bool) -> bool {
     if stderr.contains("code object is not signed at all") && !stderr.contains("flags=") {
         return true;
     }
-    status_success && stderr.contains("flags=") && !stderr.contains("runtime")
+    let mut flags = stderr.lines().filter_map(|line| {
+        line.strip_prefix("CodeDirectory ")?
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("flags="))
+    });
+    let Some(flags_field) = flags.next() else {
+        return false;
+    };
+    if !status_success || flags.next().is_some() {
+        return false;
+    }
+    let value = flags_field.split('(').next().unwrap_or_default();
+    value
+        .strip_prefix("0x")
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .is_some_and(|flags| flags & 0x10000 == 0)
 }
 
 /// True iff `program` is not hardened-runtime signed, so injecting the clip shim via
@@ -290,17 +304,24 @@ fn spawn_for(
         let cwd_canon: Option<PathBuf> = effective_cwd
             .as_ref()
             .map(|c| std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()));
-        // Resolve to an absolute path: `build_profile`'s guard needs one to reason about home
-        // exposure.
+        let path = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "PATH")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("PATH"));
         let program =
-            std::fs::canonicalize(&spec.run[0]).unwrap_or_else(|_| PathBuf::from(&spec.run[0]));
+            crate::launch_program::resolve(&spec.run[0], effective_cwd.as_deref(), path.as_deref());
 
         // Decide injection before building the profile: `allow_pasteboard` depends on it.
         // `dylib_path` is resolved once and reused below (rather than a second
         // `shim_dylib_path()` call) so a transient filesystem hiccup between the two checks
         // can't make `injectable` and the later `.expect` disagree.
         let dylib_path = session_launch.then(shim_dylib_path).flatten();
-        let injectable = session_launch && target_is_injectable(&program) && dylib_path.is_some();
+        let injectable = session_launch
+            && program.as_deref().is_some_and(target_is_injectable)
+            && dylib_path.is_some();
         let allow_pasteboard = injectable;
         // The shim dylib FILE, re-allowed for read in the profile below when injecting (`None`
         // — no re-allow — otherwise, matching unchanged pre-injection behavior).
@@ -368,7 +389,7 @@ fn spawn_for(
             // `/` here is inert (`is_safe_reallow("/")` is false) — it only matters when
             // `effective_cwd` was unset (a `current_dir()` failure, logged above).
             cwd: cwd_canon.unwrap_or_else(|| PathBuf::from("/")),
-            program,
+            program: program.unwrap_or_else(|| PathBuf::from(&spec.run[0])),
             ro_binds: reallows.ro_binds,
             ro_files,
             rw_binds: vec![],
@@ -413,6 +434,13 @@ fn spawn_for(
         }
     })?;
 
+    if let Err(error) = crate::private_session::work::record(child.id()) {
+        terminate(&mut child);
+        release_named_boards(clip.as_ref());
+        return Err(GlassError::AppNotStarted(format!(
+            "recording application ownership: {error}"
+        )));
+    }
     if !session_launch {
         return Ok(Launch {
             child,
@@ -1306,11 +1334,33 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn injectable_from_codesign_report_ignores_runtime_in_path_and_identifier() {
+        let report = "Executable=/tmp/fw-glass-runtime64/project/DevNotes\n\
+                      Identifier=com.example.runtime\n\
+                      CodeDirectory v=20400 flags=0x20002(adhoc,linker-signed) hashes=23+0 location=embedded\n";
+        assert!(injectable_from_codesign_report(report, true));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn injectable_from_codesign_report_false_when_hardened_runtime_flag_present() {
         assert!(!injectable_from_codesign_report(
             "CodeDirectory v=20500 size=634 flags=0x10000(runtime) hashes=13+3 location=embedded\n",
             true,
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn injectable_from_codesign_report_requires_unambiguous_numeric_flags() {
+        for report in [
+            "Executable=/tmp/flags=0x2/App\n",
+            "CodeDirectory v=20400 flags=garbage\n",
+            "CodeDirectory v=20400 flags=0x10000\n",
+            "CodeDirectory v=20400 flags=0x2(adhoc)\nCodeDirectory v=20500 flags=0x10000(runtime)\n",
+        ] {
+            assert!(!injectable_from_codesign_report(report, true), "{report}");
+        }
     }
 
     #[test]

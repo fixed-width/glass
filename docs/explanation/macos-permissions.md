@@ -2,10 +2,10 @@
 
 macOS gates screen capture and input injection behind its privacy system (TCC), and the way those
 grants are recorded shapes how glass is packaged and run on the Mac. Understanding this model explains
-*why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary — and why, once
-set up, it never asks again.
+*why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
+compatible updates can retain existing grants.
 
-glass needs two one-time grants before it can drive anything:
+Glass needs two grants that must be effective in the process running its backend:
 
 - **Screen Recording** — to capture the screen.
 - **Accessibility** — to manage windows and inject input.
@@ -27,13 +27,13 @@ grant is keyed to never changes.
 `launchd` its parent instead — giving glass its own grantable, responsible process. That is the whole
 reason macOS glass runs as a LaunchAgent rather than a binary you `ssh` in and start.
 
-## Grants are read at launch
+## Fresh checks after permission changes
 
-Both permissions are effectively **snapshotted when the process starts**. A grant enabled while glass
-is already running is not visible to it until it restarts — Screen Recording binds its capability at
-process start, and the Accessibility trust check is cached. This is why granting a permission is always
-followed by a relaunch or a kickstart, and why the onboarding flow is built around relaunching rather
-than live-polling.
+A long-lived process can have a stale permission view, especially for Screen Recording. Separate-account
+setup checks changes in fresh signed Glass processes and verifies the actual worker before Ready.
+The normal account's Application setup window can therefore stay open while access is granted;
+it does not require quitting that window or repeating approval in the development account.
+The shared-desktop checklist can still use Re-check/relaunch to obtain a fresh process view.
 
 ## How the packaging follows from the model
 
@@ -42,8 +42,57 @@ responsible process, so each permission request attributes to the app and the gr
 both are granted, the app installs its own LaunchAgent. Building from source, you reproduce the same
 steps by hand — establish a stable signing identity, sign the app, install it as a LaunchAgent, and
 enable it in the two Privacy panes. Either way, because the grants are keyed to a stable identity,
-rebuilding, moving the app, or restarting the LaunchAgent never re-prompts.
+compatible rebuilds and fresh launches can reuse the app's existing grants.
 
 The step-by-step for each path is in the setup and build guides:
 [how-to/setup-macos.md](../how-to/setup-macos.md) and
 [how-to/build-from-source.md](../how-to/build-from-source.md).
+
+## A separate development account
+
+With `setup --account ACCOUNT`, the grant-bearing worker runs as a LaunchAgent in that account's
+real Aqua login. The app's **Application setup…** window and CLI share the same coordinator. Enrollment
+registers a permission helper from that one Glass bundle. The GUI keeps consent controls in the normal
+account's **Application setup…** window and reads changes through fresh Glass checks. The coordinator
+waits for the manual macOS login/return and any required consent without a user deadline, then checks
+live worker readiness and pending workspace recovery. The
+[account setup guide](../how-to/setup-macos.md#apps-off-your-desktop-preview) gives the full sequence,
+including verification and MCP-client configuration.
+
+Accessibility and Screen Recording approvals for the same signed app are system-wide and reused
+across accounts. A new development account does not require a duplicate approval. Complete its
+macOS welcome screens once, then log out and return to the normal account; **Start Environment…**
+can start that initialized desktop again. Missing grants can be approved from the normal account.
+
+The MCP server in your ordinary account continues handling tools, audit records, traces and other backends;
+its own TCC snapshot does not describe the private worker's permissions. Setup checks the worker,
+and `glass_capabilities` with `scope: "session"` reports actual input support and interference.
+
+A readiness probe authenticates the worker's kernel identity, signature and login without launching
+an application or sharing a workspace. Application sessions retain an environment lease so setup
+and disable cannot change their route while they still accept input. Doctor reports busy state
+without interrupting those sessions.
+
+Enrollment records Glass's signing identity in protected service state. Before sharing a workspace,
+the owner authenticates the running worker through its kernel connection identity and code signature.
+The worker requires hardened runtime without debugging or library-validation exceptions. Compatible
+Glass updates keep the same signing identity; applications under development need no signing or
+enrollment for this check.
+
+Glass retains this account's login and grants between app runs. `glass_stop` releases owned work,
+not the login. Switching to the account for inspection suspends private work through the live
+attachment guard. Logging it out makes the worker unavailable until the next real login. Neither
+setup nor uninstall edits the TCC database or removes the user's account.
+
+Interrupted permission recovery checks recorded process births, the machine's boot identity and the
+previous private login's lifetime. A surviving process or a retained login session can conservatively
+defer recovery. Glass preserves the journal and reports the incomplete cleanup rather than restoring
+access while earlier work may still be running.
+
+## Administrator authorisation and manual control
+
+Privacy grants are separate from the root authorisation used for account creation, registration,
+desktop startup and enrollment removal. The [administrator-access reference](../reference/macos-administrator-access.md)
+shows the actual elevation wrappers, compiled operations, password handling and persistent records.
+The [manual audit/setup guide](../how-to/audit-macos-account-setup.md) covers inspection and the
+macOS account-creation/login route that avoids entering the development-account password in Glass.

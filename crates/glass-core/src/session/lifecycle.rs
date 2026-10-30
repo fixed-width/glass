@@ -23,9 +23,10 @@ impl Glass {
     fn start_on_inner(&mut self, backend: &str, spec: &AppSpec) -> Result<WindowGeometry> {
         self.observation_epoch.invalidate();
         // One active session: tear down any current one first.
-        if let Some(mut s) = self.active.take() {
-            let _ = s.platform.stop_app();
+        if let Some(session) = self.active.as_mut() {
+            session.platform.stop_app()?;
         }
+        self.active.take();
         let Backend {
             mut platform,
             accessibility,
@@ -523,6 +524,23 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec!["x11", "wayland"]);
         g.stop().unwrap();
         assert_eq!(g.active_backend(), None);
+    }
+
+    #[test]
+    fn backend_switch_reports_failed_cleanup_before_constructing_the_replacement() {
+        let constructed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&constructed);
+        let factory: PlatformFactory = Box::new(move |name| {
+            seen.lock().unwrap().push(name.to_owned());
+            Ok(Backend::display_only(Box::new(
+                FakePlatform::new(10, 10).failing_stop(),
+            )))
+        });
+        let mut glass = glass_with_factory(factory);
+        glass.start_on("first", &spec()).unwrap();
+        assert!(glass.start_on("second", &spec()).is_err());
+        assert_eq!(*constructed.lock().unwrap(), ["first"]);
+        assert_eq!(glass.active_backend(), Some("first"));
     }
 
     #[test]
