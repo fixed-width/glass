@@ -4,5 +4,5 @@
   "private": true,
   "main": "main.js",
   "scripts": {"package": "node package.js"},
-  "devDependencies": {"electron": "44.2.0"}
+  "devDependencies": {"electron": "44.9.1"}
 }
