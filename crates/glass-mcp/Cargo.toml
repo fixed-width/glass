@@ -33,7 +33,7 @@ anyhow = "1"
 zeroize = "1"
 cap-std = "4"
 cap-fs-ext = "4"
-zip = { version = "8.6", default-features = false }
+zip = { version = "9.0", default-features = false }
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
