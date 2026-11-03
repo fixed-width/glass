@@ -19,6 +19,14 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+
+- Preview Windows application development on a separate local desktop. `glass-mcp desktop enable`
+  guides the one-time Windows setting change; application workers stay unelevated. Existing tools
+  retain the desktop across application stops, while `desktop status`, `show`, `hide`, `stop`,
+  `recover`, and `disable` provide inspection and lifecycle control. The desktop uses your Windows
+  account; application containment remains a separate setting.
+
 ### Fixed
 
 - Windows contained launches keep the helper command window hidden, so it no longer obstructs

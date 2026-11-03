@@ -17,6 +17,8 @@ client's filesystem.
 
 - `--audit-log <path>` — append a JSONL audit record per actuation (same as `GLASS_AUDIT_LOG`); see
   [reference/audit-log.md](audit-log.md).
+- `--desktop shared|separate` — Windows only; override the saved desktop selection for this server.
+  Separate requires `desktop enable` setup and never falls back to shared input.
 - `--tool-profile full|lean` — fixed tool inventory for this server, default `full`.
   Lean uses `glass_do` for actions; see [tool profiles](tools.md#tool-profiles).
 - `--trace-dir <absolute-directory>` — retain supplied inputs and requested results, which can
@@ -208,3 +210,10 @@ not remove the app bundle. For account setup, stop active work first: uninstall 
 workspace permissions and removes only Glass’s worker registration with administrator authentication.
 The account, home and app data remain. Use `unenroll` to keep the ordinary startup integration while
 returning to shared-desktop operation. See [how-to/setup-macos.md](../how-to/setup-macos.md#uninstall).
+
+## `desktop` (Windows preview)
+
+Configure and control the local child desktop: `enable`, `status [--json]`, `show`, `hide`, `stop`,
+`recover`, and `disable`. Status is read-only. Enable and disable may request Windows administrator
+consent for the child-session setting; application workers remain unelevated. Application Stop retains
+the desktop, while environment Stop ends it. See [the Windows separate-desktop guide](../how-to/windows-separate-desktop.md).

@@ -4,7 +4,7 @@ use base64::Engine;
 use glass_core::*;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Request {
@@ -79,6 +79,7 @@ pub(crate) struct Properties {
     pub input: InputCapabilities,
     pub app_pid: Option<u32>,
     pub window: Option<WindowId>,
+    pub window_handle: Option<i64>,
     pub scope_basis: Option<u64>,
     pub coverage: AxStateCoverage,
 }
@@ -108,12 +109,17 @@ pub(crate) struct Response {
 }
 
 pub(crate) fn now_ns() -> Result<u64> {
-    let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    u64::try_from(time.tv_sec)
-        .ok()
-        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
-        .and_then(|seconds| seconds.checked_add(time.tv_nsec as u64))
-        .ok_or_else(|| GlassError::Backend("monotonic clock overflow".into()))
+    #[cfg(windows)]
+    return glass_windows::desktop::monotonic_ns();
+    #[cfg(unix)]
+    {
+        let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        u64::try_from(time.tv_sec)
+            .ok()
+            .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+            .and_then(|seconds| seconds.checked_add(time.tv_nsec as u64))
+            .ok_or_else(|| GlassError::Backend("monotonic clock overflow".into()))
+    }
 }
 
 pub(crate) fn expires(deadline: Deadline) -> Result<Option<u64>> {
@@ -160,6 +166,7 @@ impl<P: Platform, A: Accessibility> Dispatcher<P, A> {
             input: self.platform.input_capabilities(),
             app_pid: self.platform.app_pid(),
             window: self.platform.observation_window_id(),
+            window_handle: self.platform.active_window_handle(),
             scope_basis: self
                 .accessibility
                 .observation_scope()

@@ -1612,6 +1612,7 @@ dependencies = [
  "glass-a11y-windows",
  "glass-clip-shim-windows",
  "glass-core",
+ "serde",
  "tempfile",
  "uiautomation",
  "windows",

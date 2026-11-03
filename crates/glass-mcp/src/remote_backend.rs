@@ -266,6 +266,11 @@ impl<C: Connection + 'static> Platform for RemotePlatform<C> {
     fn observation_window_id(&self) -> Option<WindowId> {
         lock(&self.0).ok().and_then(|state| state.properties.window)
     }
+    fn active_window_handle(&self) -> Option<i64> {
+        lock(&self.0)
+            .ok()
+            .and_then(|state| state.properties.window_handle)
+    }
     fn app_pids_by(&self, deadline: Deadline) -> Result<Vec<u32>> {
         match lock(&self.0)?.call(Operation::Pids, deadline)? {
             Value::Pids(value) => Ok(value),
@@ -414,6 +419,58 @@ mod tests {
             dispatcher: Dispatcher::new(FakePlatform::new(4, 4), Reader),
             closes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    struct NativeHandle {
+        inner: Local,
+        observed: Arc<std::sync::Mutex<Option<i64>>>,
+    }
+    impl Connection for NativeHandle {
+        fn call(&mut self, operation: Operation, deadline: Deadline) -> Result<Response> {
+            if let Operation::Snapshot(context) = &operation {
+                *self.observed.lock().unwrap() = context.window_handle;
+            }
+            let mut response = self.inner.call(operation, deadline)?;
+            response.properties.window_handle = Some(0x1ab);
+            Ok(response)
+        }
+        fn close(&mut self, deadline: Deadline) -> Result<()> {
+            self.inner.close(deadline)
+        }
+    }
+
+    #[test]
+    fn core_accessibility_context_preserves_the_workers_native_window_handle() {
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&observed);
+        let directory = tempfile::tempdir().unwrap();
+        let factory: PlatformFactory = Box::new(move |_| {
+            backend(NativeHandle {
+                inner: local(),
+                observed: Arc::clone(&captured),
+            })
+        });
+        let mut glass = Glass::new(
+            factory,
+            "fake".into(),
+            BaselineStore::new(directory.path().join("baselines")),
+            100,
+        );
+        glass
+            .start(&AppSpec {
+                build: None,
+                run: vec!["fake".into()],
+                cwd: None,
+                env: Vec::new(),
+                window_hint: None,
+                timeout_ms: 1000,
+                sandbox: SandboxLevel::Off,
+                a11y: false,
+            })
+            .unwrap();
+        glass.a11y_snapshot(None).unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(0x1ab));
+        glass.stop().unwrap();
     }
 
     struct Changing {

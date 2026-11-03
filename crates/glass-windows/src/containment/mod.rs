@@ -3,6 +3,61 @@
 
 pub(crate) mod config;
 
+/// Persistent origin of a container created by an environment worker.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoxOwnership {
+    pub box_name: String,
+    pub provider_dir: String,
+    pub log_directory: std::path::PathBuf,
+}
+
+/// Record origin before configuration changes, and completion only after verified teardown.
+#[cfg(windows)]
+pub trait ContainmentJournal: Send + Sync {
+    fn created(&self, record: &BoxOwnership) -> glass_core::Result<()>;
+    fn closed(&self, record: &BoxOwnership) -> glass_core::Result<()>;
+}
+
+/// Server configuration captured before crossing the Windows logon boundary.
+#[cfg(windows)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSettings {
+    pub provider: String,
+    pub directory: String,
+    pub clipboard_dll: Option<String>,
+}
+
+#[cfg(windows)]
+impl ProviderSettings {
+    pub fn capture() -> glass_core::Result<Self> {
+        let provider =
+            std::env::var("GLASS_WIN_SANDBOX_PROVIDER").unwrap_or_else(|_| "auto".into());
+        config::ProviderChoice::parse(&provider)
+            .map_err(glass_core::GlassError::SandboxUnavailable)?;
+        let exe = std::env::current_exe().map_err(|error| {
+            glass_core::GlassError::Backend(format!("resolve desktop server executable: {error}"))
+        })?;
+        let directory = sandboxie::sandboxie_dir();
+        let clipboard_dll = config_shim_dll_path(exe.parent().and_then(|path| path.to_str()));
+        Ok(Self {
+            provider,
+            directory,
+            clipboard_dll,
+        })
+    }
+}
+
+#[cfg(windows)]
+pub fn recover_box(
+    record: &BoxOwnership,
+    deadline: glass_core::Deadline,
+) -> glass_core::Result<()> {
+    sandboxie::recover_owned_box(record, deadline)
+}
+
 #[cfg(any(windows, test))]
 mod pid_discovery;
 
@@ -72,13 +127,26 @@ mod imp {
     pub(crate) fn resolve_containment(
         spec: &AppSpec,
         protected_paths: &[ProtectedHostPath],
+        journal: Option<std::sync::Arc<dyn super::ContainmentJournal>>,
+        settings: Option<&super::ProviderSettings>,
     ) -> Result<Containment> {
-        let choice = provider_choice()?;
-        let dir = super::sandboxie::sandboxie_dir();
+        let choice = match settings {
+            Some(settings) => {
+                ProviderChoice::parse(&settings.provider).map_err(GlassError::SandboxUnavailable)?
+            }
+            None => provider_choice()?,
+        };
+        let dir = settings
+            .map(|settings| settings.directory.clone())
+            .unwrap_or_else(super::sandboxie::sandboxie_dir);
         match decide(spec.sandbox, choice, super::sandboxie::available(&dir)) {
             Decision::Unconfined => Ok(Containment::Unconfined),
             Decision::Sandboxie => {
-                let s = super::sandboxie::Sandboxie::new(dir, super::sandboxie::unique_box_name());
+                let s = super::sandboxie::Sandboxie::new(dir, super::sandboxie::unique_box_name())
+                    .with_journal(journal)?;
+                let s = s.with_clipboard_dll(
+                    settings.and_then(|settings| settings.clipboard_dll.clone()),
+                );
                 s.configure_with_paths(spec.sandbox, protected_paths)?;
                 Ok(Containment::Sandboxie(s))
             }

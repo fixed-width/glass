@@ -13,6 +13,7 @@ bench = false
 
 [dependencies]
 glass-core.workspace = true
+serde.workspace = true
 glass-clip-shim-windows = { path = "../glass-clip-shim-windows" }
 # The desktop-a11y capability signal (UI Automation creatable) reuses the a11y reader's own
 # `probe_uia`. Cross-platform dep: the crate's Windows-only bits are cfg(windows)-gated, so it
@@ -38,6 +39,9 @@ windows = { version = "0.62", features = [
   "Win32_Security_Authorization",
   # doctor/env color: switch the console into ANSI-interpreting mode before emitting escapes.
   "Win32_System_Console",
+  "Win32_UI_Shell",
+  "Win32_System_Registry",
+  "Win32_System_WinRT",
 ] }
 
 # The onbox examples + tests set Per-Monitor-V2 awareness at runtime (they carry no manifest); the

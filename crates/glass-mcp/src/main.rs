@@ -9,6 +9,24 @@ use glass_mcp::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    match cli.command {
+        Some(Command::WindowsDesktopWorker { root, instance }) => {
+            return glass_mcp::windows_environment::run_worker(&root, &instance);
+        }
+        Some(Command::WindowsDesktopSetting { action }) => {
+            std::process::exit(glass_windows::desktop::setting_action_exit_code(matches!(
+                action,
+                glass_mcp::windows_environment::SettingAction::Enable
+            )) as i32)
+        }
+        Some(Command::Desktop { command }) => {
+            return glass_mcp::windows_environment::command(command);
+        }
+        _ => {}
+    }
+    #[cfg(windows)]
+    glass_mcp::windows_environment::set_requested_mode(cli.desktop)?;
     #[cfg(target_os = "macos")]
     match cli.command {
         Some(Command::MacosWorker { owner }) => {
@@ -54,6 +72,15 @@ async fn main() -> anyhow::Result<()> {
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
+        #[cfg(windows)]
+        Some(
+            Command::WindowsDesktopWorker { .. }
+            | Command::WindowsDesktopSetting { .. }
+            | Command::Desktop { .. },
+        ) => anyhow::bail!(
+            "internal Windows command was not dispatched before server initialization"
+        ),
+
         #[cfg(target_os = "macos")]
         Some(
             Command::MacosWorker { .. }

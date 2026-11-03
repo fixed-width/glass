@@ -32,6 +32,89 @@ use glass_core::logbuf::Stream;
 use glass_core::platform::{ProtectedHostPath, ProtectedHostPathKind};
 use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel};
 
+pub(crate) fn recover_owned_box(record: &super::BoxOwnership, deadline: Deadline) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    let suffix = record
+        .box_name
+        .strip_prefix("glass_")
+        .ok_or_else(|| GlassError::SandboxUnavailable("invalid owned box name".into()))?;
+    if suffix.is_empty()
+        || suffix.len() > 40
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !Path::new(&record.provider_dir).is_absolute()
+        || !available(&record.provider_dir)
+    {
+        return Err(GlassError::SandboxUnavailable(
+            "owned container identity or provider installation changed".into(),
+        ));
+    }
+    let run = |program: String, args: &[String]| -> Result<()> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().map_err(|error| {
+            GlassError::SandboxUnavailable(format!("start owned container cleanup: {error}"))
+        })?;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|error| {
+                GlassError::SandboxUnavailable(format!("wait for container cleanup: {error}"))
+            })? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(GlassError::SandboxUnavailable(format!(
+                        "owned container cleanup exited with {status}"
+                    )))
+                };
+            }
+            if deadline.has_passed() {
+                let _ = child.kill();
+                return Err(GlassError::caller_deadline_elapsed(
+                    "owned Sandboxie cleanup",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    run(
+        start_exe(&record.provider_dir),
+        &[
+            "/silent".into(),
+            format!("/box:{}", record.box_name),
+            "/terminate".into(),
+        ],
+    )?;
+    let pids = super::pid_discovery::sandboxie_list_pids_by(
+        &start_exe(&record.provider_dir),
+        &record.box_name,
+        deadline,
+    )?;
+    if !pids.is_empty() {
+        return Err(GlassError::SandboxUnavailable(
+            "owned box still has live processes".into(),
+        ));
+    }
+    run(
+        sbieini(&record.provider_dir),
+        &[
+            "set".into(),
+            record.box_name.clone(),
+            "*".into(),
+            String::new(),
+        ],
+    )?;
+    // Recovery keeps crash logs and persistent box data for inspection; it never recursively
+    // removes a path supplied by a state record or an application.
+    Ok(())
+}
+
 use super::clip_server::ClipServer;
 use super::config;
 use super::imp::LogSink;
@@ -234,6 +317,8 @@ pub(crate) struct Sandboxie {
     /// Tracks responsibility for clearing this box's `Sandboxie.ini` section until launch transfers
     /// it to [`SandboxieApp::kill`].
     section_armed: AtomicBool,
+    journal: Option<Arc<dyn super::ContainmentJournal>>,
+    clipboard_dll: Option<String>,
 }
 
 fn clear_box_section_with(
@@ -260,6 +345,7 @@ impl Drop for Sandboxie {
             let mut runner = run_command;
             if clear_box_section_with(&self.dir, &self.box_name, &mut runner).is_ok() {
                 self.section_armed.store(false, Ordering::Relaxed);
+                self.notify_closed();
             }
         }
     }
@@ -273,6 +359,46 @@ impl Sandboxie {
             dir,
             box_name,
             section_armed: AtomicBool::new(false),
+            journal: None,
+            clipboard_dll: None,
+        }
+    }
+
+    pub(crate) fn with_clipboard_dll(mut self, path: Option<String>) -> Self {
+        self.clipboard_dll = path;
+        self
+    }
+
+    fn ownership(&self) -> super::BoxOwnership {
+        super::BoxOwnership {
+            box_name: self.box_name.clone(),
+            provider_dir: self.dir.clone(),
+            log_directory: std::env::temp_dir().join(&self.box_name),
+        }
+    }
+
+    pub(crate) fn with_journal(
+        mut self,
+        journal: Option<Arc<dyn super::ContainmentJournal>>,
+    ) -> Result<Self> {
+        if let Some(journal) = &journal {
+            journal.created(&self.ownership())?;
+        }
+        self.journal = journal;
+        Ok(self)
+    }
+
+    fn notify_closed(&self) {
+        if !self.section_armed.load(Ordering::Relaxed)
+            && self
+                .ownership()
+                .log_directory
+                .try_exists()
+                .is_ok_and(|exists| !exists)
+            && let Some(journal) = &self.journal
+            && let Err(error) = journal.closed(&self.ownership())
+        {
+            eprintln!("glass: container cleanup journal remains incomplete: {error}");
         }
     }
 
@@ -285,7 +411,9 @@ impl Sandboxie {
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()));
         let env = config::shim_dll_env(&|k| std::env::var(k).ok());
-        let dll = config::shim_dll_path(env.as_deref(), exe_dir.as_deref(), &|p| p.exists())?;
+        let dll = self.clipboard_dll.clone().or_else(|| {
+            config::shim_dll_path(env.as_deref(), exe_dir.as_deref(), &|p| p.exists())
+        })?;
         if !Path::new(&dll).exists() {
             crate::disclose_clip_disabled(&dll);
             return None;
@@ -340,7 +468,11 @@ impl Sandboxie {
         level: SandboxLevel,
         protected_paths: &[ProtectedHostPath],
     ) -> Result<()> {
-        self.configure_with_runner(level, protected_paths, run_command)
+        let result = self.configure_with_runner(level, protected_paths, run_command);
+        if result.is_err() {
+            self.notify_closed();
+        }
+        result
     }
 
     fn configure_with_runner(
@@ -537,6 +669,7 @@ impl Sandboxie {
             stop,
             tailers,
             clip: clip.map(|(store, server, _)| (store, server)),
+            journal: self.journal.clone(),
         })
     }
 }
@@ -662,6 +795,7 @@ pub(crate) struct SandboxieApp {
     /// Layer-2 private clipboard: the host store + its pipe server. `None` = Layer-1-only
     /// (app clipboard disabled, user protected).
     clip: Option<(PrivateClipboard, ClipServer)>,
+    journal: Option<Arc<dyn super::ContainmentJournal>>,
 }
 
 impl SandboxieApp {
@@ -713,9 +847,10 @@ impl SandboxieApp {
     /// Terminates the box, joins tailers after their final drain, reaps helpers, removes logs, and
     /// clears the per-attempt `Sandboxie.ini` section.
     pub(crate) fn kill(mut self) -> crate::process::Closed {
-        let _ = Command::new(start_exe(&self.dir))
+        let terminated = Command::new(start_exe(&self.dir))
             .args([&format!("/box:{}", self.box_name), "/terminate"])
-            .status();
+            .status()
+            .is_ok_and(|status| status.success());
         self.stop.store(true, Ordering::Relaxed);
         for h in self.tailers {
             let _ = h.join();
@@ -726,10 +861,32 @@ impl SandboxieApp {
         if let Some((_, server)) = self.clip.take() {
             server.stop();
         }
-        let _ = std::fs::remove_dir_all(&self.logdir);
+        let logs_removed = std::fs::remove_dir_all(&self.logdir).is_ok()
+            || self.logdir.try_exists().is_ok_and(|exists| !exists);
+        let empty = self.journal.is_none()
+            || super::pid_discovery::sandboxie_list_pids_by(
+                &start_exe(&self.dir),
+                &self.box_name,
+                Deadline::from_millis(1_000),
+            )
+            .is_ok_and(|pids| pids.is_empty());
         let mut runner = run_command;
-        if let Err(error) = clear_box_section_with(&self.dir, &self.box_name, &mut runner) {
+        let cleared = clear_box_section_with(&self.dir, &self.box_name, &mut runner);
+        if let Err(error) = &cleared {
             eprintln!("glass: {error}");
+        }
+        if terminated
+            && empty
+            && logs_removed
+            && cleared.is_ok()
+            && let Some(journal) = &self.journal
+            && let Err(error) = journal.closed(&super::BoxOwnership {
+                box_name: self.box_name.clone(),
+                provider_dir: self.dir.clone(),
+                log_directory: self.logdir.clone(),
+            })
+        {
+            eprintln!("glass: container cleanup journal remains incomplete: {error}");
         }
         // A boxed app is terminated without ever being asked to close, unlike an unconfined
         // one. Measured on-box: `PostMessageW(WM_CLOSE)` to a boxed app's top-level windows

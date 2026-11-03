@@ -18,7 +18,7 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 Input without desktop interference means the agent's pointer and keyboard stay separate from yours.
 It is already provided by owned Linux displays, the Android emulator and the iOS Simulator, using
 the normal tools without extra input configuration. An explicitly attached X11 display has no
-Glass-owned isolation guarantee. Native Windows and unenrolled macOS input can change focus or move your pointer;
+Glass-owned isolation guarantee. Shared Windows and unenrolled macOS input can change focus or move your pointer;
 a virtual monitor alone does not isolate input. Running Glass and its target inside a VM provides a
 separate desktop, but the native backend cannot attest isolation from the VM host.
 
@@ -68,6 +68,9 @@ explained in [explanation/backends.md](../explanation/backends.md) and
 [Linux](../how-to/setup-linux.md) · [Windows](../how-to/setup-windows.md) ·
 [macOS](../how-to/setup-macos.md) · [Android](../how-to/setup-android.md) ·
 [iOS](../how-to/setup-ios.md).
+
+The opt-in [Windows separate-desktop preview](../how-to/windows-separate-desktop.md) routes
+ordinary application input through a retained local child session. It uses the same Windows account.
 
 ## System requirements
 

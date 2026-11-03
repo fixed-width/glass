@@ -85,6 +85,7 @@ glass-ios = { path = "../glass-ios" }
 rustix.workspace = true
 
 [build-dependencies]
+base64 = "0.23"
 embed-manifest = "1"
 # Already a normal dependency of this crate (above), so build.rs parsing server.json adds no
 # crate to the lockfile — only a host-side build of one already in the graph.

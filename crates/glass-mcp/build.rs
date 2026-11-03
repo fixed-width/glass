@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    windows_desktop_helper();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_manifest(
             new_manifest("Glass.Mcp")
@@ -35,6 +36,72 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     watch_git_head();
     emit_server_json_identity();
+}
+
+fn windows_desktop_helper() {
+    use base64::Engine;
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let bindings = output.join("windows_desktop_payload.rs");
+    println!("cargo:rerun-if-changed=native/windows-desktop/Host.cs");
+    println!("cargo:rerun-if-changed=native/windows-desktop/build.ps1");
+    println!("cargo:rerun-if-env-changed=GLASS_DESKTOP_HELPER_DIR");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let payload = if let Some(directory) = std::env::var_os("GLASS_DESKTOP_HELPER_DIR") {
+        std::path::PathBuf::from(directory)
+    } else if cfg!(windows) {
+        let payload = output.join("windows-desktop");
+        let source = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"),
+        )
+        .join("native/windows-desktop");
+        let script =
+            std::fs::read_to_string(source.join("build.ps1")).expect("read desktop helper build");
+        let script: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let result = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+            ])
+            .arg(base64::engine::general_purpose::STANDARD.encode(script))
+            .env("GLASS_DESKTOP_SOURCE_DIR", &source)
+            .env("GLASS_DESKTOP_BUILD_DIR", &payload)
+            .output()
+            .expect("run native desktop helper build");
+        assert!(
+            result.status.success(),
+            "desktop helper build failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        payload
+    } else {
+        // Cross-host metadata builds have no mstscax.dll or Framework compiler. Their runtime
+        // explicitly reports the missing bundle; native release builds always package it.
+        std::fs::write(
+            bindings,
+            "pub const HOST: &[u8] = &[];\npub const INTEROP: &[u8] = &[];\n",
+        )
+        .expect("write cross-host desktop payload declaration");
+        println!(
+            "cargo:warning=Windows desktop helper is absent in this cross-host build; set GLASS_DESKTOP_HELPER_DIR to a native-built bundle to package it"
+        );
+        return;
+    };
+    let host = payload.join("GlassDesktopHost.exe");
+    let interop = payload.join("GlassDesktopRdp.dll");
+    for path in [&host, &interop] {
+        assert!(
+            std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(b"MZ")),
+            "invalid desktop helper payload: {}",
+            path.display()
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    std::fs::write(bindings, format!("pub const HOST: &[u8] = include_bytes!({host:?});\npub const INTEROP: &[u8] = include_bytes!({interop:?});\n")).expect("write desktop payload declaration");
 }
 
 /// Emit the `server.json` fields the MCP `initialize` handshake mirrors, as build-time env vars

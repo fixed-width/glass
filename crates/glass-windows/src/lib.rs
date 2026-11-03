@@ -15,6 +15,8 @@ use glass_core::capability::{CapabilityMap, CapabilityStatus};
 
 pub mod console; // cfg(windows) console-mode switch for ANSI output; no host-testable surface
 pub mod containment; // Windows containment provider seam (pure config is host-tested)
+#[cfg(windows)]
+pub mod desktop;
 pub mod discovery; // pure window-discovery poll-loop decision — cross-platform, host-tested
 pub mod doctor; // pure check-mapping cross-platform; Windows fact-gathering is cfg(windows)
 pub mod dpi; // pure coordinate math — cross-platform, unit-tested on any host
@@ -31,11 +33,12 @@ pub mod vkmap; // pure named-keysym->VK map — cross-platform, host-tested
 
 #[cfg(windows)]
 pub use host_fs::{
-    DirectoryEntryHandle, DirectoryEntryRecord, HostFsError, directory_entry_handles,
-    directory_entry_names, directory_entry_records, file_has_single_link,
-    file_is_private_to_current_user, file_matches_path_no_reparse,
-    open_deletable_directory_no_reparse, open_directory_beneath, open_directory_entry,
-    open_directory_no_reparse, open_entry_child, open_file_beneath, open_file_child,
+    DirectoryEntryHandle, DirectoryEntryRecord, HostFsError, create_private_child,
+    directory_entry_handles, directory_entry_names, directory_entry_records,
+    directory_matches_path_no_reparse, file_has_single_link, file_is_private_to_current_user,
+    file_matches_path_no_reparse, open_deletable_directory_no_reparse, open_directory_beneath,
+    open_directory_child_readonly, open_directory_entry, open_directory_no_reparse,
+    open_entry_child, open_file_beneath, open_file_child, open_file_child_readonly,
     path_has_private_dacl, remove_by_handle, restrict_directory_child_to_current_user,
     restrict_file_to_current_user, restrict_path_to_current_user, same_file_object,
 };
@@ -221,6 +224,8 @@ mod backend {
         active_hwnd: Option<isize>,
         external_window: Option<ExternalWindow>,
         protected_host_paths: Vec<ProtectedHostPath>,
+        containment_journal: Option<Arc<dyn crate::containment::ContainmentJournal>>,
+        provider_settings: Option<crate::containment::ProviderSettings>,
     }
 
     impl WindowsPlatform {
@@ -232,7 +237,25 @@ mod backend {
                 active_hwnd: None,
                 external_window: None,
                 protected_host_paths: Vec::new(),
+                containment_journal: None,
+                provider_settings: None,
             })
+        }
+
+        pub fn with_containment_journal(
+            mut self,
+            journal: Arc<dyn crate::containment::ContainmentJournal>,
+        ) -> Self {
+            self.containment_journal = Some(journal);
+            self
+        }
+
+        pub fn with_provider_settings(
+            mut self,
+            settings: crate::containment::ProviderSettings,
+        ) -> Self {
+            self.provider_settings = Some(settings);
+            self
         }
 
         /// Poll the desktop's top-level windows until the discovery ladder
@@ -340,8 +363,12 @@ mod backend {
             // Resolve the containment provider before doing any work. `off` → Unconfined
             // (today's direct spawn); `default`/`strict` require an in-OS provider and
             // fail closed while Sandboxie availability is stubbed false (a later task).
-            let containment =
-                crate::containment::resolve_containment(spec, &self.protected_host_paths)?;
+            let containment = crate::containment::resolve_containment(
+                spec,
+                &self.protected_host_paths,
+                self.containment_journal.clone(),
+                self.provider_settings.as_ref(),
+            )?;
             containment.run_build(spec)?;
             // Validate a usable display before launching — reject a degenerate 0x0
             // (headless / Session-0) where no window can ever appear.

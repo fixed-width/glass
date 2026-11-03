@@ -18,6 +18,11 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Windows desktop used by application tools. Separate requires desktop enable setup.
+    #[cfg(windows)]
+    #[arg(long, global = true, value_enum)]
+    pub desktop: Option<crate::windows_environment::DesktopMode>,
+
     /// Append a JSONL audit log of every actuation to PATH (also GLASS_AUDIT_LOG).
     /// Opt-in; off when unset. Content redacted by default
     /// (GLASS_AUDIT_CONTENT=none|redacted|full, GLASS_AUDIT_PREFIX_LEN=N).
@@ -39,6 +44,26 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsDesktopWorker {
+        #[arg(long)]
+        root: std::path::PathBuf,
+        #[arg(long)]
+        instance: String,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsDesktopSetting {
+        #[arg(value_enum)]
+        action: crate::windows_environment::SettingAction,
+    },
+    /// Configure, inspect, or stop the local separate Windows desktop.
+    #[cfg(windows)]
+    Desktop {
+        #[command(subcommand)]
+        command: crate::windows_environment::DesktopCommand,
+    },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     MacosWorker { owner: u32 },

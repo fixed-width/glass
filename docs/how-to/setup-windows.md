@@ -4,6 +4,8 @@ The Windows backend drives apps on the **interactive desktop** (Windows.Graphics
 UI Automation), so run it in a normal logged-in session — not a non-interactive service / Session 0.
 It is the default backend on a Windows host, so no `env` block is needed to select it.
 
+For background application work, see the opt-in [separate-desktop preview](windows-separate-desktop.md).
+
 ## System requirements
 
 Windows 10 or 11, x86-64. Nothing else to install to *run* the binary: `glass-mcp.exe` statically
