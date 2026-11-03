@@ -105,7 +105,9 @@ cursor and foreground application.
 
 ## Preview qualification
 
-The current investigation uses a local account on Windows 11 Pro with an RDP parent. Windows Home,
-managed sign-in policies and simultaneous physical-console hardware input still need qualification.
-An unavailable or failed environment returns its diagnostic instead of falling back to the user's
-desktop. RDP-to-console transfers are not part of setup or recovery.
+Preview testing covers a local account on Windows 11 Pro with an RDP parent and a 40-second
+physical-console input run. The physical run used `sandbox=off`; simultaneous physical input with
+contained applications still needs qualification. Windows Home, managed sign-in policies and
+lock/reconnect behavior also need qualification. An unavailable or failed environment returns its
+diagnostic instead of falling back to the user's desktop. RDP-to-console transfers are not part
+of setup or recovery.
