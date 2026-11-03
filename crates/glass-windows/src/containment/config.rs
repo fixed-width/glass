@@ -257,7 +257,7 @@ pub(crate) fn build_launch_cmd_env(
         s.push_str(&format!("set \"GLASS_CLIP_PIPE={pipe}\"\r\n"));
     }
     if let Some(cwd) = &spec.cwd {
-        s.push_str(&format!("cd /d \"{}\"\r\n", cwd.display()));
+        s.push_str(&format!("cd /d \"{}\" || exit /b 1\r\n", cwd.display()));
     }
     let mut line = String::new();
     for (i, part) in spec.run.iter().enumerate() {
@@ -310,6 +310,43 @@ mod tests {
         assert!(
             script.contains("1>\"out.log\" 2>\"err.log\""),
             "script: {script:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_cmd_does_not_run_the_app_when_its_working_directory_is_unavailable() {
+        use std::os::windows::process::CommandExt;
+        let scratch = tempfile::tempdir().expect("wrapper test directory");
+        let marker = scratch.path().join("app-ran.txt");
+        let app = scratch.path().join("app.cmd");
+        std::fs::write(&app, format!("@echo app-ran>\"{}\"\r\n", marker.display()))
+            .expect("marker application");
+        let mut spec = launch_spec(vec![app.to_string_lossy().into_owned()], None);
+        spec.cwd = Some(scratch.path().join("missing-project-directory"));
+        let wrapper = scratch.path().join("launch.cmd");
+        std::fs::write(
+            &wrapper,
+            build_launch_cmd_env(
+                &spec,
+                &scratch.path().join("out.log"),
+                &scratch.path().join("err.log"),
+                None,
+            )
+            .expect("wrapper"),
+        )
+        .expect("write wrapper");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"])
+            .arg(wrapper)
+            .current_dir(scratch.path())
+            .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+            .status()
+            .expect("run wrapper");
+        assert!(!status.success(), "an invalid cwd must fail the wrapper");
+        assert!(
+            !marker.exists(),
+            "the app must not run in a fallback directory"
         );
     }
 

@@ -32,6 +32,21 @@ use glass_core::logbuf::Stream;
 use glass_core::platform::{ProtectedHostPath, ProtectedHostPathKind};
 use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel};
 
+fn command_processor() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut directory = vec![0u16; 32768];
+    // SAFETY: the native function receives a live writable buffer and its length.
+    let length = unsafe {
+        windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut directory))
+    } as usize;
+    if length == 0 || length >= directory.len() {
+        return Err(GlassError::AppNotStarted(
+            "cannot resolve the Windows command processor directory".into(),
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_wide(&directory[..length])).join("cmd.exe"))
+}
+
 pub(crate) fn recover_owned_box(record: &super::BoxOwnership, deadline: Deadline) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
@@ -608,6 +623,16 @@ impl Sandboxie {
     /// Launch the app contained, redirecting its stdio to files in a per-session log dir and
     /// tailing those files into `logs`. Returns the live handle.
     pub(crate) fn launch(&self, spec: &AppSpec, logs: LogSink) -> Result<SandboxieApp> {
+        let mut launch_spec = spec.clone();
+        if launch_spec.cwd.is_none() {
+            launch_spec.cwd = Some(std::env::current_dir().map_err(|error| {
+                GlassError::AppNotStarted(format!("resolve application working directory: {error}"))
+            })?);
+        }
+        let processor = command_processor()?;
+        let bootstrap = processor.ancestors().last().ok_or_else(|| {
+            GlassError::AppNotStarted("command processor has no disk root".into())
+        })?;
         // Layer-2 clipboard: configure the hook DLL + pipe server (best-effort; None = Layer-1-only).
         // This writes clipboard ini lines and does a /reload BEFORE the logdir reload below,
         // so both sets of ini changes land before the app is ever spawned.
@@ -631,8 +656,12 @@ impl Sandboxie {
         // Generate launch.cmd: optional cd, then the quoted exe + args with stdio redirected.
         // Passes the clipboard pipe name (if Layer 2 is active) as GLASS_CLIP_PIPE env.
         let cmd_path = logdir.join("launch.cmd");
-        let script =
-            super::config::build_launch_cmd_env(spec, &out_log, &err_log, clip_pipe.as_deref())?;
+        let script = super::config::build_launch_cmd_env(
+            &launch_spec,
+            &out_log,
+            &err_log,
+            clip_pipe.as_deref(),
+        )?;
         std::fs::write(&cmd_path, script)
             .map_err(|e| GlassError::AppNotStarted(format!("write {}: {e}", cmd_path.display())))?;
 
@@ -640,13 +669,14 @@ impl Sandboxie {
         // process itself. `Off` so no Job caps are applied to the wrapper.
         let cmd_path_str = cmd_path.to_string_lossy().into_owned();
         let mut cmd = Command::new(start_exe(&self.dir));
-        cmd.args([
-            &format!("/box:{}", self.box_name),
-            "/hide_window",
-            "cmd",
-            "/c",
-            &cmd_path_str,
-        ]);
+        // Sandboxie copies its bootstrap cwd into an internal argument capped at 128 characters.
+        // The script separately restores the application's requested working directory.
+        cmd.current_dir(bootstrap)
+            .arg(format!("/box:{}", self.box_name))
+            .arg("/hide_window")
+            .arg(&processor)
+            .arg("/c")
+            .arg(&cmd_path_str);
         let inner = crate::process::spawn_suspended_in_job(&mut cmd, SandboxLevel::Off)?;
         inner.resume();
 
