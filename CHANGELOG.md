@@ -19,6 +19,11 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows contained launches keep the helper command window hidden, so it no longer obstructs
+  applications or causes semantic pointer actions to refuse valid targets as unmapped popovers.
+
 ## [1.9.0] - 2026-11-01
 
 ### Added

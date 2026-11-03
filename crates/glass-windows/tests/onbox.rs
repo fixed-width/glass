@@ -1119,6 +1119,52 @@ fn onbox_egui_set_value_honesty() {
 
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_sandboxed_semantic_pointer() {
+    use glass_core::{ActionMode, SemanticState};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    for sandbox in [
+        glass_core::SandboxLevel::Default,
+        glass_core::SandboxLevel::Strict,
+    ] {
+        let mut glass = glass_windows_with_a11y();
+        glass
+            .start(&egui_fixture_spec(sandbox))
+            .expect("launch contained fixture");
+        let windows = glass.list_windows().expect("contained app windows");
+        eprintln!("[sandbox semantic pointer] {sandbox:?}: {windows:?}");
+        assert!(
+            windows.iter().any(|window| window.active),
+            "app window must remain visible"
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|window| window.class.as_deref() != Some("ConsoleWindowClass")),
+            "the launch.cmd helper must not expose a console: {windows:?}"
+        );
+
+        let cursor = log_cursor(&mut glass);
+        glass
+            .click_target(&glass_core::ClickTargetParams {
+                target: glass_core::ActionTarget::Semantic(semantic_target(
+                    AxRole::Button,
+                    "Semantic Save",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                )),
+                mode: ActionMode::Pointer,
+                timeout_ms: Some(5_000),
+                max_nodes: None,
+            })
+            .expect("semantic pointer click in the contained app");
+        await_exact_log_count(&mut glass, cursor, "[fixture] semantic_save", 1);
+        glass.stop().expect("stop contained fixture");
+    }
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
 fn onbox_semantic_actions() {
     use glass_core::{
         ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict,

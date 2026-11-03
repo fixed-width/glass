@@ -510,6 +510,7 @@ impl Sandboxie {
         let mut cmd = Command::new(start_exe(&self.dir));
         cmd.args([
             &format!("/box:{}", self.box_name),
+            "/hide_window",
             "cmd",
             "/c",
             &cmd_path_str,
