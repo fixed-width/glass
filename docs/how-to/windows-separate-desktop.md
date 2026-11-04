@@ -105,9 +105,10 @@ cursor and foreground application.
 
 ## Preview qualification
 
-Preview testing covers a local account on Windows 11 Pro with an RDP parent and a 40-second
-physical-console input run. The physical run used `sandbox=off`; simultaneous physical input with
-contained applications still needs qualification. Windows Home, managed sign-in policies and
-lock/reconnect behavior also need qualification. An unavailable or failed environment returns its
+Preview testing covers a local account on Windows 11 Pro with RDP and physical-console parents.
+The physical-console test exercised default and strict Sandboxie while the user typed and moved
+the mouse on the parent desktop. Checks covered file redirection, protected state access, private
+clipboard roundtrips and strict network denial. Windows Home, managed sign-in policies and
+lock/reconnect behavior still need qualification. An unavailable or failed environment returns its
 diagnostic instead of falling back to the user's desktop. RDP-to-console transfers are not part
 of setup or recovery.
