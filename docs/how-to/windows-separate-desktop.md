@@ -109,6 +109,14 @@ Preview testing covers a local account on Windows 11 Pro with RDP and physical-c
 The physical-console test exercised default and strict Sandboxie while the user typed and moved
 the mouse on the parent desktop. Checks covered file redirection, protected state access, private
 clipboard roundtrips and strict network denial. Windows Home, managed sign-in policies and
-lock/reconnect behavior still need qualification. An unavailable or failed environment returns its
-diagnostic instead of falling back to the user's desktop. RDP-to-console transfers are not part
-of setup or recovery.
+non-admin setup still need qualification.
+
+On the same Windows 11 Pro host, a strict Sandboxie app survived a parent lock/unlock and an
+ordinary RDP disconnect/reconnect. Three input, fresh-capture and private-clipboard rounds passed
+after each transition on the original app process and window. Semantic pointer requests while
+the parent was locked or disconnected returned `transport_failure` before dispatch. Keep the
+parent unlocked and connected for GUI input; this test does not establish unattended operation
+in either state.
+
+An unavailable or failed environment returns its diagnostic instead of falling back to the user's
+desktop. RDP-to-console transfers are not part of setup or recovery.
