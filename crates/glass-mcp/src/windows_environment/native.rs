@@ -32,6 +32,7 @@ pub(crate) struct Manager {
     selection: Mutex<Selection>,
     runtime: Mutex<Option<Arc<Runtime>>>,
     admitted: AtomicU8,
+    resident: bool,
     #[cfg(feature = "network")]
     cancel: AtomicBool,
 }
@@ -42,6 +43,7 @@ impl Manager {
             selection: Mutex::new(Selection::new(REQUESTED.get().copied().flatten())),
             runtime: Mutex::new(None),
             admitted: AtomicU8::new(0),
+            resident: false,
             #[cfg(feature = "network")]
             cancel: AtomicBool::new(false),
         }
@@ -58,6 +60,9 @@ impl Manager {
     }
 
     fn backend_inner(&self) -> Result<Backend> {
+        if self.resident && self.admitted.load(Ordering::Acquire) != 2 {
+            return Err(GlassError::EnvironmentNotReady.into());
+        }
         if self
             .selection
             .lock()
@@ -75,10 +80,7 @@ impl Manager {
             .preference
             == Some(DesktopMode::Shared)
         {
-            return Ok(Backend {
-                platform: Box::new(glass_windows::WindowsPlatform::new()?),
-                accessibility: Some(Box::new(glass_a11y_windows::WindowsA11y::new())),
-            });
+            return self.shared_backend();
         }
         let configuration = configuration()?;
         if configuration.setup_pending {
@@ -91,10 +93,7 @@ impl Manager {
             .select(&configuration)
             .map_err(anyhow::Error::msg)?;
         if mode == DesktopMode::Shared {
-            return Ok(Backend {
-                platform: Box::new(glass_windows::WindowsPlatform::new()?),
-                accessibility: Some(Box::new(glass_a11y_windows::WindowsA11y::new())),
-            });
+            return self.shared_backend();
         }
         if self.admitted.load(Ordering::Acquire) != 2
             || !glass_windows::desktop::child_sessions_enabled()?
@@ -109,6 +108,20 @@ impl Manager {
             .as_ref()
             .context("Windows desktop owner is unavailable")?;
         crate::remote_backend::backend(owner.acquire()?).map_err(Into::into)
+    }
+
+    fn shared_backend(&self) -> Result<Backend> {
+        let mut platform = glass_windows::WindowsPlatform::new()?;
+        if self.resident {
+            platform =
+                platform.with_private_host_paths(vec![glass_core::ProtectedHostPath::directory(
+                    base_path()?,
+                )]);
+        }
+        Ok(Backend {
+            platform: Box::new(platform),
+            accessibility: Some(Box::new(glass_a11y_windows::WindowsA11y::new())),
+        })
     }
 
     pub fn shutdown(&self, deadline: Deadline) -> Result<()> {
@@ -159,14 +172,61 @@ impl Manager {
 
     #[cfg(feature = "network")]
     pub fn resident() -> Result<Self> {
-        ensure!(
-            REQUESTED.get().copied().flatten() != Some(DesktopMode::Shared),
-            "the tray app prepares a separate desktop; omit --desktop shared"
-        );
+        let mode = REQUESTED
+            .get()
+            .copied()
+            .flatten()
+            .or(configuration()?.saved_mode());
         Ok(Self {
-            selection: Mutex::new(Selection::new(Some(DesktopMode::Separate))),
+            selection: Mutex::new(Selection::new(mode)),
+            resident: true,
             ..Self::new()
         })
+    }
+
+    #[cfg(feature = "network")]
+    pub fn mode(&self) -> Result<Option<DesktopMode>> {
+        Ok(self
+            .selection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop selection is poisoned"))?
+            .preference)
+    }
+
+    #[cfg(feature = "network")]
+    pub fn choose_mode(&self, mode: DesktopMode) -> Result<()> {
+        self.close_admission();
+        self.shutdown(Deadline::from_millis(30_000))?;
+        let mut value = configuration()?;
+        if mode == DesktopMode::Shared
+            && (value.enabled || value.owns_setting || value.setup_pending)
+        {
+            let base = base()?;
+            let current = ProcessIdentity::current()?;
+            for (_, journal) in runtime::journals(&base)? {
+                ensure!(
+                    journal.clean || journal.parent == current || !journal.owner.is_current()?,
+                    "Another Glass environment is active. Stop it from its owning Glass instance before changing Application setup."
+                );
+            }
+            command(DesktopCommand::Disable)?;
+            value = configuration()?;
+        }
+        let base = base()?;
+        let _lock = lock_configuration(&base)?;
+        value.mode = Some(mode);
+        value.revision = format!("{:032x}", rand::random::<u128>());
+        base.write("configuration.json", &value)?;
+        *self
+            .selection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop selection is poisoned"))? =
+            Selection::new(Some(mode));
+        *self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))? = None;
+        Ok(())
     }
 
     #[cfg(feature = "network")]
@@ -186,6 +246,23 @@ impl Manager {
         if self.ready().unwrap_or(false) {
             return Ok(());
         }
+        if self.mode()? == Some(DesktopMode::Shared) {
+            let current = ProcessIdentity::current()?;
+            ensure!(
+                current.session != 0,
+                "Open Glass from your signed-in Windows desktop"
+            );
+            glass_windows::doctor::shared_desktop_ready()?;
+            ensure!(
+                !self.cancel.load(Ordering::Acquire),
+                "Environment setup cancelled"
+            );
+            return self.admit_prepared();
+        }
+        ensure!(
+            self.mode()? == Some(DesktopMode::Separate),
+            "Choose On your desktop or Off your desktop in Application setup first"
+        );
         let previous = self
             .runtime
             .lock()
@@ -239,6 +316,9 @@ impl Manager {
     pub fn ready(&self) -> Result<bool> {
         if self.admitted.load(Ordering::Acquire) != 2 {
             return Ok(false);
+        }
+        if self.mode()? == Some(DesktopMode::Shared) {
+            return Ok(true);
         }
         let current = self
             .runtime
@@ -355,9 +435,10 @@ pub fn command(command: DesktopCommand) -> Result<()> {
             );
             value.setup_pending = false;
             value.enabled = true;
+            value.mode = Some(DesktopMode::Separate);
             base.write("configuration.json", &value)?;
             println!(
-                "Separate Windows desktop enabled for this account. Open Glass and choose Start development desktop before agent work."
+                "Off-desktop setup is enabled for this account. Open Application setup and choose Start Environment before agent work."
             );
         }
         DesktopCommand::Disable => {
@@ -382,6 +463,7 @@ pub fn command(command: DesktopCommand) -> Result<()> {
             }
             value.setup_pending = false;
             value.owns_setting = false;
+            value.mode = Some(DesktopMode::Shared);
             base.write("configuration.json", &value)?;
             println!(
                 "Separate Windows desktop disabled. Restart existing MCP servers before using shared desktop input. Application files and persistent sandbox data were retained."

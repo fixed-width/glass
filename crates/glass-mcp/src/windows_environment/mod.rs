@@ -9,6 +9,8 @@ mod native;
 #[cfg(windows)]
 mod runtime;
 #[cfg(all(windows, feature = "network"))]
+mod startup;
+#[cfg(all(windows, feature = "network"))]
 pub mod tray;
 #[cfg(windows)]
 mod work;
@@ -22,7 +24,8 @@ pub use native::{command, set_requested_mode};
 #[cfg(windows)]
 pub use worker::run as run_worker;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
 pub enum DesktopMode {
     /// Use the signed-in desktop; application input may affect its cursor and focus.
     Shared,
@@ -68,6 +71,8 @@ struct Configuration {
     setting_before: Option<bool>,
     owns_setting: bool,
     setup_pending: bool,
+    #[serde(default)]
+    mode: Option<DesktopMode>,
 }
 
 impl Default for Configuration {
@@ -79,11 +84,23 @@ impl Default for Configuration {
             setting_before: None,
             owns_setting: false,
             setup_pending: false,
+            mode: None,
         }
     }
 }
 
 impl Configuration {
+    fn saved_mode(&self) -> Option<DesktopMode> {
+        self.mode.or_else(|| {
+            if self.enabled || self.setup_pending || self.owns_setting {
+                Some(DesktopMode::Separate)
+            } else if self.revision != "unconfigured" {
+                Some(DesktopMode::Shared)
+            } else {
+                None
+            }
+        })
+    }
     fn validate(&self) -> Result<(), String> {
         if self.version != 1
             || (self.revision != "unconfigured"
@@ -120,11 +137,10 @@ impl Selection {
         if configuration.setup_pending {
             return Err("Windows desktop setup is still pending".into());
         }
-        let chosen = self.preference.unwrap_or(if configuration.enabled {
-            DesktopMode::Separate
-        } else {
-            DesktopMode::Shared
-        });
+        let chosen = self
+            .preference
+            .or(configuration.saved_mode())
+            .unwrap_or(DesktopMode::Shared);
         if let Some(revision) = &self.separate_revision
             && (revision != &configuration.revision || chosen != DesktopMode::Separate)
         {
@@ -148,6 +164,35 @@ mod tests {
             revision: revision.to_string().repeat(32),
             ..Configuration::default()
         }
+    }
+
+    #[test]
+    fn saved_desktop_choice_migrates_previous_setup_without_implicit_opt_in() {
+        assert_eq!(Configuration::default().saved_mode(), None);
+        let enabled = enrolled('a');
+        assert_eq!(enabled.saved_mode(), Some(DesktopMode::Separate));
+        let disabled = Configuration {
+            enabled: false,
+            ..enabled.clone()
+        };
+        assert_eq!(disabled.saved_mode(), Some(DesktopMode::Shared));
+        let pending = Configuration {
+            setup_pending: true,
+            ..disabled.clone()
+        };
+        assert_eq!(pending.saved_mode(), Some(DesktopMode::Separate));
+        let explicit = Configuration {
+            mode: Some(DesktopMode::Shared),
+            ..enabled
+        };
+        assert_eq!(explicit.saved_mode(), Some(DesktopMode::Shared));
+    }
+
+    #[test]
+    fn previous_version_one_configuration_remains_readable() {
+        let value: Configuration = serde_json::from_str(r#"{"version":1,"enabled":true,"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","setting_before":false,"owns_setting":true,"setup_pending":false}"#).unwrap();
+        assert_eq!(value.saved_mode(), Some(DesktopMode::Separate));
+        assert!(value.validate().is_ok());
     }
 
     #[test]

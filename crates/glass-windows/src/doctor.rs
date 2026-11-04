@@ -259,6 +259,26 @@ pub fn checks(_deep: bool) -> Vec<Check> {
     build_checks(&gather_facts())
 }
 
+/// Check a signed-in desktop without creating or activating a readiness window.
+#[cfg(windows)]
+pub fn shared_desktop_ready() -> glass_core::Result<()> {
+    let facts = gather_facts();
+    if matches!(facts.session, SessionKind::Session0) {
+        return Err(glass_core::GlassError::Backend(
+            "Open Glass from your signed-in Windows desktop".into(),
+        ));
+    }
+    match facts.wgc_supported {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(glass_core::GlassError::Unsupported(
+            "Windows graphics capture is unavailable on this desktop".into(),
+        )),
+        Err(error) => Err(glass_core::GlassError::Backend(format!(
+            "Windows graphics capture check failed: {error:?}"
+        ))),
+    }
+}
+
 /// Windows sandbox section for the doctor (pure mapping + the host probes).
 #[cfg(windows)]
 pub fn sandbox_checks() -> Vec<Check> {

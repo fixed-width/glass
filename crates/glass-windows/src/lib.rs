@@ -224,6 +224,7 @@ mod backend {
         active_hwnd: Option<isize>,
         external_window: Option<ExternalWindow>,
         protected_host_paths: Vec<ProtectedHostPath>,
+        private_host_paths: Vec<ProtectedHostPath>,
         containment_journal: Option<Arc<dyn crate::containment::ContainmentJournal>>,
         provider_settings: Option<crate::containment::ProviderSettings>,
     }
@@ -237,6 +238,7 @@ mod backend {
                 active_hwnd: None,
                 external_window: None,
                 protected_host_paths: Vec::new(),
+                private_host_paths: Vec::new(),
                 containment_journal: None,
                 provider_settings: None,
             })
@@ -247,6 +249,12 @@ mod backend {
             journal: Arc<dyn crate::containment::ContainmentJournal>,
         ) -> Self {
             self.containment_journal = Some(journal);
+            self
+        }
+
+        /// Preserve host control paths alongside the caller's per-run artifact protection.
+        pub fn with_private_host_paths(mut self, paths: Vec<ProtectedHostPath>) -> Self {
+            self.private_host_paths = paths;
             self
         }
 
@@ -355,7 +363,10 @@ mod backend {
             &mut self,
             paths: &[ProtectedHostPath],
         ) -> Result<HostPathProtectionMode> {
-            self.protected_host_paths = crate::containment::validate_protected_host_paths(paths)?;
+            let mut combined = self.private_host_paths.clone();
+            combined.extend_from_slice(paths);
+            self.protected_host_paths =
+                crate::containment::validate_protected_host_paths(&combined)?;
             Ok(HostPathProtectionMode::SandboxRules)
         }
 

@@ -146,12 +146,20 @@ async fn main() -> anyhow::Result<()> {
             token_file,
             menubar,
             tray,
+            startup,
         }) => {
             #[cfg(feature = "network")]
             {
+                #[cfg(not(windows))]
+                let _ = startup;
                 if tray {
                     #[cfg(windows)]
                     {
+                        let startup_token_file = token_file
+                            .clone()
+                            .map(std::path::PathBuf::from)
+                            .map(std::fs::canonicalize)
+                            .transpose()?;
                         let mut argv = vec!["--http".to_string()];
                         if let Some(addr) = addr {
                             argv.extend(["--addr".into(), addr]);
@@ -167,7 +175,13 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(anyhow::Error::msg)?;
                         cfg.tool_profile = tool_profile;
                         cfg.trace = trace;
-                        glass_mcp::windows_environment::tray::run(cfg, audit_log.as_deref()).await
+                        glass_mcp::windows_environment::tray::run(
+                            cfg,
+                            audit_log.as_deref(),
+                            startup,
+                            startup_token_file,
+                        )
+                        .await
                     }
                     #[cfg(not(windows))]
                     anyhow::bail!("--tray is Windows-only")
@@ -225,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "network"))]
             {
-                let _ = (http, addr, token_file, menubar, tray, &audit_log);
+                let _ = (http, addr, token_file, menubar, tray, startup, &audit_log);
                 anyhow::bail!(
                     "`serve` (the network transport) is not included in this build; it \
                      requires the default-on `network` feature, which a \

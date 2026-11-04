@@ -6,13 +6,14 @@ generic JSON config. For the verified-host list and what glass needs from a host
 [Host compatibility](../reference/host-compatibility.md). There are two transports — pick by how
 glass is running.
 
-- If glass runs on the **same machine** as your agent (Linux or Windows shared-desktop operation),
-  use **stdio**.
-- If glass runs as a **resident desktop app** (the macOS menu-bar app or Windows separate-desktop
+- If your client launches the binary directly (the Linux default or Windows shared-desktop
+  compatibility), use **stdio**.
+- If glass runs as a **resident desktop app** (the macOS menu-bar app or Windows system-tray
   tray app), or the agent and app run on different machines, use **HTTP**.
 
 For the [Windows separate-desktop preview](windows-separate-desktop.md), open Glass with
-`glass-mcp desktop open`, choose **Start development desktop**, and wait for **Ready**. Register its
+`glass-mcp desktop open`, choose **Off your desktop…** in Application setup, then **Start Environment…**,
+and wait for **Ready**. **On your desktop** uses the same tray app and HTTP URL. Register its
 HTTP URL even when the agent runs on that same PC. The agent connects to the running tray app;
 it does not launch another Glass process or handle Windows sign-in. The saved URL remains the same
 across desktop starts and MCP client reconnects. A stdio-only client needs a relay; the current

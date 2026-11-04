@@ -152,6 +152,9 @@ pub enum Command {
         /// Run the resident Windows system-tray app. Implies --http.
         #[arg(long, conflicts_with = "menubar")]
         tray: bool,
+        /// Open a configured Windows tray quietly after sign-in.
+        #[arg(long, requires = "tray")]
+        startup: bool,
     },
     /// Generate a bearer token for the network transport.
     GenToken {
@@ -385,12 +388,14 @@ mod tests {
                 token_file,
                 menubar,
                 tray,
+                startup,
             }) => {
                 assert!(http);
                 assert_eq!(addr.as_deref(), Some("0.0.0.0:7300"));
                 assert_eq!(token_file.as_deref(), Some("/t"));
                 assert!(!menubar, "menubar defaults to false");
                 assert!(!tray, "tray defaults to false");
+                assert!(!startup, "startup defaults to false");
             }
             other => panic!("expected serve, got {other:?}"),
         }

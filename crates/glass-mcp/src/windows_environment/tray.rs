@@ -3,6 +3,7 @@
 use super::files::{Root, base_path};
 use super::native::{Manager, lock_named};
 use super::runtime::{self, Launch};
+use super::{DesktopMode, startup};
 use anyhow::{Context, Result, ensure};
 use glass_core::Deadline;
 use glass_windows::desktop::ProcessIdentity;
@@ -20,6 +21,8 @@ enum Action {
     Show,
     Hide,
     Quit,
+    Configure,
+    Refresh,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +32,8 @@ struct Request {
     instance: String,
     sequence: u64,
     action: Action,
+    mode: Option<DesktopMode>,
+    start_with_windows: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -43,6 +48,9 @@ struct Status<'a> {
     ready: bool,
     can_start: bool,
     closing: bool,
+    mode: Option<DesktopMode>,
+    start_with_windows: bool,
+    preparing: bool,
 }
 
 fn validate_request(request: &Request, instance: &str, acknowledged: u64) -> Result<()> {
@@ -69,7 +77,15 @@ pub fn open() -> Result<()> {
             launch.parent.session == current.session && launch.parent.logon == current.logon,
             "Glass is running in a different Windows logon"
         );
-        println!("Glass is already running. Open it from the system tray.");
+        ensure!(
+            launch.instance.len() == 32 && launch.instance.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Glass launch identity changed"
+        );
+        let tray = base
+            .child(&format!("tray-{}", launch.instance), false)?
+            .context("Glass application setup is unavailable")?;
+        tray.write("open.json", &serde_json::json!({"version":1,"instance":launch.instance,"request":format!("{:032x}",rand::random::<u128>())}))?;
+        println!("Glass is already running. Opening Application setup.");
         return Ok(());
     }
     let executable = std::env::current_exe()?;
@@ -98,7 +114,7 @@ pub fn open() -> Result<()> {
                 .as_ref()
                 .is_some_and(|p| p.is_current().unwrap_or(false))
         {
-            println!("Glass is open. Choose Start development desktop before agent work.");
+            println!("Glass is open. Complete Application setup before agent work.");
             break;
         }
         if child.try_wait()?.is_some() || std::time::Instant::now() >= deadline {
@@ -115,7 +131,12 @@ pub fn open() -> Result<()> {
 }
 
 /// Host one desktop and HTTP server independently of MCP client lifetimes.
-pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) -> Result<()> {
+pub async fn run(
+    cfg: crate::serve::config::ServeConfig,
+    audit: Option<&str>,
+    startup_launch: bool,
+    token_file: Option<std::path::PathBuf>,
+) -> Result<()> {
     crate::serve::check_exposure(&cfg)?;
     let manager = Arc::new(Manager::resident()?);
     let base = Root::open(&base_path()?, true)?.context("private Windows desktop directory")?;
@@ -130,6 +151,11 @@ pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) ->
         .await
         .context("bind Glass MCP endpoint")?;
     let endpoint = format!("http://{}/", listener.local_addr()?);
+    let startup_settings = startup::Settings {
+        addr: cfg.addr,
+        token_file,
+        needs_token: cfg.token.is_some(),
+    };
     let instance = format!("{:032x}", rand::random::<u128>());
     let root = base
         .child(&format!("tray-{instance}"), true)?
@@ -143,6 +169,7 @@ pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) ->
         worker_exe: parent.image.clone(),
     };
     root.write("intent.json", &launch)?;
+    root.write("options.json", &serde_json::json!({"version":1,"instance":instance,"hidden":startup_launch && manager.mode()?.is_some()}))?;
     let (sink, report) = crate::audit::resolve(audit, |key| std::env::var(key).ok())?;
     let server = crate::server::GlassServer::new_configured(
         crate::boot_with_desktop(sink, manager.clone()),
@@ -177,8 +204,11 @@ pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) ->
         &root,
         &launch,
         &endpoint,
-        manager.clone(),
-        server,
+        Controls {
+            manager: manager.clone(),
+            server,
+            settings: startup_settings,
+        },
         &mut helper,
         &serving,
     )
@@ -203,6 +233,9 @@ pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) ->
             ready: false,
             can_start: false,
             closing: true,
+            mode: manager.mode()?,
+            start_with_windows: false,
+            preparing: false,
         },
     )?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -219,41 +252,110 @@ pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) ->
 
 fn action_task(
     action: Action,
+    mode: Option<DesktopMode>,
+    wanted_startup: Option<bool>,
     manager: Arc<Manager>,
     server: crate::server::GlassServer,
-) -> tokio::task::JoinHandle<Result<()>> {
+    settings: startup::Settings,
+) -> tokio::task::JoinHandle<Result<Option<bool>>> {
     tokio::spawn(async move {
         match action {
             Action::Start => {
                 server.stop_from_desktop_ui().await?;
-                tokio::task::spawn_blocking(move || manager.prepare()).await?
+                tokio::task::spawn_blocking(move || manager.prepare()).await??;
             }
             Action::Stop => {
                 server.stop_from_desktop_ui().await?;
-                tokio::task::spawn_blocking(move || manager.shutdown(Deadline::from_millis(30_000)))
+                tokio::task::spawn_blocking(move || {
+                    manager.shutdown(Deadline::from_millis(30_000))
+                })
+                .await??;
+            }
+            Action::Configure => {
+                let mode = mode.context("Choose where applications run")?;
+                let wanted = wanted_startup.context("Choose the Start with Windows preference")?;
+                if manager.mode()? != Some(mode) {
+                    manager.close_admission();
+                    server.stop_from_desktop_ui().await?;
+                    let owner = manager.clone();
+                    tokio::task::spawn_blocking(move || owner.choose_mode(mode)).await??;
+                }
+                let actual =
+                    tokio::task::spawn_blocking(move || startup::configure(wanted, &settings))
+                        .await??;
+                if mode == DesktopMode::Shared && !manager.ready()? {
+                    manager.begin_preparation();
+                    tokio::task::spawn_blocking(move || manager.prepare()).await??;
+                }
+                return Ok(Some(actual));
+            }
+            Action::Refresh => {
+                return tokio::task::spawn_blocking(startup::enabled)
                     .await?
+                    .map(Some);
             }
             Action::Show | Action::Hide => {
-                tokio::task::spawn_blocking(move || manager.viewer(action == Action::Show)).await?
+                tokio::task::spawn_blocking(move || manager.viewer(action == Action::Show))
+                    .await??;
             }
             Action::Quit => anyhow::bail!("Quit must finish owned cleanup first"),
         }
+        Ok(None)
     })
+}
+
+struct Controls {
+    manager: Arc<Manager>,
+    server: crate::server::GlassServer,
+    settings: startup::Settings,
 }
 
 async fn control(
     root: &Root,
     launch: &Launch,
     endpoint: &str,
-    manager: Arc<Manager>,
-    server: crate::server::GlassServer,
+    controls: Controls,
     helper: &mut std::process::Child,
     serving: &tokio::task::JoinHandle<Result<()>>,
 ) -> Result<()> {
+    let Controls {
+        manager,
+        server,
+        settings,
+    } = controls;
     let mut acknowledged = 0;
     let mut phase = "Not ready".to_owned();
-    let mut detail = "Start the development desktop before agent work. Windows may request administrator consent and local sign-in.".to_owned();
-    let mut pending: Option<(Action, tokio::task::JoinHandle<Result<()>>)> = None;
+    let mut detail =
+        "Open Application setup to choose On your desktop or Off your desktop.".to_owned();
+    let startup_state = tokio::task::spawn_blocking(startup::enabled).await?;
+    let mut start_with_windows = match startup_state {
+        Ok(value) => value,
+        Err(error) => {
+            phase = "Needs attention".into();
+            detail = format!("{error:#}");
+            false
+        }
+    };
+    let mut pending: Option<(Action, tokio::task::JoinHandle<Result<Option<bool>>>)> = None;
+    if manager.mode()? == Some(DesktopMode::Shared) {
+        manager.begin_preparation();
+        phase = "Starting".into();
+        detail = "Checking your desktop.".into();
+        pending = Some((
+            Action::Start,
+            action_task(
+                Action::Start,
+                None,
+                None,
+                manager.clone(),
+                server.clone(),
+                settings.clone(),
+            ),
+        ));
+    } else if manager.mode()? == Some(DesktopMode::Separate) {
+        detail =
+            "Choose Start Environment… and complete any Windows sign-in before agent work.".into();
+    }
     let mut quitting = false;
     let mut ui_gone = false;
     let mut stop_queued = false;
@@ -263,88 +365,72 @@ async fn control(
         loop {
             interval.tick().await;
             if !server_failed && serving.is_finished() {
-                server_failed = true;
-                manager.cancel_preparation();
-                stop_queued = !matches!(pending, Some((Action::Stop, _)));
+                server_failed=true;manager.cancel_preparation();
+                stop_queued = !matches!(pending,Some((Action::Stop,_)));
             }
             if !ui_gone && helper.try_wait()?.is_some() {
-                ui_gone = true;
-                quitting = true;
-                manager.cancel_preparation();
-                stop_queued = !matches!(pending, Some((Action::Stop, _)));
+                ui_gone=true;quitting=true;manager.cancel_preparation();
+                stop_queued = !matches!(pending,Some((Action::Stop,_)));
             }
-            if pending.as_ref().is_some_and(|(_, task)| task.is_finished()) {
-                let (action, task) = pending.take().context("pending desktop action")?;
-                let result = task.await.context("desktop action task failed")?;
-                if action == Action::Stop && quitting {
-                    if result.is_ok() { break; }
-                    if ui_gone { return result; }
-                    quitting = false;
+            if pending.as_ref().is_some_and(|(_,task)|task.is_finished()) {
+                let (action,task)=pending.take().context("pending application setup operation")?;
+                let result=task.await.context("application setup operation failed")?;
+                if action==Action::Stop && quitting {
+                    if result.is_ok(){break;}
+                    if ui_gone{return result.map(|_|());}
+                    quitting=false;
                 }
                 match result {
-                    Ok(()) => {
+                    Ok(preference)=>{
+                        if let Some(value)=preference{start_with_windows=value;}
                         if manager.ready()? {
-                            phase = "Ready".into();
-                            detail = "The development desktop is ready for agent work.".into();
+                            phase="Ready".into();detail="Glass is ready for application work.".into();
                         } else {
-                            phase = "Not ready".into();
-                            detail = "Start the development desktop before agent work.".into();
+                            phase="Not ready".into();detail="Open Application setup to finish setup or choose Start Environment….".into();
                         }
                     }
-                    Err(error) => {
-                        phase = "Needs attention".into();
-                        detail = format!("{error:#}");
-                    }
+                    Err(error)=>{phase="Needs attention".into();detail=format!("{error:#}");}
                 }
             }
-            if let Some(request) = root.read::<Request>("request.json")?
-                && request.sequence != acknowledged
-            {
-                validate_request(&request, &launch.instance, acknowledged)?;
-                acknowledged = request.sequence;
+            if let Some(request)=root.read::<Request>("request.json")? && request.sequence!=acknowledged {
+                validate_request(&request,&launch.instance,acknowledged)?;
+                acknowledged=request.sequence;
                 match request.action {
-                    Action::Stop | Action::Quit => {
-                        quitting |= request.action == Action::Quit;
-                        manager.cancel_preparation();
-                        stop_queued = !matches!(pending, Some((Action::Stop, _)));
-                        detail = "Stopping the desktop. Complete or cancel any Windows dialog.".into();
+                    Action::Stop|Action::Quit=>{
+                        quitting|=request.action==Action::Quit;manager.cancel_preparation();
+                        stop_queued = !matches!(pending,Some((Action::Stop,_)));
+                        detail="Stopping owned work. Complete or cancel any Windows dialog.".into();
                     }
-                    Action::Start if pending.is_none() && !quitting && !server_failed => {
+                    Action::Start if pending.is_none() && !quitting && !server_failed=>{
                         if !manager.ready().unwrap_or(false) {
-                            manager.begin_preparation();
-                            phase = "Starting".into();
-                            detail = "Complete any Windows administrator consent and sign-in dialogs locally. You can cancel from Windows or Glass.".into();
-                            pending = Some((Action::Start, action_task(Action::Start, manager.clone(), server.clone())));
+                            manager.begin_preparation();phase="Starting".into();
+                            detail="Complete any Windows administrator consent and sign-in locally.".into();
+                            pending=Some((Action::Start,action_task(Action::Start,None,None,manager.clone(),server.clone(),settings.clone())));
                         }
                     }
-                    Action::Show | Action::Hide if pending.is_none() && !quitting => {
-                        pending = Some((request.action, action_task(request.action, manager.clone(), server.clone())));
+                    Action::Configure|Action::Refresh|Action::Show|Action::Hide if pending.is_none() && !quitting && !server_failed=>{
+                        if request.action==Action::Configure {phase="Checking setup".into();detail="Saving Application setup. Complete any Windows consent locally.".into();}
+                        pending=Some((request.action,action_task(request.action,request.mode,request.start_with_windows,manager.clone(),server.clone(),settings.clone())));
                     }
-                    _ => {}
+                    _=>{}
                 }
             }
             if stop_queued && pending.is_none() {
-                stop_queued = false;
-                phase = "Stopping".into();
-                detail = "Stopping agent work and the owned desktop.".into();
-                pending = Some((Action::Stop, action_task(Action::Stop, manager.clone(), server.clone())));
+                stop_queued=false;phase="Stopping".into();detail="Stopping owned application work and the environment.".into();
+                pending=Some((Action::Stop,action_task(Action::Stop,None,None,manager.clone(),server.clone(),settings.clone())));
             }
-            let ready = manager.ready();
-            if pending.is_none() && phase == "Ready" && !matches!(ready, Ok(true)) {
-                manager.close_admission();
-                phase = "Needs attention".into();
-                detail = ready.err().map(|e| format!("{e:#}")).unwrap_or_else(|| "The desktop ended. Choose Start development desktop to prepare it again.".into());
+            let ready=manager.ready();
+            if pending.is_none() && phase=="Ready" && !matches!(ready,Ok(true)) {
+                manager.close_admission();phase="Needs attention".into();
+                detail=ready.err().map(|e|format!("{e:#}")).unwrap_or_else(||"The environment ended. Open Application setup to start it again.".into());
             }
-            let displayed_phase = if matches!(pending, Some((Action::Start, _))) {
-                preparation_phase().unwrap_or_else(|| phase.clone())
-            } else { phase.clone() };
-            if server_failed {
-                phase = "Needs attention".into();
-                detail = "The MCP server stopped. Quit Glass and open it again before starting work.".into();
-            }
-            root.write("status.json", &Status {
-                version: 1, instance: &launch.instance, acknowledged, phase: if server_failed { "Needs attention" } else { &displayed_phase },
-                detail: &detail, endpoint, busy: pending.is_some(), ready: manager.ready().unwrap_or(false), can_start: !server_failed && !quitting, closing: false,
+            let preparing=matches!(pending,Some((Action::Start,_)));
+            let displayed=if preparing {preparation_phase().unwrap_or_else(||phase.clone())}else{phase.clone()};
+            if server_failed {phase="Needs attention".into();detail="The MCP server stopped. Quit Glass and open it again.".into();}
+            root.write("status.json",&Status {
+                version:1,instance:&launch.instance,acknowledged,phase:if server_failed{"Needs attention"}else{&displayed},
+                detail:&detail,endpoint,busy:pending.is_some(),ready:manager.ready().unwrap_or(false),
+                can_start:!server_failed && !quitting,closing:false,mode:manager.mode()?,start_with_windows,preparing,
             })?;
         }
         Ok(())
@@ -353,7 +439,7 @@ async fn control(
     if let Some((_, task)) = pending {
         let cleanup = task
             .await
-            .context("finish desktop action before resident shutdown")?;
+            .context("finish application setup before resident shutdown")?;
         if outcome.is_ok() {
             cleanup?;
         }
@@ -385,6 +471,8 @@ mod tests {
             instance: "current".into(),
             sequence: 1,
             action: Action::Start,
+            mode: None,
+            start_with_windows: None,
         };
         assert!(validate_request(&request, "current", 0).is_ok());
         assert!(validate_request(&request, "other", 0).is_err());

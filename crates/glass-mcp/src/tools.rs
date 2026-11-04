@@ -151,7 +151,7 @@ impl SafeErrorCategory {
             Self::UnsupportedAccessibility => "accessibility operation is unsupported",
             Self::PermissionDenied => "permission denied",
             Self::EnvironmentNotReady => {
-                "development desktop is not ready; open Glass and choose Start development desktop before launching an app"
+                "environment is not ready; open Glass → Application setup… to finish setup or start the environment before launching an app"
             }
             Self::TransportFailure => "backend transport failed",
             Self::ActionDeadlineExceeded => "action deadline exceeded",

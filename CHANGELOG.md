@@ -30,6 +30,10 @@ internal refactors, CI, or test-only changes.
   work. Open it with `glass-mcp desktop open` or `serve --tray`, then connect to its HTTP endpoint.
   Client reconnects retain the desktop; application requests return `environment_not_ready`
   instead of opening Windows sign-in. Start, Stop, Show and Hide are available from Glass.
+- Windows Application setup now offers **On your desktop** and opt-in **Off your desktop…**
+  through the same resident HTTP endpoint. **Start with Windows** opens Glass quietly at sign-in;
+  off-desktop authentication remains an explicit **Start Environment…** step. Shared setup works
+  without child-session support, and operation names follow the macOS app.
 
 ### Fixed
 

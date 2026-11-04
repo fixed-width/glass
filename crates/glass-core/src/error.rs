@@ -278,7 +278,7 @@ pub enum GlassError {
 
     /// The user must prepare the development environment before application work.
     #[error(
-        "development desktop is not ready; open Glass and choose Start development desktop before launching an app"
+        "environment is not ready; open Glass → Application setup… to finish setup or start the environment before launching an app"
     )]
     EnvironmentNotReady,
 

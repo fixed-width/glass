@@ -17,7 +17,8 @@ Open Glass from a terminal on your signed-in Windows desktop:
 glass-mcp desktop open
 ```
 
-Choose **Start development desktop** in the Glass window or system-tray menu. Windows may ask
+In **Application setup…**, choose **Off your desktop…** and **Continue setup**. Choose
+**Start Environment…** in the window or system-tray menu. Windows may ask
 for administrator consent to enable local child sessions, followed by a native Windows sign-in
 dialog. Complete these locally; keep passwords out of agent messages and tool arguments. Glass
 shows **Ready** only after the child and its application worker are connected and verified.
@@ -38,10 +39,12 @@ glass-mcp serve --tray --addr 127.0.0.1:7300 --token-file C:\path\to\token
 ```
 
 `--tray` implies HTTP serving. The default endpoint is `http://127.0.0.1:7300/`. Configure the same
-bearer token in your MCP client when using one. Login startup is not installed automatically.
+bearer token in your MCP client when using one. **Start with Windows** installs a per-user,
+unelevated sign-in startup task and opens quietly in the system tray. Authenticated startup uses
+the supplied token-file path; an environment-only token is not saved for startup.
 
 If the desktop is not ready or has ended, application requests return `environment_not_ready`
-with an instruction to start it from Glass. Tools never open a sign-in dialog or recreate the
+with an instruction to finish Application setup. Tools never open a sign-in dialog or recreate the
 desktop. A separate stdio server cannot borrow the resident app's child; use the tray app's endpoint.
 `desktop enable` can configure the Windows setting alone; complete preparation in Glass afterward.
 
@@ -87,8 +90,8 @@ private clipboard support remains an explicit restriction.
 glass-mcp desktop stop
 ```
 
-This ends the owned environment and retains setup. In the resident app, choose **Start development
-desktop** to prepare another environment. An agent request never restarts it or switches silently
+This ends the owned environment and retains setup. In the resident app, choose **Start
+Environment…** to prepare another environment. An agent request never restarts it or switches silently
 to shared desktop input after a stop or selection change.
 
 If an owner exited with unfinished cleanup, run:

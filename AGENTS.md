@@ -73,6 +73,7 @@ do, most of which run from any host.
 
 ## Invariants
 
+- Use [CONTEXT.md](CONTEXT.md) for desktop operation names; retain native OS terminology for system actions.
 - **External automation only** — drive apps as a black box; never require the app to be glass-aware.
 - **Keep `glass-core` platform-agnostic** — no OS types in core; every OS detail lives behind `Platform`.
 - **No silent fallbacks** — a failed capture/input returns a structured error, never a blank/stale frame.

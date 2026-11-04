@@ -33,7 +33,7 @@ fn unprepared_environment_returns_a_setup_action_before_app_work() {
         value["error"]["summary"]
             .as_str()
             .unwrap()
-            .contains("Start development desktop")
+            .contains("Application setup")
     );
     assert_eq!(value["result"]["dispatch"], "not_dispatched");
     assert_eq!(value["result"]["side_effects_may_have_occurred"], false);

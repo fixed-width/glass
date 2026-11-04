@@ -451,6 +451,9 @@ internal static class Program {
         string root=Path.GetFullPath(args[0]); Mutex gate=null; bool held=false;
         try {
             Files.RequirePrivate(root);
+            if (args.Length==2 && args[1]=="startup") return Startup.Run(root);
+            if (args.Length==2 && args[1]=="startup-configure") return Startup.Configure(root,false);
+            if (args.Length==2 && args[1]=="startup-status") return Startup.Configure(root,true);
             if (args.Length==2 && args[1]=="tray") return TrayApp.Run(root);
             bool created;
             var security=new MutexSecurity();
