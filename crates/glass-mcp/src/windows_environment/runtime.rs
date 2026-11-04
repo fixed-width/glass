@@ -337,13 +337,23 @@ pub(super) fn stop_external(root: &Root, journal: &Journal, deadline: Deadline) 
         "stop.json",
         &serde_json::json!({"version":1,"instance":journal.instance}),
     )?;
-    glass_windows::desktop::signal_stop(&journal.stop_event)?;
+    if let Err(error) = glass_windows::desktop::signal_stop(&journal.stop_event) {
+        let state = read_journal(root, &current)?;
+        ensure!(
+            state.owner == journal.owner && native_cleanup_finished(&state)?,
+            "{error}"
+        );
+    }
     let finalizing_grace = std::time::Instant::now() + Duration::from_secs(2);
     let mut forced = false;
     while journal.owner.is_current()? {
         if !forced && std::time::Instant::now() >= finalizing_grace {
             let state = read_journal(root, &current)?;
-            if state.phase == "finalizing" || (state.phase == "stopped" && state.clean) {
+            ensure!(
+                state.owner == journal.owner,
+                "desktop owner changed during stop"
+            );
+            if native_cleanup_finished(&state)? {
                 // The host publishes finalizing only after child/task/application cleanup. Its
                 // remaining resource is its own control process, whose COM disposal can stall.
                 state.owner.terminate()?;
@@ -372,6 +382,20 @@ pub(super) fn stop_external(root: &Root, journal: &Journal, deadline: Deadline) 
             .unwrap_or("owner exited without confirming cleanup")
     );
     Ok(final_state)
+}
+
+fn native_cleanup_finished(state: &Journal) -> Result<bool> {
+    if !state.child_gone
+        || !(state.phase == "finalizing" || (state.phase == "stopped" && state.clean))
+    {
+        return Ok(false);
+    }
+    Ok(!state
+        .worker
+        .as_ref()
+        .map(ProcessIdentity::is_current)
+        .transpose()?
+        .unwrap_or(false))
 }
 
 pub(super) fn recover(
@@ -862,6 +886,50 @@ impl crate::remote_backend::Connection for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cleanup_record() -> Journal {
+        let process = ProcessIdentity::current().expect("test process");
+        Journal {
+            version: 1,
+            child: u32::MAX,
+            instance: "1234567890abcdef1234567890abcdef".into(),
+            phase: "finalizing".into(),
+            error: None,
+            task: String::new(),
+            worker_arguments: None,
+            pipe: String::new(),
+            stop_event: String::new(),
+            show_event: String::new(),
+            hide_event: String::new(),
+            parent: process.clone(),
+            owner: process,
+            worker: None,
+            child_logon: 0,
+            child_gone: true,
+            child_enabled_before: true,
+            changed_child_setting: false,
+            clean: false,
+            viewer_visible: false,
+        }
+    }
+
+    #[test]
+    fn disposed_stop_event_is_tolerated_only_after_confirmed_native_cleanup() {
+        let mut state = cleanup_record();
+        assert!(native_cleanup_finished(&state).expect("cleanup fact"));
+        state.child_gone = false;
+        assert!(!native_cleanup_finished(&state).expect("child still present"));
+        state.child_gone = true;
+        state.phase = "cleanup_failed".into();
+        assert!(!native_cleanup_finished(&state).expect("failed cleanup"));
+    }
+
+    #[test]
+    fn a_live_worker_prevents_finalizing_the_host() {
+        let mut state = cleanup_record();
+        state.worker = Some(ProcessIdentity::current().expect("live worker stand-in"));
+        assert!(!native_cleanup_finished(&state).expect("worker fact"));
+    }
 
     #[test]
     fn pending_start_is_visible_readonly_and_cannot_be_archived_while_parent_lives() {

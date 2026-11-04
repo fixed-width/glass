@@ -29,6 +29,7 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- A timed-out Windows child-desktop startup can finish cleanup when the host has already removed its stop event, without abandoning a host stalled in final COM disposal.
 - Windows Sandboxie launches now work from long directories, including a separate desktop's private state directory, while preserving the application's working directory. An inaccessible application directory stops the wrapper before launching the app.
 - Repeated Windows capability probes no longer retain a capture factory after its WinRT apartment closes, preventing a crash when retrying a failed probe.
 - Windows contained launches keep the helper command window hidden, so it no longer obstructs
