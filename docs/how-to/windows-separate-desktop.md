@@ -136,11 +136,12 @@ and a fresh desktop after an explicit Stop/Start in the same resident app. Nativ
 Quit and detached launching were exercised as well.
 
 The common setup flow has been checked with both desktop choices. Strict-contained app interaction,
-capture, private clipboard and protected-state access checks passed on and off desktop. The
-per-user startup action was triggered directly and reached on-desktop Ready with the setup window
-hidden; the actual post-reboot sign-in trigger remains a separate qualification case. Disabling
-startup kept the running resident, changed startup definitions were retained, and switching modes
-preserved the HTTP endpoint.
+capture, private clipboard and protected-state access checks passed on and off desktop. With
+**On your desktop** and **Start with Windows** saved, an actual Windows restart and sign-in
+started Glass quietly, preserved its HTTP endpoint and reached Ready automatically. A strict-contained
+app then passed pointer input, typing, capture, private clipboard and protected-state checks.
+Disabling startup kept the running resident, changed startup definitions were retained, and
+switching modes preserved the HTTP endpoint.
 
 An unavailable or failed environment returns its diagnostic instead of falling back to the user's
 desktop. RDP-to-console transfers are not part of setup or recovery.
