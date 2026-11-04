@@ -43,6 +43,7 @@ fn windows_desktop_helper() {
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     let bindings = output.join("windows_desktop_payload.rs");
     println!("cargo:rerun-if-changed=native/windows-desktop/Host.cs");
+    println!("cargo:rerun-if-changed=native/windows-desktop/Tray.cs");
     println!("cargo:rerun-if-changed=native/windows-desktop/build.ps1");
     println!("cargo:rerun-if-env-changed=GLASS_DESKTOP_HELPER_DIR");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {

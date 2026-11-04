@@ -9,32 +9,41 @@ import a type library on your machine. It uses Windows' installed Remote Desktop
 .NET Framework. Availability is checked through Windows APIs and actual startup, without an
 edition-name allowlist.
 
-## Enable the preview
+## Prepare the desktop before agent work
 
-Run this from a terminal on your signed-in Windows desktop:
-
-```powershell
-glass-mcp desktop enable
-```
-
-Windows may ask for administrator consent to enable local child sessions. Builds, applications and
-the application worker run unelevated. The Windows child-session switch is machine-wide; Glass's
-saved desktop selection is per account. Setup does not enable network Remote Desktop access or
-change firewall rules. If child sessions were already enabled, Glass preserves that setting when
-you later disable the preview.
-
-Restart your MCP client after setup. New Windows MCP servers use the saved selection. To make
-the choice explicit in a registration, launch the server with:
+Open Glass from a terminal on your signed-in Windows desktop:
 
 ```powershell
-glass-mcp --desktop separate
+glass-mcp desktop open
 ```
 
-Use the existing `glass_start`, capture, accessibility, input, logs and stop tools. The first
-application launch starts the child and may open a native Windows sign-in dialog. Complete that
-dialog locally; keep passwords out of agent messages and tool arguments. Stopping an application
-retains the authenticated desktop for the next build or launch. Exiting the MCP server ends its
-environment.
+Choose **Start development desktop** in the Glass window or system-tray menu. Windows may ask
+for administrator consent to enable local child sessions, followed by a native Windows sign-in
+dialog. Complete these locally; keep passwords out of agent messages and tool arguments. Glass
+shows **Ready** only after the child and its application worker are connected and verified.
+
+The child-session switch is machine-wide; Glass's saved desktop selection is per account. Builds,
+applications and the worker run unelevated. Setup does not enable network Remote Desktop access
+or change firewall rules. Glass preserves an already enabled setting when you later disable setup.
+
+Copy the **MCP endpoint** from Glass and register it as an HTTP MCP connection in your agent.
+Use the normal `glass_start`, capture, accessibility, input, logs and stop tools. Application stops
+and MCP client reconnects retain the authenticated desktop. Closing the Glass window hides it;
+Glass continues running in the system tray. **Quit Glass** stops its work and owned desktop.
+
+To run the resident app with a chosen endpoint or bearer-token file:
+
+```powershell
+glass-mcp serve --tray --addr 127.0.0.1:7300 --token-file C:\path\to\token
+```
+
+`--tray` implies HTTP serving. The default endpoint is `http://127.0.0.1:7300/`. Configure the same
+bearer token in your MCP client when using one. Login startup is not installed automatically.
+
+If the desktop is not ready or has ended, application requests return `environment_not_ready`
+with an instruction to start it from Glass. Tools never open a sign-in dialog or recreate the
+desktop. A separate stdio server cannot borrow the resident app's child; use the tray app's endpoint.
+`desktop enable` can configure the Windows setting alone; complete preparation in Glass afterward.
 
 Windows permits one active connected child session at a time. A different child or another server
 using the slot produces a busy error. Glass does not take over an existing child or silently route
@@ -78,9 +87,9 @@ private clipboard support remains an explicit restriction.
 glass-mcp desktop stop
 ```
 
-This ends the owned environment and retains setup. Restart the MCP server before creating another
-environment. An existing server refuses to switch silently to shared desktop input after a stop
-or selection change.
+This ends the owned environment and retains setup. In the resident app, choose **Start development
+desktop** to prepare another environment. An agent request never restarts it or switches silently
+to shared desktop input after a stop or selection change.
 
 If an owner exited with unfinished cleanup, run:
 

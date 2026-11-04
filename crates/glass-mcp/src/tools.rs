@@ -90,6 +90,7 @@ pub(crate) enum SafeErrorCategory {
     OptionNotFound,
     UnsupportedAccessibility,
     PermissionDenied,
+    EnvironmentNotReady,
     TransportFailure,
     ActionDeadlineExceeded,
     SequenceDeadlineExceeded,
@@ -115,6 +116,7 @@ impl SafeErrorCategory {
             glass_core::GlassError::AxUnsupported
             | glass_core::GlassError::AxActionUnavailable(_) => Self::UnsupportedAccessibility,
             glass_core::GlassError::PermissionDenied { .. } => Self::PermissionDenied,
+            glass_core::GlassError::EnvironmentNotReady => Self::EnvironmentNotReady,
             glass_core::GlassError::CaptureFailed(_)
             | glass_core::GlassError::AccessibilityUnavailable(_)
             | glass_core::GlassError::Backend(_)
@@ -148,6 +150,9 @@ impl SafeErrorCategory {
             Self::OptionNotFound => "requested option was not found",
             Self::UnsupportedAccessibility => "accessibility operation is unsupported",
             Self::PermissionDenied => "permission denied",
+            Self::EnvironmentNotReady => {
+                "development desktop is not ready; open Glass and choose Start development desktop before launching an app"
+            }
             Self::TransportFailure => "backend transport failed",
             Self::ActionDeadlineExceeded => "action deadline exceeded",
             Self::SequenceDeadlineExceeded => "sequence deadline exceeded",
@@ -174,6 +179,7 @@ impl SafeErrorCategory {
             Self::OptionNotFound => "option_not_found",
             Self::UnsupportedAccessibility => "unsupported_accessibility",
             Self::PermissionDenied => "permission_denied",
+            Self::EnvironmentNotReady => "environment_not_ready",
             Self::TransportFailure => "transport_failure",
             Self::ActionDeadlineExceeded => "action_deadline_exceeded",
             Self::SequenceDeadlineExceeded => "sequence_deadline_exceeded",
@@ -262,7 +268,13 @@ impl ContextualError {
     }
 
     fn standalone_message(self, tool: &'static str) -> String {
-        if self.category == SafeErrorCategory::UnsupportedOperation {
+        if self.category == SafeErrorCategory::EnvironmentNotReady {
+            let not_dispatched = self.bound_dispatch == Some(BoundDispatch::NotDispatched);
+            json!({"ok":false,"tool":tool,
+                "error":{"code":self.code,"category":self.category,"summary":self.safe_summary},
+                "result":{"dispatch":if not_dispatched { "not_dispatched" } else { "may_have_dispatched" },
+                          "side_effects_may_have_occurred":!not_dispatched}}).to_string()
+        } else if self.category == SafeErrorCategory::UnsupportedOperation {
             json!({
                 "ok": false,
                 "tool": tool,

@@ -276,6 +276,12 @@ pub enum GlassError {
     #[error("{which} permission denied: {remedy}")]
     PermissionDenied { which: String, remedy: String },
 
+    /// The user must prepare the development environment before application work.
+    #[error(
+        "development desktop is not ready; open Glass and choose Start development desktop before launching an app"
+    )]
+    EnvironmentNotReady,
+
     /// A backend failure the backend itself reported. [`Self::Bounded`] and [`Self::ToolFailed`]
     /// display identically and this variant is false for both, so classify with [`Self::bound`]
     /// and [`Self::tool_said`] rather than by matching it.

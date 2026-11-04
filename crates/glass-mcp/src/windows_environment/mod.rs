@@ -8,6 +8,8 @@ mod files;
 mod native;
 #[cfg(windows)]
 mod runtime;
+#[cfg(all(windows, feature = "network"))]
+pub mod tray;
 #[cfg(windows)]
 mod work;
 #[cfg(windows)]
@@ -30,6 +32,8 @@ pub enum DesktopMode {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum DesktopCommand {
+    /// Open Glass in the system tray to prepare the desktop before agent work.
+    Open,
     /// Enable separate-desktop development; Windows may ask for administrator consent once.
     Enable,
     /// Read configuration and live environment state without starting or changing anything.

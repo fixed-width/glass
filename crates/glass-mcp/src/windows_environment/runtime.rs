@@ -77,7 +77,7 @@ pub(super) fn require_payload() -> Result<()> {
     Ok(())
 }
 
-fn helper(base: &Root) -> Result<PathBuf> {
+pub(super) fn helper(base: &Root) -> Result<PathBuf> {
     require_payload()?;
     let mut hash = Sha256::new();
     hash.update(payload::HOST);
@@ -497,7 +497,12 @@ pub(super) struct Runtime {
 }
 
 impl Runtime {
-    pub fn start(base: Root, revision: String) -> Result<Self> {
+    #[cfg(feature = "network")]
+    pub fn start(
+        base: Root,
+        revision: String,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
         let parent = ProcessIdentity::current()?;
         ensure!(
             parent.session != 0,
@@ -542,6 +547,10 @@ impl Runtime {
         let deadline = Deadline::from_millis(125_000);
         let result = (|| {
             loop {
+                ensure!(
+                    !cancel.load(std::sync::atomic::Ordering::Acquire),
+                    "Desktop preparation cancelled"
+                );
                 if let Some(journal) = root.read::<Journal>("owner.json")? {
                     validate_journal(&journal, &parent)?;
                     ensure!(
@@ -649,6 +658,28 @@ impl Runtime {
             owner: Arc::clone(self),
             closed: false,
         })
+    }
+
+    #[cfg(feature = "network")]
+    pub fn ready(&self) -> Result<bool> {
+        match self.state.try_lock() {
+            Ok(state) => {
+                self.guard(&state, false)?;
+                Ok(state.pipe.as_ref().is_some_and(LocalPipe::is_healthy))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(true),
+            Err(_) => bail!("Windows desktop transport is poisoned"),
+        }
+    }
+
+    #[cfg(feature = "network")]
+    pub fn viewer(&self, show: bool) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Windows desktop transport is poisoned"))?;
+        self.guard(&state, false)?;
+        control(&self.root, &state.journal, show)
     }
 
     fn guard(&self, state: &State, stopping: bool) -> Result<()> {

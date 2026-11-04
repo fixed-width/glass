@@ -451,6 +451,7 @@ internal static class Program {
         string root=Path.GetFullPath(args[0]); Mutex gate=null; bool held=false;
         try {
             Files.RequirePrivate(root);
+            if (args.Length==2 && args[1]=="tray") return TrayApp.Run(root);
             bool created;
             var security=new MutexSecurity();
             security.AddAccessRule(new MutexAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid,null),MutexRights.Synchronize|MutexRights.Modify,AccessControlType.Allow));

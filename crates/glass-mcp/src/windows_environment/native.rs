@@ -4,6 +4,9 @@ use super::{Configuration, DesktopCommand, DesktopMode, Selection};
 use anyhow::{Context, Result, ensure};
 use glass_core::{Backend, Deadline, GlassError};
 use glass_windows::desktop::{ProcessIdentity, SettingChange};
+#[cfg(feature = "network")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 static REQUESTED: OnceLock<Option<DesktopMode>> = OnceLock::new();
@@ -28,6 +31,9 @@ pub(super) fn configuration() -> Result<Configuration> {
 pub(crate) struct Manager {
     selection: Mutex<Selection>,
     runtime: Mutex<Option<Arc<Runtime>>>,
+    admitted: AtomicU8,
+    #[cfg(feature = "network")]
+    cancel: AtomicBool,
 }
 
 impl Manager {
@@ -35,16 +41,33 @@ impl Manager {
         Self {
             selection: Mutex::new(Selection::new(REQUESTED.get().copied().flatten())),
             runtime: Mutex::new(None),
+            admitted: AtomicU8::new(0),
+            #[cfg(feature = "network")]
+            cancel: AtomicBool::new(false),
         }
     }
 
     pub fn backend(&self) -> glass_core::Result<Backend> {
-        self.backend_inner().map_err(|error| {
-            GlassError::Backend(format!("Windows desktop: {error:#}")).before_dispatch()
-        })
+        self.backend_inner()
+            .map_err(|error| match error.downcast::<GlassError>() {
+                Ok(error) => error.before_dispatch(),
+                Err(error) => {
+                    GlassError::Backend(format!("Windows desktop: {error:#}")).before_dispatch()
+                }
+            })
     }
 
     fn backend_inner(&self) -> Result<Backend> {
+        if self
+            .selection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop selection is poisoned"))?
+            .preference
+            == Some(DesktopMode::Separate)
+            && self.admitted.load(Ordering::Acquire) != 2
+        {
+            return Err(GlassError::EnvironmentNotReady.into());
+        }
         if self
             .selection
             .lock()
@@ -58,6 +81,9 @@ impl Manager {
             });
         }
         let configuration = configuration()?;
+        if configuration.setup_pending {
+            return Err(GlassError::EnvironmentNotReady.into());
+        }
         let mode = self
             .selection
             .lock()
@@ -70,19 +96,15 @@ impl Manager {
                 accessibility: Some(Box::new(glass_a11y_windows::WindowsA11y::new())),
             });
         }
-        ensure!(
-            glass_windows::desktop::child_sessions_enabled()?,
-            "child sessions are disabled; run glass-mcp desktop enable from your Windows desktop and complete setup first"
-        );
-        let mut current = self
+        if self.admitted.load(Ordering::Acquire) != 2
+            || !glass_windows::desktop::child_sessions_enabled()?
+        {
+            return Err(GlassError::EnvironmentNotReady.into());
+        }
+        let current = self
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))?;
-        if current.is_none() {
-            let base = Root::open(&base_path()?, true)?
-                .context("private Windows desktop state directory")?;
-            *current = Some(Arc::new(Runtime::start(base, configuration.revision)?));
-        }
         let owner = current
             .as_ref()
             .context("Windows desktop owner is unavailable")?;
@@ -90,6 +112,7 @@ impl Manager {
     }
 
     pub fn shutdown(&self, deadline: Deadline) -> Result<()> {
+        self.close_admission();
         let current = self
             .runtime
             .lock()
@@ -98,7 +121,146 @@ impl Manager {
         if let Some(owner) = current {
             owner.shutdown(deadline)?;
         }
+        if let Some(base) = Root::open(&base_path()?, false)? {
+            let current = ProcessIdentity::current()?;
+            for (root, journal) in runtime::journals(&base)? {
+                if journal.parent == current && !journal.clean {
+                    if journal.owner.is_current()? {
+                        runtime::stop_external(&root, &journal, deadline)?;
+                    } else {
+                        runtime::recover(&base, &root, &journal, deadline)?;
+                    }
+                }
+            }
+            for name in base
+                .names()?
+                .into_iter()
+                .filter(|n| n.starts_with("environment-"))
+            {
+                let root = base
+                    .child(&name, false)?
+                    .context("desktop startup directory disappeared")?;
+                if root.read::<runtime::Journal>("owner.json")?.is_none()
+                    && let Some(intent) = root.read::<runtime::Launch>("intent.json")?
+                    && intent.parent == current
+                {
+                    anyhow::bail!(
+                        "Desktop startup has not confirmed cleanup. Keep its ownership record and run desktop recover."
+                    );
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub fn close_admission(&self) {
+        self.admitted.store(0, Ordering::Release);
+    }
+
+    #[cfg(feature = "network")]
+    pub fn resident() -> Result<Self> {
+        ensure!(
+            REQUESTED.get().copied().flatten() != Some(DesktopMode::Shared),
+            "the tray app prepares a separate desktop; omit --desktop shared"
+        );
+        Ok(Self {
+            selection: Mutex::new(Selection::new(Some(DesktopMode::Separate))),
+            ..Self::new()
+        })
+    }
+
+    #[cfg(feature = "network")]
+    pub fn cancel_preparation(&self) {
+        self.cancel.store(true, Ordering::Release);
+        self.close_admission();
+    }
+
+    #[cfg(feature = "network")]
+    pub fn begin_preparation(&self) {
+        self.cancel.store(false, Ordering::Release);
+        self.admitted.store(1, Ordering::Release);
+    }
+
+    #[cfg(feature = "network")]
+    pub fn prepare(&self) -> Result<()> {
+        if self.ready().unwrap_or(false) {
+            return Ok(());
+        }
+        let previous = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))?
+            .clone();
+        if let Some(previous) = previous {
+            previous.shutdown(Deadline::from_millis(30_000))?;
+            *self
+                .runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))? = None;
+        }
+        command(DesktopCommand::Enable)?;
+        ensure!(
+            !self.cancel.load(Ordering::Acquire),
+            "Desktop preparation cancelled"
+        );
+        let configuration = configuration()?;
+        *self
+            .selection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop selection is poisoned"))? =
+            Selection::new(Some(DesktopMode::Separate));
+        let base =
+            Root::open(&base_path()?, true)?.context("private Windows desktop state directory")?;
+        let runtime = Arc::new(Runtime::start(base, configuration.revision, &self.cancel)?);
+        *self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))? = Some(runtime);
+        ensure!(
+            !self.cancel.load(Ordering::Acquire),
+            "Desktop preparation cancelled"
+        );
+        self.admit_prepared()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    fn admit_prepared(&self) -> Result<()> {
+        ensure!(
+            self.admitted
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "Desktop preparation cancelled before readiness"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "network")]
+    pub fn ready(&self) -> Result<bool> {
+        if self.admitted.load(Ordering::Acquire) != 2 {
+            return Ok(false);
+        }
+        let current = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))?
+            .clone();
+        match current {
+            Some(runtime) => runtime.ready(),
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(feature = "network")]
+    pub fn viewer(&self, show: bool) -> Result<()> {
+        let current = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))?
+            .clone();
+        current
+            .context("Start the development desktop first")?
+            .viewer(show)
     }
 }
 
@@ -107,11 +269,15 @@ fn base() -> Result<Root> {
 }
 
 fn lock_configuration(base: &Root) -> Result<std::fs::File> {
-    let name = std::ffi::OsStr::new("configuration.lock");
+    lock_named(base, "configuration.lock")
+}
+
+pub(super) fn lock_named(base: &Root, filename: &str) -> Result<std::fs::File> {
+    let name = std::ffi::OsStr::new(filename);
     let file = if base
         .names()?
         .iter()
-        .any(|name| name.eq_ignore_ascii_case("configuration.lock"))
+        .any(|name| name.eq_ignore_ascii_case(filename))
     {
         glass_windows::open_file_child_readonly(&base.directory, name)
             .map_err(|_| anyhow::anyhow!("configuration lock changed identity"))?
@@ -128,6 +294,12 @@ fn lock_configuration(base: &Root) -> Result<std::fs::File> {
 }
 
 pub fn command(command: DesktopCommand) -> Result<()> {
+    if matches!(command, DesktopCommand::Open) {
+        #[cfg(feature = "network")]
+        return super::tray::open();
+        #[cfg(not(feature = "network"))]
+        anyhow::bail!("the tray app requires the network feature");
+    }
     if let DesktopCommand::Status { json } = command {
         return status(json);
     }
@@ -185,7 +357,7 @@ pub fn command(command: DesktopCommand) -> Result<()> {
             value.enabled = true;
             base.write("configuration.json", &value)?;
             println!(
-                "Separate Windows desktop enabled for this account. Restart the MCP server. Windows sign-in may be requested at the first application launch."
+                "Separate Windows desktop enabled for this account. Open Glass and choose Start development desktop before agent work."
             );
         }
         DesktopCommand::Disable => {
@@ -244,7 +416,7 @@ pub fn command(command: DesktopCommand) -> Result<()> {
             }
             ensure!(found, "there is no running separate desktop in this logon");
         }
-        DesktopCommand::Status { .. } => {
+        DesktopCommand::Status { .. } | DesktopCommand::Open => {
             unreachable!("handled before acquiring configuration lock")
         }
     }
@@ -349,4 +521,36 @@ fn status(json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "network"))]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn resident_refuses_app_work_before_any_windows_probe_or_signin() {
+        let manager = Manager::resident().unwrap();
+        let error = manager
+            .backend()
+            .err()
+            .expect("unprepared factory must refuse");
+        assert!(matches!(error.cause(), GlassError::EnvironmentNotReady));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn cancelling_preparation_cannot_be_undone_by_late_worker_readiness() {
+        let manager = Manager::resident().unwrap();
+        manager.begin_preparation();
+        manager.cancel_preparation();
+        assert!(manager.admit_prepared().is_err());
+        assert!(!manager.ready().unwrap());
+        assert!(matches!(
+            manager.backend().err().unwrap().cause(),
+            GlassError::EnvironmentNotReady
+        ));
+    }
 }

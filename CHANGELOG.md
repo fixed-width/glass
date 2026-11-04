@@ -26,6 +26,10 @@ internal refactors, CI, or test-only changes.
   retain the desktop across application stops, while `desktop status`, `show`, `hide`, `stop`,
   `recover`, and `disable` provide inspection and lifecycle control. The desktop uses your Windows
   account; application containment remains a separate setting.
+- A resident Windows tray app prepares and authenticates the development desktop before agent
+  work. Open it with `glass-mcp desktop open` or `serve --tray`, then connect to its HTTP endpoint.
+  Client reconnects retain the desktop; application requests return `environment_not_ready`
+  instead of opening Windows sign-in. Start, Stop, Show and Hide are available from Glass.
 
 ### Fixed
 

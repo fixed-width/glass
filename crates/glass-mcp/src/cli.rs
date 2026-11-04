@@ -149,6 +149,9 @@ pub enum Command {
         /// MCP on a background thread while an NSStatusItem shows it is running.
         #[arg(long)]
         menubar: bool,
+        /// Run the resident Windows system-tray app. Implies --http.
+        #[arg(long, conflicts_with = "menubar")]
+        tray: bool,
     },
     /// Generate a bearer token for the network transport.
     GenToken {
@@ -285,6 +288,21 @@ mod tests {
     }
 
     #[test]
+    fn tray_implies_a_resident_mode_and_cannot_combine_with_menubar() {
+        assert!(matches!(
+            Cli::try_parse_from(["glass-mcp", "serve", "--tray"])
+                .unwrap()
+                .command,
+            Some(Command::Serve {
+                tray: true,
+                http: false,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["glass-mcp", "serve", "--tray", "--menubar"]).is_err());
+    }
+
+    #[test]
     fn doctor_flags_parse() {
         let cli = Cli::try_parse_from(["glass-mcp", "doctor", "--deep", "--json"]).unwrap();
         assert!(matches!(
@@ -366,11 +384,13 @@ mod tests {
                 addr,
                 token_file,
                 menubar,
+                tray,
             }) => {
                 assert!(http);
                 assert_eq!(addr.as_deref(), Some("0.0.0.0:7300"));
                 assert_eq!(token_file.as_deref(), Some("/t"));
                 assert!(!menubar, "menubar defaults to false");
+                assert!(!tray, "tray defaults to false");
             }
             other => panic!("expected serve, got {other:?}"),
         }

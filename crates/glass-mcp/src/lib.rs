@@ -384,6 +384,27 @@ fn default_baseline_dir() -> std::path::PathBuf {
 
 /// Build the `Glass` session manager, installing the audit sink if one is configured.
 pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
+    #[cfg(windows)]
+    return boot_with_desktop(
+        audit,
+        std::sync::Arc::new(windows_environment::Manager::new()),
+    );
+    #[cfg(not(windows))]
+    boot_inner(audit)
+}
+
+#[cfg(windows)]
+pub(crate) fn boot_with_desktop(
+    audit: Option<Box<dyn glass_core::AuditSink>>,
+    desktop: std::sync::Arc<windows_environment::Manager>,
+) -> Glass {
+    boot_inner(audit, desktop)
+}
+
+fn boot_inner(
+    audit: Option<Box<dyn glass_core::AuditSink>>,
+    #[cfg(windows)] desktop: std::sync::Arc<windows_environment::Manager>,
+) -> Glass {
     let raw = std::env::var("GLASS_BACKEND").ok();
     let default = default_backend(raw.as_deref()).to_string();
     if backend_env_unrecognized(raw.as_deref()) {
@@ -430,8 +451,6 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     let platform_factory: glass_core::PlatformFactory =
         Box::new(move |b| make_platform(b, &reg_factory, &agents_factory, &a11y_factory));
-    #[cfg(windows)]
-    let desktop = std::sync::Arc::new(windows_environment::Manager::new());
     #[cfg(windows)]
     let desktop_factory = std::sync::Arc::clone(&desktop);
     #[cfg(windows)]

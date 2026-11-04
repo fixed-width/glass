@@ -347,6 +347,24 @@ impl GlassServer {
         self.glass.clone()
     }
 
+    #[cfg(all(windows, feature = "network"))]
+    pub(crate) async fn stop_from_desktop_ui(&self) -> anyhow::Result<()> {
+        let result = self
+            .run("glass_stop", tool_effect("glass_stop"), |glass| {
+                if glass.active_backend().is_some() {
+                    glass.stop().map_err(|e| e.to_string())?;
+                }
+                Ok(ToolOutput::result("glass_stop", serde_json::json!({})))
+            })
+            .await?;
+        anyhow::ensure!(
+            result.is_error != Some(true),
+            "Application cleanup failed: {:?}",
+            result.content
+        );
+        Ok(())
+    }
+
     pub(crate) fn trace_recorder(&self) -> Option<crate::trace::TraceRecorder> {
         self.trace.clone()
     }

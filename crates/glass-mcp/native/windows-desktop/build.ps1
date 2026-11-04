@@ -32,5 +32,5 @@ public static class DesktopInteropBuild {
 '@
 [DesktopInteropBuild]::Run((Join-Path $env:SystemRoot 'System32\mstscax.dll'), (Join-Path $output 'GlassDesktopRdp.dll'))
 $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ /out:GlassDesktopHost.exe /reference:GlassDesktopRdp.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:Microsoft.CSharp.dll (Join-Path $source 'Host.cs')
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ /out:GlassDesktopHost.exe /reference:GlassDesktopRdp.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:Microsoft.CSharp.dll (Join-Path $source 'Host.cs') (Join-Path $source 'Tray.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Desktop host compilation failed' }
