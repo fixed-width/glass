@@ -79,6 +79,7 @@ pub fn open() -> Result<()> {
         std::ffi::OsStr::new(&log_name),
         false,
     )?;
+    glass_windows::desktop::protect_stdio_inheritance()?;
     let mut child = Command::new(executable)
         .args(["serve", "--tray"])
         .creation_flags(0x0800_0000)
@@ -150,6 +151,7 @@ pub async fn run(cfg: crate::serve::config::ServeConfig, audit: Option<&str>) ->
         cfg.trace.as_ref(),
         "http",
     )?;
+    glass_windows::desktop::protect_stdio_inheritance()?;
     let mut helper = Command::new(runtime::helper(&base)?)
         .arg(&root.path)
         .arg("tray")
