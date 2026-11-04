@@ -127,5 +127,10 @@ the parent was locked or disconnected returned `transport_failure` before dispat
 parent unlocked and connected for GUI input. The lifecycle checks passed retention and resumption;
 continuing GUI input during a lock or disconnection is outside the preview's requirements.
 
+The resident tray flow has also been tested on that host: preparation before app work, refusals
+before preparation and after Stop, retained strict Sandboxie apps across MCP client reconnects,
+and a fresh desktop after an explicit Stop/Start in the same resident app. Native Show, Hide,
+Quit and detached launching were exercised as well.
+
 An unavailable or failed environment returns its diagnostic instead of falling back to the user's
 desktop. RDP-to-console transfers are not part of setup or recovery.
