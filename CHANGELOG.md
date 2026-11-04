@@ -37,6 +37,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Windows sign-in startup preserves an existing Glass resident when signing in to its separate
+  desktop, avoiding a duplicate resident and a misleading startup error inside the child session.
 - Windows child-desktop connections enable the native client-side credentials dialog when authentication needs user input; passwords stay in Windows' sign-in UI.
 - A timed-out Windows child-desktop startup can finish cleanup when the host has already removed its stop event, without abandoning a host stalled in final COM disposal.
 - Windows Sandboxie launches now work from long directories, including a separate desktop's private state directory, while preserving the application's working directory. An inaccessible application directory stops the wrapper before launching the app.

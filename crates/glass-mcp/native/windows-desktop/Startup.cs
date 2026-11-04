@@ -83,7 +83,8 @@ internal static class Startup {
             string index=Path.Combine(root,"tray.json");
             if(File.Exists(index)) {
                 var live=Files.Read<Launch>(root,"tray.json");
-                if(live.parent!=null && live.parent.Live() && live.parent.sid==current.sid && live.parent.session==current.session)return 0;
+                // Signing in to a child can trigger startup again for the same account.
+                if(live.parent!=null && live.parent.Live() && live.parent.sid==current.sid)return 0;
             }
             if(!File.Exists(recipe.executable))throw new InvalidOperationException("The Glass executable has moved. Open Glass and save Start with Windows again.");
             var arguments=new List<string>();foreach(string argument in recipe.arguments)arguments.Add(Files.Quote(argument));
