@@ -115,8 +115,8 @@ On the same Windows 11 Pro host, a strict Sandboxie app survived a parent lock/u
 ordinary RDP disconnect/reconnect. Three input, fresh-capture and private-clipboard rounds passed
 after each transition on the original app process and window. Semantic pointer requests while
 the parent was locked or disconnected returned `transport_failure` before dispatch. Keep the
-parent unlocked and connected for GUI input; this test does not establish unattended operation
-in either state.
+parent unlocked and connected for GUI input. The lifecycle checks passed retention and resumption;
+continuing GUI input during a lock or disconnection is outside the preview's requirements.
 
 An unavailable or failed environment returns its diagnostic instead of falling back to the user's
 desktop. RDP-to-console transfers are not part of setup or recovery.
