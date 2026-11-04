@@ -41,7 +41,8 @@ glass-mcp serve --tray --addr 127.0.0.1:7300 --token-file C:\path\to\token
 `--tray` implies HTTP serving. The default endpoint is `http://127.0.0.1:7300/`. Configure the same
 bearer token in your MCP client when using one. **Start with Windows** installs a per-user,
 unelevated sign-in startup task and opens quietly in the system tray. Authenticated startup uses
-the supplied token-file path; an environment-only token is not saved for startup.
+the supplied token-file path; an environment-only token is not saved for startup. A child sign-in
+preserves the existing resident instead of starting another Glass instance inside the child.
 
 If the desktop is not ready or has ended, application requests return `environment_not_ready`
 with an instruction to finish Application setup. Tools never open a sign-in dialog or recreate the
@@ -142,6 +143,16 @@ started Glass quietly, preserved its HTTP endpoint and reached Ready automatical
 app then passed pointer input, typing, capture, private clipboard and protected-state checks.
 Disabling startup kept the running resident, changed startup definitions were retained, and
 switching modes preserved the HTTP endpoint.
+
+**Off your desktop** has also been checked across an actual restart with an active child.
+Glass started quietly with the saved choice and endpoint, refused app work before preparation,
+then recovered the old ownership records and prepared a fresh child after **Start Environment…**
+and Windows sign-in. An app with strict containment then passed three rounds of input, fresh
+capture, private clipboard and protected-state checks in that child.
+
+Teardown exposed an intermittent process-query access error. Ownership records were retained,
+and a subsequent `desktop disable` completed setting restoration. This remains a known cleanup
+issue.
 
 An unavailable or failed environment returns its diagnostic instead of falling back to the user's
 desktop. RDP-to-console transfers are not part of setup or recovery.
