@@ -300,7 +300,7 @@ internal sealed class DesktopHost : Form {
             client.AdvancedSettings7.EnableCredSspSupport=true;
             var credentials=(IMsRdpClientNonScriptable5)host.Client;
             credentials.AllowCredentialSaving=false; credentials.AllowPromptingForCredentials=true;
-            credentials.PromptForCredentials=false; credentials.PromptForCredsOnClient=false; credentials.DisableConnectionBar=true;
+            credentials.PromptForCredentials=true; credentials.PromptForCredsOnClient=true; credentials.DisableConnectionBar=true;
             Listen("OnConnected",new Action(()=>{ if (!loginComplete) Save("authentication_pending"); }));
             Listen("OnLoginComplete",new Action(()=>{ loginComplete=true; Save("starting_desktop"); }));
             Listen("OnDisconnected",new Action<int>(reason=>{ if (!ending) Fail(new InvalidOperationException("Child connection ended ("+reason+", "+client.ExtendedDisconnectReason+")")); }));
