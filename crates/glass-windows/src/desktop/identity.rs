@@ -1,8 +1,10 @@
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
 use serde::{Deserialize, Serialize};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
-use windows::Win32::Foundation::{FILETIME, HANDLE, HLOCAL, LocalFree, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    FILETIME, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TOKEN_USER, TokenStatistics, TokenUser,
@@ -82,9 +84,18 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
-    /// End only this exact generation after its caller has established ownership and cleanup authority.
-    pub fn terminate(&self) -> Result<()> {
-        use windows::Win32::System::Threading::{PROCESS_TERMINATE, TerminateProcess};
+    /// End only this generation after the caller establishes ownership and cleanup authority.
+    /// Confirm exit within the deadline, capped at five seconds.
+    pub fn terminate(&self, deadline: Deadline) -> Result<()> {
+        use windows::Win32::System::Threading::PROCESS_TERMINATE;
+        let deadline = Deadline::at(
+            deadline
+                .resolve(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .0,
+        );
+        if deadline.has_passed() {
+            return Err(failure("owned process termination", "deadline exceeded"));
+        }
         // SAFETY: a retained query/terminate handle prevents acting through an unbound PID.
         let handle = unsafe {
             OpenProcess(
@@ -101,9 +112,10 @@ impl ProcessIdentity {
                 "process identity changed",
             ));
         }
-        // SAFETY: the retained handle names the generation just verified; this call never resolves a PID again.
-        unsafe { TerminateProcess(HANDLE(process.as_raw_handle()), 1) }
-            .map_err(|error| failure("terminate owned process", error))
+        if deadline.has_passed() {
+            return Err(failure("owned process termination", "deadline exceeded"));
+        }
+        terminate_process(HANDLE(process.as_raw_handle()), deadline)
     }
     pub fn current() -> Result<Self> {
         Self::read(std::process::id())
@@ -251,6 +263,35 @@ impl ProcessIdentity {
     }
 }
 
+fn terminate_process(handle: HANDLE, deadline: Deadline) -> Result<()> {
+    use windows::Win32::System::Threading::TerminateProcess;
+    // SAFETY: the caller retains the verified process handle throughout termination and waiting.
+    let termination = unsafe { TerminateProcess(handle, 1) };
+    match wait_for_process_exit(handle, deadline) {
+        Ok(()) => Ok(()),
+        Err(wait) => termination
+            .map_err(|error| failure("terminate owned process", error))
+            .and(Err(wait)),
+    }
+}
+
+fn wait_for_process_exit(handle: HANDLE, deadline: Deadline) -> Result<()> {
+    let remaining = deadline
+        .remaining()
+        .unwrap_or(std::time::Duration::from_secs(5))
+        .min(std::time::Duration::from_secs(5));
+    let milliseconds = remaining.as_millis() as u32;
+    // SAFETY: the caller keeps the process handle open for the entire bounded wait.
+    match unsafe { WaitForSingleObject(handle, milliseconds) } {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT => Err(failure("owned process exit", "deadline exceeded")),
+        _ => Err(failure(
+            "wait for owned process exit",
+            windows::core::Error::from_thread(),
+        )),
+    }
+}
+
 /// Configuration only: `false` means disabled, rather than unsupported.
 pub fn child_sessions_enabled() -> Result<bool> {
     let mut enabled = windows::core::BOOL(0);
@@ -348,4 +389,115 @@ pub fn stop_requested(instance: &str) -> Result<bool> {
         unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) }
             == windows::Win32::Foundation::WAIT_OBJECT_0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+
+    struct SuspendedProcess(Child);
+
+    impl SuspendedProcess {
+        fn new() -> Self {
+            let executable =
+                PathBuf::from(std::env::var_os("SystemRoot").expect("Windows directory"))
+                    .join("System32\\cmd.exe");
+            Self(
+                Command::new(executable)
+                    .creation_flags((CREATE_NO_WINDOW | CREATE_SUSPENDED).0)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("owned suspended process"),
+            )
+        }
+
+        fn handle(&self) -> HANDLE {
+            HANDLE(self.0.as_raw_handle())
+        }
+    }
+
+    impl Drop for SuspendedProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn owned_termination_confirms_exit_before_returning() {
+        let process = SuspendedProcess::new();
+        let identity = ProcessIdentity::read(process.0.id()).expect("owned identity");
+        identity
+            .terminate(Deadline::from_millis(5_000))
+            .expect("owned termination");
+        // SAFETY: the child retains its process handle for this nonblocking observation.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.handle(), 0) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn changed_generation_cannot_terminate_the_live_process() {
+        let mut process = SuspendedProcess::new();
+        let mut identity = ProcessIdentity::read(process.0.id()).expect("owned identity");
+        identity.created += 1;
+        assert!(identity.terminate(Deadline::from_millis(5_000)).is_err());
+        assert!(process.0.try_wait().expect("process state").is_none());
+    }
+
+    #[test]
+    fn expired_termination_deadline_leaves_the_process_alive() {
+        let mut process = SuspendedProcess::new();
+        let identity = ProcessIdentity::read(process.0.id()).expect("owned identity");
+        let deadline = Deadline::at(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(identity.terminate(deadline).is_err());
+        assert!(process.0.try_wait().expect("process state").is_none());
+    }
+
+    #[test]
+    fn exit_wait_timeout_does_not_report_a_live_process_as_exited() {
+        let mut process = SuspendedProcess::new();
+        assert!(wait_for_process_exit(process.handle(), Deadline::from_millis(5)).is_err());
+        assert!(process.0.try_wait().expect("process state").is_none());
+    }
+
+    #[test]
+    fn wait_failure_is_not_reported_as_process_exit() {
+        assert!(wait_for_process_exit(HANDLE::default(), Deadline::from_millis(5)).is_err());
+    }
+
+    #[test]
+    fn exit_between_verification_and_termination_is_confirmed_by_the_bound_handle() {
+        let mut process = SuspendedProcess::new();
+        process.0.kill().expect("end owned process");
+        process.0.wait().expect("confirmed exit");
+        terminate_process(process.handle(), Deadline::from_millis(5_000))
+            .expect("already exited generation");
+    }
+
+    #[test]
+    fn termination_denied_for_a_live_process_still_returns_an_error() {
+        let mut process = SuspendedProcess::new();
+        // SAFETY: this test opens its own process without termination rights and retains the handle.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                false,
+                process.0.id(),
+            )
+        }
+        .expect("query-only process handle");
+        // SAFETY: successful OpenProcess transfers ownership of this handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        assert!(
+            terminate_process(HANDLE(handle.as_raw_handle()), Deadline::from_millis(5)).is_err()
+        );
+        assert!(process.0.try_wait().expect("process state").is_none());
+    }
 }

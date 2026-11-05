@@ -60,7 +60,7 @@ fn invoke(root: &Root, role: &str, request: &str) -> Result<bool> {
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            identity.terminate()?;
+            identity.terminate(glass_core::Deadline::from_millis(5_000))?;
             anyhow::bail!(
                 "Windows startup is not responding. Its saved registration was retained for inspection."
             );

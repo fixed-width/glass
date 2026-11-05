@@ -37,6 +37,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Windows child-desktop shutdown waits for the verified helper's process handle to confirm exit,
+  avoiding Access Denied errors from querying an asynchronously terminating process.
 - Windows sign-in startup preserves an existing Glass resident when signing in to its separate
   desktop, avoiding a duplicate resident and a misleading startup error inside the child session.
 - Windows child-desktop connections enable the native client-side credentials dialog when authentication needs user input; passwords stay in Windows' sign-in UI.

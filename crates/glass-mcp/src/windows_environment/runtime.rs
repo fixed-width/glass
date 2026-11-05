@@ -345,9 +345,11 @@ pub(super) fn stop_external(root: &Root, journal: &Journal, deadline: Deadline) 
         );
     }
     let finalizing_grace = std::time::Instant::now() + Duration::from_secs(2);
-    let mut forced = false;
-    while journal.owner.is_current()? {
-        if !forced && std::time::Instant::now() >= finalizing_grace {
+    let forced = wait_for_owner(
+        deadline,
+        finalizing_grace,
+        || journal.owner.is_current().map_err(Into::into),
+        || {
             let state = read_journal(root, &current)?;
             ensure!(
                 state.owner == journal.owner,
@@ -356,17 +358,17 @@ pub(super) fn stop_external(root: &Root, journal: &Journal, deadline: Deadline) 
             if native_cleanup_finished(&state)? {
                 // The host publishes finalizing only after child/task/application cleanup. Its
                 // remaining resource is its own control process, whose COM disposal can stall.
-                state.owner.terminate()?;
-                forced = true;
+                state.owner.terminate(deadline)?;
+                return Ok(true);
             }
-        }
-        ensure!(
-            !deadline.has_passed(),
-            "Windows desktop teardown is still pending; its ownership record was retained"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
+            Ok(false)
+        },
+    )?;
     let mut final_state = read_journal(root, &current)?;
+    ensure!(
+        final_state.owner == journal.owner && final_state.instance == journal.instance,
+        "Windows desktop owner changed during stop"
+    );
     if forced && final_state.phase == "finalizing" {
         final_state.phase = "stopped".into();
         final_state.clean = true;
@@ -382,6 +384,25 @@ pub(super) fn stop_external(root: &Root, journal: &Journal, deadline: Deadline) 
             .unwrap_or("owner exited without confirming cleanup")
     );
     Ok(final_state)
+}
+
+fn wait_for_owner(
+    deadline: Deadline,
+    finalizing_grace: std::time::Instant,
+    mut is_current: impl FnMut() -> Result<bool>,
+    mut finish: impl FnMut() -> Result<bool>,
+) -> Result<bool> {
+    while is_current()? {
+        ensure!(
+            !deadline.has_passed(),
+            "Windows desktop teardown is still pending; its ownership record was retained"
+        );
+        if std::time::Instant::now() >= finalizing_grace && finish()? {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(false)
 }
 
 fn native_cleanup_finished(state: &Journal) -> Result<bool> {
@@ -917,6 +938,164 @@ impl crate::remote_backend::Connection for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalized_owner_is_not_queried_again() {
+        let finalized = std::cell::Cell::new(false);
+        let result = wait_for_owner(
+            Deadline::from_millis(1_000),
+            std::time::Instant::now(),
+            || {
+                ensure!(!finalized.get(), "process executable: Access is denied");
+                Ok(true)
+            },
+            || {
+                finalized.set(true);
+                Ok(true)
+            },
+        );
+        assert!(result.expect("confirmed exit must not re-query its PID"));
+    }
+
+    #[test]
+    fn identity_failure_before_finalization_is_not_ignored() {
+        let result = wait_for_owner(
+            Deadline::from_millis(1_000),
+            std::time::Instant::now(),
+            || bail!("unverified owner"),
+            || panic!("an unverified owner must not be terminated"),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "unverified owner");
+    }
+
+    #[test]
+    fn finalization_failure_is_not_reported_as_owner_exit() {
+        let result = wait_for_owner(
+            Deadline::from_millis(1_000),
+            std::time::Instant::now(),
+            || Ok(true),
+            || bail!("process did not exit before deadline"),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "process did not exit before deadline"
+        );
+    }
+
+    #[test]
+    fn expired_stop_deadline_does_not_terminate_an_owner() {
+        let result = wait_for_owner(
+            Deadline::at(std::time::Instant::now() - Duration::from_secs(1)),
+            std::time::Instant::now(),
+            || Ok(true),
+            || panic!("expired stop must not begin termination"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn naturally_exited_owner_needs_no_forced_finalization() {
+        let result = wait_for_owner(
+            Deadline::from_millis(1_000),
+            std::time::Instant::now(),
+            || Ok(false),
+            || panic!("exited owner must not be terminated"),
+        );
+        assert!(!result.expect("natural exit"));
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture; inert without its private environment flag"]
+    fn finalizing_owner_child() {
+        if std::env::var("GLASS_FINALIZING_OWNER_CHILD").as_deref() == Ok("1") {
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the signed-in standard Windows session"]
+    fn finalizing_owner_exits_and_commits_cleanup_on_the_first_stop() {
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let parent = ProcessIdentity::current().expect("test parent");
+        assert_ne!(parent.session, 0, "run through the interactive task bridge");
+        let scratch = tempfile::tempdir().expect("test scratch");
+        let root = Root::open(&scratch.path().join("state"), true)
+            .expect("private test state")
+            .expect("state exists");
+        let executable = scratch.path().join("GlassDesktopHost.exe");
+        std::fs::copy(
+            std::env::current_exe().expect("test executable"),
+            &executable,
+        )
+        .expect("copy owned fixture");
+        let iterations = std::env::var("GLASS_TEARDOWN_ITERATIONS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("iteration count"))
+            .unwrap_or(1);
+        assert!((1..=20).contains(&iterations));
+        for iteration in 0..iterations {
+            let instance = format!("{:032x}", rand::random::<u128>());
+            let stop_event = format!("Global\\Glass.Desktop.Stop.{instance}");
+            let mut child = ChildGuard(
+                Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "windows_environment::runtime::tests::finalizing_owner_child",
+                        "--ignored",
+                    ])
+                    .env("GLASS_FINALIZING_OWNER_CHILD", "1")
+                    .creation_flags(0x0800_0000)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("owned idle fixture"),
+            );
+            let owner = ProcessIdentity::read(child.0.id()).expect("fixture identity");
+            let journal = Journal {
+                version: 1,
+                child: u32::MAX,
+                instance: instance.clone(),
+                phase: "finalizing".into(),
+                error: None,
+                task: format!("Glass.Desktop.{instance}"),
+                worker_arguments: None,
+                pipe: format!("glass-desktop-{instance}"),
+                stop_event,
+                show_event: format!("Local\\Glass.Desktop.Show.{instance}"),
+                hide_event: format!("Local\\Glass.Desktop.Hide.{instance}"),
+                parent: parent.clone(),
+                owner,
+                worker: None,
+                child_logon: 0,
+                child_gone: true,
+                child_enabled_before: false,
+                changed_child_setting: false,
+                clean: false,
+                viewer_visible: false,
+            };
+            root.write("owner.json", &journal)
+                .expect("publish finalizing state");
+            let final_state = stop_external(&root, &journal, Deadline::from_millis(10_000))
+                .expect("first stop confirms helper exit and cleanup");
+            assert!(child.0.try_wait().expect("fixture exit state").is_some());
+            assert!(final_state.clean && final_state.child_gone && final_state.phase == "stopped");
+            assert!(root.read::<Journal>("owner.json").unwrap().unwrap().clean);
+            eprintln!(
+                "finalizing owner iteration {} completed on first stop",
+                iteration + 1
+            );
+        }
+    }
 
     fn cleanup_record() -> Journal {
         let process = ProcessIdentity::current().expect("test process");
