@@ -134,6 +134,18 @@ pub fn change_setting(
     enabled: bool,
     deadline: Deadline,
 ) -> Result<SettingChange> {
+    change_setting_with(executable, enabled, deadline, |launch| {
+        // SAFETY: the caller retains all strings and requests the normal Windows consent UI.
+        unsafe { ShellExecuteExW(launch) }
+    })
+}
+
+fn change_setting_with(
+    executable: &Path,
+    enabled: bool,
+    deadline: Deadline,
+    elevate: impl FnOnce(&mut SHELLEXECUTEINFOW) -> windows::core::Result<()>,
+) -> Result<SettingChange> {
     let path: Vec<u16> = executable
         .as_os_str()
         .encode_wide()
@@ -156,10 +168,11 @@ pub fn change_setting(
         nShow: SW_HIDE.0,
         ..Default::default()
     };
-    // SAFETY: all shell input strings remain valid; runas presents the normal Windows consent UI.
-    unsafe { ShellExecuteExW(&mut launch) }.map_err(|error| {
+    elevate(&mut launch).map_err(|error| {
+        let action = if enabled { "enable" } else { "restore" };
         GlassError::Backend(format!(
-            "Windows desktop setup elevation was declined or unavailable: {error}"
+            "Windows administrator approval to {action} child sessions was canceled, denied or unavailable. \
+             If this was unexpected, ask your administrator to review elevation permissions. {error}"
         ))
     })?;
     if launch.hProcess.is_invalid() {
@@ -186,6 +199,10 @@ pub fn change_setting(
     // SAFETY: the completed process and exit-code pointer are valid.
     unsafe { GetExitCodeProcess(HANDLE(process.as_raw_handle()), &mut code) }
         .map_err(|error| GlassError::Backend(format!("read Windows setup result: {error}")))?;
+    setting_result(code, enabled)
+}
+
+fn setting_result(code: u32, enabled: bool) -> Result<SettingChange> {
     match code {
         0 => Ok(SettingChange::Changed),
         10 => Ok(SettingChange::AlreadySet),
@@ -203,11 +220,72 @@ pub fn change_setting(
             "Windows could not query the child-session setting during setup".into(),
         )),
         code if code & 0x1000_0000 != 0 => Err(GlassError::Backend(format!(
-            "Windows child-session change failed: {}",
+            "Windows could not {} child sessions. Ask your administrator to review permissions for this setting. {}",
+            if enabled { "enable" } else { "restore" },
             std::io::Error::from_raw_os_error((code & 0x0fff_ffff) as i32)
         ))),
         code => Err(GlassError::Backend(format!(
             "Windows desktop setup exited with code {code}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denied_elevation_preserves_native_error_and_names_setup_action() {
+        for enabled in [true, false] {
+            let error = change_setting_with(
+                Path::new(r"C:\Glass\glass-mcp.exe"),
+                enabled,
+                Deadline::from_millis(1000),
+                |_| {
+                    Err(windows::core::Error::from_hresult(
+                        windows::core::HRESULT::from_win32(5),
+                    ))
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("0x80070005"), "{error}");
+            assert!(
+                error.contains(if enabled {
+                    "enable child sessions"
+                } else {
+                    "restore child sessions"
+                }),
+                "{error}"
+            );
+            assert!(error.contains("ask your administrator"), "{error}");
+        }
+    }
+
+    #[test]
+    fn canceled_elevation_is_not_reported_as_an_identified_policy() {
+        let error = change_setting_with(
+            Path::new(r"C:\Glass\glass-mcp.exe"),
+            true,
+            Deadline::from_millis(1000),
+            |_| {
+                Err(windows::core::Error::from_hresult(
+                    windows::core::HRESULT::from_win32(1223),
+                ))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("0x800704C7"), "{error}");
+        assert!(error.contains("canceled, denied or unavailable"), "{error}");
+        assert!(!error.contains("blocked by policy"), "{error}");
+    }
+
+    #[test]
+    fn denied_setting_helper_retains_native_code_and_restoration_context() {
+        let error = setting_result(0x1000_0005, false).unwrap_err().to_string();
+        assert!(error.contains("restore child sessions"), "{error}");
+        assert!(error.contains("os error 5"), "{error}");
+        assert!(error.contains("administrator"), "{error}");
     }
 }

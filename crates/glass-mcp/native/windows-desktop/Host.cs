@@ -344,6 +344,7 @@ internal sealed class DesktopHost : Form {
     void StartWorker() {
         state.worker_arguments="windows-desktop-worker --root "+Files.Quote(root)+" --instance "+launch.instance;
         Files.Write(root,state);
+        try {
         dynamic scheduler=Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service",true)); scheduler.Connect();
         dynamic task=scheduler.NewTask(0);
         task.Principal.UserId=launch.parent.sid; task.Principal.LogonType=3; task.Principal.RunLevel=0;
@@ -354,6 +355,7 @@ internal sealed class DesktopHost : Form {
         dynamic folder=scheduler.GetFolder("\\");
         dynamic registered=folder.RegisterTaskDefinition(state.task,task,2,null,null,3,null);
         registered.RunEx(null,4,checked((int)state.child),null);
+        } catch(Exception error) { throw new InvalidOperationException(Startup.TaskFailure("start the child-session worker through Task Scheduler",error),error); }
     }
     void HideAndRestore() {
         uint foregroundPid; Native.GetWindowThreadProcessId(Native.GetForegroundWindow(),out foregroundPid);

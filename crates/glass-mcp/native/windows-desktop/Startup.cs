@@ -16,6 +16,11 @@ public sealed class StartupRecipe {
 }
 
 internal static class Startup {
+    internal static string TaskFailure(string operation,Exception failure) {
+        string guidance=failure is UnauthorizedAccessException || unchecked((uint)failure.HResult)==0x80070005
+            ? " Ask your administrator to review Task Scheduler permissions." : "";
+        return "Windows could not "+operation+" (HRESULT 0x"+unchecked((uint)failure.HResult).ToString("X8")+")."+guidance+" "+failure;
+    }
     static string Name(string root) {
         using(var hash=SHA256.Create())return "Glass.Startup."+BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(root.ToLowerInvariant()))).Replace("-","").Substring(0,16).ToLowerInvariant();
     }
@@ -43,11 +48,17 @@ internal static class Startup {
             !String.Equals((string)action.WorkingDirectory,root,StringComparison.OrdinalIgnoreCase) || trigger.Type!=9 || Sid((string)trigger.UserId)!=recipe.sid)
             throw new InvalidOperationException("Windows startup action or trigger was changed; it was retained");
     }
-    internal static int Configure(string root,bool inspect) {
+    static dynamic Connect() {
+        dynamic service=Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service",true));service.Connect();return service;
+    }
+    internal static int Configure(string root,bool inspect) { return Configure(root,inspect,Connect); }
+    internal static int Configure(string root,bool inspect,Func<dynamic> connect) {
         StartupRecipe recipe=null;string taskName=Name(root);bool enabled=false;string error=null;
+        string operation="read Glass startup settings";
         try {
             recipe=Files.Read<StartupRecipe>(root,"startup.json");Validate(recipe);
-            dynamic service=Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service",true));service.Connect();
+            operation="connect to Task Scheduler";dynamic service=connect();
+            operation="inspect Glass startup registration";
             dynamic folder=service.GetFolder("\\"),existing=null;
             try{existing=folder.GetTask(taskName);}catch(FileNotFoundException){}
             catch(System.Runtime.InteropServices.COMException missing){if((uint)missing.ErrorCode!=0x80070002)throw;}
@@ -62,14 +73,17 @@ internal static class Startup {
                     dynamic trigger=task.Triggers.Create(9);trigger.UserId=recipe.sid;trigger.Enabled=true;
                     dynamic action=task.Actions.Create(0);action.Path=Process.GetCurrentProcess().MainModule.FileName;
                     action.Arguments=Files.Quote(root)+" startup";action.WorkingDirectory=root;
+                    operation="register Glass startup";
                     folder.RegisterTaskDefinition(taskName,task,6,null,null,3,null);
                     dynamic registered=folder.GetTask(taskName);Owned(registered,root,recipe);enabled=registered.Enabled;
                 } else {
-                    if(existing!=null)existing.Enabled=false;
+                    operation="disable Glass startup";if(existing!=null)existing.Enabled=false;
                     enabled=false;
                 }
             }
-        }catch(Exception failure){error=failure.ToString();}
+        }catch(Exception failure){
+            error=TaskFailure(operation,failure);
+        }
         Files.WriteText(root,"startup-receipt.json",new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(
             new { version=1,request=recipe==null ? "" : recipe.request,enabled=enabled,task=taskName,error=error }));
         return error==null ? 0 : 1;

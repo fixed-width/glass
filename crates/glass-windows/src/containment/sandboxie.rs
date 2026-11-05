@@ -163,6 +163,7 @@ fn box_appends(level: SandboxLevel, protected_paths: &[ProtectedHostPath]) -> Ve
 #[derive(Debug)]
 struct CommandOutcome {
     success: bool,
+    code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -172,6 +173,7 @@ impl CommandOutcome {
     fn success(stdout: &[u8]) -> Self {
         Self {
             success: true,
+            code: Some(0),
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         }
@@ -181,6 +183,7 @@ impl CommandOutcome {
     fn failure(stderr: &[u8]) -> Self {
         Self {
             success: false,
+            code: Some(1),
             stdout: Vec::new(),
             stderr: stderr.to_vec(),
         }
@@ -188,14 +191,25 @@ impl CommandOutcome {
 }
 
 fn run_command(exe: &OsStr, args: &[OsString]) -> std::io::Result<CommandOutcome> {
-    Command::new(exe)
-        .args(args)
-        .output()
+    run_command_with_budget(exe, args, Duration::from_secs(5))
+}
+
+fn run_command_with_budget(
+    exe: &OsStr,
+    args: &[OsString],
+    budget: Duration,
+) -> std::io::Result<CommandOutcome> {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(exe);
+    command.args(args).creation_flags(0x0800_0000);
+    glass_core::run_bounded(&mut command, budget, "Sandboxie configuration command")
         .map(|output| CommandOutcome {
             success: output.status.success(),
+            code: output.status.code(),
             stdout: output.stdout,
             stderr: output.stderr,
         })
+        .map_err(std::io::Error::other)
 }
 
 fn bounded_diagnostic(bytes: &[u8]) -> String {
@@ -203,6 +217,18 @@ fn bounded_diagnostic(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..bytes.len().min(MAX)])
         .trim()
         .to_owned()
+}
+
+fn command_failure(outcome: &CommandOutcome) -> String {
+    format!(
+        "exit code {}; stderr: \"{}\"; stdout: \"{}\". \
+         Ask your administrator to review Sandboxie configuration access if this failure was unexpected.",
+        outcome
+            .code
+            .map_or_else(|| "unavailable".into(), |code| code.to_string()),
+        bounded_diagnostic(&outcome.stderr),
+        bounded_diagnostic(&outcome.stdout)
+    )
 }
 
 fn require_success(
@@ -216,7 +242,7 @@ fn require_success(
     } else {
         Err(format!(
             "Sandboxie command failed: {}",
-            bounded_diagnostic(&outcome.stderr)
+            command_failure(&outcome)
         ))
     }
 }
@@ -348,7 +374,7 @@ fn clear_box_section_with(
     if !outcome.success {
         return Err(GlassError::SandboxUnavailable(format!(
             "clearing owned Sandboxie box section failed: {}",
-            bounded_diagnostic(&outcome.stderr)
+            command_failure(&outcome)
         )));
     }
     Ok(())
@@ -507,7 +533,7 @@ impl Sandboxie {
                     return Err(self.configuration_failed(
                         format!(
                             "querying Sandboxie global network prompt setting failed: {}",
-                            bounded_diagnostic(&outcome.stderr)
+                            command_failure(&outcome)
                         ),
                         &mut runner,
                     ));
@@ -943,6 +969,111 @@ mod tests {
         BoxAppend, CommandOutcome, Sandboxie, box_appends, box_name_for, closed_file_paths,
         mix_process_identity, unique_box_name, validate_closed_path,
     };
+
+    #[test]
+    fn stalled_configuration_helper_has_a_finite_wait() {
+        let args = [
+            "/d",
+            "/c",
+            "echo policy-helper-pending & for /L %i in (1,0,2) do @rem",
+        ]
+        .map(OsString::from);
+        let started = std::time::Instant::now();
+        let error = super::run_command_with_budget(
+            super::command_processor().unwrap().as_os_str(),
+            &args,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        let failure = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<glass_core::GlassError>()
+            .unwrap();
+        assert_eq!(failure.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert!(
+            failure.to_string().contains("policy-helper-pending"),
+            "{failure}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn configuration_denial_keeps_stdout_diagnostic_and_stops_commands() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut calls = 0;
+        let error = sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], |_, _| {
+                calls += 1;
+                Ok(CommandOutcome {
+                    success: false,
+                    code: Some(5),
+                    stdout: b"Access denied (5): Sandboxie configuration is locked".to_vec(),
+                    stderr: Vec::new(),
+                })
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configuration is locked"), "{error}");
+        assert!(error.contains("exit code 5"), "{error}");
+        assert!(error.contains("administrator"), "{error}");
+        assert_eq!(calls, 1);
+        assert!(!sandboxie.section_is_armed());
+    }
+
+    #[test]
+    fn denied_cleanup_keeps_container_journal_open_until_retry_succeeds() {
+        #[derive(Default)]
+        struct Journal(std::sync::Mutex<Vec<bool>>);
+        impl super::super::ContainmentJournal for Journal {
+            fn created(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
+                self.0.lock().unwrap().push(false);
+                Ok(())
+            }
+            fn closed(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
+                self.0.lock().unwrap().push(true);
+                Ok(())
+            }
+        }
+        let journal = std::sync::Arc::new(Journal::default());
+        let sandboxie = Sandboxie::new("S".into(), unique_box_name())
+            .with_journal(Some(journal.clone()))
+            .unwrap();
+        let mut calls = 0;
+        let error = sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], |_, _| {
+                calls += 1;
+                if calls == 1 {
+                    return Ok(CommandOutcome::success(b""));
+                }
+                Ok(CommandOutcome {
+                    success: false,
+                    code: Some(5),
+                    stdout: if calls == 2 {
+                        b"Edit denied".to_vec()
+                    } else {
+                        b"Cleanup denied".to_vec()
+                    },
+                    stderr: Vec::new(),
+                })
+            })
+            .unwrap_err()
+            .to_string();
+        sandboxie.notify_closed();
+        assert_eq!(calls, 3);
+        assert!(
+            error.contains("Edit denied") && error.contains("Cleanup denied"),
+            "{error}"
+        );
+        assert!(sandboxie.section_is_armed());
+        assert_eq!(*journal.0.lock().unwrap(), vec![false]);
+        sandboxie
+            .retry_clear_with_runner(|_, _| Ok(CommandOutcome::success(b"")))
+            .unwrap();
+        sandboxie.notify_closed();
+        assert!(!sandboxie.section_is_armed());
+        assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+    }
 
     #[derive(Clone, Copy)]
     enum FailureKind {

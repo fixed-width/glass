@@ -89,6 +89,19 @@ them. Pass other build-specific variables through `glass_start`'s existing `env`
 Contained clipboard availability follows the normal Windows containment provider; unavailable
 private clipboard support remains an explicit restriction.
 
+## Resolve a denied operation
+
+Glass respects Windows and Sandboxie access restrictions. A failed setup or task operation names
+the action and retains the available Windows error code. Failed Sandboxie configuration commands
+include their exit code and bounded output; each command has a five-second execution budget.
+Share the error with your administrator when the denial is unexpected. An access-denied error
+alone does not identify a particular organizational policy.
+
+Required setup or worker failures keep the separate environment unavailable. A containment failure
+refuses the application launch. Glass keeps the selected desktop and containment mode and does not
+weaken administrator restrictions. If cleanup or setting restoration is refused, its ownership
+records remain available for a later attempt after access is resolved.
+
 ## Stop, recover or disable
 
 ```powershell
@@ -137,6 +150,11 @@ desktop. Disabling startup and stopping the child also passed. A separate setup 
 that enabling and disabling Glass preserves a machine setting already enabled by an administrator.
 This does not qualify managed Sandboxie configuration restrictions or a standard console account
 without Remote Desktop logon rights.
+
+Representative denial checks cover rejected elevation, Sandboxie configuration and cleanup errors,
+and native Task Scheduler registration denied to a standard user in an isolated restricted folder.
+Checks preserve native diagnostics and incomplete cleanup without changing machine policies. These
+are failure-handling checks; an actual enterprise-managed device remains unqualified.
 
 On the same Windows 11 Pro host, a strict Sandboxie app survived a parent lock/unlock and an
 ordinary RDP disconnect/reconnect. Three input, fresh-capture and private-clipboard rounds passed
