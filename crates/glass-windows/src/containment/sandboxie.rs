@@ -485,16 +485,8 @@ impl Sandboxie {
 
     /// Run a Sandboxie CLI tool, mapping a spawn failure or non-zero exit to `Backend`.
     fn run_sbie(&self, exe: &str, args: &[&str]) -> Result<()> {
-        let status = Command::new(exe)
-            .args(args)
-            .status()
-            .map_err(|e| GlassError::Backend(format!("spawn {exe}: {e}")))?;
-        if !status.success() {
-            return Err(GlassError::Backend(format!(
-                "{exe} {args:?} failed with status {status}"
-            )));
-        }
-        Ok(())
+        let args: Vec<_> = args.iter().map(OsString::from).collect();
+        require_success(&mut run_command, OsStr::new(exe), &args).map_err(GlassError::Backend)
     }
 
     /// Configure the box for `level`: strict global gate first, then the policy `set` pairs,
@@ -969,6 +961,25 @@ mod tests {
         BoxAppend, CommandOutcome, Sandboxie, box_appends, box_name_for, closed_file_paths,
         mix_process_identity, unique_box_name, validate_closed_path,
     };
+
+    #[test]
+    fn clipboard_configuration_uses_the_same_command_diagnostics() {
+        let sandboxie = Sandboxie::new("unused".into(), "unused".into());
+        let executable = super::command_processor().unwrap();
+        let error = sandboxie
+            .run_sbie(
+                executable.to_str().unwrap(),
+                &[
+                    "/d",
+                    "/c",
+                    "echo clipboard-configuration-denied & exit /b 5",
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("clipboard-configuration-denied"), "{error}");
+        assert!(error.contains("exit code 5"), "{error}");
+    }
 
     #[test]
     fn stalled_configuration_helper_has_a_finite_wait() {
