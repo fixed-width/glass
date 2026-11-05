@@ -39,6 +39,8 @@ internal refactors, CI, or test-only changes.
 
 - Windows setup and Sandboxie failures retain native diagnostics and administrator guidance.
   Sandboxie configuration helpers have a finite wait.
+- Windows Sandboxie launches verify that required settings were saved, and cleanup verifies that
+  its configuration was removed. A successful helper exit alone no longer confirms either action.
 - Windows private-clipboard shutdown handles a race that could leave cleanup waiting for another
   pipe client.
 - Windows child-desktop shutdown waits for the verified helper's process handle to confirm exit,

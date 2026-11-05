@@ -32,6 +32,66 @@ use glass_core::logbuf::Stream;
 use glass_core::platform::{ProtectedHostPath, ProtectedHostPathKind};
 use glass_core::{AppSpec, Deadline, GlassError, Result, SandboxLevel};
 
+use super::configuration_file::{self, Section};
+
+trait ConfigurationAccess {
+    fn run(&mut self, exe: &OsStr, args: &[OsString]) -> std::io::Result<CommandOutcome>;
+    fn snapshot(&mut self, provider: &str, box_name: &str) -> Result<Section>;
+}
+
+struct NativeConfiguration;
+
+impl ConfigurationAccess for NativeConfiguration {
+    fn run(&mut self, exe: &OsStr, args: &[OsString]) -> std::io::Result<CommandOutcome> {
+        run_command(exe, args)
+    }
+    fn snapshot(&mut self, provider: &str, box_name: &str) -> Result<Section> {
+        configuration_file::read(provider, box_name)
+    }
+}
+
+fn require_values(
+    section: &Section,
+    key: &str,
+    values: &[String],
+) -> std::result::Result<(), String> {
+    if section.present
+        && section
+            .values
+            .get(&key.to_ascii_lowercase())
+            .is_some_and(|actual| actual == values)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Sandboxie did not apply the required {key} setting. Ask your administrator to review configuration access."
+        ))
+    }
+}
+
+fn require_configuration(
+    section: &Section,
+    level: SandboxLevel,
+    paths: &[ProtectedHostPath],
+) -> std::result::Result<(), String> {
+    for (key, value) in config::box_settings(level) {
+        require_values(section, key, &[value.into()])?;
+    }
+    let mut templates = Vec::new();
+    let mut closed = Vec::new();
+    for append in box_appends(level, paths) {
+        match append {
+            BoxAppend::Template(value) => templates.push(value.to_string_lossy().into_owned()),
+            BoxAppend::ClosedFilePath(value) => closed.push(value.to_string_lossy().into_owned()),
+        }
+    }
+    require_values(section, "Template", &templates)?;
+    if !closed.is_empty() {
+        require_values(section, "ClosedFilePath", &closed)?;
+    }
+    Ok(())
+}
+
 fn command_processor() -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     let mut directory = vec![0u16; 32768];
@@ -125,6 +185,9 @@ pub(crate) fn recover_owned_box(record: &super::BoxOwnership, deadline: Deadline
             String::new(),
         ],
     )?;
+    if configuration_file::read(&record.provider_dir, &record.box_name)?.present {
+        return Err(GlassError::SandboxUnavailable("Sandboxie retained the owned configuration after cleanup. Ask your administrator to review configuration access.".into()));
+    }
     // Recovery keeps crash logs and persistent box data for inspection; it never recursively
     // removes a path supplied by a state record or an application.
     Ok(())
@@ -360,22 +423,28 @@ pub(crate) struct Sandboxie {
     section_armed: AtomicBool,
     journal: Option<Arc<dyn super::ContainmentJournal>>,
     clipboard_dll: Option<String>,
+    configured_paths: std::sync::Mutex<Vec<ProtectedHostPath>>,
 }
 
 fn clear_box_section_with(
     dir: &str,
     box_name: &str,
-    runner: &mut impl FnMut(&OsStr, &[OsString]) -> std::io::Result<CommandOutcome>,
+    runner: &mut impl ConfigurationAccess,
 ) -> Result<()> {
     let args = ["set", box_name, "*", ""].map(OsString::from);
-    let outcome = runner(OsStr::new(&sbieini(dir)), &args).map_err(|error| {
-        GlassError::SandboxUnavailable(format!("clearing owned Sandboxie box section: {error}"))
-    })?;
+    let outcome = runner
+        .run(OsStr::new(&sbieini(dir)), &args)
+        .map_err(|error| {
+            GlassError::SandboxUnavailable(format!("clearing owned Sandboxie box section: {error}"))
+        })?;
     if !outcome.success {
         return Err(GlassError::SandboxUnavailable(format!(
             "clearing owned Sandboxie box section failed: {}",
             command_failure(&outcome)
         )));
+    }
+    if runner.snapshot(dir, box_name)?.present {
+        return Err(GlassError::SandboxUnavailable("Sandboxie retained the owned configuration after cleanup. Ask your administrator to review configuration access.".into()));
     }
     Ok(())
 }
@@ -383,7 +452,7 @@ fn clear_box_section_with(
 impl Drop for Sandboxie {
     fn drop(&mut self) {
         if self.section_armed.load(Ordering::Relaxed) {
-            let mut runner = run_command;
+            let mut runner = NativeConfiguration;
             if clear_box_section_with(&self.dir, &self.box_name, &mut runner).is_ok() {
                 self.section_armed.store(false, Ordering::Relaxed);
                 self.notify_closed();
@@ -402,6 +471,7 @@ impl Sandboxie {
             section_armed: AtomicBool::new(false),
             journal: None,
             clipboard_dll: None,
+            configured_paths: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -480,6 +550,10 @@ impl Sandboxie {
         if self.run_sbie(&start_exe(&self.dir), &["/reload"]).is_err() {
             return None;
         }
+        let observed = configuration_file::read(&self.dir, &self.box_name).ok()?;
+        for (key, value) in config::clip_layer2_lines(&self.box_name, &dll) {
+            require_values(&observed, &key, &[value]).ok()?;
+        }
         Some((store, server, pipe))
     }
 
@@ -501,7 +575,7 @@ impl Sandboxie {
         level: SandboxLevel,
         protected_paths: &[ProtectedHostPath],
     ) -> Result<()> {
-        let result = self.configure_with_runner(level, protected_paths, run_command);
+        let result = self.configure_with_runner(level, protected_paths, &mut NativeConfiguration);
         if result.is_err() {
             self.notify_closed();
         }
@@ -512,14 +586,18 @@ impl Sandboxie {
         &self,
         level: SandboxLevel,
         protected_paths: &[ProtectedHostPath],
-        mut runner: impl FnMut(&OsStr, &[OsString]) -> std::io::Result<CommandOutcome>,
+        runner: &mut impl ConfigurationAccess,
     ) -> Result<()> {
         let protected_paths = validate_protected_host_paths(protected_paths)?;
         let sbieini = sbieini(&self.dir);
+        let existing = runner.snapshot(&self.dir, &self.box_name)?;
+        if existing.present {
+            return Err(GlassError::SandboxUnavailable("The generated Sandboxie configuration name is already in use; the existing section was retained.".into()));
+        }
 
         if level == SandboxLevel::Strict {
             let args = ["query", "GlobalSettings", "PromptForInternetAccess"].map(OsString::from);
-            let outcome = match runner(OsStr::new(&sbieini), &args) {
+            let outcome = match runner.run(OsStr::new(&sbieini), &args) {
                 Ok(outcome) if outcome.success => outcome,
                 Ok(outcome) => {
                     return Err(self.configuration_failed(
@@ -527,13 +605,13 @@ impl Sandboxie {
                             "querying Sandboxie global network prompt setting failed: {}",
                             command_failure(&outcome)
                         ),
-                        &mut runner,
+                        runner,
                     ));
                 }
                 Err(error) => {
                     return Err(self.configuration_failed(
                         format!("querying Sandboxie global network prompt setting: {error}"),
-                        &mut runner,
+                        runner,
                     ));
                 }
             };
@@ -544,18 +622,30 @@ impl Sandboxie {
                 return Err(self.configuration_failed(
                     "Sandboxie global network prompt setting is incompatible with strict mode"
                         .into(),
-                    &mut runner,
+                    runner,
                 ));
             }
         }
 
-        clear_box_section_with(&self.dir, &self.box_name, &mut runner)?;
         self.section_armed.store(true, Ordering::Relaxed);
+        if let Err(error) = clear_box_section_with(&self.dir, &self.box_name, runner) {
+            if runner
+                .snapshot(&self.dir, &self.box_name)
+                .is_ok_and(|section| !section.present)
+            {
+                self.section_armed.store(false, Ordering::Relaxed);
+            }
+            return Err(error);
+        }
 
         for (key, value) in config::box_settings(level) {
             let args = ["set", &self.box_name, key, value].map(OsString::from);
-            if let Err(error) = require_success(&mut runner, OsStr::new(&sbieini), &args) {
-                return Err(self.configuration_failed(error, &mut runner));
+            if let Err(error) = require_success(
+                &mut |exe, args| runner.run(exe, args),
+                OsStr::new(&sbieini),
+                &args,
+            ) {
+                return Err(self.configuration_failed(error, runner));
             }
         }
 
@@ -570,22 +660,40 @@ impl Sandboxie {
                 OsString::from(key),
                 value,
             ];
-            if let Err(error) = require_success(&mut runner, OsStr::new(&sbieini), &args) {
-                return Err(self.configuration_failed(error, &mut runner));
+            if let Err(error) = require_success(
+                &mut |exe, args| runner.run(exe, args),
+                OsStr::new(&sbieini),
+                &args,
+            ) {
+                return Err(self.configuration_failed(error, runner));
             }
         }
 
         let args = [OsString::from("/reload")];
-        if let Err(error) = require_success(&mut runner, OsStr::new(&start_exe(&self.dir)), &args) {
-            return Err(self.configuration_failed(error, &mut runner));
+        if let Err(error) = require_success(
+            &mut |exe, args| runner.run(exe, args),
+            OsStr::new(&start_exe(&self.dir)),
+            &args,
+        ) {
+            return Err(self.configuration_failed(error, runner));
         }
+        let verified = runner
+            .snapshot(&self.dir, &self.box_name)
+            .map_err(|error| error.to_string())
+            .and_then(|section| require_configuration(&section, level, &protected_paths));
+        if let Err(error) = verified {
+            return Err(self.configuration_failed(error, runner));
+        }
+        *self.configured_paths.lock().map_err(|_| {
+            GlassError::SandboxUnavailable("Sandboxie configuration state is poisoned".into())
+        })? = protected_paths;
         Ok(())
     }
 
     fn configuration_failed(
         &self,
         original: String,
-        runner: &mut impl FnMut(&OsStr, &[OsString]) -> std::io::Result<CommandOutcome>,
+        runner: &mut impl ConfigurationAccess,
     ) -> GlassError {
         if !self.section_armed.load(Ordering::Relaxed) {
             return GlassError::SandboxUnavailable(original);
@@ -602,11 +710,8 @@ impl Sandboxie {
     }
 
     #[cfg(test)]
-    fn retry_clear_with_runner(
-        &self,
-        mut runner: impl FnMut(&OsStr, &[OsString]) -> std::io::Result<CommandOutcome>,
-    ) -> Result<()> {
-        clear_box_section_with(&self.dir, &self.box_name, &mut runner)?;
+    fn retry_clear_with_runner(&self, runner: &mut impl ConfigurationAccess) -> Result<()> {
+        clear_box_section_with(&self.dir, &self.box_name, runner)?;
         self.section_armed.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -619,7 +724,7 @@ impl Sandboxie {
     fn configure_logdir_with_runner(
         &self,
         logdir: &Path,
-        mut runner: impl FnMut(&OsStr, &[OsString]) -> std::io::Result<CommandOutcome>,
+        runner: &mut impl ConfigurationAccess,
     ) -> Result<()> {
         let args = [
             OsString::from("set"),
@@ -627,13 +732,34 @@ impl Sandboxie {
             OsString::from("OpenFilePath"),
             logdir.as_os_str().to_owned(),
         ];
-        if let Err(error) = require_success(&mut runner, OsStr::new(&sbieini(&self.dir)), &args) {
-            return Err(self.configuration_failed(error, &mut runner));
+        if let Err(error) = require_success(
+            &mut |exe, args| runner.run(exe, args),
+            OsStr::new(&sbieini(&self.dir)),
+            &args,
+        ) {
+            return Err(self.configuration_failed(error, runner));
         }
 
         let args = [OsString::from("/reload")];
-        if let Err(error) = require_success(&mut runner, OsStr::new(&start_exe(&self.dir)), &args) {
-            return Err(self.configuration_failed(error, &mut runner));
+        if let Err(error) = require_success(
+            &mut |exe, args| runner.run(exe, args),
+            OsStr::new(&start_exe(&self.dir)),
+            &args,
+        ) {
+            return Err(self.configuration_failed(error, runner));
+        }
+        let verified = runner
+            .snapshot(&self.dir, &self.box_name)
+            .map_err(|error| error.to_string())
+            .and_then(|section| {
+                require_values(
+                    &section,
+                    "OpenFilePath",
+                    &[logdir.to_string_lossy().into_owned()],
+                )
+            });
+        if let Err(error) = verified {
+            return Err(self.configuration_failed(error, runner));
         }
         Ok(())
     }
@@ -663,7 +789,24 @@ impl Sandboxie {
         })?;
 
         // Allow the box to write to the log dir on the host, then reload.
-        if let Err(error) = self.configure_logdir_with_runner(&logdir, run_command) {
+        if let Err(error) = self.configure_logdir_with_runner(&logdir, &mut NativeConfiguration) {
+            let _ = std::fs::remove_dir_all(&logdir);
+            return Err(error);
+        }
+
+        let verified = self
+            .configured_paths
+            .lock()
+            .map_err(|_| {
+                GlassError::SandboxUnavailable("Sandboxie configuration state is poisoned".into())
+            })
+            .and_then(|paths| {
+                let paths = validate_protected_host_paths(&paths)?;
+                let observed = configuration_file::read(&self.dir, &self.box_name)?;
+                require_configuration(&observed, spec.sandbox, &paths)
+                    .map_err(GlassError::SandboxUnavailable)
+            });
+        if let Err(error) = verified {
             let _ = std::fs::remove_dir_all(&logdir);
             return Err(error);
         }
@@ -918,7 +1061,7 @@ impl SandboxieApp {
                 Deadline::from_millis(1_000),
             )
             .is_ok_and(|pids| pids.is_empty());
-        let mut runner = run_command;
+        let mut runner = NativeConfiguration;
         let cleared = clear_box_section_with(&self.dir, &self.box_name, &mut runner);
         if let Err(error) = &cleared {
             eprintln!("glass: {error}");
@@ -961,6 +1104,19 @@ mod tests {
         BoxAppend, CommandOutcome, Sandboxie, box_appends, box_name_for, closed_file_paths,
         mix_process_identity, unique_box_name, validate_closed_path,
     };
+
+    #[derive(Default)]
+    struct Journal(std::sync::Mutex<Vec<bool>>);
+    impl super::super::ContainmentJournal for Journal {
+        fn created(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
+            self.0.lock().unwrap().push(false);
+            Ok(())
+        }
+        fn closed(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
+            self.0.lock().unwrap().push(true);
+            Ok(())
+        }
+    }
 
     #[test]
     fn clipboard_configuration_uses_the_same_command_diagnostics() {
@@ -1012,75 +1168,53 @@ mod tests {
     #[test]
     fn configuration_denial_keeps_stdout_diagnostic_and_stops_commands() {
         let sandboxie = Sandboxie::new("S".into(), "box".into());
-        let mut calls = 0;
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "*", ""],
+            FailureKind::Diagnostic("Access denied (5): Sandboxie configuration is locked"),
+        );
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |_, _| {
-                calls += 1;
-                Ok(CommandOutcome {
-                    success: false,
-                    code: Some(5),
-                    stdout: b"Access denied (5): Sandboxie configuration is locked".to_vec(),
-                    stderr: Vec::new(),
-                })
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err()
             .to_string();
         assert!(error.contains("configuration is locked"), "{error}");
         assert!(error.contains("exit code 5"), "{error}");
         assert!(error.contains("administrator"), "{error}");
-        assert_eq!(calls, 1);
+        assert_eq!(runner.commands.len(), 1);
         assert!(!sandboxie.section_is_armed());
     }
 
     #[test]
     fn denied_cleanup_keeps_container_journal_open_until_retry_succeeds() {
-        #[derive(Default)]
-        struct Journal(std::sync::Mutex<Vec<bool>>);
-        impl super::super::ContainmentJournal for Journal {
-            fn created(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
-                self.0.lock().unwrap().push(false);
-                Ok(())
-            }
-            fn closed(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
-                self.0.lock().unwrap().push(true);
-                Ok(())
-            }
-        }
         let journal = std::sync::Arc::new(Journal::default());
         let sandboxie = Sandboxie::new("S".into(), unique_box_name())
             .with_journal(Some(journal.clone()))
             .unwrap();
-        let mut calls = 0;
+        let mut runner = FakeRunner::default();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", &sandboxie.box_name, "Enabled", "y"],
+            FailureKind::Diagnostic("Edit denied"),
+        );
+        runner.fail_after_match(
+            r"S\SbieIni.exe",
+            &["set", &sandboxie.box_name, "*", ""],
+            FailureKind::Diagnostic("Cleanup denied"),
+        );
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |_, _| {
-                calls += 1;
-                if calls == 1 {
-                    return Ok(CommandOutcome::success(b""));
-                }
-                Ok(CommandOutcome {
-                    success: false,
-                    code: Some(5),
-                    stdout: if calls == 2 {
-                        b"Edit denied".to_vec()
-                    } else {
-                        b"Cleanup denied".to_vec()
-                    },
-                    stderr: Vec::new(),
-                })
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err()
             .to_string();
         sandboxie.notify_closed();
-        assert_eq!(calls, 3);
+        assert_eq!(runner.commands.len(), 3);
         assert!(
             error.contains("Edit denied") && error.contains("Cleanup denied"),
             "{error}"
         );
         assert!(sandboxie.section_is_armed());
         assert_eq!(*journal.0.lock().unwrap(), vec![false]);
-        sandboxie
-            .retry_clear_with_runner(|_, _| Ok(CommandOutcome::success(b"")))
-            .unwrap();
+        sandboxie.retry_clear_with_runner(&mut runner).unwrap();
         sandboxie.notify_closed();
         assert!(!sandboxie.section_is_armed());
         assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
@@ -1090,6 +1224,213 @@ mod tests {
     enum FailureKind {
         Spawn(io::ErrorKind),
         Status,
+        Diagnostic(&'static str),
+        Ignore,
+    }
+
+    #[test]
+    fn zero_exit_without_applied_updates_refuses_default_and_strict() {
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let sandboxie = Sandboxie::new("S".into(), "box".into());
+            let mut runner = FakeRunner {
+                ignore_updates: true,
+                ..Default::default()
+            };
+            let error = sandboxie
+                .configure_with_runner(level, &[], &mut runner)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Enabled") && error.contains("administrator"),
+                "{error}"
+            );
+            assert!(!sandboxie.section_is_armed());
+        }
+    }
+
+    #[test]
+    fn unverifiable_configuration_is_refused_before_any_mutation() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut runner = FakeRunner {
+            snapshot_denied: true,
+            ..Default::default()
+        };
+        assert!(
+            sandboxie
+                .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
+                .is_err()
+        );
+        assert!(runner.commands.is_empty());
+        assert!(!sandboxie.section_is_armed());
+    }
+
+    #[test]
+    fn preexisting_configuration_is_retained_without_adoption() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut runner = FakeRunner::default();
+        runner.configuration.present = true;
+        assert!(
+            sandboxie
+                .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
+                .is_err()
+        );
+        assert!(runner.commands.is_empty());
+        assert!(runner.configuration.present);
+    }
+
+    #[test]
+    fn each_required_boolean_is_read_back_even_when_every_command_succeeds() {
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            for (key, value) in super::config::box_settings(level) {
+                let sandboxie = Sandboxie::new("S".into(), "box".into());
+                let mut runner = FakeRunner::default();
+                runner.fail(
+                    r"S\SbieIni.exe",
+                    &["set", "box", key, value],
+                    FailureKind::Ignore,
+                );
+                let error = sandboxie
+                    .configure_with_runner(level, &[], &mut runner)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error
+                        .to_ascii_lowercase()
+                        .contains(&key.to_ascii_lowercase()),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_paths_and_templates_require_confirmed_persistence() {
+        let scratch = tempfile::tempdir().unwrap();
+        let paths = [ProtectedHostPath::directory(scratch.path())];
+        for (key, value) in [
+            ("Template", "SkipHook"),
+            ("ClosedFilePath", scratch.path().to_str().unwrap()),
+        ] {
+            let sandboxie = Sandboxie::new("S".into(), "box".into());
+            let mut runner = FakeRunner::default();
+            runner.fail(
+                r"S\SbieIni.exe",
+                &["append", "box", key, value],
+                FailureKind::Ignore,
+            );
+            let error = sandboxie
+                .configure_with_runner(SandboxLevel::Default, &paths, &mut runner)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error
+                    .to_ascii_lowercase()
+                    .contains(&key.to_ascii_lowercase()),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_exit_cleanup_keeps_ownership_until_the_section_is_absent() {
+        let journal = std::sync::Arc::new(Journal::default());
+        let sandboxie = Sandboxie::new("S".into(), "box".into())
+            .with_journal(Some(journal.clone()))
+            .unwrap();
+        let mut runner = FakeRunner::default();
+        sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
+            .unwrap();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "*", ""],
+            FailureKind::Ignore,
+        );
+        assert!(sandboxie.retry_clear_with_runner(&mut runner).is_err());
+        sandboxie.notify_closed();
+        assert!(sandboxie.section_is_armed());
+        assert_eq!(*journal.0.lock().unwrap(), vec![false]);
+        sandboxie.retry_clear_with_runner(&mut runner).unwrap();
+        sandboxie.notify_closed();
+        assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn unreadable_readback_does_not_confirm_cleanup() {
+        let journal = std::sync::Arc::new(Journal::default());
+        let sandboxie = Sandboxie::new("S".into(), "box".into())
+            .with_journal(Some(journal.clone()))
+            .unwrap();
+        let mut runner = FakeRunner::default();
+        sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
+            .unwrap();
+        runner.snapshot_denied = true;
+        assert!(sandboxie.retry_clear_with_runner(&mut runner).is_err());
+        sandboxie.notify_closed();
+        assert_eq!(*journal.0.lock().unwrap(), vec![false]);
+        runner.snapshot_denied = false;
+        sandboxie.retry_clear_with_runner(&mut runner).unwrap();
+        sandboxie.notify_closed();
+        assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn silently_ignored_log_access_is_refused_before_launch() {
+        let sandboxie = Sandboxie::new("S".into(), "box".into());
+        let mut runner = FakeRunner::default();
+        sandboxie
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
+            .unwrap();
+        runner.fail(
+            r"S\SbieIni.exe",
+            &["set", "box", "OpenFilePath", r"C:\logs"],
+            FailureKind::Ignore,
+        );
+        let error = sandboxie
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), &mut runner)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("OpenFilePath"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires Sandboxie; creates and removes only fresh owned configuration sections"]
+    fn onbox_configuration_readback_verifies_and_removes_owned_sections() {
+        let provider = std::env::var("GLASS_SANDBOXIE_DIR").expect("explicit test provider");
+        let actor = crate::desktop::ProcessIdentity::current().unwrap();
+        println!("READBACK_ACTOR {} {}", actor.sid, actor.session);
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let protected = tempfile::tempdir().unwrap();
+            let directory = protected.path().join("用户");
+            std::fs::create_dir(&directory).unwrap();
+            let paths = [ProtectedHostPath::directory(directory)];
+            let journal = std::sync::Arc::new(Journal::default());
+            let sandboxie = Sandboxie::new(provider.clone(), unique_box_name())
+                .with_journal(Some(journal.clone()))
+                .unwrap();
+            println!("OWNED_BOX {}", sandboxie.box_name);
+            sandboxie
+                .configure_with_paths(level, &paths)
+                .expect("actual persisted configuration must match");
+            let observed = super::configuration_file::read(&provider, &sandboxie.box_name).unwrap();
+            super::require_configuration(&observed, level, &paths).unwrap();
+            let logs = tempfile::tempdir().unwrap();
+            sandboxie
+                .configure_logdir_with_runner(logs.path(), &mut super::NativeConfiguration)
+                .unwrap();
+            if let Ok(dll) = std::env::var("GLASS_CLIP_SHIM_DLL") {
+                let sandboxie = sandboxie.with_clipboard_dll(Some(dll));
+                let clipboard = sandboxie
+                    .setup_private_clipboard()
+                    .expect("private clipboard settings must read back");
+                drop(clipboard);
+                drop(sandboxie);
+            } else {
+                drop(sandboxie);
+            }
+            assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+        }
     }
 
     #[derive(Clone)]
@@ -1105,6 +1446,9 @@ mod tests {
     struct FakeRunner {
         commands: Vec<(OsString, Vec<OsString>)>,
         failures: Vec<CommandFailure>,
+        configuration: super::Section,
+        ignore_updates: bool,
+        snapshot_denied: bool,
     }
 
     impl FakeRunner {
@@ -1143,7 +1487,28 @@ mod tests {
                 return match failure.kind {
                     FailureKind::Spawn(kind) => Err(io::Error::new(kind, "injected")),
                     FailureKind::Status => Ok(CommandOutcome::failure(b"injected status")),
+                    FailureKind::Diagnostic(message) => Ok(CommandOutcome {
+                        success: false,
+                        code: Some(5),
+                        stdout: message.as_bytes().to_vec(),
+                        stderr: Vec::new(),
+                    }),
+                    FailureKind::Ignore => Ok(CommandOutcome::success(b"")),
                 };
+            }
+            if !self.ignore_updates && args.len() >= 4 && (args[0] == "set" || args[0] == "append")
+            {
+                let key = args[2].to_string_lossy().to_ascii_lowercase();
+                if key == "*" {
+                    self.configuration = super::Section::default();
+                } else {
+                    self.configuration.present = true;
+                    let values = self.configuration.values.entry(key).or_default();
+                    if args[0] == "set" {
+                        values.clear();
+                    }
+                    values.push(args[3].to_string_lossy().into_owned());
+                }
             }
             Ok(CommandOutcome::success(
                 if args.first().is_some_and(|arg| arg == "query") {
@@ -1163,6 +1528,20 @@ mod tests {
                         .collect()
                 })
                 .collect()
+        }
+    }
+
+    impl super::ConfigurationAccess for FakeRunner {
+        fn run(&mut self, exe: &OsStr, args: &[OsString]) -> io::Result<CommandOutcome> {
+            FakeRunner::run(self, exe, args)
+        }
+        fn snapshot(&mut self, _: &str, _: &str) -> glass_core::Result<super::Section> {
+            if self.snapshot_denied {
+                return Err(glass_core::GlassError::SandboxUnavailable(
+                    "Configuration readback denied (os error 5)".into(),
+                ));
+            }
+            Ok(self.configuration.clone())
         }
     }
 
@@ -1279,7 +1658,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Strict, &[], |exe, args| runner.run(exe, args))
+            .configure_with_runner(SandboxLevel::Strict, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1300,7 +1679,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Strict, &[], |exe, args| runner.run(exe, args))
+            .configure_with_runner(SandboxLevel::Strict, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1322,9 +1701,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1354,9 +1731,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1385,9 +1760,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1414,9 +1787,7 @@ mod tests {
         let mut runner = FakeRunner::default();
 
         sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap();
 
         let arguments = runner.arguments();
@@ -1445,7 +1816,7 @@ mod tests {
         let mut runner = FakeRunner::default();
 
         sandboxie
-            .configure_with_runner(SandboxLevel::Strict, &[], |exe, args| runner.run(exe, args))
+            .configure_with_runner(SandboxLevel::Strict, &[], &mut runner)
             .unwrap();
 
         assert_eq!(
@@ -1476,9 +1847,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -1486,9 +1855,7 @@ mod tests {
         ));
         assert!(sandboxie.section_is_armed());
 
-        sandboxie
-            .retry_clear_with_runner(|exe, args| runner.run(exe, args))
-            .unwrap();
+        sandboxie.retry_clear_with_runner(&mut runner).unwrap();
         assert!(!sandboxie.section_is_armed());
         assert_eq!(runner.arguments().last(), Some(&clear_command()));
     }
@@ -1569,9 +1936,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1593,9 +1958,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &[], |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &[], &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1620,7 +1983,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1654,7 +2017,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1687,7 +2050,7 @@ mod tests {
         );
 
         let error = sandboxie
-            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1717,7 +2080,7 @@ mod tests {
         runner.fail(r"S\Start.exe", &["/reload"], FailureKind::Status);
 
         let error = sandboxie
-            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1746,7 +2109,7 @@ mod tests {
         let mut runner = FakeRunner::default();
 
         sandboxie
-            .configure_logdir_with_runner(Path::new(r"C:\logs"), |exe, args| runner.run(exe, args))
+            .configure_logdir_with_runner(Path::new(r"C:\logs"), &mut runner)
             .unwrap();
 
         assert_eq!(
@@ -1782,9 +2145,7 @@ mod tests {
         let mut runner = FakeRunner::default();
 
         let error = sandboxie
-            .configure_with_runner(SandboxLevel::Default, &paths, |exe, args| {
-                runner.run(exe, args)
-            })
+            .configure_with_runner(SandboxLevel::Default, &paths, &mut runner)
             .unwrap_err();
 
         assert!(matches!(
@@ -1838,9 +2199,7 @@ mod tests {
             let sandboxie = Sandboxie::new("S".into(), "box".into());
             let mut runner = FakeRunner::default();
             let error = sandboxie
-                .configure_with_runner(SandboxLevel::Default, &paths, |exe, args| {
-                    runner.run(exe, args)
-                })
+                .configure_with_runner(SandboxLevel::Default, &paths, &mut runner)
                 .unwrap_err();
             assert!(
                 matches!(error, glass_core::GlassError::SandboxUnavailable(_)),

@@ -67,6 +67,9 @@ mod clip_server;
 #[cfg(windows)]
 mod sandboxie;
 
+#[cfg(windows)]
+mod configuration_file;
+
 // On-box deterministic validation of the private-clipboard hook. Compiled only for the
 // Windows test profile; the tests inside are `#[ignore]`d (need Sandboxie + the built DLL).
 #[cfg(all(test, windows))]

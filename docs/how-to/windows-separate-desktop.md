@@ -97,6 +97,11 @@ include their exit code and bounded output; each command has a five-second execu
 Share the error with your administrator when the denial is unexpected. An access-denied error
 alone does not identify a particular organizational policy.
 
+Glass also reads back its required box settings before launch and checks that its owned section
+is absent before confirming configuration cleanup. Your account needs read access to Sandboxie's
+configured INI file for this verification. Unreadable, malformed or unapplied configuration
+produces an error; helper success alone does not establish that a change took effect.
+
 Required setup or worker failures keep the separate environment unavailable. A containment failure
 refuses the application launch. Glass keeps the selected desktop and containment mode and does not
 weaken administrator restrictions. If cleanup or setting restoration is refused, its ownership
