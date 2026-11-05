@@ -27,6 +27,10 @@ The child-session switch is machine-wide; Glass's saved desktop selection is per
 applications and the worker run unelevated. Setup does not enable network Remote Desktop access
 or change firewall rules. Glass preserves an already enabled setting when you later disable setup.
 
+A standard Windows account can use both desktop choices. If setup or restoration needs a machine
+setting changed, complete Windows' prompt with an administrator account. The resident, worker,
+per-user startup task and private state continue to belong to the signed-in standard account.
+
 Copy the **MCP endpoint** from Glass and register it as an HTTP MCP connection in your agent.
 Use the normal `glass_start`, capture, accessibility, input, logs and stop tools. Application stops
 and MCP client reconnects retain the authenticated desktop. Closing the Glass window hides it;
@@ -121,8 +125,18 @@ cursor and foreground application.
 Preview testing covers a local account on Windows 11 Pro with RDP and physical-console parents.
 The physical-console test exercised default and strict Sandboxie while the user typed and moved
 the mouse on the parent desktop. Checks covered file redirection, protected state access, private
-clipboard roundtrips and strict network denial. Windows Home, managed sign-in policies and
-non-admin setup still need qualification.
+clipboard roundtrips and strict network denial. Windows Home and managed policies still need
+qualification.
+
+A genuine standard account has also been checked with an RDP parent on that host. Default and
+strict Sandboxie apps passed input, capture, private-clipboard and protected-state checks in both
+desktop modes. Setup and restoration used another account's administrator credentials in Windows'
+native dialog; the resident, worker, tasks and private state retained the standard account's
+ownership. Actual Windows sign-out/sign-in started Glass quietly and reached Ready on the main
+desktop. Disabling startup and stopping the child also passed. A separate setup check confirmed
+that enabling and disabling Glass preserves a machine setting already enabled by an administrator.
+This does not qualify managed Sandboxie configuration restrictions or a standard console account
+without Remote Desktop logon rights.
 
 On the same Windows 11 Pro host, a strict Sandboxie app survived a parent lock/unlock and an
 ordinary RDP disconnect/reconnect. Three input, fresh-capture and private-clipboard rounds passed

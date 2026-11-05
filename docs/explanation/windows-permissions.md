@@ -9,17 +9,20 @@ core capabilities all work with no consent prompt and nothing to click:
 - **Input injection** (SendInput)
 - **The accessibility tree** (UI Automation)
 
-This is why Windows glass ships as a plain `glass-mcp.exe` with no onboarding flow: there is no grant
-for an onboarding flow to collect. `glass-mcp doctor` verifies *environment* facts (an interactive
-session, a supported Windows build, DPI awareness, containment), never a permission grant.
+Windows Glass ships as `glass-mcp.exe`. Its **Application setup…** flow chooses **On your desktop**
+or **Off your desktop…** and optional **Start with Windows**; it does not collect privacy grants.
+Separate-desktop setup can require Windows administrator approval for the machine-wide child-session
+setting and a native Windows sign-in. `glass-mcp doctor` verifies environment facts such as an
+interactive session, supported Windows build, DPI awareness and containment.
 
 ## What actually constrains access on Windows
 
 Three things gate what glass can reach — none of them a privacy-consent dialog.
 
-**The interactive session.** Only the active, logged-in *console* session composes a desktop that
-Windows.Graphics.Capture can grab. A process in **Session 0** — a Windows service, or a bare
-`ssh user@box` shell — has no rendering desktop, so capture has nothing to read. Run glass in a normal
+**The interactive session.** Capture and input need a usable signed-in desktop. Glass has been
+tested on console and RDP desktops and in its verified child session. A process in **Session 0** —
+a Windows service, or a bare `ssh user@box` shell — has no rendering desktop, so capture has nothing
+to read. Run glass in a normal
 logged-in session (the doctor's `interactive session` check reports this). See
 [how-to/setup-windows.md](../how-to/setup-windows.md).
 
@@ -29,8 +32,11 @@ logged-in session (the doctor's `interactive session` check reports this). See
 It also cannot capture the **secure desktop** that hosts UAC prompts, the lock screen, and
 Ctrl+Alt+Del. This is the closest thing Windows has to a "permission," but it is a launch-context
 relationship, not a consent grant: to drive an elevated app, run glass at the same (elevated) integrity
-so the two processes match. Most apps run at medium integrity, where the default works with no special
-handling.
+so the two processes match. The resident separate-desktop flow keeps application work unelevated;
+its setup helper changes only the machine setting after native approval. A standard account can
+supply a different administrator's credentials in Windows' dialog while retaining ownership of
+the resident, worker, private state and per-user tasks. Most apps run at medium integrity, where
+the default works with no special handling.
 
 **SmartScreen and Defender (distribution, not runtime).** These gate *installing* a downloaded binary,
 not *what a running binary may do*. The release `glass-mcp.exe` is Authenticode-signed (publisher: Fixed
