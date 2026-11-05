@@ -143,7 +143,8 @@ cursor and foreground application.
 Preview testing covers a local account on Windows 11 Pro with RDP and physical-console parents.
 The physical-console test exercised default and strict Sandboxie while the user typed and moved
 the mouse on the parent desktop. Checks covered file redirection, protected state access, private
-clipboard roundtrips and strict network denial. Windows Home still needs qualification.
+clipboard roundtrips and strict network denial. The new desktop-choice setup and child-session
+paths still need qualification on Windows Home.
 Managed-device compatibility depends on the administrator's controls; representative refusal
 behavior is covered below.
 
