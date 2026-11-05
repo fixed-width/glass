@@ -150,9 +150,10 @@ then recovered the old ownership records and prepared a fresh child after **Star
 and Windows sign-in. An app with strict containment then passed three rounds of input, fresh
 capture, private clipboard and protected-state checks in that child.
 
-Teardown exposed an intermittent process-query access error. Ownership records were retained,
-and a subsequent `desktop disable` completed setting restoration. This remains a known cleanup
-issue.
+An intermittent teardown process-query error was fixed by waiting on the verified helper's
+process handle before recording completion. Native handle tests, five finalizing-helper runs
+and a real **Stop Environment** check passed without a teardown retry. Identity-check failures
+and exit-wait timeouts still preserve incomplete cleanup instead of reporting success.
 
 An unavailable or failed environment returns its diagnostic instead of falling back to the user's
 desktop. RDP-to-console transfers are not part of setup or recovery.
