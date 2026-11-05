@@ -5,6 +5,52 @@ use std::sync::atomic::AtomicUsize;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED};
 use windows::Win32::System::Pipes::WaitNamedPipeW;
 
+#[test]
+fn shutdown_during_pipe_creation_does_not_wait_for_another_client() {
+    let name = format!("glass-shutdown-race-{}", std::process::id());
+    let path = format!(r"\\.\pipe\{name}");
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let worker_path = path.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        accept_loop(
+            &worker_path,
+            PrivateClipboard::new(),
+            worker_stop,
+            "unused".into(),
+            name,
+            || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        );
+        done_tx.send(()).unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    stop.store(true, Ordering::Relaxed);
+    release_tx.send(()).unwrap();
+    let finished = done_rx.recv_timeout(Duration::from_secs(1));
+    if finished.is_err() {
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    thread.join().unwrap();
+    assert!(
+        finished.is_ok(),
+        "shutdown needed an extra client after signaling stop"
+    );
+    assert_pipe_closed(&path);
+}
+
 fn start_server() -> ClipServer {
     static NEXT_PIPE: AtomicUsize = AtomicUsize::new(0);
     let name = format!(

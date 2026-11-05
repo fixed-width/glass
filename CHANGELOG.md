@@ -37,6 +37,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Windows private-clipboard shutdown handles a race that could leave cleanup waiting for another
+  pipe client.
 - Windows child-desktop shutdown waits for the verified helper's process handle to confirm exit,
   avoiding Access Denied errors from querying an asynchronously terminating process.
 - Windows sign-in startup preserves an existing Glass resident when signing in to its separate
