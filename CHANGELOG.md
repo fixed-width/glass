@@ -21,50 +21,18 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
-- Preview Windows application development on a separate local desktop. `glass-mcp desktop enable`
-  guides the one-time Windows setting change; application workers stay unelevated. Existing tools
-  retain the desktop across application stops, while `desktop status`, `show`, `hide`, `stop`,
-  `recover`, and `disable` provide inspection and lifecycle control. The desktop uses your Windows
-  account; application containment remains a separate setting.
-- A resident Windows tray app prepares and authenticates the development desktop before agent
-  work. Open it with `glass-mcp desktop open` or `serve --tray`, then connect to its HTTP endpoint.
-  Client reconnects retain the desktop; application requests return `environment_not_ready`
-  instead of opening Windows sign-in. Start, Stop, Show and Hide are available from Glass.
-- Windows Application setup now offers **On your desktop** and opt-in **Off your desktop…**
-  through the same resident HTTP endpoint. **Start with Windows** opens Glass quietly at sign-in;
-  off-desktop authentication remains an explicit **Start Environment…** step. Shared setup works
-  without child-session support, and operation names follow the macOS app.
+- Preview Windows development on a separate desktop, so agents can work without interrupting you.
+  The system tray app provides guided setup, optional startup at sign-in and an HTTP MCP endpoint.
+  You can also choose **On your desktop**, including on Windows Home. See the
+  [Windows setup guide](docs/how-to/windows-separate-desktop.md).
 
 ### Fixed
 
-- Windows child-desktop cancellation records the authenticated child before teardown and retains
-  incomplete cleanup when its identity cannot be verified. Starting an application no longer
-  imposes a two-minute limit on its build.
-- Windows contained launches preserve relative working directories and application environment
-  overrides, including the caller's PATH on a separate desktop. Rejected launches remove their
-  temporary logs so subsequent starts can reuse the environment.
-- Windows Application setup follows desktop choice, environment preparation and agent connection
-  in order, then opens a compact Ready view. Fast main-desktop checks advance without a flashing
-  loader; startup preferences and their errors stay separate from environment readiness.
-- Windows Application setup disables **Off your desktop…** with an explanation when required
-  Remote Desktop hosting is unavailable or cannot be verified. Setup refuses before changing
-  Windows settings or opening sign-in; **On your desktop** remains available.
-- Windows setup and Sandboxie failures retain native diagnostics and administrator guidance.
-  Sandboxie configuration helpers have a finite wait.
-- Windows Sandboxie launches verify that required settings were saved, and cleanup verifies that
-  its configuration was removed. A successful helper exit alone no longer confirms either action.
-- Windows private-clipboard shutdown handles a race that could leave cleanup waiting for another
-  pipe client.
-- Windows child-desktop shutdown waits for the verified helper's process handle to confirm exit,
-  avoiding Access Denied errors from querying an asynchronously terminating process.
-- Windows sign-in startup preserves an existing Glass resident when signing in to its separate
-  desktop, avoiding a duplicate resident and a misleading startup error inside the child session.
-- Windows child-desktop connections enable the native client-side credentials dialog when authentication needs user input; passwords stay in Windows' sign-in UI.
-- A timed-out Windows child-desktop startup can finish cleanup when the host has already removed its stop event, without abandoning a host stalled in final COM disposal.
-- Windows Sandboxie launches now work from long directories, including a separate desktop's private state directory, while preserving the application's working directory. An inaccessible application directory stops the wrapper before launching the app.
-- Repeated Windows capability probes no longer retain a capture factory after its WinRT apartment closes, preventing a crash when retrying a failed probe.
-- Windows contained launches keep the helper command window hidden, so it no longer obstructs
-  applications or causes semantic pointer actions to refuse valid targets as unmapped popovers.
+- Windows Sandboxie apps now honor environment overrides, launch from long working directories,
+  and avoid extra command windows.
+- Windows Sandboxie reports settings that are blocked or fail to apply.
+- Stopping a Windows contained app no longer hangs during private clipboard cleanup.
+- Repeated Windows capability checks no longer crash Glass.
 
 ## [1.9.0] - 2026-11-01
 
