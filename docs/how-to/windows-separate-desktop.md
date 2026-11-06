@@ -147,10 +147,15 @@ cursor and foreground application.
 Preview testing covers a local account on Windows 11 Pro with RDP and physical-console parents.
 The physical-console test exercised default and strict Sandboxie while the user typed and moved
 the mouse on the parent desktop. Checks covered file redirection, protected state access, private
-clipboard roundtrips and strict network denial. The new desktop-choice setup and child-session
-paths still need qualification on Windows Home.
+clipboard roundtrips and strict network denial.
 Managed-device compatibility depends on the administrator's controls; representative refusal
 behavior is covered below.
+
+Windows 11 Home (build 26300.9711) passed main-desktop setup and actual sign-in startup. The
+off-desktop choice is disabled with an explanation based on Windows' hosting entitlement; CLI
+enable refuses before creating setup state or opening Windows consent. An older saved separate
+choice keeps Start disabled and can be explicitly changed back to main-desktop Ready. These
+checks cover the new setup boundaries, rather than qualifying a working child session on Home.
 
 A genuine standard account has also been checked with an RDP parent on that host. Default and
 strict Sandboxie apps passed input, capture, private-clipboard and protected-state checks in both
