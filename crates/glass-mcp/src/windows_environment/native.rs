@@ -392,11 +392,13 @@ pub fn command(command: DesktopCommand) -> Result<()> {
         current.session != 0,
         "run this desktop action from your signed-in Windows desktop"
     );
+    if matches!(command, DesktopCommand::Enable) {
+        glass_windows::desktop::child_desktop_available()?;
+    }
     let base = base()?;
     let _configuration_lock = lock_configuration(&base)?;
     match command {
         DesktopCommand::Enable => {
-            glass_windows::desktop::child_desktop_available()?;
             runtime::require_payload()?;
             let mut value = base
                 .read::<Configuration>("configuration.json")?
