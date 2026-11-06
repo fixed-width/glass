@@ -8,9 +8,9 @@ using System.Windows.Forms;
 
 public sealed class TrayStatus {
     public uint version;
-    public string instance,phase,detail,endpoint,mode;
+    public string instance,phase,detail,endpoint,mode,separate_detail;
     public ulong acknowledged;
-    public bool busy,ready,closing,can_start,start_with_windows,preparing;
+    public bool busy,ready,closing,can_start,start_with_windows,preparing,separate_available;
 }
 public sealed class TrayOptions { public uint version; public string instance; public bool hidden; }
 public sealed class OpenRequest { public uint version; public string instance,request; }
@@ -24,6 +24,7 @@ internal sealed class TrayWindow : Form {
     readonly Label heading=new Label(),currentMode=new Label(),notice=new Label();
     readonly TextBox endpoint=new TextBox();
     readonly RadioButton onDesktop=new RadioButton(),offDesktop=new RadioButton();
+    readonly Label separateHint=new Label();
     readonly CheckBox startup=new CheckBox();
     readonly Button apply=new Button(),start=new Button(),stop=new Button(),show=new Button(),hide=new Button();
     readonly ToolStripMenuItem menuStart=new ToolStripMenuItem("Start Environment…"),
@@ -49,8 +50,8 @@ internal sealed class TrayWindow : Form {
         onDesktop.Text="On your desktop";onDesktop.AutoSize=true;onDesktop.SetBounds(16,25,500,26);onDesktop.Checked=true;
         var shared=new Label { Text="Use visible windows. Glass can move your pointer, change focus and type.",AutoSize=false };shared.SetBounds(40,53,510,35);
         offDesktop.Text="Off your desktop…";offDesktop.AutoSize=true;offDesktop.SetBounds(16,92,500,26);
-        var separate=new Label { Text="Use a separate Windows desktop with your Windows account. Requires setup and sign-in.",AutoSize=false };separate.SetBounds(40,120,510,38);
-        choices.Controls.AddRange(new Control[]{onDesktop,shared,offDesktop,separate});
+        separateHint.SetBounds(40,120,510,38);
+        choices.Controls.AddRange(new Control[]{onDesktop,shared,offDesktop,separateHint});
         startup.Text="Start with Windows";startup.AutoSize=true;startup.SetBounds(24,349,330,26);
         onDesktop.CheckedChanged+=(sender,args)=>{if(!syncing)editing=true;};
         offDesktop.CheckedChanged+=(sender,args)=>{if(!syncing)editing=true;};
@@ -128,7 +129,12 @@ internal sealed class TrayWindow : Form {
     void UpdateButtons(){
         bool idle=status!=null && sequence==status.acknowledged && !status.busy;
         bool separate=status!=null && status.mode=="separate";
-        onDesktop.Enabled=offDesktop.Enabled=startup.Enabled=apply.Enabled=idle;
+        onDesktop.Enabled=startup.Enabled=idle;
+        offDesktop.Enabled=idle && status.separate_available;
+        apply.Enabled=idle && (onDesktop.Checked || (offDesktop.Checked && offDesktop.Enabled));
+        separateHint.Text=status==null ? "Checking availability…" : status.separate_available
+            ? "Use a separate Windows desktop with your Windows account. Requires setup and sign-in."
+            : status.separate_detail ?? "Off your desktop is unavailable. Choose On your desktop.";
         start.Visible=stop.Visible=show.Visible=hide.Visible=separate;
         menuStart.Visible=menuStop.Visible=menuShow.Visible=menuHide.Visible=separate;
         start.Enabled=menuStart.Enabled=idle && !status.ready && status.can_start;

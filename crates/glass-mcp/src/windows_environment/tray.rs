@@ -51,6 +51,8 @@ struct Status<'a> {
     mode: Option<DesktopMode>,
     start_with_windows: bool,
     preparing: bool,
+    separate_available: bool,
+    separate_detail: Option<&'a str>,
 }
 
 fn validate_request(request: &Request, instance: &str, acknowledged: u64) -> Result<()> {
@@ -236,6 +238,8 @@ pub async fn run(
             mode: manager.mode()?,
             start_with_windows: false,
             preparing: false,
+            separate_available: false,
+            separate_detail: None,
         },
     )?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -274,6 +278,10 @@ fn action_task(
             Action::Configure => {
                 let mode = mode.context("Choose where applications run")?;
                 let wanted = wanted_startup.context("Choose the Start with Windows preference")?;
+                if mode == DesktopMode::Separate {
+                    tokio::task::spawn_blocking(glass_windows::desktop::child_desktop_available)
+                        .await??;
+                }
                 if manager.mode()? != Some(mode) {
                     manager.close_admission();
                     server.stop_from_desktop_ui().await?;
@@ -310,6 +318,16 @@ struct Controls {
     settings: startup::Settings,
 }
 
+async fn separate_desktop_error() -> Option<String> {
+    match tokio::task::spawn_blocking(glass_windows::desktop::child_desktop_available).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(error) => Some(format!(
+            "Off-desktop availability could not be checked: {error}"
+        )),
+    }
+}
+
 async fn control(
     root: &Root,
     launch: &Launch,
@@ -324,6 +342,7 @@ async fn control(
         settings,
     } = controls;
     let mut acknowledged = 0;
+    let mut separate_error = separate_desktop_error().await;
     let mut phase = "Not ready".to_owned();
     let mut detail =
         "Open Application setup to choose On your desktop or Off your desktop.".to_owned();
@@ -353,8 +372,9 @@ async fn control(
             ),
         ));
     } else if manager.mode()? == Some(DesktopMode::Separate) {
-        detail =
-            "Choose Start Environment… and complete any Windows sign-in before agent work.".into();
+        detail = separate_error.clone().unwrap_or_else(|| {
+            "Choose Start Environment… and complete any Windows sign-in before agent work.".into()
+        });
     }
     let mut quitting = false;
     let mut ui_gone = false;
@@ -375,6 +395,7 @@ async fn control(
             if pending.as_ref().is_some_and(|(_,task)|task.is_finished()) {
                 let (action,task)=pending.take().context("pending application setup operation")?;
                 let result=task.await.context("application setup operation failed")?;
+                if action==Action::Refresh {separate_error=separate_desktop_error().await;}
                 if action==Action::Stop && quitting {
                     if result.is_ok(){break;}
                     if ui_gone{return result.map(|_|());}
@@ -427,10 +448,12 @@ async fn control(
             let preparing=matches!(pending,Some((Action::Start,_)));
             let displayed=if preparing {preparation_phase().unwrap_or_else(||phase.clone())}else{phase.clone()};
             if server_failed {phase="Needs attention".into();detail="The MCP server stopped. Quit Glass and open it again.".into();}
+            let mode=manager.mode()?;
             root.write("status.json",&Status {
                 version:1,instance:&launch.instance,acknowledged,phase:if server_failed{"Needs attention"}else{&displayed},
                 detail:&detail,endpoint,busy:pending.is_some(),ready:manager.ready().unwrap_or(false),
-                can_start:!server_failed && !quitting,closing:false,mode:manager.mode()?,start_with_windows,preparing,
+                can_start:!server_failed && !quitting && (mode!=Some(DesktopMode::Separate) || separate_error.is_none()),closing:false,mode,start_with_windows,preparing,
+                separate_available:separate_error.is_none(),separate_detail:separate_error.as_deref(),
             })?;
         }
         Ok(())

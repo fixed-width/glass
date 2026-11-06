@@ -37,6 +37,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Windows Application setup disables **Off your desktop…** with an explanation when required
+  Remote Desktop hosting is unavailable or cannot be verified. Setup refuses before changing
+  Windows settings or opening sign-in; **On your desktop** remains available.
 - Windows setup and Sandboxie failures retain native diagnostics and administrator guidance.
   Sandboxie configuration helpers have a finite wait.
 - Windows Sandboxie launches verify that required settings were saved, and cleanup verifies that

@@ -1,10 +1,12 @@
 //! Native identity and transport primitives for an owned Windows desktop.
 
+mod availability;
 mod identity;
 mod pipe;
 mod probe;
 mod settings;
 
+pub use availability::{child_desktop_available, rdp_host_licensed};
 pub use identity::RuntimeApartment;
 pub use identity::protect_stdio_inheritance;
 pub use identity::signal_control;

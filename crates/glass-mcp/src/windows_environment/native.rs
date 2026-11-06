@@ -195,6 +195,9 @@ impl Manager {
 
     #[cfg(feature = "network")]
     pub fn choose_mode(&self, mode: DesktopMode) -> Result<()> {
+        if mode == DesktopMode::Separate {
+            glass_windows::desktop::child_desktop_available()?;
+        }
         self.close_admission();
         self.shutdown(Deadline::from_millis(30_000))?;
         let mut value = configuration()?;
@@ -263,6 +266,7 @@ impl Manager {
             self.mode()? == Some(DesktopMode::Separate),
             "Choose On your desktop or Off your desktop in Application setup first"
         );
+        glass_windows::desktop::child_desktop_available()?;
         let previous = self
             .runtime
             .lock()
@@ -392,8 +396,8 @@ pub fn command(command: DesktopCommand) -> Result<()> {
     let _configuration_lock = lock_configuration(&base)?;
     match command {
         DesktopCommand::Enable => {
+            glass_windows::desktop::child_desktop_available()?;
             runtime::require_payload()?;
-            glass_windows::desktop::rdp_control_available()?;
             let mut value = base
                 .read::<Configuration>("configuration.json")?
                 .unwrap_or_default();
@@ -563,7 +567,8 @@ fn status(json: bool) -> Result<()> {
         glass_windows::desktop::child_sessions_enabled().map_err(|error| error.to_string());
     let control =
         glass_windows::desktop::rdp_control_available().map_err(|error| error.to_string());
-    let report = serde_json::json!({"configured":value.enabled,"setup_pending":value.setup_pending,"setting_before":value.setting_before,"owns_setting":value.owns_setting,"parent_session":current.session,"interactive_parent":current.session!=0,"helper_packaged":runtime::require_payload().is_ok(),"child_sessions_enabled":setting,"rdp_control":control,"environments":environments});
+    let hosting = glass_windows::desktop::rdp_host_licensed().map_err(|error| error.to_string());
+    let report = serde_json::json!({"configured":value.enabled,"setup_pending":value.setup_pending,"setting_before":value.setting_before,"owns_setting":value.owns_setting,"parent_session":current.session,"interactive_parent":current.session!=0,"helper_packaged":runtime::require_payload().is_ok(),"child_sessions_enabled":setting,"rdp_control":control,"rdp_host_licensed":hosting,"environments":environments});
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -579,6 +584,11 @@ fn status(json: bool) -> Result<()> {
         );
         if current.session == 0 {
             println!("Start it from a signed-in Windows desktop.");
+        }
+        match hosting {
+            Ok(true) => println!("Remote Desktop hosting: available"),
+            Ok(false) => println!("Remote Desktop hosting: unavailable; choose On your desktop."),
+            Err(error) => eprintln!("Remote Desktop hosting availability: {error}"),
         }
         for environment in report["environments"]
             .as_array()

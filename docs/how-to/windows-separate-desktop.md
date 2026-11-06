@@ -7,7 +7,9 @@ containment level separately; a child desktop does not provide a separate-accoun
 The distributed Windows executable includes its desktop host. Setup does not compile code or
 import a type library on your machine. It uses Windows' installed Remote Desktop control and
 .NET Framework. Availability is checked through Windows APIs and actual startup, without an
-edition-name allowlist.
+edition-name allowlist. **Off your desktop…** requires Windows to license Remote Desktop hosting.
+Application setup disables that choice with a reason when the feature is unavailable or cannot
+be checked. **On your desktop** remains available, including on Windows Home.
 
 ## Prepare the desktop before agent work
 
@@ -67,6 +69,8 @@ glass-mcp desktop status --json
 Status is read-only: it does not start a desktop, show a sign-in dialog or change Windows settings.
 It distinguishes configuration from the live owner and worker. Disabled functionality is not
 reported as proof that your Windows edition lacks it.
+The hosting-entitlement result is separate from that enabled setting and from the installed
+RDP client control. A present client or a successfully enabled switch does not establish support.
 
 Windows may start other programs inside the child. A covering window can prevent an input action
 from reaching its target. Inspect the child from the Windows logon that owns it:
