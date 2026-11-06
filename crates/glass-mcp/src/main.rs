@@ -9,6 +9,24 @@ use glass_mcp::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    match cli.command {
+        Some(Command::WindowsDesktopWorker { root, instance }) => {
+            return glass_mcp::windows_environment::run_worker(&root, &instance);
+        }
+        Some(Command::WindowsDesktopSetting { action }) => {
+            std::process::exit(glass_windows::desktop::setting_action_exit_code(matches!(
+                action,
+                glass_mcp::windows_environment::SettingAction::Enable
+            )) as i32)
+        }
+        Some(Command::Desktop { command }) => {
+            return glass_mcp::windows_environment::command(command);
+        }
+        _ => {}
+    }
+    #[cfg(windows)]
+    glass_mcp::windows_environment::set_requested_mode(cli.desktop)?;
     #[cfg(target_os = "macos")]
     match cli.command {
         Some(Command::MacosWorker { owner }) => {
@@ -54,6 +72,15 @@ async fn main() -> anyhow::Result<()> {
     // Resolve (and OPEN, fail-closed) the audit sink only in the serving arms below —
     // never for doctor/env/gen-token, so those never create the audit file as a side effect.
     match cli.command {
+        #[cfg(windows)]
+        Some(
+            Command::WindowsDesktopWorker { .. }
+            | Command::WindowsDesktopSetting { .. }
+            | Command::Desktop { .. },
+        ) => anyhow::bail!(
+            "internal Windows command was not dispatched before server initialization"
+        ),
+
         #[cfg(target_os = "macos")]
         Some(
             Command::MacosWorker { .. }
@@ -118,10 +145,47 @@ async fn main() -> anyhow::Result<()> {
             addr,
             token_file,
             menubar,
+            tray,
+            startup,
         }) => {
             #[cfg(feature = "network")]
             {
-                if menubar {
+                #[cfg(not(windows))]
+                let _ = startup;
+                if tray {
+                    #[cfg(windows)]
+                    {
+                        let startup_token_file = token_file
+                            .clone()
+                            .map(std::path::PathBuf::from)
+                            .map(std::fs::canonicalize)
+                            .transpose()?;
+                        let mut argv = vec!["--http".to_string()];
+                        if let Some(addr) = addr {
+                            argv.extend(["--addr".into(), addr]);
+                        }
+                        if let Some(path) = token_file {
+                            argv.extend(["--token-file".into(), path]);
+                        }
+                        let mut cfg = glass_mcp::serve::config::parse_args(
+                            &argv,
+                            std::env::var("GLASS_TOKEN").ok(),
+                            |p| std::fs::read_to_string(p),
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        cfg.tool_profile = tool_profile;
+                        cfg.trace = trace;
+                        glass_mcp::windows_environment::tray::run(
+                            cfg,
+                            audit_log.as_deref(),
+                            startup,
+                            startup_token_file,
+                        )
+                        .await
+                    }
+                    #[cfg(not(windows))]
+                    anyhow::bail!("--tray is Windows-only")
+                } else if menubar {
                     // The visible menu-bar app (macOS only) — `menubar::run` binds and
                     // serves (see menubar.rs). Reuse `serve::config::parse_args` (the
                     // "single source of truth" resolver `serve::run` itself delegates to
@@ -175,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "network"))]
             {
-                let _ = (http, addr, token_file, menubar, &audit_log);
+                let _ = (http, addr, token_file, menubar, tray, startup, &audit_log);
                 anyhow::bail!(
                     "`serve` (the network transport) is not included in this build; it \
                      requires the default-on `network` feature, which a \

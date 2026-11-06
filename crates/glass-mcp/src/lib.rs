@@ -384,6 +384,27 @@ fn default_baseline_dir() -> std::path::PathBuf {
 
 /// Build the `Glass` session manager, installing the audit sink if one is configured.
 pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
+    #[cfg(windows)]
+    return boot_with_desktop(
+        audit,
+        std::sync::Arc::new(windows_environment::Manager::new()),
+    );
+    #[cfg(not(windows))]
+    boot_inner(audit)
+}
+
+#[cfg(windows)]
+pub(crate) fn boot_with_desktop(
+    audit: Option<Box<dyn glass_core::AuditSink>>,
+    desktop: std::sync::Arc<windows_environment::Manager>,
+) -> Glass {
+    boot_inner(audit, desktop)
+}
+
+fn boot_inner(
+    audit: Option<Box<dyn glass_core::AuditSink>>,
+    #[cfg(windows)] desktop: std::sync::Arc<windows_environment::Manager>,
+) -> Glass {
     let raw = std::env::var("GLASS_BACKEND").ok();
     let default = default_backend(raw.as_deref()).to_string();
     if backend_env_unrecognized(raw.as_deref()) {
@@ -427,11 +448,26 @@ pub fn boot(audit: Option<Box<dyn glass_core::AuditSink>>) -> Glass {
             &sim_factory,
         )
     });
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
     let platform_factory: glass_core::PlatformFactory =
         Box::new(move |b| make_platform(b, &reg_factory, &agents_factory, &a11y_factory));
+    #[cfg(windows)]
+    let desktop_factory = std::sync::Arc::clone(&desktop);
+    #[cfg(windows)]
+    let platform_factory: glass_core::PlatformFactory = Box::new(move |backend| {
+        if backend == "windows" {
+            return desktop_factory.backend();
+        }
+        make_platform(backend, &reg_factory, &agents_factory, &a11y_factory)
+    });
     let mut glass = Glass::new(platform_factory, default, baselines, 10_000);
     glass.set_shutdown_hook(Box::new(move |deadline| {
+        #[cfg(windows)]
+        if let Err(error) = desktop.shutdown(deadline)
+            && !deadline.has_passed()
+        {
+            eprintln!("glass: Windows desktop shutdown incomplete: {error:#}");
+        }
         glass_android::hand_the_device_back(&a11y, &agents, &registry, deadline);
         // Not under the deadline: it does not wait (see `request_shutdown_all`).
         #[cfg(target_os = "macos")]
@@ -896,7 +932,7 @@ mod tests {
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(any(windows, target_os = "macos", all(test, unix)))]
 mod backend_worker;
 #[cfg(target_os = "macos")]
 pub mod macos_worker;
@@ -904,8 +940,10 @@ pub mod macos_worker;
 pub mod native_backend;
 #[cfg(target_os = "macos")]
 mod permission_journal;
-#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg(any(windows, target_os = "macos", all(test, unix)))]
 mod remote_backend;
+#[cfg(any(windows, test))]
+pub mod windows_environment;
 #[cfg(target_os = "macos")]
 mod workspace_permissions;
 

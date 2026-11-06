@@ -18,6 +18,11 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
+    /// Windows desktop used by application tools. Separate requires desktop enable setup.
+    #[cfg(windows)]
+    #[arg(long, global = true, value_enum)]
+    pub desktop: Option<crate::windows_environment::DesktopMode>,
+
     /// Append a JSONL audit log of every actuation to PATH (also GLASS_AUDIT_LOG).
     /// Opt-in; off when unset. Content redacted by default
     /// (GLASS_AUDIT_CONTENT=none|redacted|full, GLASS_AUDIT_PREFIX_LEN=N).
@@ -39,6 +44,26 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsDesktopWorker {
+        #[arg(long)]
+        root: std::path::PathBuf,
+        #[arg(long)]
+        instance: String,
+    },
+    #[cfg(windows)]
+    #[command(hide = true)]
+    WindowsDesktopSetting {
+        #[arg(value_enum)]
+        action: crate::windows_environment::SettingAction,
+    },
+    /// Configure, inspect, or stop the local separate Windows desktop.
+    #[cfg(windows)]
+    Desktop {
+        #[command(subcommand)]
+        command: crate::windows_environment::DesktopCommand,
+    },
     #[cfg(target_os = "macos")]
     #[command(hide = true)]
     MacosWorker { owner: u32 },
@@ -124,6 +149,12 @@ pub enum Command {
         /// MCP on a background thread while an NSStatusItem shows it is running.
         #[arg(long)]
         menubar: bool,
+        /// Run the resident Windows system-tray app. Implies --http.
+        #[arg(long, conflicts_with = "menubar")]
+        tray: bool,
+        /// Open a configured Windows tray quietly after sign-in.
+        #[arg(long, requires = "tray")]
+        startup: bool,
     },
     /// Generate a bearer token for the network transport.
     GenToken {
@@ -260,6 +291,21 @@ mod tests {
     }
 
     #[test]
+    fn tray_implies_a_resident_mode_and_cannot_combine_with_menubar() {
+        assert!(matches!(
+            Cli::try_parse_from(["glass-mcp", "serve", "--tray"])
+                .unwrap()
+                .command,
+            Some(Command::Serve {
+                tray: true,
+                http: false,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["glass-mcp", "serve", "--tray", "--menubar"]).is_err());
+    }
+
+    #[test]
     fn doctor_flags_parse() {
         let cli = Cli::try_parse_from(["glass-mcp", "doctor", "--deep", "--json"]).unwrap();
         assert!(matches!(
@@ -341,11 +387,15 @@ mod tests {
                 addr,
                 token_file,
                 menubar,
+                tray,
+                startup,
             }) => {
                 assert!(http);
                 assert_eq!(addr.as_deref(), Some("0.0.0.0:7300"));
                 assert_eq!(token_file.as_deref(), Some("/t"));
                 assert!(!menubar, "menubar defaults to false");
+                assert!(!tray, "tray defaults to false");
+                assert!(!startup, "startup defaults to false");
             }
             other => panic!("expected serve, got {other:?}"),
         }

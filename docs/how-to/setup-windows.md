@@ -4,6 +4,9 @@ The Windows backend drives apps on the **interactive desktop** (Windows.Graphics
 UI Automation), so run it in a normal logged-in session — not a non-interactive service / Session 0.
 It is the default backend on a Windows host, so no `env` block is needed to select it.
 
+The resident system-tray app offers **On your desktop** and opt-in **Off your desktop…** through
+the same HTTP MCP endpoint. Off-desktop details are in the [preview guide](windows-separate-desktop.md).
+
 ## System requirements
 
 Windows 10 or 11, x86-64. Nothing else to install to *run* the binary: `glass-mcp.exe` statically
@@ -70,10 +73,32 @@ remedy.
 
 ## Connect and test
 
-[Register glass with your agent](connect-an-agent.md) over stdio, restart the agent, then ask it
-something like:
+Open Application setup from your signed-in Windows desktop:
+
+```powershell
+glass-mcp desktop open
+```
+
+Choose where applications run, then click **Continue setup**:
+
+- **On your desktop** uses visible windows and can move your pointer, change focus and type.
+  It needs no child session, administrator consent or second sign-in. Containment remains available.
+- **Off your desktop…** uses a separate Windows desktop with your Windows account. Choose
+  **Start Environment…** and complete the required Windows setup and sign-in before agent work.
+  A failed off-desktop environment never switches onto your desktop automatically.
+
+**Start with Windows** opens Glass in the system tray when you sign in. On-desktop mode checks
+readiness automatically. Off-desktop mode waits for **Start Environment…**. This preference can
+be changed later from **Application setup…**. Closing the setup window hides it; **Quit Glass**
+stops the resident server and its owned work.
+
+Wait for **Ready**, then [register its HTTP endpoint with your agent](connect-an-agent.md#over-http).
+The default URL is `http://127.0.0.1:7300/`, and changing desktop choice keeps that URL. For example,
+ask your agent:
 
 > "Use glass to launch `charmap.exe` and take a screenshot."
+
+Direct stdio remains available for shared-desktop compatibility using `--desktop shared`.
 
 Use a classic single-process app like `charmap` or `mspaint` for a first test — some packaged Store
 apps (including the Windows 11 `notepad`) launch out-of-process and hand off, which glass sees as the

@@ -259,6 +259,26 @@ pub fn checks(_deep: bool) -> Vec<Check> {
     build_checks(&gather_facts())
 }
 
+/// Check a signed-in desktop without creating or activating a readiness window.
+#[cfg(windows)]
+pub fn shared_desktop_ready() -> glass_core::Result<()> {
+    let facts = gather_facts();
+    if matches!(facts.session, SessionKind::Session0) {
+        return Err(glass_core::GlassError::Backend(
+            "Open Glass from your signed-in Windows desktop".into(),
+        ));
+    }
+    match facts.wgc_supported {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(glass_core::GlassError::Unsupported(
+            "Windows graphics capture is unavailable on this desktop".into(),
+        )),
+        Err(error) => Err(glass_core::GlassError::Backend(format!(
+            "Windows graphics capture check failed: {error:?}"
+        ))),
+    }
+}
+
 /// Windows sandbox section for the doctor (pure mapping + the host probes).
 #[cfg(windows)]
 pub fn sandbox_checks() -> Vec<Check> {
@@ -390,12 +410,7 @@ fn gather_session() -> SessionKind {
 /// Whether Windows.Graphics.Capture is usable on this system (the real capability gate).
 ///
 /// Successful answers are cached; failed probes are retried on the next call.
-/// `IsSupported` activates a WinRT runtime class on
-/// whatever thread calls it, and doing that on a borrowed thread that later exits faults with
-/// `STATUS_ACCESS_VIOLATION`: `cargo test --workspace` on Windows crashed the `glass-mcp` test
-/// binary about half the time, libtest giving each test its own short-lived thread. Caching alone
-/// does not fix it — one activation on a borrowed thread is enough — so the apartment is
-/// initialized and torn down here, on a thread whose lifetime is bounded by the `join` below.
+/// Each probe owns its WinRT apartment and factory; neither survives the probe thread.
 #[cfg(windows)]
 fn gather_wgc() -> Result<bool, ProbeFailure> {
     static SUPPORTED: Mutex<Option<bool>> = Mutex::new(None);
@@ -424,25 +439,27 @@ fn gather_wgc_with(
 /// Runs only on the owned thread created by [`gather_wgc_with`].
 #[cfg(windows)]
 fn probe_wgc() -> Result<bool, ProbeFailure> {
-    use windows::Graphics::Capture::GraphicsCaptureSession;
-    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Graphics::Capture::IGraphicsCaptureSessionStatics;
+    use windows::Win32::System::WinRT::RoGetActivationFactory;
+    use windows::core::{HSTRING, Interface};
 
-    struct Apartment;
-    impl Drop for Apartment {
-        fn drop(&mut self) {
-            // SAFETY: constructed only after successful CoInitializeEx on this same thread;
-            // balances S_OK and S_FALSE, including when the probe unwinds.
-            unsafe { CoUninitialize() };
-        }
+    let _apartment = crate::desktop::RuntimeApartment::initialize()
+        .map_err(|error| ProbeFailure::Failed(error.to_string()))?;
+    // The generated static accessor caches a factory past apartment teardown. Keep this one local.
+    // SAFETY: the runtime is initialized, and this typed factory drops before its apartment.
+    let factory: IGraphicsCaptureSessionStatics = unsafe {
+        RoGetActivationFactory(&HSTRING::from(
+            "Windows.Graphics.Capture.GraphicsCaptureSession",
+        ))
     }
-
-    // SAFETY: initializes COM on our owned probe thread; no borrowed pointers.
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-        .ok()
-        .map_err(|e| ProbeFailure::Failed(format!("CoInitializeEx: {e}")))?;
-    let _apartment = Apartment;
-    GraphicsCaptureSession::IsSupported()
-        .map_err(|e| ProbeFailure::Failed(format!("GraphicsCaptureSession::IsSupported: {e}")))
+    .map_err(|error| ProbeFailure::Failed(format!("activate capture support probe: {error}")))?;
+    let mut supported = false;
+    // SAFETY: the live typed interface owns this vtable, and its boolean output remains valid.
+    unsafe { (factory.vtable().IsSupported)(factory.as_raw(), &mut supported) }
+        .map(|| supported)
+        .map_err(|error| {
+            ProbeFailure::Failed(format!("GraphicsCaptureSession::IsSupported: {error}"))
+        })
 }
 
 /// Port of the validated PMv2 probe: classify the thread's DPI-awareness context.
@@ -493,6 +510,15 @@ fn gather_build() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn native_capture_probe_releases_its_factory_before_each_apartment_ends() {
+        for _ in 0..8 {
+            // Failures are valid in SSH/session 0; every retry must remain a safe native call.
+            let _ = std::thread::spawn(probe_wgc).join().expect("probe thread");
+        }
+    }
 
     fn wgc_check(wgc_supported: Result<bool, ProbeFailure>) -> Check {
         build_checks(&DoctorFacts {

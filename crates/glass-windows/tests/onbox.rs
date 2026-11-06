@@ -1119,6 +1119,165 @@ fn onbox_egui_set_value_honesty() {
 
 #[test]
 #[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
+fn onbox_sandboxed_semantic_pointer() {
+    use glass_core::{ActionMode, SemanticState};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    dpi_aware_once();
+    for sandbox in [
+        glass_core::SandboxLevel::Default,
+        glass_core::SandboxLevel::Strict,
+    ] {
+        let mut glass = glass_windows_with_a11y();
+        glass
+            .start(&egui_fixture_spec(sandbox))
+            .expect("launch contained fixture");
+        let windows = glass.list_windows().expect("contained app windows");
+        eprintln!("[sandbox semantic pointer] {sandbox:?}: {windows:?}");
+        assert!(
+            windows.iter().any(|window| window.active),
+            "app window must remain visible"
+        );
+        assert!(
+            windows
+                .iter()
+                .all(|window| window.class.as_deref() != Some("ConsoleWindowClass")),
+            "the launch.cmd helper must not expose a console: {windows:?}"
+        );
+
+        let cursor = log_cursor(&mut glass);
+        glass
+            .click_target(&glass_core::ClickTargetParams {
+                target: glass_core::ActionTarget::Semantic(semantic_target(
+                    AxRole::Button,
+                    "Semantic Save",
+                    vec![SemanticState::Enabled, SemanticState::Visible],
+                )),
+                mode: ActionMode::Pointer,
+                timeout_ms: Some(5_000),
+                max_nodes: None,
+            })
+            .expect("semantic pointer click in the contained app");
+        await_exact_log_count(&mut glass, cursor, "[fixture] semantic_save", 1);
+        glass.stop().expect("stop contained fixture");
+    }
+}
+
+#[test]
+#[ignore = "on-box only: needs an interactive session, Sandboxie and rustc"]
+fn onbox_sandboxed_long_working_directory() {
+    use glass_windows::containment::{BoxOwnership, ContainmentJournal};
+
+    struct Journal;
+    impl ContainmentJournal for Journal {
+        fn created(&self, record: &BoxOwnership) -> glass_core::Result<()> {
+            eprintln!("OWNED_CWD_BOX={}", record.box_name);
+            Ok(())
+        }
+        fn closed(&self, record: &BoxOwnership) -> glass_core::Result<()> {
+            eprintln!("CLOSED_CWD_BOX={}", record.box_name);
+            Ok(())
+        }
+    }
+    struct RestoreDirectory(std::path::PathBuf);
+    impl Drop for RestoreDirectory {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).expect("restore test working directory");
+        }
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    dpi_aware_once();
+    let scratch = tempfile::tempdir().expect("cwd probe scratch");
+    let caller = scratch.path().join("caller".repeat(24));
+    let project = scratch.path().join("project".repeat(21));
+    std::fs::create_dir_all(&caller).expect("long caller directory");
+    std::fs::create_dir_all(&project).expect("long application directory");
+    assert!(caller.as_os_str().len() > 128 && project.as_os_str().len() > 128);
+    let sentinel = caller.join("protected.txt");
+    std::fs::write(&sentinel, "private test sentinel").expect("protected sentinel");
+    let fixture = scratch.path().join("cwd-probe.exe");
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cwd_probe.rs");
+    assert!(
+        std::process::Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(source)
+            .arg("-o")
+            .arg(&fixture)
+            .status()
+            .expect("compile cwd probe")
+            .success()
+    );
+    let _restore = RestoreDirectory(std::env::current_dir().expect("original cwd"));
+    std::env::set_current_dir(&caller).expect("enter long caller cwd");
+    for sandbox in [
+        glass_core::SandboxLevel::Default,
+        glass_core::SandboxLevel::Strict,
+    ] {
+        for requested in [None, Some(project.clone())] {
+            let mut platform = WindowsPlatform::new()
+                .expect("Windows backend")
+                .with_containment_journal(Arc::new(Journal));
+            if requested.is_some() {
+                platform
+                    .configure_protected_host_paths(&[glass_core::ProtectedHostPath::directory(
+                        &caller,
+                    )])
+                    .expect("protect caller state directory");
+            }
+            let expected = requested.as_ref().unwrap_or(&caller);
+            platform
+                .start_app(&AppSpec {
+                    run: vec![
+                        fixture.to_string_lossy().into_owned(),
+                        sentinel.to_string_lossy().into_owned(),
+                    ],
+                    cwd: requested.clone(),
+                    sandbox,
+                    timeout_ms: 10_000,
+                    window_hint: Some(WindowHint {
+                        title: Some("Glass Sandboxie cwd probe".into()),
+                        class: None,
+                    }),
+                    ..charmap_spec()
+                })
+                .expect("boxed probe must launch despite long inherited cwd");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut observed = Vec::new();
+            loop {
+                observed.extend(platform.drain_logs().into_iter().map(|(_, line)| line));
+                if observed.iter().any(|line| line == "sandboxie_loaded=true")
+                    && (requested.is_none()
+                        || observed
+                            .iter()
+                            .any(|line| line == "protected_read_denied=true"))
+                    && observed
+                        .iter()
+                        .any(|line| line == &format!("cwd={}", expected.display()))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "boxed cwd observation missing: {observed:?}"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if requested.is_some() {
+                assert!(
+                    observed
+                        .iter()
+                        .any(|line| line == "protected_read_denied=true"),
+                    "caller protection weakened: {observed:?}"
+                );
+            }
+            platform.stop_app().expect("close owned boxed probe");
+        }
+    }
+}
+
+#[test]
+#[ignore = "on-box only: needs the interactive desktop session + builds the egui fixture"]
 fn onbox_semantic_actions() {
     use glass_core::{
         ActionMethod, ActionMode, ActionTarget, ActionabilityCheckName, ActionabilityVerdict,

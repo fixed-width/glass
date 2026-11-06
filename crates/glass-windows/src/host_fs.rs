@@ -116,6 +116,25 @@ pub fn file_matches_path_no_reparse(file: &File, path: &Path) -> Result<bool, Ho
     Ok(file_identity(file)? == file_identity(&current)?)
 }
 
+/// Verify the path of a retained directory without accepting a regular file or a reparse target.
+pub fn directory_matches_path_no_reparse(
+    directory: &File,
+    path: &Path,
+) -> Result<bool, HostFsError> {
+    directory_matches_path(directory, path)
+}
+
+/// Read a regular-file child together with its owner/DACL, without delete authority.
+pub fn open_file_child_readonly(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
+    use windows::Win32::Storage::FileSystem::READ_CONTROL;
+    open_relative_with_access(
+        directory,
+        filename,
+        Some(false),
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | READ_CONTROL,
+    )
+}
+
 /// Opens a generated regular-file child through the retained handle after confirming path identity,
 /// so directory renames cannot redirect lookup.
 pub fn open_file_beneath(
@@ -129,6 +148,20 @@ pub fn open_file_beneath(
 /// Opens one single-component directory child relative to a retained directory handle.
 pub fn open_directory_beneath(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
     open_relative(directory, filename, Some(true))
+}
+
+/// Traverse an existing directory without requesting delete authority over a shared ancestor.
+pub fn open_directory_child_readonly(
+    directory: &File,
+    filename: &OsStr,
+) -> Result<File, HostFsError> {
+    use windows::Win32::Storage::FileSystem::READ_CONTROL;
+    open_relative_with_access(
+        directory,
+        filename,
+        Some(true),
+        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE | READ_CONTROL,
+    )
 }
 
 /// Opens one single-component regular-file child relative to a retained directory handle.
@@ -515,6 +548,100 @@ fn open_file_beneath_with_hook(
 
 fn open_relative_file(directory: &File, filename: &OsStr) -> Result<File, HostFsError> {
     open_relative(directory, filename, Some(false))
+}
+
+/// Create a new private child through the retained parent, without following a path or reparse point.
+pub fn create_private_child(
+    parent: &File,
+    filename: &OsStr,
+    directory: bool,
+) -> glass_core::Result<File> {
+    use windows::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_DIRECTORY_FILE};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    if !valid_child_name(filename) {
+        return Err(GlassError::Backend("invalid private child name".into()));
+    }
+    let owner = with_current_user_sid(|sid| {
+        let mut text = PWSTR::null();
+        // SAFETY: the token-owned SID remains live; conversion allocates the returned string.
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }
+            .map_err(|error| backend_error("private child owner", error))?;
+        // SAFETY: this terminated LocalAlloc string is converted and freed exactly once.
+        unsafe {
+            let result = text
+                .to_string()
+                .map_err(|error| backend_error("private child owner text", error.into()));
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+            result
+        }
+    })?;
+    let sddl = wide_text(&format!("O:{owner}{PRIVATE_DACL}"));
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the terminated SDDL and descriptor output stay live through conversion.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| backend_error("private child security", error))?;
+    let mut name = filename.encode_wide().collect::<Vec<_>>();
+    let length = name
+        .len()
+        .checked_mul(2)
+        .and_then(|value| u16::try_from(value).ok());
+    let result = (|| {
+        let length =
+            length.ok_or_else(|| GlassError::Backend("private child name too long".into()))?;
+        let name = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: PWSTR(name.as_mut_ptr()),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: HANDLE(parent.as_raw_handle()),
+            ObjectName: &name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: descriptor.0.cast(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut handle = HANDLE::default();
+        let mut status = IO_STATUS_BLOCK::default();
+        // SAFETY: all referenced storage is live, the parent is retained, and FILE_CREATE cannot
+        // replace an existing entry. The security descriptor applies at creation, before access.
+        unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_ALL_ACCESS,
+                &attributes,
+                &mut status,
+                None,
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_CREATE,
+                (if directory {
+                    FILE_DIRECTORY_FILE
+                } else {
+                    FILE_NON_DIRECTORY_FILE
+                }) | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT,
+                None,
+                0,
+            )
+            .ok()
+            .map_err(|error| backend_error("create private child", error))?;
+        }
+        // SAFETY: successful creation returned this new, exclusively owned handle.
+        Ok(unsafe { File::from_raw_handle(handle.0) })
+    })();
+    // SAFETY: this descriptor is the LocalAlloc allocation returned above.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    result
 }
 
 fn open_relative(

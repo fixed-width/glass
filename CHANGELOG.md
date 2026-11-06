@@ -19,6 +19,21 @@ internal refactors, CI, or test-only changes.
 
 ## [Unreleased]
 
+### Added
+
+- Preview Windows development on a separate desktop, so agents can work without interrupting you.
+  The system tray app provides guided setup, optional startup at sign-in and an HTTP MCP endpoint.
+  You can also choose **On your desktop**, including on Windows Home. See the
+  [Windows setup guide](docs/how-to/windows-separate-desktop.md).
+
+### Fixed
+
+- Windows Sandboxie apps now honor environment overrides, launch from long working directories,
+  and avoid extra command windows.
+- Windows Sandboxie reports settings that are blocked or fail to apply.
+- Stopping a Windows contained app no longer hangs during private clipboard cleanup.
+- Repeated Windows capability checks no longer crash Glass.
+
 ## [1.9.0] - 2026-11-01
 
 ### Added

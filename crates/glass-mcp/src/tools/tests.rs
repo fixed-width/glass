@@ -17,6 +17,28 @@ fn start_args() -> StartArgs {
     }
 }
 
+#[test]
+fn unprepared_environment_returns_a_setup_action_before_app_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut glass = glass_core::Glass::new(
+        Box::new(|_| Err(glass_core::GlassError::EnvironmentNotReady.before_dispatch())),
+        "test".into(),
+        glass_core::BaselineStore::new(directory.path()),
+        10,
+    );
+    let error = start(&mut glass, &start_args()).unwrap_err();
+    let value = structured_error(&error, "glass_start");
+    assert_eq!(value["error"]["code"], "environment_not_ready");
+    assert!(
+        value["error"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Application setup")
+    );
+    assert_eq!(value["result"]["dispatch"], "not_dispatched");
+    assert_eq!(value["result"]["side_effects_may_have_occurred"], false);
+}
+
 fn structured_error(output: &ToolOutput, tool: &str) -> serde_json::Value {
     let blocks = output.render_text_blocks();
     let envelope: serde_json::Value =

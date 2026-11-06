@@ -64,7 +64,7 @@ impl ClipServer {
         let path_t = pipe_path.clone();
         let thread = std::thread::Builder::new()
             .name(format!("glass-clip:{pipe_name}"))
-            .spawn(move || accept_loop(&path_t, store, stop_t, dir, box_name))
+            .spawn(move || accept_loop(&path_t, store, stop_t, dir, box_name, || {}))
             .map_err(|e| GlassError::Backend(format!("spawn clip server: {e}")))?;
         Ok(ClipServer {
             pipe_path,
@@ -153,6 +153,7 @@ fn accept_loop(
     stop: Arc<AtomicBool>,
     dir: String,
     box_name: String,
+    mut before_create: impl FnMut(),
 ) {
     let wide = to_wide(pipe_path);
     let (sa, psd) = match make_security() {
@@ -164,6 +165,7 @@ fn accept_loop(
     // are stable within a session).
     let mut pids: (Instant, Vec<u32>) = (Instant::now(), Vec::new());
     while !stop.load(Ordering::Relaxed) {
+        before_create();
         use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         // SAFETY: classic CreateNamedPipeW; `wide` is NUL-terminated; sa points at a live SD.
         let pipe = unsafe {
@@ -183,6 +185,10 @@ fn accept_loop(
         }
         // SAFETY: CreateNamedPipeW returned a valid new handle, transferred to its sole owner.
         let pipe = unsafe { OwnedHandle::from_raw_handle(pipe.0) };
+        // Shutdown's self-connect can miss an instance that has not been created yet.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         // SAFETY: blocks until a client connects (or our self-poke in stop()).
         // A client that connects in the gap between CreateNamedPipeW and
         // ConnectNamedPipe makes the call return FALSE + ERROR_PIPE_CONNECTED —

@@ -449,21 +449,33 @@ fn snapshot_covers_the_declared_linux_roles() {
 /// with `a11y: true` once cost a constant ~25s — the app's startup probe of
 /// `org.freedesktop.portal.Desktop` triggered a D-Bus activation on the private session bus
 /// that never replied, so the window did not map until the 25s reply timeout elapsed. The
-/// private bus now declares no auto-activatable services, so the launch is fast. `timeout_ms`
-/// is left generous here (a regressed hang would complete within it) so the timing assertion —
-/// a coarse tripwire, not a perf gate — is what catches the regression. The 20s threshold sits
-/// above `PrivateBus::start`'s own worst-case bring-up budget (READY_TIMEOUT + resolve ≈ 15s),
-/// so a merely-slow-but-healthy bus can't trip it, yet stays well below the ~25s hang. The
-/// snapshot check proves a11y is still functional, not merely fast.
+/// private bus now declares no auto-activatable services, so the launch is fast. Prepare Xvfb
+/// before timing: its own readiness timeout and retry do not indicate a portal hang. The 20s
+/// launch limit remains above the private bus's ~15s bring-up budget and below the ~25s hang.
+/// The snapshot check proves a11y is still functional, not merely fast.
 #[test]
 #[ignore = "needs session bus + AT-SPI registry + GTK4 fixture; run via scripts/test-a11y.sh"]
 fn a11y_launch_is_fast_without_the_portal_hang() {
+    let xvfb = glass_x11::Xvfb::start("1280x800x24").expect("prepare private display");
+    let display = xvfb.display.clone();
+    let factory: PlatformFactory = Box::new(move |_backend| {
+        Ok(Backend {
+            platform: Box::new(glass_x11::X11Platform::connect(Some(&display))?),
+            accessibility: Some(Box::new(glass_a11y_linux::LinuxA11y::new())),
+        })
+    });
+    let baselines = tempfile::tempdir().expect("private baselines");
+    let mut glass = Glass::new(
+        factory,
+        "x11".into(),
+        BaselineStore::new(baselines.path()),
+        100,
+    );
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/a11y_fixture.py"
     );
     let started = std::time::Instant::now();
-    let mut glass = glass_x11_with_a11y();
     glass
         .start(&AppSpec {
             build: None,

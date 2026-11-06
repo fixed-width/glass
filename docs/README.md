@@ -19,6 +19,7 @@ way it does? The explanations.
 
 - [Linux](how-to/setup-linux.md) — X11 and Wayland
 - [Windows](how-to/setup-windows.md)
+- [Use a separate Windows desktop](how-to/windows-separate-desktop.md) — preview, same account
 - [macOS](how-to/setup-macos.md)
 - [Audit and manually manage macOS account setup](how-to/audit-macos-account-setup.md)
 - [Android](how-to/setup-android.md) — an AVD emulator, from any host

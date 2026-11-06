@@ -6,9 +6,18 @@ generic JSON config. For the verified-host list and what glass needs from a host
 [Host compatibility](../reference/host-compatibility.md). There are two transports — pick by how
 glass is running.
 
-- If glass runs on the **same machine** as your agent (the Linux and Windows default), use **stdio**.
-- If glass runs as a **network server** (the macOS menu-bar LaunchAgent, or the agent and app on
-  different machines), use **HTTP**.
+- If your client launches the binary directly (the Linux default or Windows shared-desktop
+  compatibility), use **stdio**.
+- If glass runs as a **resident desktop app** (the macOS menu-bar app or Windows system-tray
+  tray app), or the agent and app run on different machines, use **HTTP**.
+
+For the [Windows separate-desktop preview](windows-separate-desktop.md), open Glass with
+`glass-mcp desktop open`, choose **Off your desktop…** in Application setup, then **Start Environment…**,
+and wait for **Ready**. **On your desktop** uses the same tray app and HTTP URL. Register its
+HTTP URL even when the agent runs on that same PC. The agent connects to the running tray app;
+it does not launch another Glass process or handle Windows sign-in. The saved URL remains the same
+across desktop starts and MCP client reconnects. A stdio-only client needs a relay; the current
+Windows tray implementation does not include one.
 
 Once connected, your agent has the tools in [reference/tools.md](../reference/tools.md); run the
 `glass_doctor` tool to confirm the environment is ready. To have your agent drive glass well from the
@@ -24,7 +33,7 @@ Register the binary; your client spawns it and talks over stdin/stdout.
 claude mcp add glass --scope user -- /absolute/path/to/glass-mcp
 ```
 
-On Windows, point at the `.exe`:
+For Windows shared-desktop operation, point at the `.exe`:
 
 ```powershell
 claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
@@ -64,6 +73,12 @@ override a default — the specific variables are in [reference/environment.md](
 ## Over HTTP
 
 When glass runs as a network server (`glass-mcp serve --http`), register its URL instead of a command.
+The Windows tray app (`glass-mcp desktop open` or `serve --tray`) serves the same HTTP transport.
+
+Start Glass before connecting the agent. If Glass is not running, the connection fails; start it
+and reconnect or reload the MCP connection as required by your client. If the Windows tray is
+running but its desktop is not prepared, MCP connects and application requests return
+`environment_not_ready` until you complete preparation in Glass.
 
 **Claude Code:**
 

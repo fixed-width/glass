@@ -15,7 +15,7 @@
 //!
 //! ## Actions
 //!
-//! "Quit glass" uses AppKit's built-in `terminate:` routed through the responder chain to
+//! "Quit Glass" uses AppKit's built-in `terminate:` routed through the responder chain to
 //! `NSApp`. "Copy endpoint", "Restart", and "Uninstall glass…" are wired to a minimal custom
 //! [`MenuTarget`] (an `objc2` `define_class!` object) that invokes the boxed callbacks the host
 //! supplied. `setTarget:` is a *weak* reference, so the retained `MenuTarget` (and the status
@@ -169,7 +169,7 @@ pub fn show_error(title: &str, detail: &str) -> Result<()> {
 
 /// Run the menu-bar app: install the status item + menu and block the main thread on the
 /// AppKit run loop. Returns only if the run loop stops without the process exiting (a user
-/// "Quit glass" terminates the process directly via `terminate:`).
+/// "Quit Glass" terminates the process directly via `terminate:`).
 ///
 /// Fails fast with [`GlassError::Backend`] if called off the main thread — the one
 /// precondition this crate can enforce; everything else (the status item appearing, the menu
@@ -239,16 +239,16 @@ pub fn run_with_quit(actions: MenuBarActions, on_quit: Option<Box<dyn Fn()>>) ->
 
     // 4. Quit glass — nil target lets the responder chain deliver `terminate:` to `NSApp`.
     let quit_item = if target.ivars().on_quit.is_some() {
-        action_item(mtm, "Quit glass", sel!(quit:), "q", Some(&target))
+        action_item(mtm, "Quit Glass", sel!(quit:), "q", Some(&target))
     } else {
-        action_item(mtm, "Quit glass", sel!(terminate:), "q", None)
+        action_item(mtm, "Quit Glass", sel!(terminate:), "q", None)
     };
     menu.addItem(&quit_item);
 
     // 5. Uninstall glass… — routed to our custom target. The trailing ellipsis is the macOS
     // convention for "opens a dialog first": the host confirms (and warns it stops glass now)
     // before removing the LaunchAgent, so a stray click can't uninstall. A separator sets it
-    // apart from "Quit glass" above, matching macOS HIG for destructive items.
+    // apart from "Quit Glass" above, matching macOS HIG for destructive items.
     let sep3 = NSMenuItem::separatorItem(mtm);
     menu.addItem(&sep3);
 

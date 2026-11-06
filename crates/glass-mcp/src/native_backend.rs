@@ -66,6 +66,7 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
                             input: glass_core::InputCapabilities::unknown(),
                             app_pid: None,
                             window: None,
+                            window_handle: None,
                             scope_basis: None,
                             coverage: glass_core::AxStateCoverage::NONE,
                         };

@@ -34,6 +34,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_SANDBOX_FLOOR` | Operator-enforced minimum containment level; raises an omitted request, refuses an explicit one below it | `off` (no floor) | all |
 | `GLASS_ARTIFACT_DIR` | Absolute artifact cache-root override; relative paths are rejected | Linux: `$XDG_CACHE_HOME/glass/artifacts`, falling back to `~/.cache/glass/artifacts`; macOS: `~/Library/Caches/glass/artifacts`; Windows: `%LOCALAPPDATA%\glass\artifacts` | all |
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
+| `GLASS_WINDOWS_DESKTOP_STATE_DIR` | Private local directory for Windows desktop configuration and ownership records; changing its path does not grant isolation authority | Local application data under `fixedwidth/glass` | Windows |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
 | `GLASS_CLIP_SHIM_DLL` | Private-clipboard shim DLL (`glass_clip_shim_windows.dll`) injected into a Sandboxie-boxed app | next to `glass-mcp`, else Layer-2 clipboard isolation is unavailable | Windows |
