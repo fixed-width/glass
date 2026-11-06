@@ -303,7 +303,7 @@ internal sealed class TrayWindow : Form {
         editDesktop.Enabled=windowSetup.Enabled=menuSetup.Enabled=idle;
         heading.Text=daily ? "Glass" : "Application setup";Text=daily ? "Glass" : "Glass — Application setup";
         string error=localError;
-        if(String.IsNullOrEmpty(error) && ready && status.phase=="Needs attention" && status.detail!=status.startup_error)error=status.detail;
+        if(String.IsNullOrEmpty(error) && status!=null && !preparing && status.phase=="Needs attention" && status.detail!=status.startup_error)error=status.detail;
         notice.Text=error??"";notice.Visible=!String.IsNullOrEmpty(error);
         desktop.Visible=preparation.Visible=connection.Visible=!daily;operating.Visible=daily;
         desktop.Display(choosing ? 1 : 2,!choosing && status!=null ? ModeName(status.mode) : "",choosing);
