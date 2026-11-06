@@ -48,6 +48,8 @@ pub(super) struct Journal {
     pub worker: Option<ProcessIdentity>,
     pub child_logon: i64,
     #[serde(default)]
+    pub child_pending: bool,
+    #[serde(default)]
     pub child_gone: bool,
     pub child_enabled_before: bool,
     pub changed_child_setting: bool,
@@ -153,6 +155,10 @@ pub(super) fn validate_journal(journal: &Journal, current: &ProcessIdentity) -> 
             "invalid child-session generation"
         );
     }
+    ensure!(
+        !journal.child_pending || (!journal.child_gone && !journal.clean),
+        "unresolved child identity cannot confirm cleanup"
+    );
     if let Some(worker) = &journal.worker {
         ensure!(
             worker.sid == current.sid
@@ -409,7 +415,8 @@ fn wait_for_owner(
 }
 
 fn native_cleanup_finished(state: &Journal) -> Result<bool> {
-    if !state.child_gone
+    if state.child_pending
+        || !state.child_gone
         || !(state.phase == "finalizing" || (state.phase == "stopped" && state.clean))
     {
         return Ok(false);
@@ -798,13 +805,7 @@ impl Runtime {
         if matches!(&operation, Operation::Start(_)) {
             state.app_stopped = false;
         }
-        let bound = Deadline::at(
-            std::time::Instant::now()
-                + deadline
-                    .remaining()
-                    .unwrap_or(Duration::from_secs(120))
-                    .min(Duration::from_secs(120)),
-        );
+        let bound = request_deadline(&operation, deadline);
         state.next_id = state
             .next_id
             .checked_add(1)
@@ -904,6 +905,19 @@ impl Runtime {
     }
 }
 
+fn request_deadline(operation: &Operation, deadline: Deadline) -> Deadline {
+    // Start includes the build, which has no implicit time limit.
+    if matches!(operation, Operation::Start(_)) {
+        deadline
+    } else {
+        Deadline::at(
+            deadline
+                .resolve(std::time::Instant::now() + Duration::from_secs(120))
+                .0,
+        )
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown(Deadline::from_millis(5_000)) {
@@ -957,6 +971,44 @@ impl crate::remote_backend::Connection for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn start_operation() -> Operation {
+        Operation::Start(glass_core::AppSpec {
+            build: Some("cargo build".into()),
+            run: vec!["app.exe".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 300_000,
+            sandbox: glass_core::SandboxLevel::Default,
+            a11y: false,
+        })
+    }
+
+    #[test]
+    fn start_preserves_unbounded_build_and_long_caller_deadlines() {
+        let operation = start_operation();
+        assert_eq!(
+            request_deadline(&operation, Deadline::UNBOUNDED),
+            Deadline::UNBOUNDED
+        );
+        let caller = Deadline::from_millis(600_000);
+        assert_eq!(request_deadline(&operation, caller), caller);
+        let expired = Deadline::at(std::time::Instant::now() - Duration::from_secs(1));
+        assert_eq!(request_deadline(&operation, expired), expired);
+    }
+
+    #[test]
+    fn ordinary_worker_requests_keep_a_finite_transport_bound() {
+        let bound = request_deadline(&Operation::Stop, Deadline::UNBOUNDED);
+        assert!(
+            bound
+                .remaining()
+                .is_some_and(|left| left <= Duration::from_secs(120))
+        );
+        let caller = Deadline::from_millis(1_000);
+        assert!(request_deadline(&Operation::Stop, caller).instant() <= caller.instant());
+    }
 
     #[test]
     fn finalized_owner_is_not_queried_again() {
@@ -1096,6 +1148,7 @@ mod tests {
                 owner,
                 worker: None,
                 child_logon: 0,
+                child_pending: false,
                 child_gone: true,
                 child_enabled_before: false,
                 changed_child_setting: false,
@@ -1134,6 +1187,7 @@ mod tests {
             owner: process,
             worker: None,
             child_logon: 0,
+            child_pending: false,
             child_gone: true,
             child_enabled_before: true,
             changed_child_setting: false,
@@ -1151,6 +1205,13 @@ mod tests {
         state.child_gone = true;
         state.phase = "cleanup_failed".into();
         assert!(!native_cleanup_finished(&state).expect("failed cleanup"));
+    }
+
+    #[test]
+    fn unresolved_child_identity_prevents_finalizing_cleanup() {
+        let mut state = cleanup_record();
+        state.child_pending = true;
+        assert!(!native_cleanup_finished(&state).unwrap());
     }
 
     #[test]

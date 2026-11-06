@@ -1,5 +1,5 @@
 use super::files::Root;
-use super::runtime::{Hello, Journal, Launch, validate_journal};
+use super::runtime::{ExecutionContext, Hello, Journal, Launch, validate_journal};
 use crate::backend_worker::{self, Dispatcher, Operation, Request};
 use anyhow::{Context, Result, ensure};
 use glass_core::{Deadline, Platform, ProtectedHostPath};
@@ -33,6 +33,21 @@ fn stop_requested(root: &Root, instance: &str) -> Result<bool> {
         return Ok(true);
     }
     Ok(false)
+}
+
+fn apply_launch_context(spec: &mut glass_core::AppSpec, context: &ExecutionContext) {
+    spec.cwd = Some(match spec.cwd.take() {
+        Some(cwd) => context.cwd.join(cwd),
+        None => context.cwd.clone(),
+    });
+    if !spec
+        .env
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        && let Some(path) = &context.path
+    {
+        spec.env.push(("PATH".into(), path.clone()));
+    }
 }
 
 pub fn run(path: &Path, instance: &str) -> Result<()> {
@@ -179,17 +194,7 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
             }
             if let Operation::Start(spec) = &mut request.operation {
                 idle = false;
-                if spec.cwd.is_none() {
-                    spec.cwd = Some(context.cwd.clone());
-                }
-                if !spec
-                    .env
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("PATH"))
-                    && let Some(path) = &context.path
-                {
-                    spec.env.push(("PATH".into(), path.clone()));
-                }
+                apply_launch_context(spec, &context);
             }
             let deadline = backend_worker::deadline(request.expires_ns)?;
             let mut response = dispatcher.handle(request);
@@ -227,4 +232,64 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
     root.write("receipt.json", &serde_json::json!({"version":1,"instance":instance,"clean":cleanup.is_ok(),"app_pid":properties.app_pid,"error":cleanup.as_ref().err().map(ToString::to_string)}))?;
     cleanup?;
     serving
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glass_core::{AppSpec, SandboxLevel};
+
+    fn spec(cwd: Option<&str>) -> AppSpec {
+        AppSpec {
+            build: Some("custom-tool build".into()),
+            run: vec!["custom-tool".into()],
+            cwd: cwd.map(Into::into),
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Default,
+            a11y: false,
+        }
+    }
+
+    fn context() -> ExecutionContext {
+        ExecutionContext {
+            cwd: r"C:\caller".into(),
+            path: Some(r"C:\developer-tools;C:\Windows\System32".into()),
+            providers: glass_windows::containment::ProviderSettings {
+                provider: "auto".into(),
+                directory: "unused".into(),
+                clipboard_dll: None,
+            },
+        }
+    }
+
+    #[test]
+    fn worker_resolves_default_relative_and_absolute_cwd_before_build_and_launch() {
+        let context = context();
+        for (supplied, expected) in [
+            (None, r"C:\caller"),
+            (Some("project"), r"C:\caller\project"),
+            (Some(r"D:\other"), r"D:\other"),
+        ] {
+            let mut spec = spec(supplied);
+            apply_launch_context(&mut spec, &context);
+            assert_eq!(spec.cwd.as_deref(), Some(Path::new(expected)));
+        }
+    }
+
+    #[test]
+    fn worker_forwards_caller_path_but_preserves_case_insensitive_override() {
+        let context = context();
+        let mut forwarded = spec(None);
+        apply_launch_context(&mut forwarded, &context);
+        assert_eq!(
+            forwarded.env,
+            vec![("PATH".into(), context.path.clone().unwrap())]
+        );
+        let mut explicit = spec(None);
+        explicit.env.push(("Path".into(), "custom".into()));
+        apply_launch_context(&mut explicit, &context);
+        assert_eq!(explicit.env, vec![("Path".into(), "custom".into())]);
+    }
 }

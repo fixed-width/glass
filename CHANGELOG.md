@@ -37,6 +37,12 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Windows child-desktop cancellation records the authenticated child before teardown and retains
+  incomplete cleanup when its identity cannot be verified. Starting an application no longer
+  imposes a two-minute limit on its build.
+- Windows contained launches preserve relative working directories and application environment
+  overrides, including the caller's PATH on a separate desktop. Rejected launches remove their
+  temporary logs so subsequent starts can reuse the environment.
 - Windows Application setup follows desktop choice, environment preparation and agent connection
   in order, then opens a compact Ready view. Fast main-desktop checks advance without a flashing
   loader; startup preferences and their errors stay separate from environment readiness.

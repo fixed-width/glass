@@ -541,6 +541,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("GlassDesktopRdp.dll"), runtime::TEST_INTEROP).unwrap();
+        std::fs::write(
+            root.join("ChildOwnership.cs"),
+            include_str!("../../native/windows-desktop/tests/ChildOwnership.cs"),
+        )
+        .unwrap();
         let compiler = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
             .join("Microsoft.NET/Framework64/v4.0.30319/csc.exe");
         let compiled = Command::new(compiler)
@@ -561,6 +566,7 @@ mod tests {
                 "Tray.cs",
                 "Startup.cs",
                 "SetupFlow.cs",
+                "ChildOwnership.cs",
             ])
             .creation_flags(0x0800_0000)
             .output()
@@ -583,7 +589,7 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
-        assert_eq!(report["count"], 13);
+        assert_eq!(report["count"], 19);
     }
 
     #[test]

@@ -168,7 +168,28 @@ public sealed class Journal {
     public string instance,phase,error,task,worker_arguments,pipe,stop_event,show_event,hide_event;
     public ProcessRecord parent,owner,worker;
     public long child_logon;
-    public bool child_enabled_before,changed_child_setting,clean,viewer_visible,child_gone;
+    public bool child_enabled_before,changed_child_setting,clean,viewer_visible,child_gone,child_pending;
+}
+
+internal static class ChildOwnership {
+    internal static void LoginCompleted(Journal state,Action save,Func<uint> queryChild,Func<uint,long> queryLogon) {
+        state.child_pending=true; save();
+        Capture(state,queryChild,queryLogon); save();
+    }
+    internal static bool Capture(Journal state,Func<uint> queryChild,Func<uint,long> queryLogon) {
+        uint child=queryChild();
+        if (child==UInt32.MaxValue) return false;
+        if (child==0 || child==state.parent.session) throw new InvalidOperationException("Windows has not provided a separate child session");
+        long logon=queryLogon(child);
+        if (logon<=0) return false;
+        if (state.child!=UInt32.MaxValue && (child!=state.child || logon!=state.child_logon))
+            throw new InvalidOperationException("Child session generation changed");
+        state.child=child; state.child_logon=logon; state.child_pending=false;
+        return true;
+    }
+    internal static void RequireResolved(Journal state) {
+        if (state.child_pending) throw new InvalidOperationException("Child login completed without a verified session generation; cleanup remains unconfirmed");
+    }
 }
 
 internal static class Files {
@@ -302,7 +323,12 @@ internal sealed class DesktopHost : Form {
             credentials.AllowCredentialSaving=false; credentials.AllowPromptingForCredentials=true;
             credentials.PromptForCredentials=true; credentials.PromptForCredsOnClient=true; credentials.DisableConnectionBar=true;
             Listen("OnConnected",new Action(()=>{ if (!loginComplete) Save("authentication_pending"); }));
-            Listen("OnLoginComplete",new Action(()=>{ loginComplete=true; Save("starting_desktop"); }));
+            Listen("OnLoginComplete",new Action(()=>{
+                try {
+                    loginComplete=true;
+                    ChildOwnership.LoginCompleted(state,()=>Save("starting_desktop"),Native.Child,Native.Logon);
+                } catch (Exception error) { Fail(error); }
+            }));
             Listen("OnDisconnected",new Action<int>(reason=>{ if (!ending) Fail(new InvalidOperationException("Child connection ended ("+reason+", "+client.ExtendedDisconnectReason+")")); }));
             Listen("OnFatalError",new Action<int>(code=>Fail(new InvalidOperationException("RDP control error "+code))));
             timer.Start(); client.Connect();
@@ -310,6 +336,7 @@ internal sealed class DesktopHost : Form {
     }
     void Tick(object sender,EventArgs args) {
         try {
+            if (loginComplete && !workerStarted) CaptureChild();
             if (stop.WaitOne(0) || Native.WaitForSingleObject(parentHandle,0)!=258) { CloseOwned(); return; }
             if (workerStarted && File.Exists(Path.Combine(root,"worker-error.json"))) {
                 var failure=Files.Read<Dictionary<string,object>>(root,"worker-error.json");
@@ -323,9 +350,8 @@ internal sealed class DesktopHost : Form {
             if (child==UInt32.MaxValue && !workerStarted && DateTime.UtcNow<startupDeadline) return;
             if (child==UInt32.MaxValue || child==0 || child==launch.parent.session) throw new InvalidOperationException("Windows has not provided a separate child session");
             if (!workerStarted) {
-                state.child=child; state.child_logon=Native.Logon(child);
-                if (state.child_logon<=0 && DateTime.UtcNow<startupDeadline) return;
-                if (state.child_logon<=0) throw new InvalidOperationException("Child logon generation did not become available");
+                if (state.child_pending && DateTime.UtcNow<startupDeadline) return;
+                ChildOwnership.RequireResolved(state);
                 HideAndRestore(); Save("starting_worker");
                 StartWorker(); workerStarted=true;
             }
@@ -340,6 +366,9 @@ internal sealed class DesktopHost : Form {
             if (state.phase!="ready" && DateTime.UtcNow>startupDeadline) throw new TimeoutException("Child worker did not become ready");
             if (state.worker!=null && !state.worker.Live()) throw new InvalidOperationException("Child worker exited");
         } catch (Exception error) { Fail(error); }
+    }
+    void CaptureChild() {
+        if (ChildOwnership.Capture(state,Native.Child,Native.Logon)) Files.Write(root,state);
     }
     void StartWorker() {
         state.worker_arguments="windows-desktop-worker --root "+Files.Quote(root)+" --instance "+launch.instance;
@@ -371,6 +400,7 @@ internal sealed class DesktopHost : Form {
         stop.Set(); ending=true; timer.Stop();
         if (!loginComplete && state.error==null) state.error="Desktop startup was cancelled";
         try {
+            if (loginComplete && !workerStarted) CaptureChild();
             Save("stopping");
             Cleanup(root,state);
             state.clean=false; Save("finalizing");
@@ -385,6 +415,12 @@ internal sealed class DesktopHost : Form {
         }
     }
     internal static void Cleanup(string root,Journal state) {
+        if (state.child_pending && !state.owner.Live()) {
+            var current=ProcessRecord.Read((uint)Process.GetCurrentProcess().Id);
+            if (current.session==state.parent.session && current.logon==state.parent.logon && Native.Child()==UInt32.MaxValue)
+                state.child_pending=false;
+        }
+        ChildOwnership.RequireResolved(state);
         string workerFailure=null;
         if (state.worker!=null) {
             DateTime deadline=DateTime.UtcNow.AddSeconds(5);

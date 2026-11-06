@@ -12,6 +12,7 @@ internal static class SetupFlowTests {
     static int Main(string[] args){
         var passed=new List<string>();var report=new Dictionary<string,object>();
         try{
+            ChildOwnershipTests.Run(passed);
             Test(passed,"first run requires desktop choice",()=>{
                 var flow=new SetupFlow();var status=Status(null,false,false,0);flow.Observe(status);
                 Require(flow.Page(status,Now)==SetupPage.Desktop,"Fresh setup skipped desktop selection");

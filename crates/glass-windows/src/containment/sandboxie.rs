@@ -768,77 +768,75 @@ impl Sandboxie {
     /// tailing those files into `logs`. Returns the live handle.
     pub(crate) fn launch(&self, spec: &AppSpec, logs: LogSink) -> Result<SandboxieApp> {
         let mut launch_spec = spec.clone();
-        if launch_spec.cwd.is_none() {
-            launch_spec.cwd = Some(std::env::current_dir().map_err(|error| {
-                GlassError::AppNotStarted(format!("resolve application working directory: {error}"))
-            })?);
-        }
+        launch_spec.cwd = Some(
+            std::path::absolute(spec.cwd.as_deref().unwrap_or_else(|| Path::new("."))).map_err(
+                |error| {
+                    GlassError::AppNotStarted(format!(
+                        "resolve application working directory: {error}"
+                    ))
+                },
+            )?,
+        );
         let processor = command_processor()?;
         let bootstrap = processor.ancestors().last().ok_or_else(|| {
             GlassError::AppNotStarted("command processor has no disk root".into())
         })?;
+        let logdir = std::env::temp_dir().join(&self.box_name);
+        let out_log = logdir.join("out.log");
+        let err_log = logdir.join("err.log");
+        // Reject unsupported launch tokens before creating resources or changing configuration.
+        super::config::build_launch_cmd_env(&launch_spec, &out_log, &err_log, None)?;
+
         // Layer-2 clipboard: configure the hook DLL + pipe server (best-effort; None = Layer-1-only).
         // This writes clipboard ini lines and does a /reload BEFORE the logdir reload below,
         // so both sets of ini changes land before the app is ever spawned.
         let clip = self.setup_private_clipboard();
         let clip_pipe = clip.as_ref().map(|(_, _, p)| p.clone());
 
-        let logdir = std::env::temp_dir().join(&self.box_name);
-        std::fs::create_dir_all(&logdir).map_err(|e| {
-            GlassError::AppNotStarted(format!("create log dir {}: {e}", logdir.display()))
+        let inner = self.prepare_launch(|| {
+            self.configure_logdir_with_runner(&logdir, &mut NativeConfiguration)?;
+            self.configured_paths
+                .lock()
+                .map_err(|_| {
+                    GlassError::SandboxUnavailable(
+                        "Sandboxie configuration state is poisoned".into(),
+                    )
+                })
+                .and_then(|paths| {
+                    let paths = validate_protected_host_paths(&paths)?;
+                    let observed = configuration_file::read(&self.dir, &self.box_name)?;
+                    require_configuration(&observed, spec.sandbox, &paths)
+                        .map_err(GlassError::SandboxUnavailable)
+                })?;
+
+            // Generate launch.cmd: optional cd, then the quoted exe + args with stdio redirected.
+            // Passes the clipboard pipe name (if Layer 2 is active) as GLASS_CLIP_PIPE env.
+            let cmd_path = logdir.join("launch.cmd");
+            let script = super::config::build_launch_cmd_env(
+                &launch_spec,
+                &out_log,
+                &err_log,
+                clip_pipe.as_deref(),
+            )?;
+            std::fs::write(&cmd_path, script).map_err(|e| {
+                GlassError::AppNotStarted(format!("write {}: {e}", cmd_path.display()))
+            })?;
+
+            // Spawn the Start.exe wrapper, reusing the Job wrapper for teardown of the launcher
+            // process itself. `Off` so no Job caps are applied to the wrapper.
+            let cmd_path_str = cmd_path.to_string_lossy().into_owned();
+            let mut cmd = Command::new(start_exe(&self.dir));
+            // Sandboxie copies its bootstrap cwd into an internal argument capped at 128 characters.
+            // The script separately restores the application's requested working directory.
+            cmd.current_dir(bootstrap)
+                .envs(launch_spec.env.iter().map(|(name, value)| (name, value)))
+                .arg(format!("/box:{}", self.box_name))
+                .arg("/hide_window")
+                .arg(&processor)
+                .arg("/c")
+                .arg(&cmd_path_str);
+            crate::process::spawn_suspended_in_job(&mut cmd, SandboxLevel::Off)
         })?;
-
-        // Allow the box to write to the log dir on the host, then reload.
-        if let Err(error) = self.configure_logdir_with_runner(&logdir, &mut NativeConfiguration) {
-            let _ = std::fs::remove_dir_all(&logdir);
-            return Err(error);
-        }
-
-        let verified = self
-            .configured_paths
-            .lock()
-            .map_err(|_| {
-                GlassError::SandboxUnavailable("Sandboxie configuration state is poisoned".into())
-            })
-            .and_then(|paths| {
-                let paths = validate_protected_host_paths(&paths)?;
-                let observed = configuration_file::read(&self.dir, &self.box_name)?;
-                require_configuration(&observed, spec.sandbox, &paths)
-                    .map_err(GlassError::SandboxUnavailable)
-            });
-        if let Err(error) = verified {
-            let _ = std::fs::remove_dir_all(&logdir);
-            return Err(error);
-        }
-
-        let out_log = logdir.join("out.log");
-        let err_log = logdir.join("err.log");
-
-        // Generate launch.cmd: optional cd, then the quoted exe + args with stdio redirected.
-        // Passes the clipboard pipe name (if Layer 2 is active) as GLASS_CLIP_PIPE env.
-        let cmd_path = logdir.join("launch.cmd");
-        let script = super::config::build_launch_cmd_env(
-            &launch_spec,
-            &out_log,
-            &err_log,
-            clip_pipe.as_deref(),
-        )?;
-        std::fs::write(&cmd_path, script)
-            .map_err(|e| GlassError::AppNotStarted(format!("write {}: {e}", cmd_path.display())))?;
-
-        // Spawn the Start.exe wrapper, reusing the Job wrapper for teardown of the launcher
-        // process itself. `Off` so no Job caps are applied to the wrapper.
-        let cmd_path_str = cmd_path.to_string_lossy().into_owned();
-        let mut cmd = Command::new(start_exe(&self.dir));
-        // Sandboxie copies its bootstrap cwd into an internal argument capped at 128 characters.
-        // The script separately restores the application's requested working directory.
-        cmd.current_dir(bootstrap)
-            .arg(format!("/box:{}", self.box_name))
-            .arg("/hide_window")
-            .arg(&processor)
-            .arg("/c")
-            .arg(&cmd_path_str);
-        let inner = crate::process::spawn_suspended_in_job(&mut cmd, SandboxLevel::Off)?;
         inner.resume();
 
         // Tail the redirected stdio files into the sink. Keep the JoinHandles so kill() can
@@ -862,6 +860,28 @@ impl Sandboxie {
             clip: clip.map(|(store, server, _)| (store, server)),
             journal: self.journal.clone(),
         })
+    }
+
+    fn prepare_launch<T>(&self, prepare: impl FnOnce() -> Result<T>) -> Result<T> {
+        prepare_launch_directory(&self.ownership().log_directory, prepare)
+            .inspect_err(|_| self.notify_closed())
+    }
+}
+
+fn prepare_launch_directory<T>(logdir: &Path, prepare: impl FnOnce() -> Result<T>) -> Result<T> {
+    // A pre-existing directory is not ours to remove on failure.
+    std::fs::create_dir(logdir).map_err(|error| {
+        GlassError::AppNotStarted(format!("create log dir {}: {error}", logdir.display()))
+    })?;
+    match prepare() {
+        Ok(value) => Ok(value),
+        Err(error) => match std::fs::remove_dir_all(logdir) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(GlassError::AppNotStarted(format!(
+                "{error}; remove launch log directory {}: {cleanup}; container cleanup remains unconfirmed",
+                logdir.display(),
+            ))),
+        },
     }
 }
 
@@ -1115,6 +1135,224 @@ mod tests {
         fn closed(&self, _: &super::super::BoxOwnership) -> glass_core::Result<()> {
             self.0.lock().unwrap().push(true);
             Ok(())
+        }
+    }
+
+    fn launch_spec(run: &[&str]) -> glass_core::AppSpec {
+        glass_core::AppSpec {
+            build: None,
+            run: run.iter().map(|part| (*part).into()).collect(),
+            cwd: None,
+            env: vec![],
+            window_hint: None,
+            timeout_ms: 1,
+            sandbox: SandboxLevel::Default,
+            a11y: false,
+        }
+    }
+
+    #[test]
+    fn rejected_script_does_not_leave_logs_or_block_journal_completion() {
+        let journal = std::sync::Arc::new(Journal::default());
+        let sandboxie = Sandboxie::new("unused".into(), unique_box_name())
+            .with_journal(Some(journal.clone()))
+            .unwrap();
+        let error = sandboxie
+            .launch(
+                &launch_spec(&["app.exe", "%unsupported%"]),
+                Default::default(),
+            )
+            .err()
+            .expect("unsafe batch token must be rejected");
+        assert!(error.to_string().contains('%'), "{error}");
+        assert!(!sandboxie.ownership().log_directory.exists());
+        sandboxie.notify_closed();
+        assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn script_write_and_spawn_failures_remove_owned_launch_directory() {
+        let scratch = tempfile::tempdir().unwrap();
+        let logs = scratch.path().join("logs");
+        let error = super::prepare_launch_directory(&logs, || {
+            std::fs::create_dir(logs.join("launch.cmd")).unwrap();
+            std::fs::write(logs.join("launch.cmd"), "script").map_err(|error| {
+                glass_core::GlassError::AppNotStarted(format!("write launch script: {error}"))
+            })
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("write launch script"));
+        assert!(!logs.exists());
+        let error = super::prepare_launch_directory(&logs, || {
+            std::fs::write(logs.join("launch.cmd"), "script").unwrap();
+            let mut command = std::process::Command::new(scratch.path().join("missing.exe"));
+            crate::process::spawn_suspended_in_job(&mut command, SandboxLevel::Off)
+        })
+        .err()
+        .expect("missing launcher must fail");
+        assert!(!error.to_string().is_empty());
+        assert!(!logs.exists());
+        // A later launch can acquire the same directory after either failure.
+        super::prepare_launch_directory(&logs, || Ok(())).unwrap();
+        std::fs::remove_dir(&logs).unwrap();
+    }
+
+    #[test]
+    fn failed_launch_does_not_remove_a_preexisting_directory() {
+        let scratch = tempfile::tempdir().unwrap();
+        let existing = scratch.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("foreign.txt"), "preserve").unwrap();
+        assert!(
+            super::prepare_launch_directory(&existing, || -> glass_core::Result<()> {
+                panic!("preexisting directory must refuse before launch")
+            })
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing.join("foreign.txt")).unwrap(),
+            "preserve"
+        );
+    }
+
+    #[test]
+    fn preparation_that_already_cleared_configuration_finishes_journal_after_log_removal() {
+        let journal = std::sync::Arc::new(Journal::default());
+        let sandboxie = Sandboxie::new("unused".into(), unique_box_name())
+            .with_journal(Some(journal.clone()))
+            .unwrap();
+        let error = sandboxie
+            .prepare_launch(|| -> glass_core::Result<()> {
+                sandboxie.notify_closed();
+                assert_eq!(*journal.0.lock().unwrap(), vec![false]);
+                Err(glass_core::GlassError::AppNotStarted(
+                    "configuration refused".into(),
+                ))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("configuration refused"));
+        assert!(!sandboxie.ownership().log_directory.exists());
+        assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    fn failed_log_removal_is_reported_and_keeps_journal_open() {
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        let journal = std::sync::Arc::new(Journal::default());
+        let sandboxie = Sandboxie::new("unused".into(), unique_box_name())
+            .with_journal(Some(journal.clone()))
+            .unwrap();
+        let logs = sandboxie.ownership().log_directory;
+        let mut locked = None;
+        let error = super::prepare_launch_directory(&logs, || -> glass_core::Result<()> {
+            locked = Some(
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(logs.join("locked.txt"))
+                    .unwrap(),
+            );
+            Err(glass_core::GlassError::AppNotStarted(
+                "launch refused".into(),
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("launch refused")
+                && error.to_string().contains("cleanup remains unconfirmed"),
+            "{error}"
+        );
+        sandboxie.notify_closed();
+        assert_eq!(*journal.0.lock().unwrap(), vec![false]);
+        drop(locked);
+        std::fs::remove_dir_all(&logs).unwrap();
+        sandboxie.notify_closed();
+        assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
+    }
+
+    #[test]
+    #[ignore = "on-box: needs Sandboxie; launches only a hidden command process"]
+    fn contained_launch_preserves_relative_cwd_and_custom_path() {
+        use std::os::windows::process::CommandExt;
+        let caller = std::env::current_dir().unwrap();
+        let scratch = tempfile::tempdir_in(&caller).unwrap();
+        let tool = format!("glass-context-tool-{}.exe", std::process::id());
+        let source = scratch.path().join("ContextFixture.cs");
+        std::fs::write(&source, r#"using System;
+class ContextFixture {
+    static void Main() {
+        Console.WriteLine("CONTEXT-CWD="+Environment.CurrentDirectory);
+        Console.WriteLine("CONTEXT_FIXTURE_VALUE="+Environment.GetEnvironmentVariable("CONTEXT_FIXTURE_VALUE"));
+        Console.WriteLine("CONTEXT-COMPLETE");
+    }
+}"#).unwrap();
+        let compiler = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("Microsoft.NET/Framework64/v4.0.30319/csc.exe");
+        let compiled = std::process::Command::new(compiler)
+            .args(["/nologo", "/target:exe", "/platform:x64"])
+            .arg(format!("/out:{}", scratch.path().join(&tool).display()))
+            .arg(source)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let expected = "literal %PATH% & quoted \"value\"";
+        for level in [SandboxLevel::Default, SandboxLevel::Strict] {
+            let journal = std::sync::Arc::new(Journal::default());
+            let sandboxie = Sandboxie::new(super::sandboxie_dir(), unique_box_name())
+                .with_journal(Some(journal.clone()))
+                .unwrap();
+            eprintln!(
+                "context fixture owned box: {} ({level:?})",
+                sandboxie.box_name
+            );
+            sandboxie.configure(level).unwrap();
+            let mut spec = launch_spec(&[&tool]);
+            spec.cwd = Some(scratch.path().strip_prefix(&caller).unwrap().into());
+            spec.env = vec![
+                ("PATH".into(), scratch.path().to_string_lossy().into_owned()),
+                ("CONTEXT_FIXTURE_VALUE".into(), expected.into()),
+            ];
+            spec.sandbox = level;
+            let logs: super::LogSink = Default::default();
+            let app = sandboxie.launch(&spec, logs.clone()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, line)| line == "CONTEXT-COMPLETE")
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            app.kill();
+            let lines: Vec<_> = logs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, line)| line.clone())
+                .collect();
+            assert!(
+                lines.contains(&format!("CONTEXT-CWD={}", scratch.path().display())),
+                "{level:?}: {lines:?}"
+            );
+            assert!(
+                lines.contains(&format!("CONTEXT_FIXTURE_VALUE={expected}")),
+                "{level:?}: {lines:?}"
+            );
+            assert!(
+                lines.contains(&"CONTEXT-COMPLETE".into()),
+                "{level:?}: {lines:?}"
+            );
+            assert_eq!(*journal.0.lock().unwrap(), vec![false, true]);
         }
     }
 
