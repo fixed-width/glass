@@ -19,11 +19,22 @@ Open Glass from a terminal on your signed-in Windows desktop:
 glass-mcp desktop open
 ```
 
-In **Application setup…**, choose **Off your desktop…** and **Continue setup**. Choose
-**Start Environment…** in the window or system-tray menu. Windows may ask
+In **Application setup…**, choose **Off your desktop…** and **Continue setup**. The next section
+prepares the environment. Choose **Start Environment…** in the window or system-tray menu. Windows may ask
 for administrator consent to enable local child sessions, followed by a native Windows sign-in
 dialog. Complete these locally; keep passwords out of agent messages and tool arguments. Glass
 shows **Ready** only after the child and its application worker are connected and verified.
+
+Setup then shows **Connect the agent** with the HTTP MCP endpoint. Copy the endpoint into your
+agent configuration, review **Start with Windows**, and choose **Finish setup**. Copying the URL
+does not verify that an agent is connected. The completed view is remembered for that endpoint;
+starting another environment does not repeat agent setup. **On your desktop** advances after its
+readiness check without another Windows sign-in.
+
+The compact operating view keeps **Agent connection** and **Settings** available. **Show Desktop**
+changes to **Hide Desktop** while the viewer is visible. Use the window menu or system tray for
+**Stop Environment** and **Quit Glass**. Changing the saved desktop stops owned work after
+confirmation; saving the same desktop preserves its prepared environment.
 
 The child-session switch is machine-wide; Glass's saved desktop selection is per account. Builds,
 applications and the worker run unelevated. Setup does not enable network Remote Desktop access
@@ -32,6 +43,10 @@ or change firewall rules. Glass preserves an already enabled setting when you la
 A standard Windows account can use both desktop choices. If setup or restoration needs a machine
 setting changed, complete Windows' prompt with an administrator account. The resident, worker,
 per-user startup task and private state continue to belong to the signed-in standard account.
+
+Startup is optional. A startup-setting failure stays visible separately from environment readiness;
+you can finish without changing that setting, then inspect or retry it under **Settings**. Changing
+startup does not stop application work or switch desktops.
 
 Copy the **MCP endpoint** from Glass and register it as an HTTP MCP connection in your agent.
 Use the normal `glass_start`, capture, accessibility, input, logs and stop tools. Application stops

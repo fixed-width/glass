@@ -22,6 +22,7 @@ enum Action {
     Hide,
     Quit,
     Configure,
+    SaveStartup,
     Refresh,
 }
 
@@ -53,6 +54,9 @@ struct Status<'a> {
     preparing: bool,
     separate_available: bool,
     separate_detail: Option<&'a str>,
+    startup_error: Option<&'a str>,
+    viewer_visible: Option<bool>,
+    viewer_error: Option<&'a str>,
 }
 
 fn validate_request(request: &Request, instance: &str, acknowledged: u64) -> Result<()> {
@@ -240,6 +244,9 @@ pub async fn run(
             preparing: false,
             separate_available: false,
             separate_detail: None,
+            startup_error: None,
+            viewer_visible: None,
+            viewer_error: None,
         },
     )?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -277,7 +284,6 @@ fn action_task(
             }
             Action::Configure => {
                 let mode = mode.context("Choose where applications run")?;
-                let wanted = wanted_startup.context("Choose the Start with Windows preference")?;
                 if mode == DesktopMode::Separate {
                     tokio::task::spawn_blocking(glass_windows::desktop::child_desktop_available)
                         .await??;
@@ -288,14 +294,24 @@ fn action_task(
                     let owner = manager.clone();
                     tokio::task::spawn_blocking(move || owner.choose_mode(mode)).await??;
                 }
-                let actual =
-                    tokio::task::spawn_blocking(move || startup::configure(wanted, &settings))
-                        .await??;
+                let actual = match wanted_startup {
+                    Some(wanted) => Some(
+                        tokio::task::spawn_blocking(move || startup::configure(wanted, &settings))
+                            .await??,
+                    ),
+                    None => None,
+                };
                 if mode == DesktopMode::Shared && !manager.ready()? {
                     manager.begin_preparation();
                     tokio::task::spawn_blocking(move || manager.prepare()).await??;
                 }
-                return Ok(Some(actual));
+                return Ok(actual);
+            }
+            Action::SaveStartup => {
+                let wanted = wanted_startup.context("Choose the Start with Windows preference")?;
+                return tokio::task::spawn_blocking(move || startup::configure(wanted, &settings))
+                    .await?
+                    .map(Some);
             }
             Action::Refresh => {
                 return tokio::task::spawn_blocking(startup::enabled)
@@ -347,6 +363,10 @@ async fn control(
     let mut detail =
         "Open Application setup to choose On your desktop or Off your desktop.".to_owned();
     let startup_state = tokio::task::spawn_blocking(startup::enabled).await?;
+    let mut startup_error = startup_state
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
     let mut start_with_windows = match startup_state {
         Ok(value) => value,
         Err(error) => {
@@ -395,6 +415,9 @@ async fn control(
             if pending.as_ref().is_some_and(|(_,task)|task.is_finished()) {
                 let (action,task)=pending.take().context("pending application setup operation")?;
                 let result=task.await.context("application setup operation failed")?;
+                if matches!(action,Action::SaveStartup|Action::Refresh) {
+                    startup_error=result.as_ref().err().map(|error|format!("{error:#}"));
+                }
                 if action==Action::Refresh {separate_error=separate_desktop_error().await;}
                 if action==Action::Stop && quitting {
                     if result.is_ok(){break;}
@@ -429,7 +452,7 @@ async fn control(
                             pending=Some((Action::Start,action_task(Action::Start,None,None,manager.clone(),server.clone(),settings.clone())));
                         }
                     }
-                    Action::Configure|Action::Refresh|Action::Show|Action::Hide if pending.is_none() && !quitting && !server_failed=>{
+                    Action::Configure|Action::SaveStartup|Action::Refresh|Action::Show|Action::Hide if pending.is_none() && !quitting && !server_failed=>{
                         if request.action==Action::Configure {phase="Checking setup".into();detail="Saving Application setup. Complete any Windows consent locally.".into();}
                         pending=Some((request.action,action_task(request.action,request.mode,request.start_with_windows,manager.clone(),server.clone(),settings.clone())));
                     }
@@ -449,11 +472,14 @@ async fn control(
             let displayed=if preparing {preparation_phase().unwrap_or_else(||phase.clone())}else{phase.clone()};
             if server_failed {phase="Needs attention".into();detail="The MCP server stopped. Quit Glass and open it again.".into();}
             let mode=manager.mode()?;
+            let viewer=manager.viewer_visible();
+            let viewer_error=viewer.as_ref().err().map(|error|format!("{error:#}"));
             root.write("status.json",&Status {
                 version:1,instance:&launch.instance,acknowledged,phase:if server_failed{"Needs attention"}else{&displayed},
                 detail:&detail,endpoint,busy:pending.is_some(),ready:manager.ready().unwrap_or(false),
                 can_start:!server_failed && !quitting && (mode!=Some(DesktopMode::Separate) || separate_error.is_none()),closing:false,mode,start_with_windows,preparing,
                 separate_available:separate_error.is_none(),separate_detail:separate_error.as_deref(),
+                startup_error:startup_error.as_deref(),viewer_visible:viewer.ok().flatten(),viewer_error:viewer_error.as_deref(),
             })?;
         }
         Ok(())
@@ -487,6 +513,79 @@ fn preparation_phase() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_setup_flow_covers_sequence_and_retained_configuration() {
+        runtime::require_payload()
+            .expect("native Windows helper is required for the setup model test");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(
+            root.join("Host.cs"),
+            include_str!("../../native/windows-desktop/Host.cs"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Tray.cs"),
+            include_str!("../../native/windows-desktop/Tray.cs"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Startup.cs"),
+            include_str!("../../native/windows-desktop/Startup.cs"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("SetupFlow.cs"),
+            include_str!("../../native/windows-desktop/tests/SetupFlow.cs"),
+        )
+        .unwrap();
+        std::fs::write(root.join("GlassDesktopRdp.dll"), runtime::TEST_INTEROP).unwrap();
+        let compiler = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("Microsoft.NET/Framework64/v4.0.30319/csc.exe");
+        let compiled = Command::new(compiler)
+            .current_dir(root)
+            .args([
+                "/nologo",
+                "/codepage:65001",
+                "/target:exe",
+                "/platform:x64",
+                "/main:SetupFlowTests",
+                "/out:SetupFlowTests.exe",
+                "/reference:GlassDesktopRdp.dll",
+                "/reference:System.Windows.Forms.dll",
+                "/reference:System.Drawing.dll",
+                "/reference:System.Web.Extensions.dll",
+                "/reference:Microsoft.CSharp.dll",
+                "Host.cs",
+                "Tray.cs",
+                "Startup.cs",
+                "SetupFlow.cs",
+            ])
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "native setup model compilation failed: {} {}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let result = Command::new(root.join("SetupFlowTests.exe"))
+            .current_dir(root)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "native setup model failed: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(report["count"], 13);
+    }
+
     #[test]
     fn tray_commands_refuse_replay_wrong_launch_and_skipped_sequences() {
         let mut request = Request {

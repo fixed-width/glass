@@ -37,6 +37,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Windows Application setup follows desktop choice, environment preparation and agent connection
+  in order, then opens a compact Ready view. Fast main-desktop checks advance without a flashing
+  loader; startup preferences and their errors stay separate from environment readiness.
 - Windows Application setup disables **Off your desktop…** with an explanation when required
   Remote Desktop hosting is unavailable or cannot be verified. Setup refuses before changing
   Windows settings or opening sign-in; **On your desktop** remains available.

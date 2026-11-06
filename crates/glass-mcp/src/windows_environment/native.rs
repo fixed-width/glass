@@ -336,6 +336,23 @@ impl Manager {
     }
 
     #[cfg(feature = "network")]
+    pub fn viewer_visible(&self) -> Result<Option<bool>> {
+        if self.mode()? != Some(DesktopMode::Separate) || self.admitted.load(Ordering::Acquire) != 2
+        {
+            return Ok(None);
+        }
+        let current = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("desktop runtime is poisoned"))?
+            .clone();
+        match current {
+            Some(owner) => owner.viewer_visible(),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "network")]
     pub fn viewer(&self, show: bool) -> Result<()> {
         let current = self
             .runtime

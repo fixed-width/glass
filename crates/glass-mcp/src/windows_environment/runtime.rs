@@ -15,6 +15,9 @@ mod payload {
     include!(concat!(env!("OUT_DIR"), "/windows_desktop_payload.rs"));
 }
 
+#[cfg(test)]
+pub(super) use payload::INTEROP as TEST_INTEROP;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Launch {
@@ -691,6 +694,22 @@ impl Runtime {
             Err(std::sync::TryLockError::WouldBlock) => Ok(true),
             Err(_) => bail!("Windows desktop transport is poisoned"),
         }
+    }
+
+    #[cfg(feature = "network")]
+    pub fn viewer_visible(&self) -> Result<Option<bool>> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => bail!("Windows desktop transport is poisoned"),
+        };
+        self.guard(&state, false)?;
+        let journal = read_journal(&self.root, &state.journal.parent)?;
+        ensure!(
+            journal.instance == state.journal.instance && journal.owner == state.journal.owner,
+            "Windows desktop viewer identity changed"
+        );
+        Ok((journal.phase == "ready").then_some(journal.viewer_visible))
     }
 
     #[cfg(feature = "network")]
