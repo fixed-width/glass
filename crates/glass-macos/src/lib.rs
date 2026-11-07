@@ -28,6 +28,8 @@ mod input_deadline; // pure post-focus/input deadline sequencing — cross-platf
 pub mod keymap; // pure ASCII -> (keycode, shift) US map — cross-platform, host-tested
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod launch_program;
+#[cfg(any(target_os = "macos", test))]
+mod owned_cleanup;
 pub mod settle; // settle policy + poll loop over successive readings — cross-platform, host-tested
 #[cfg(any(target_os = "macos", test))]
 mod shareable_receive; // pure completion-channel receive classification — cross-platform, host-tested
