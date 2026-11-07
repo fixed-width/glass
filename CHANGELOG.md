@@ -30,6 +30,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Stopping recorded macOS apps off your desktop allows more time for exit confirmation and
+  reserves time for forced termination within short deadlines. No signal is sent after an
+  ownership check exhausts the cleanup deadline.
 - X11 window discovery remains usable after a selected dialog closes, including application
   windows located by title/class without PID properties.
 - Wayland capture refreshes window geometry and rejects a closed selected window instead of
