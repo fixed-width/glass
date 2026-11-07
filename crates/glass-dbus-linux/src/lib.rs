@@ -615,6 +615,26 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
+    #[test]
+    fn toolkit_bus_failures_are_distinct_from_ordinary_application_output() {
+        for line in [
+            "Couldn't connect to accessibility bus: Empty address ''",
+            "Unable to connect to the accessibility bus at 'unix:path=/missing': No such file",
+            "Failed to launch bus: Bus exited with code 1",
+            "AT-SPI: Error retrieving accessibility bus address: connection refused",
+        ] {
+            assert!(reports_bus_failure(line), "{line}");
+        }
+        for line in [
+            "",
+            "ready",
+            "no accessibility tree published",
+            "dconf: service unavailable",
+        ] {
+            assert!(!reports_bus_failure(line), "{line}");
+        }
+    }
+
     /// A directory holding `name` at `mode`.
     fn dir_with(name: &str, mode: u32) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

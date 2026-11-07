@@ -422,6 +422,16 @@ fn is_window_gone(err: &ReplyError) -> bool {
     )
 }
 
+fn listed_window_geometry(
+    geometry: std::result::Result<WindowGeometry, ReplyError>,
+) -> Result<Option<WindowGeometry>> {
+    match geometry {
+        Ok(geometry) => Ok(Some(geometry)),
+        Err(error) if is_window_gone(&error) => Ok(None),
+        Err(error) => Err(GlassError::Backend(format!("window geometry: {error}"))),
+    }
+}
+
 /// Start a reader over one of the launch's streams, or reap the launch and say why it could not.
 ///
 /// The failed start consumed the pipe, so the app's next write to that stream takes `SIGPIPE` — a
@@ -1926,17 +1936,14 @@ impl Platform for X11Platform {
             dispatch.mark();
             let mut out = Vec::new();
             for win in platform.scan_all_windows(&identities, platform.discovery_hint.as_ref())? {
+                let Some(geometry) = listed_window_geometry(platform.geometry_of_raw(win))? else {
+                    continue;
+                };
                 out.push(WindowInfo {
                     id: WindowId(win as u64),
                     title: platform.window_name(win),
                     class: platform.window_class(win).map(|(_instance, class)| class),
-                    geometry: match platform.geometry_of_raw(win) {
-                        Ok(geometry) => geometry,
-                        Err(error) if is_window_gone(&error) => continue,
-                        Err(error) => {
-                            return Err(GlassError::Backend(format!("window geometry: {error}")));
-                        }
-                    },
+                    geometry,
                     active: Some(win) == active,
                 });
             }
@@ -2116,9 +2123,10 @@ fn button_number(button: glass_core::MouseButton) -> u8 {
 mod tests {
     use super::{
         ContainedChild, LaunchedChild, X11DeadlineWatch, X11Dispatch, dispatch_launch,
-        hint_matches, legacy_window_selection, modifier_keycodes_dispatched, pid_matches,
-        require_contained_root, rollback_bounded_window_selection, run_clicks_by,
-        run_scroll_buttons_by, run_x11_call_by, run_x11_type_by,
+        hint_matches, legacy_window_selection, listed_window_geometry,
+        modifier_keycodes_dispatched, pid_matches, require_contained_root,
+        rollback_bounded_window_selection, run_clicks_by, run_scroll_buttons_by, run_x11_call_by,
+        run_x11_type_by,
     };
     use glass_core::{
         BoundDispatch, BoundKind, Deadline, GlassError, Result, TypeSink, Whose, WindowHint,
@@ -2128,6 +2136,42 @@ mod tests {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn listing_skips_disappeared_windows_but_preserves_other_geometry_failures() {
+        use x11rb::{errors::ReplyError, protocol::ErrorKind, x11_utils::X11Error};
+        let geometry = glass_core::WindowGeometry {
+            x: 3,
+            y: 4,
+            width: 80,
+            height: 60,
+        };
+        assert_eq!(
+            listed_window_geometry(Ok(geometry.clone())).unwrap(),
+            Some(geometry)
+        );
+        for (error_kind, error_code) in [
+            (ErrorKind::Window, 3),
+            (ErrorKind::Drawable, 9),
+            (ErrorKind::Access, 10),
+        ] {
+            let result = listed_window_geometry(Err(ReplyError::X11Error(X11Error {
+                error_kind,
+                error_code,
+                sequence: 1,
+                bad_value: 42,
+                minor_opcode: 0,
+                major_opcode: 14,
+                extension_name: None,
+                request_name: Some("GetGeometry"),
+            })));
+            if error_kind == ErrorKind::Access {
+                assert!(matches!(result, Err(GlassError::Backend(_))));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+    }
 
     struct LaunchedCleanup(LaunchedChild);
 
@@ -3940,6 +3984,53 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a private Xvfb; needs Xvfb"]
+    fn accessibility_setup_failure_survives_log_drains() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        platform
+            .logs
+            .lock()
+            .unwrap()
+            .push((Stream::Stdout, "ready".into()));
+        platform.drain_logs();
+        assert!(platform.accessibility_health().is_ok());
+        platform.logs.lock().unwrap().push((
+            Stream::Stderr,
+            "Couldn't connect to accessibility bus: Empty address ''".into(),
+        ));
+        assert_eq!(platform.drain_logs().len(), 1);
+        assert!(matches!(
+            platform.accessibility_health(),
+            Err(GlassError::AccessibilityUnavailable(_))
+        ));
+        assert!(platform.drain_logs().is_empty());
+        assert!(matches!(
+            platform.accessibility_health(),
+            Err(GlassError::AccessibilityUnavailable(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "starts a private Xvfb; needs Xvfb"]
+    fn explicit_inputs_reject_missing_paths_and_protected_files() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let root = tempfile::tempdir().unwrap();
+        platform
+            .configure_protected_host_paths(&[glass_core::ProtectedHostPath::directory(
+                root.path(),
+            )])
+            .unwrap();
+        for path in [root.path().to_path_buf(), root.path().join("missing.wav")] {
+            assert!(matches!(
+                platform.configure_read_only_inputs(&[path]),
+                Err(GlassError::SandboxUnavailable(_))
+            ));
+        }
+    }
+
+    #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
     fn a_click_presses_the_mapped_button_at_the_requested_point() {
         let x = TestX::start();
@@ -4365,20 +4456,24 @@ mod display_tests {
     fn capture_geometry_reports_left_and_right_clipping_and_visible_windows() {
         let x = TestX::sized("320x240x24");
         let mut platform = x.platform();
-        for (x_pos, width, complete, captured_x) in [
-            (-20, 100, false, 20),
-            (280, 100, false, 0),
-            (20, 100, true, 0),
+        for (x_pos, y_pos, width, complete, captured_x, captured_y) in [
+            (-20, 10, 100, false, 20, 0),
+            (280, 10, 100, false, 0, 0),
+            (20, -10, 100, false, 0, 10),
+            (20, 220, 100, false, 0, 0),
+            (20, 10, 100, true, 0, 0),
         ] {
-            let window = x.window().at(x_pos, 10).sized(width, 50).create();
+            let window = x.window().at(x_pos, y_pos).sized(width, 50).create();
             platform.window = Some(window);
             let frame = platform.capture_frame(None).unwrap();
             let capture = frame.capture.unwrap();
             assert_eq!(capture.complete(), complete);
             assert_eq!(capture.captured.x, captured_x);
+            assert_eq!(capture.captured.y, captured_y);
             assert_eq!(capture.requested.width, u32::from(width));
             assert_eq!(capture.captured.width, frame.width);
             assert_eq!(capture.display.width, 320);
+            assert_eq!(capture.display.height, 240);
             x.destroy(window);
         }
         platform.window = Some(x.window().at(400, 0).create());

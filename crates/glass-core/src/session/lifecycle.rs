@@ -215,11 +215,15 @@ mod tests {
 
     struct UnawarePlatform {
         starts: Arc<AtomicUsize>,
+        start_error: Option<GlassError>,
     }
 
     impl Platform for UnawarePlatform {
         fn start_app(&mut self, _spec: &AppSpec) -> Result<WindowGeometry> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.start_error.take() {
+                return Err(error);
+            }
             Ok(WindowGeometry {
                 x: 0,
                 y: 0,
@@ -273,6 +277,7 @@ mod tests {
         glass_with_factory(Box::new(move |_| {
             Ok(Backend::display_only(Box::new(UnawarePlatform {
                 starts: starts.clone(),
+                start_error: None,
             })))
         }))
     }
@@ -320,6 +325,137 @@ mod tests {
         g.start(&spec()).unwrap();
 
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_inputs_refuse_uncontained_and_unsupported_launches_before_starting() {
+        for (sandbox, expected_reason) in [
+            (SandboxLevel::Off, "requires containment"),
+            (SandboxLevel::Default, "supported only"),
+            (SandboxLevel::Strict, "supported only"),
+        ] {
+            let starts = Arc::new(AtomicUsize::new(0));
+            let mut glass = glass_with_unaware(starts.clone());
+            let mut launch = spec();
+            launch.sandbox = sandbox;
+            let error = glass
+                .start_on_with_inputs("x11", &launch, &[PathBuf::from("/inputs/sample.wav")])
+                .unwrap_err();
+            assert!(matches!(&error, GlassError::SandboxUnavailable(_)));
+            assert!(error.to_string().contains(expected_reason), "{error}");
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert!(glass.active_backend().is_none());
+        }
+    }
+
+    #[test]
+    fn session_display_size_is_unknown_for_unaware_backends_and_absent_sessions() {
+        let mut glass = glass_with_unaware(Arc::new(AtomicUsize::new(0)));
+        assert_eq!(glass.default_backend(), "x11");
+        assert_eq!(glass.display_size(), None);
+        glass.start(&spec()).unwrap();
+        assert_eq!(glass.display_size(), None);
+        glass.stop().unwrap();
+        assert_eq!(glass.display_size(), None);
+    }
+
+    #[test]
+    fn session_display_size_reports_the_backend_display_instead_of_the_window_size() {
+        let mut glass = glass_with(FakePlatform::new(80, 60).with_display_size(1680, 1050));
+        glass.start(&spec()).unwrap();
+        assert_eq!(glass.display_size(), Some((1680, 1050)));
+        assert_eq!(
+            (
+                glass.geometry().unwrap().width,
+                glass.geometry().unwrap().height
+            ),
+            (80, 60)
+        );
+        glass.stop().unwrap();
+        assert_eq!(glass.display_size(), None);
+    }
+
+    #[test]
+    fn failed_launch_retains_the_original_phase_exit_code_and_discovery_criteria() {
+        for (error, phase, code) in [
+            (
+                GlassError::BuildFailed {
+                    status: "exit status: 2".into(),
+                    stdout: "build output".into(),
+                    stderr: "build error".into(),
+                },
+                "build",
+                None,
+            ),
+            (
+                GlassError::AccessibilityUnavailable("bus failed".into()),
+                "accessibility_setup",
+                None,
+            ),
+            (
+                GlassError::SandboxUnavailable("namespace failed".into()),
+                "containment_setup",
+                None,
+            ),
+            (
+                GlassError::AppExited(Some(23)),
+                "window_discovery",
+                Some(23),
+            ),
+            (
+                GlassError::SandboxedAppExited(Some(2)),
+                "window_discovery",
+                Some(2),
+            ),
+            (
+                GlassError::Backend("window geometry failed".into()),
+                "window_discovery",
+                None,
+            ),
+        ] {
+            let mut error = Some(error);
+            let mut glass = glass_with_factory(Box::new(move |_| {
+                Ok(Backend::display_only(Box::new(UnawarePlatform {
+                    starts: Arc::new(AtomicUsize::new(0)),
+                    start_error: error.take(),
+                })))
+            }));
+            let mut launch = spec();
+            launch.run = vec!["target-app".into(), "--test".into()];
+            launch.cwd = Some(PathBuf::from("/workspace"));
+            launch.window_hint = Some(crate::WindowHint {
+                title: Some("Expected window".into()),
+                class: None,
+            });
+            launch.timeout_ms = 777;
+            assert!(glass.start_on("test-backend", &launch).is_err());
+            let diagnostic = glass.failed_launch().unwrap();
+            assert_eq!(diagnostic.backend, "test-backend");
+            assert_eq!(diagnostic.phase, phase);
+            assert_eq!(diagnostic.exit_code, code);
+            assert_eq!(diagnostic.run, launch.run);
+            assert_eq!(diagnostic.cwd, launch.cwd);
+            assert_eq!(diagnostic.window_hint, launch.window_hint);
+            assert_eq!(diagnostic.timeout_ms, launch.timeout_ms);
+            assert!(glass.logs(0, 10, None, None).unwrap().0.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_replacement_teardown_preserves_the_existing_session_and_its_logs() {
+        let mut glass = glass_with(
+            FakePlatform::new(80, 60)
+                .with_logs(vec![(Stream::Stdout, "original session")])
+                .failing_stop(),
+        );
+        glass.start(&spec()).unwrap();
+        assert!(glass.start(&spec()).is_err());
+        assert!(glass.failed_launch().is_none());
+        assert_eq!(glass.active_backend(), Some("x11"));
+        assert_eq!(
+            glass.logs(0, 10, None, None).unwrap().0[0].text,
+            "original session"
+        );
     }
 
     #[test]

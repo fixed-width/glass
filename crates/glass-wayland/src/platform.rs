@@ -3028,6 +3028,60 @@ mod pure_tests {
     /// tests, which assert on a fraction of it.
     const PROMPT_WAIT_BUDGET: Duration = Duration::from_secs(1);
 
+    fn idle_platform() -> WaylandPlatform {
+        WaylandPlatform {
+            sway: PathBuf::new(),
+            logs: Arc::new(Mutex::new(Vec::new())),
+            active: None,
+            clipboard_owner: None,
+            dbus: None,
+            protected_host_paths: Vec::new(),
+            a11y_setup_failed: false,
+            read_only_inputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_inputs_reject_missing_paths_and_protected_files() {
+        let mut platform = idle_platform();
+        let root = tempfile::tempdir().unwrap();
+        platform
+            .configure_protected_host_paths(&[ProtectedHostPath::directory(root.path())])
+            .unwrap();
+        for path in [root.path().to_path_buf(), root.path().join("missing.wav")] {
+            assert!(matches!(
+                platform.configure_read_only_inputs(&[path]),
+                Err(GlassError::SandboxUnavailable(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn accessibility_setup_failure_survives_log_drains() {
+        let mut platform = idle_platform();
+        platform
+            .logs
+            .lock()
+            .unwrap()
+            .push((Stream::Stdout, "ready".into()));
+        platform.drain_logs();
+        assert!(platform.accessibility_health().is_ok());
+        platform.logs.lock().unwrap().push((
+            Stream::Stderr,
+            "Couldn't connect to accessibility bus: Empty address ''".into(),
+        ));
+        assert_eq!(platform.drain_logs().len(), 1);
+        assert!(matches!(
+            platform.accessibility_health(),
+            Err(GlassError::AccessibilityUnavailable(_))
+        ));
+        assert!(platform.drain_logs().is_empty());
+        assert!(matches!(
+            platform.accessibility_health(),
+            Err(GlassError::AccessibilityUnavailable(_))
+        ));
+    }
+
     #[derive(Default)]
     struct RecordingTypeSink {
         characters: Vec<char>,
@@ -3738,14 +3792,7 @@ mod pure_tests {
         assert_eq!(next, 2, "re-fetching must not consume an id");
     }
 
-    /// Serializes the tests that exec a fixture they just wrote.
-    ///
-    /// Another thread's `fork` inherits the write fd `fs::write` holds, until that child execs —
-    /// so a sibling spawning mid-write fails this exec with `ETXTBSY`, and the lock must cover
-    /// the write, not just the exec. Not a product bug: glass never writes a binary it is about
-    /// to probe.
-    ///
-    /// Poison is ignored — one test's panic must not fail its siblings.
+    /// Keep timing-sensitive probes from competing with one another.
     fn one_spawner_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
         SPAWN
@@ -3761,10 +3808,31 @@ mod pure_tests {
     fn sway_script(script: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let bin = dir.path().join("sway");
-        let guard = "[ \"$1\" = --version ] || exit 3\n";
-        std::fs::write(&bin, format!("#!/bin/sh\n{guard}{script}")).expect("write");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        write_sway_script(&bin, script);
         dir
+    }
+
+    fn write_sway_script(bin: &Path, script: &str) {
+        let guard = "[ \"$1\" = --version ] || exit 3\n";
+        std::fs::write(bin, format!("#!/bin/sh\n{guard}{script}")).expect("write");
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // A sibling fork can retain the write fd until exec, even after our write returns.
+        for _ in 0..100 {
+            match std::process::Command::new(bin)
+                .arg("--fixture-ready")
+                .status()
+            {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(status) => {
+                    assert_eq!(status.code(), Some(3), "fixture guard: {}", bin.display());
+                    return;
+                }
+                Err(error) => panic!("cannot execute fixture {}: {error}", bin.display()),
+            }
+        }
+        panic!("fixture {} stayed busy for writing", bin.display());
     }
 
     /// A directory holding a `sway` that answers `--version` with `reply`.
@@ -3800,18 +3868,16 @@ mod pure_tests {
     /// `exec`, so that pid stays the sleeping process: a shell that forked its sleep would hand
     /// the probe a child whose death proves nothing about the process actually left behind.
     fn hung_sway() -> (tempfile::TempDir, PathBuf) {
-        let dir = sway_script("");
+        let dir = tempfile::tempdir().expect("tempdir");
         let pidfile = dir.path().join("pid");
         let bin = dir.path().join("sway");
-        let guard = "[ \"$1\" = --version ] || exit 3\n";
-        std::fs::write(
+        write_sway_script(
             &bin,
-            format!(
-                "#!/bin/sh\n{guard}echo $$ > {}\nexec sleep {HUNG_SWAY_SECS}\n",
+            &format!(
+                "echo $$ > {}\nexec sleep {HUNG_SWAY_SECS}\n",
                 pidfile.display()
             ),
-        )
-        .expect("write");
+        );
         (dir, pidfile)
     }
 
@@ -5658,6 +5724,30 @@ mod session_tests {
             std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
             "the session's own bus, not the developer's"
         );
+        let lines = s.wait_for_log("testw: accessibility bus ");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &format!("testw: accessibility bus {addr}")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a private compositor and AT-SPI bus; needs sway, Mesa and AT-SPI"]
+    fn an_explicit_accessibility_address_reaches_the_launched_app() {
+        let address = "unix:path=/tmp/explicit-test-atspi";
+        let mut session = Launch::new()
+            .with_a11y()
+            .env("AT_SPI_BUS_ADDRESS", address)
+            .start();
+        let lines = session.wait_for_log("testw: accessibility bus ");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == &format!("testw: accessibility bus {address}")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -5733,6 +5823,23 @@ mod session_tests {
             "the window's own fill colour, not the compositor's background"
         );
         assert_eq!(px[3], 255, "opaque");
+        let geometry = frame.capture.unwrap();
+        assert_eq!(
+            geometry.requested,
+            Region {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 160
+            }
+        );
+        assert_eq!(geometry.captured, geometry.requested);
+        assert_eq!(
+            s.platform().display_size(),
+            Some((geometry.display.width, geometry.display.height))
+        );
+        assert!(geometry.complete());
+        assert!(geometry.window_complete());
     }
 
     #[test]
