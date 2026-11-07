@@ -5,11 +5,12 @@ use rustix::process::{Pid, Signal, kill_process};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use super::ProcessIdentity;
+use crate::owned_cleanup::{self, StopSignal};
 
 const ROOT_LIMIT: usize = 1024;
 
@@ -56,11 +57,7 @@ pub fn terminate_owned(processes: &[ProcessOrigin], deadline: Deadline) -> io::R
             "owned cleanup requires its attached worker account",
         ));
     }
-    let deadline = Deadline::at(
-        deadline
-            .resolve(Instant::now() + Duration::from_millis(800))
-            .0,
-    );
+    let deadline = owned_cleanup::bounded_deadline(deadline, Instant::now());
     stop_lifetimes(processes, rustix::process::geteuid().as_raw(), deadline)
 }
 
@@ -85,49 +82,25 @@ fn stop_lifetimes(processes: &[ProcessOrigin], uid: u32, deadline: Deadline) -> 
             return Err(io::Error::other("owned cleanup cannot target its broker"));
         }
     }
-    let mut signalled = BTreeMap::<u64, Instant>::new();
-    loop {
-        let mut live = false;
-        for process in processes {
-            if deadline.has_passed() {
-                return Err(io::Error::other("owned cleanup deadline elapsed"));
-            }
-            if remaining_root(*process, uid)?.is_none() {
-                continue;
-            }
-            live = true;
-            let (signal, escalate) = match signalled.get(&process.unique) {
-                None => {
-                    let grace = deadline
-                        .remaining()
-                        .unwrap_or(Duration::from_millis(500))
-                        .saturating_sub(Duration::from_millis(50))
-                        .min(Duration::from_millis(500));
-                    (Signal::TERM, Instant::now() + grace)
-                }
-                Some(at) if Instant::now() >= *at => (Signal::KILL, *at),
-                Some(_) => continue,
-            };
+    owned_cleanup::stop_by(
+        processes,
+        deadline,
+        Instant::now,
+        std::thread::sleep,
+        |process| remaining_root(process, uid).map(|current| current.is_some()),
+        |process, signal| {
             let pid = Pid::from_raw(process.process.pid() as i32)
                 .ok_or_else(|| io::Error::other("invalid owned PID"))?;
+            let signal = match signal {
+                StopSignal::Term => Signal::TERM,
+                StopSignal::Kill => Signal::KILL,
+            };
             match kill_process(pid, signal) {
-                Ok(()) => {
-                    signalled.insert(process.unique, escalate);
-                }
-                Err(rustix::io::Errno::SRCH) => {}
-                Err(error) => return Err(error.into()),
+                Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+                Err(error) => Err(error.into()),
             }
-        }
-        if !live {
-            return Ok(());
-        }
-        std::thread::sleep(
-            deadline
-                .remaining()
-                .unwrap_or(Duration::from_millis(20))
-                .min(Duration::from_millis(20)),
-        );
-    }
+        },
+    )
 }
 
 fn observe_for(pid: u32, uid: u32) -> io::Result<ProcessOrigin> {
@@ -624,7 +597,7 @@ mod tests {
         let broker = observe(std::process::id(), uid).unwrap();
         assert!(stop_lifetimes(&[child, broker], uid, Deadline::from_millis(800)).is_err());
         assert!(remaining_root(child, uid).unwrap().is_some());
-        stop_lifetimes(&[child], uid, Deadline::from_millis(800)).unwrap();
+        stop_lifetimes(&[child], uid, Deadline::from_millis(5000)).unwrap();
         assert!(remaining_root(child, uid).unwrap().is_none());
         assert!(remaining_root(unrelated, uid).unwrap().is_some());
         drop(input);
@@ -636,7 +609,8 @@ mod tests {
     fn exact_owned_cleanup_escalates_without_a_host_inventory() {
         let (_fixture, input, child) = detached("resist");
         let uid = rustix::process::geteuid().as_raw();
-        let result = stop_lifetimes(&[child], uid, Deadline::from_millis(800));
+        // Native scheduling and orphan reaping are not the deadline-policy test.
+        let result = stop_lifetimes(&[child], uid, Deadline::from_millis(5000));
         drop(input);
         wait_gone(child, uid);
         result.unwrap();
