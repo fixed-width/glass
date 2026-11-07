@@ -100,6 +100,7 @@ pub(crate) struct FakePlatform {
     protected_path_mode: HostPathProtectionMode,
     fail_protected_path_configuration: bool,
     fail_start: bool,
+    reported_display_size: Option<(u32, u32)>,
     fail_stop: bool,
     lifecycle_log: Option<Arc<Mutex<Vec<&'static str>>>>,
     protected_paths_log: Option<Arc<Mutex<Vec<Vec<ProtectedHostPath>>>>>,
@@ -141,6 +142,10 @@ impl FakePlatform {
     }
     pub(crate) fn failing_start(mut self) -> Self {
         self.fail_start = true;
+        self
+    }
+    pub(crate) fn with_display_size(mut self, width: u32, height: u32) -> Self {
+        self.reported_display_size = Some((width, height));
         self
     }
     pub(crate) fn failing_stop(mut self) -> Self {
@@ -360,6 +365,9 @@ impl Platform for FakePlatform {
         }
         self.started = true;
         Ok(self.geometry.clone())
+    }
+    fn display_size(&self) -> Option<(u32, u32)> {
+        self.reported_display_size
     }
     fn stop_app(&mut self) -> Result<()> {
         self.started = false;

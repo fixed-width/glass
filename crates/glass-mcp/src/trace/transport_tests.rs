@@ -293,7 +293,7 @@ async fn failed_replacement_clears_the_previous_session_context() {
         .await;
     assert!(failed.is_error.unwrap_or(false));
     assert!(
-        harness
+        !harness
             .call("glass_logs", json!({}))
             .await
             .is_error

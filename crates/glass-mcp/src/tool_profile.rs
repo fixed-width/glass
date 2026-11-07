@@ -188,8 +188,8 @@ mod tests {
     #[test]
     fn advertised_schema_and_instructions_stay_within_budgets() {
         for (profile, budget) in [
-            (ToolProfile::Full, 55 * 1024),
-            (ToolProfile::Lean, 38 * 1024),
+            (ToolProfile::Full, 56 * 1024),
+            (ToolProfile::Lean, 39 * 1024),
         ] {
             let tools = tool_inventory(profile);
             let bytes = serde_json::to_vec(&tools).unwrap().len();

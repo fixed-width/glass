@@ -5,24 +5,33 @@ use std::process::Command;
 use glass_core::{AppSpec, ProtectedHostPath, Result, SandboxLevel};
 use glass_sandbox_linux::{WrapOpts, ephemeral_home, wrap_argv};
 
-/// Build the launch command for `spec.run`, forcing `DISPLAY=<display>` (and, when `a11y`
-/// is given, `DBUS_SESSION_BUS_ADDRESS=<addr>` + `XDG_RUNTIME_DIR=<dir>` so the child both
-/// talks to, and resolves its AT-SPI bus within, the private a11y dir — never the host's
-/// `/run/user/UID/at-spi/`) so the child renders on the backend's X server. Entries in
-/// `spec.env` are applied after, so the caller can still override either deliberately.
+/// Build the X11 launch command with the display and managed session/AT-SPI addresses.
+/// With accessibility enabled, XDG_RUNTIME_DIR is the writable private `dir/app-runtime`.
+/// Explicit `spec.env` entries override these defaults.
 ///
 /// When `spec.sandbox` is not `Off`, the command is wrapped in a `bwrap`
 /// invocation so the launched process runs in a sandboxed user namespace.
 /// The X11 socket dir (`/tmp/.X11-unix`) is re-exposed read-only inside the
 /// namespace so the app can still connect to the display. When `a11y.dir`
 /// is given, that directory (which holds the private session-bus and at-spi
-/// sockets) is also re-exposed so a sandboxed app can reach the a11y bus.
+/// sockets) is re-exposed read-only with its app-runtime subdirectory writable.
 pub fn build_command(
     spec: &AppSpec,
     display: &str,
     a11y: Option<glass_core::A11yBind>,
     status_fd: Option<i32>,
     protected_paths: &[ProtectedHostPath],
+) -> Result<Command> {
+    build_command_with_inputs(spec, display, a11y, status_fd, protected_paths, &[])
+}
+
+pub fn build_command_with_inputs(
+    spec: &AppSpec,
+    display: &str,
+    a11y: Option<glass_core::A11yBind>,
+    status_fd: Option<i32>,
+    protected_paths: &[ProtectedHostPath],
+    inputs: &[std::path::PathBuf],
 ) -> Result<Command> {
     let dbus_addr = a11y.map(|a| a.addr);
     let a11y_bind_dir = a11y.map(|a| a.dir);
@@ -70,11 +79,14 @@ pub fn build_command(
                 ro_binds.push(dir.to_path_buf());
             }
             let opts = WrapOpts {
+                read_only_inputs: inputs.to_vec(),
                 level,
                 home: home_os,
                 cwd: effective_cwd,
                 ro_binds,
-                rw_binds: vec![],
+                rw_binds: a11y_bind_dir
+                    .map(|dir| vec![dir.join("app-runtime")])
+                    .unwrap_or_default(),
                 status_fd,
                 protected_paths: protected_paths.to_vec(),
             };
@@ -92,14 +104,12 @@ pub fn build_command(
     if let Some(addr) = dbus_addr {
         cmd.env("DBUS_SESSION_BUS_ADDRESS", addr);
     }
+    if let Some(bus) = a11y {
+        cmd.env("AT_SPI_BUS_ADDRESS", bus.a11y_addr);
+    }
     if let Some(dir) = a11y_bind_dir {
-        // Point the app's AT-SPI resolution at the private runtime dir (mirroring the
-        // Wayland path). Without this the app inherits the host XDG_RUNTIME_DIR, so
-        // accesskit/at-spi can fall back to the host's /run/user/UID/at-spi/bus_0 — which
-        // may be wedged/unlinked — and accesskit_unix panics on the missing socket. The
-        // private dir is re-exposed read-only into the sandbox above, so the same absolute
-        // path resolves inside bwrap too. Keeps a11y resolution isolated AND on a live bus.
-        cmd.env("XDG_RUNTIME_DIR", dir);
+        // Keep app runtime writes separate from the read-only bus sockets and config.
+        cmd.env("XDG_RUNTIME_DIR", dir.join("app-runtime"));
     }
     // Under containment, X11 MIT-SHM can't attach to glass's out-of-sandbox X server (bwrap's
     // --unshare-ipc), so GTK4/Qt's default present paths paint black on the headless display; force
@@ -140,6 +150,7 @@ mod tests {
             &s,
             ":99",
             Some(glass_core::A11yBind {
+                a11y_addr: "unix:path=/tmp/test-atspi",
                 addr: "unix:path=/tmp/bus",
                 dir: temp.path(),
             }),
@@ -209,6 +220,7 @@ mod tests {
             &spec(&["app"]),
             ":99",
             Some(glass_core::A11yBind {
+                a11y_addr: "unix:path=/tmp/test-atspi",
                 addr: "unix:path=/tmp/bus",
                 dir: std::path::Path::new("/tmp/bus-dir"),
             }),
@@ -231,6 +243,7 @@ mod tests {
             &s,
             ":99",
             Some(glass_core::A11yBind {
+                a11y_addr: "unix:path=/tmp/test-atspi",
                 addr: "unix:path=/tmp/bus",
                 dir: std::path::Path::new("/tmp/bus-dir"),
             }),
@@ -306,6 +319,7 @@ mod tests {
             &spec(&["app"]),
             ":9",
             Some(glass_core::A11yBind {
+                a11y_addr: "unix:path=/tmp/test-atspi",
                 addr: "unix:path=/tmp/glass-a11y-xyz/session-bus",
                 dir: std::path::Path::new("/tmp/glass-a11y-xyz"),
             }),
@@ -314,7 +328,7 @@ mod tests {
             .get_envs()
             .find(|(k, _)| *k == OsStr::new("XDG_RUNTIME_DIR"))
             .and_then(|(_, v)| v);
-        assert_eq!(xrd, Some(OsStr::new("/tmp/glass-a11y-xyz")));
+        assert_eq!(xrd, Some(OsStr::new("/tmp/glass-a11y-xyz/app-runtime")));
     }
 
     #[test]
@@ -432,6 +446,7 @@ mod tests {
             &s,
             ":9",
             Some(glass_core::A11yBind {
+                a11y_addr: "unix:path=/tmp/test-atspi",
                 addr: "unix:path=/tmp/glass-a11y-xyz/session-bus",
                 dir,
             }),

@@ -27,7 +27,7 @@ pub use set_value::{
 };
 
 pub mod frame;
-pub use frame::{Frame, Region};
+pub use frame::{CaptureGeometry, Frame, Region};
 
 pub mod pixels;
 pub use pixels::{SourceOrder, to_opaque_rgba, to_opaque_rgba_in_place};
@@ -126,14 +126,15 @@ pub use audit::{Actuation, ActuationContext, AuditOutcome, AuditSink, ElementRef
 pub mod session;
 pub use session::{
     ActionDeadline, ActionMethod, ActionMode, ActionTarget, AxObservation, Backend,
-    ClickTargetParams, ConfirmationStatus, DispatchStatus, FindElementsOutcome, FindElementsParams,
-    Glass, MutationReport, ObservationContext, ObservationEpoch, ObservationGeneration,
-    ObservationInvalidation, PlatformFactory, ResolutionReport, RetryGuidance,
-    SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS,
-    SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScrollDirection, ScrollToElementOutcome, ScrollToElementParams,
-    SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticTarget,
-    SetValueTargetParams, TypeTargetParams, WaitElementOutcome, WaitElementParams, WaitLogOutcome,
-    WaitLogParams, WaitRegionOutcome, WaitRegionParams, WaitStableOutcome, WaitStableParams,
+    ClickTargetParams, ConfirmationStatus, DispatchStatus, FailedLaunch, FindElementsOutcome,
+    FindElementsParams, Glass, MutationReport, ObservationContext, ObservationEpoch,
+    ObservationGeneration, ObservationInvalidation, PlatformFactory, ResolutionReport,
+    RetryGuidance, SCROLL_TO_DEFAULT_STEP, SCROLL_TO_DEFAULT_TIMEOUT_MS,
+    SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScrollDirection,
+    ScrollToElementOutcome, ScrollToElementParams, SemanticActionError, SemanticActionFailureKind,
+    SemanticActionOutcome, SemanticTarget, SetValueTargetParams, TypeTargetParams,
+    WaitElementOutcome, WaitElementParams, WaitLogOutcome, WaitLogParams, WaitRegionOutcome,
+    WaitRegionParams, WaitStableOutcome, WaitStableParams,
 };
 
 fn simd_level() -> fearless_simd::Level {

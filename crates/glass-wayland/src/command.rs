@@ -46,6 +46,24 @@ pub fn sway_config(
     status_fd: Option<i32>,
     protected_paths: &[ProtectedHostPath],
 ) -> Result<Vec<u8>> {
+    sway_config_with_inputs(
+        spec,
+        runtime_dir,
+        a11y_bind_dir,
+        status_fd,
+        protected_paths,
+        &[],
+    )
+}
+
+pub fn sway_config_with_inputs(
+    spec: &AppSpec,
+    runtime_dir: &Path,
+    a11y_bind_dir: Option<&Path>,
+    status_fd: Option<i32>,
+    protected_paths: &[ProtectedHostPath],
+    inputs: &[PathBuf],
+) -> Result<Vec<u8>> {
     let argv: Vec<OsString> = match spec.sandbox {
         SandboxLevel::Off => spec.run.iter().map(OsString::from).collect(),
         level => {
@@ -80,6 +98,7 @@ pub fn sway_config(
                 ro_binds.push(dir.to_path_buf());
             }
             let opts = WrapOpts {
+                read_only_inputs: inputs.to_vec(),
                 level,
                 home: home_os,
                 cwd: effective_cwd,

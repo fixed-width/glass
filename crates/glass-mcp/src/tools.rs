@@ -589,27 +589,54 @@ fn start_spec(a: &StartArgs) -> Result<AppSpec, String> {
 pub(crate) fn start(glass: &mut Glass, a: &StartArgs) -> BatchToolResult {
     let spec =
         start_spec(a).map_err(|message| ToolOutput(vec![OutContent::trusted_error(message)]))?;
-    let geo = match a.backend.as_deref() {
-        Some(b) => glass.start_on(b, &spec),
-        None => glass.start(&spec),
-    }
-    .map_err(|error| {
-        let diagnostic = match error.cause() {
-            glass_core::GlassError::BuildFailed { stdout, stderr, .. } => {
-                Some(OutContent::untrusted_observation(
-                    &json!({"stdout": stdout, "stderr": stderr}).to_string(),
-                ))
+    let inputs = a
+        .read_only_inputs
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let backend = a
+        .backend
+        .as_deref()
+        .unwrap_or(glass.default_backend())
+        .to_owned();
+    let geo = glass
+        .start_on_with_inputs(&backend, &spec, &inputs)
+        .map_err(|error| {
+            let diagnostic = match error.cause() {
+                glass_core::GlassError::BuildFailed { stdout, stderr, .. } => {
+                    Some(OutContent::untrusted_observation(
+                        &json!({"stdout": stdout, "stderr": stderr}).to_string(),
+                    ))
+                }
+                _ => None,
+            };
+            let mut output = vec![OutContent::trusted_error(core_error_message(
+                "glass_start",
+                error,
+            ))];
+            output.extend(diagnostic);
+            if glass.failed_launch().is_some() {
+                let logs = glass.logs(0, 100, None, None).ok().map(|(lines, _)| {
+                    lines
+                        .into_iter()
+                        .map(|line| json!({"stream": line.stream, "text": line.text}))
+                        .collect::<Vec<_>>()
+                });
+                output.push(OutContent::untrusted_observation(
+                    &json!({"failed_launch": glass.failed_launch(), "logs": logs}).to_string(),
+                ));
             }
-            _ => None,
-        };
-        let mut output = vec![OutContent::trusted_error(core_error_message(
-            "glass_start",
-            error,
-        ))];
-        output.extend(diagnostic);
-        ToolOutput(output)
-    })?;
-    Ok(ToolOutput::result("glass_start", geometry_value(&geo)))
+            ToolOutput(output)
+        })?;
+    let mut result = geometry_value(&geo);
+    if let Some((width, height)) = glass.display_size() {
+        result["display"] = json!({"width": width, "height": height});
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(backend.as_str(), "x11" | "wayland") {
+        result["filesystem"] = glass_sandbox_linux::input_visibility(&spec, &inputs);
+    }
+    Ok(ToolOutput::result("glass_start", result))
 }
 
 pub fn stop(glass: &mut Glass) -> ToolResult {

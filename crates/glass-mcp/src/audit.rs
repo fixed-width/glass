@@ -1242,6 +1242,7 @@ mod tests {
         tools::start(
             &mut g,
             &StartArgs {
+                read_only_inputs: Vec::new(),
                 _rejected_input_mode: None,
                 build: None,
                 run: vec!["app".into()],
@@ -1258,6 +1259,7 @@ mod tests {
         tools::screenshot(
             &mut g,
             &ScreenshotArgs {
+                require_full: false,
                 max_width: None,
                 max_height: None,
                 region: None,
@@ -1361,6 +1363,7 @@ mod tests {
 
         fn args() -> StartArgs {
             StartArgs {
+                read_only_inputs: Vec::new(),
                 _rejected_input_mode: None,
                 build: None,
                 run: vec!["app".into()],

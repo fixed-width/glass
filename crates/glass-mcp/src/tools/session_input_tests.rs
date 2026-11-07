@@ -95,7 +95,8 @@ fn unchanged_start_result_and_normal_input_need_no_mode_configuration() {
                 .with_input_route(route),
         );
         let output = start(&mut glass, &args(json!({"run": ["app"], "a11y": false}))).unwrap();
-        let result = assert_envelope(&output, "glass_start");
+        let mut result = assert_envelope(&output, "glass_start");
+        result.as_object_mut().unwrap().remove("filesystem");
         assert_eq!(result, json!({"x": 0, "y": 0, "width": 100, "height": 100}));
         assert_eq!(specs.lock().unwrap().len(), 1);
         type_text(&mut glass, &args(json!({"text": "normal typing"}))).unwrap();

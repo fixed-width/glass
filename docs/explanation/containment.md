@@ -42,6 +42,21 @@ Containment has a different implementation per OS:
   containment step (and no sandbox crate).
 - **macOS** — the OS's built-in **Seatbelt** sandbox (`sandbox_init`); nothing to install.
 
+## Linux file inputs
+
+Linux mounts the host filesystem read-only and replaces HOME and `/tmp` with ephemeral storage.
+The workspace is writable unless it is one of those roots or an ancestor of one. Launch paths
+are re-exposed so the executable and helper scripts remain reachable.
+
+Pass existing absolute paths in `glass_start.read_only_inputs` to open external files through a
+file chooser. A file input exposes that file; a directory input exposes its contents. These mounts
+stay read-only even inside the writable workspace. `glass_start.filesystem` reports the roots and
+canonical input paths. Protected Glass paths remain denied.
+
+With X11 accessibility enabled, the application receives a writable private runtime directory with
+mode `0700`, separate from the read-only managed bus configuration and sockets. Nested D-Bus wrappers
+can replace the session bus while accessibility continues to use the managed AT-SPI address.
+
 ## The macOS Seatbelt profile
 
 The generated Seatbelt profile is **deny-default**: anything not explicitly allowed is denied. Its

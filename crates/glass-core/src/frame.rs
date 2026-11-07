@@ -7,6 +7,31 @@ pub struct Frame {
     pub height: u32,
     /// Length is always `width * height * 4`.
     pub pixels: Vec<u8>,
+    /// Geometry recorded by the backend during this capture, before preview resizing.
+    pub capture: Option<CaptureGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureGeometry {
+    pub window: crate::WindowGeometry,
+    pub requested: Region,
+    pub captured: Region,
+    pub display: Region,
+}
+
+impl CaptureGeometry {
+    pub fn complete(&self) -> bool {
+        self.requested == self.captured
+    }
+    pub fn window_complete(&self) -> bool {
+        self.captured
+            == (Region {
+                x: 0,
+                y: 0,
+                width: self.window.width,
+                height: self.window.height,
+            })
+    }
 }
 
 /// A window-relative sub-rectangle to crop a captured frame to. Top-left
@@ -94,6 +119,7 @@ impl Frame {
             width,
             height,
             pixels,
+            capture: None,
         })
     }
 
@@ -109,6 +135,7 @@ impl Frame {
             width,
             height,
             pixels,
+            capture: None,
         }
     }
 
@@ -129,13 +156,136 @@ impl Frame {
             let start = (r.y as usize + oy) * src_stride + r.x as usize * 4;
             out.extend_from_slice(&self.pixels[start..start + row_bytes]);
         }
-        Frame::new(r.width, r.height, out)
+        let mut frame = Frame::new(r.width, r.height, out)?;
+        frame.capture = self.capture.as_ref().map(|geometry| {
+            let mut geometry = geometry.clone();
+            geometry.captured = Region {
+                x: geometry.captured.x + r.x,
+                y: geometry.captured.y + r.y,
+                ..*r
+            };
+            geometry.requested = geometry.captured;
+            geometry
+        });
+        Ok(frame)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_completeness_distinguishes_a_full_window_from_a_complete_region() {
+        let full = Region {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 80,
+        };
+        let region = Region {
+            x: 12,
+            y: 15,
+            width: 30,
+            height: 20,
+        };
+        let clipped = Region {
+            x: 4,
+            y: 7,
+            width: 96,
+            height: 73,
+        };
+        for (requested, captured, complete, window_complete) in [
+            (full, full, true, true),
+            (region, region, true, false),
+            (full, clipped, false, false),
+            (
+                region,
+                Region {
+                    width: 20,
+                    ..region
+                },
+                false,
+                false,
+            ),
+        ] {
+            let geometry = CaptureGeometry {
+                window: crate::WindowGeometry {
+                    x: -4,
+                    y: -7,
+                    width: full.width,
+                    height: full.height,
+                },
+                requested,
+                captured,
+                display: Region {
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 800,
+                },
+            };
+            assert_eq!(geometry.complete(), complete, "{geometry:?}");
+            assert_eq!(geometry.window_complete(), window_complete, "{geometry:?}");
+        }
+    }
+
+    #[test]
+    fn cropping_a_clipped_frame_preserves_its_window_coordinates_and_display() {
+        let window = crate::WindowGeometry {
+            x: -10,
+            y: -20,
+            width: 30,
+            height: 40,
+        };
+        let display = Region {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let mut frame = Frame::solid(6, 8, [10, 20, 30, 255]);
+        frame.capture = Some(CaptureGeometry {
+            window: window.clone(),
+            requested: Region {
+                x: 0,
+                y: 0,
+                width: 30,
+                height: 40,
+            },
+            captured: Region {
+                x: 10,
+                y: 20,
+                width: 6,
+                height: 8,
+            },
+            display,
+        });
+        let cropped = frame
+            .crop(&Region {
+                x: 2,
+                y: 3,
+                width: 3,
+                height: 4,
+            })
+            .unwrap();
+        assert_eq!((cropped.width, cropped.height), (3, 4));
+        let geometry = cropped.capture.unwrap();
+        assert_eq!(geometry.window, window);
+        assert_eq!(geometry.display, display);
+        assert_eq!(
+            geometry.captured,
+            Region {
+                x: 12,
+                y: 23,
+                width: 3,
+                height: 4
+            }
+        );
+        assert_eq!(geometry.requested, geometry.captured);
+        assert!(geometry.complete());
+        assert!(!geometry.window_complete());
+    }
 
     #[test]
     fn new_rejects_wrong_buffer_length() {

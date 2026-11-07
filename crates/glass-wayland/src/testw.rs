@@ -411,6 +411,10 @@ fn fixture() {
     let Ok(spec) = std::env::var(WINDOWS) else {
         return;
     };
+    println!(
+        "testw: accessibility bus {}",
+        std::env::var("AT_SPI_BUS_ADDRESS").unwrap_or_default()
+    );
     let specs = parse_specs(&spec);
     if std::env::var_os(USE_X11).is_some() {
         x11_app::run(&specs);

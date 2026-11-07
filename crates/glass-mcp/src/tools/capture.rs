@@ -39,7 +39,31 @@ pub(crate) fn screenshot_with(
             context.deadline,
         )
         .map_err(|e| ContextualError::from_core(e, context))?;
-    let origin = a.region.as_ref().map_or((0, 0), |r| (r.x, r.y));
+    if a.require_full {
+        let geometry = frame.capture.as_ref().ok_or_else(|| {
+            ContextualError::validation(
+                "full capture required but this backend cannot prove capture completeness".into(),
+            )
+        })?;
+        if !geometry.complete() {
+            return Err(ContextualError::validation(format!(
+                "full capture required: requested {}x{} at ({},{}), captured {}x{} at ({},{}); resize/move the window or increase the private display size",
+                geometry.requested.width,
+                geometry.requested.height,
+                geometry.requested.x,
+                geometry.requested.y,
+                geometry.captured.width,
+                geometry.captured.height,
+                geometry.captured.x,
+                geometry.captured.y,
+            )));
+        }
+    }
+    let origin = frame
+        .capture
+        .as_ref()
+        .map(|geometry| (geometry.captured.x, geometry.captured.y))
+        .unwrap_or_else(|| a.region.as_ref().map_or((0, 0), |r| (r.x, r.y)));
     let img = encode_image(frame, origin, a.max_width, a.max_height)
         .map_err(|e| ContextualError::from_core(e, context))?;
     let mut meta = json!({ "width": img.width, "height": img.height });
@@ -250,9 +274,14 @@ pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
         })
         .collect();
     let body = json!({ "lines": json_lines }).to_string();
+    let mut result = json!({ "cursor": cursor });
+    if let Some(launch) = glass.failed_launch() {
+        result["failed_launch"] =
+            serde_json::to_value(launch).map_err(|error| error.to_string())?;
+    }
     Ok(ToolOutput::result_with(
         "glass_logs",
-        json!({ "cursor": cursor }),
+        result,
         vec![OutContent::untrusted_observation(&body)],
     ))
 }
@@ -267,6 +296,7 @@ mod tests {
     fn started_with(platform: FakePlatform) -> Glass {
         let mut g = glass_with(platform);
         let a = StartArgs {
+            read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
             build: None,
             run: vec!["app".into()],
@@ -327,6 +357,7 @@ mod tests {
         let out = screenshot(
             &mut g,
             &ScreenshotArgs {
+                require_full: false,
                 max_width: None,
                 max_height: None,
                 region: None,
@@ -350,6 +381,57 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_completeness_and_native_origin_survive_preview_resizing() {
+        for (complete, require_full) in [(false, false), (false, true), (true, true)] {
+            let mut frame = Frame::solid(80, 40, [5, 6, 7, 255]);
+            frame.capture = Some(glass_core::CaptureGeometry {
+                window: glass_core::WindowGeometry {
+                    x: -20,
+                    y: 0,
+                    width: 100,
+                    height: 40,
+                },
+                requested: glass_core::Region {
+                    x: 0,
+                    y: 0,
+                    width: if complete { 80 } else { 100 },
+                    height: 40,
+                },
+                captured: glass_core::Region {
+                    x: if complete { 0 } else { 20 },
+                    y: 0,
+                    width: 80,
+                    height: 40,
+                },
+                display: glass_core::Region {
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 800,
+                },
+            });
+            let mut glass = started_with(FakePlatform::new(100, 40).with_frames(vec![frame]));
+            let args: ScreenshotArgs =
+                serde_json::from_value(json!({"require_full": require_full, "max_width": 40}))
+                    .unwrap();
+            let result = screenshot(&mut glass, &args);
+            if require_full && !complete {
+                assert!(result.unwrap_err().contains("full capture required"));
+            } else {
+                let output = result.unwrap();
+                let metadata = envelope_at(&output, 1);
+                assert_eq!(metadata["result"]["width"], 40);
+                assert_eq!(metadata["result"]["capture"]["complete"], complete);
+                assert_eq!(
+                    metadata["result"]["image"]["source"]["x"],
+                    if complete { 0 } else { 20 }
+                );
+                assert_eq!(metadata["result"]["capture"]["captured"]["width"], 80);
+            }
+        }
+    }
+
+    #[test]
     fn screenshot_with_region_returns_cropped_dims() {
         let mut g = started_with(FakePlatform::new(4, 4).with_frames(vec![Frame::solid(
             4,
@@ -357,6 +439,7 @@ mod tests {
             [5, 6, 7, 255],
         )]));
         let a = ScreenshotArgs {
+            require_full: false,
             max_width: None,
             max_height: None,
             region: Some(RegionArgs {
@@ -390,6 +473,7 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = ScreenshotArgs {
+            require_full: false,
             max_width: None,
             max_height: None,
             region: Some(RegionArgs {
@@ -414,6 +498,7 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = ScreenshotArgs {
+            require_full: false,
             max_width: None,
             max_height: None,
             region: None,
@@ -1025,6 +1110,7 @@ mod tests {
         let out = screenshot(
             &mut g,
             &ScreenshotArgs {
+                require_full: false,
                 max_width: None,
                 max_height: None,
                 region: None,

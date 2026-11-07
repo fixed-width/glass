@@ -21,6 +21,8 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Linux launches accept `read_only_inputs` for files outside the workspace and report filesystem
+  visibility and display size. Screenshots report capture completeness and accept `require_full`.
 - Preview Windows development on a separate desktop, so agents can work without interrupting you.
   The system tray app provides guided setup, optional startup at sign-in and an HTTP MCP endpoint.
   You can also choose **On your desktop**, including on Windows Home. See the
@@ -28,6 +30,14 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- X11 window discovery remains usable after a selected dialog closes, including application
+  windows located by title/class without PID properties.
+- Wayland capture refreshes window geometry and rejects a closed selected window instead of
+  capturing its old rectangle.
+- Contained X11 apps with accessibility enabled receive a private writable runtime directory;
+  accessibility stays connected through nested D-Bus launch wrappers. Reported bus setup failures
+  are distinguished from an application with no accessibility tree.
+- Failed launches retain bounded output, exit codes and discovery criteria for diagnosis.
 - Windows Sandboxie apps now honor environment overrides, launch from long working directories,
   and avoid extra command windows.
 - Windows Sandboxie reports settings that are blocked or fail to apply.
