@@ -180,6 +180,10 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   what it could not use rather than ignoring it.
 - `build` (string) — shell command run in `cwd` before launching.
 - `cwd` (string) — working directory for `build` and `run`.
+- `read_only_inputs` (array of absolute paths, default empty) — Linux X11/Wayland only, with
+  containment enabled. Expose exactly these existing files or directories read-only, including
+  files outside the workspace. File inputs do not expose sibling files. Paths are canonicalized;
+  protected Glass paths are refused. Use the returned canonical path in file choosers.
 - `env` (object) — extra environment variables, as `{ "KEY": "VALUE" }` pairs. They configure
   `build` and reach the launched app on the desktop backends and on `ios`; on `android` they
   configure the `build` command on the host only, since an app launched by `am start` is forked
@@ -199,6 +203,16 @@ Build, launch, and locate a native GUI app; returns its window geometry.
 - `timeout_ms` (integer) — launch timeout.
 
 Returns the located window's geometry: `{x, y, width, height}`.
+Linux also returns `display: {width, height}` and `filesystem` with the workspace, ephemeral roots,
+launch read-only roots and explicit inputs. Host HOME and `/tmp` are hidden except for these binds.
+If a chooser reports an existing host file as missing, relaunch with that path in `read_only_inputs`.
+Failed launches retain bounded stdout/stderr for `glass_logs`, together with the launch phase,
+command, working directory, window hint, timeout and exit code when available.
+Linux keeps `AT_SPI_BUS_ADDRESS` pinned to the managed accessibility bus through nested D-Bus
+wrappers. A wrapper that replaces that variable routes the app elsewhere. A standard nested
+session bus can also activate installed desktop services; portal startup may require its own
+configuration and can exhaust the launch timeout. `glass_doctor` checks host prerequisites,
+while launch logs describe this session's setup.
 
 ### `glass_stop`
 
@@ -256,11 +270,19 @@ completion, or stability.
   whole window. Vision cost scales with pixel area, so a tight region is a recurring token saving.
 - `window_id` (integer) — capture this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target. Omit for the active window.
+- `require_full` (boolean, default false) — refuse a clipped capture or a backend that cannot prove
+  completeness. With `region`, require that complete region; otherwise require the complete window.
 - `max_width`, `max_height` (optional positive integers) — shrink the returned image after cropping;
   see [image size controls](#image-size-controls). Omit both for native pixels.
 
 Returns `{width, height}` — the returned image dimensions — plus native `x, y` (the region's origin)
 when `region` was given. Supplying a size bound also adds `image` metadata.
+On Linux, `capture` reports `complete`, `window_complete`, the full screen-relative `window`
+rectangle, window-relative `requested` and `captured` rectangles, and the `display` rectangle.
+These describe native pixels independently of preview resizing. `image.source` uses the actual
+captured origin, including left/top clipping. Fully off-display windows fail capture.
+Set `GLASS_XVFB_SCREEN=1920x1080x24` or `GLASS_WAYLAND_SCREEN=1920x1080` before starting Glass
+to enlarge the private display; both default to 1280×800. `glass_start.display` reports its size.
 
 #### Image size controls
 
@@ -1138,6 +1160,9 @@ before performing the action. A page limited by `max_lines` can leave older outp
 
 Returns `{cursor}` — resume a later call from here; the matched lines themselves (each
 `{seq, stream, text}`) ride as an untrusted sibling text block, since log output is app-controlled.
+After a failed launch, logs remain readable without an active session and the result includes
+`failed_launch` discovery criteria and phase. Retention ends at the next launch attempt; failed
+launch logs retain at most 200 lines, each capped at 4096 characters.
 
 ### `glass_doctor`
 

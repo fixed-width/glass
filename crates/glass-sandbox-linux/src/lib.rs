@@ -55,6 +55,8 @@ fn sh_bin() -> String {
 
 /// Inputs `wrap_argv` needs. `level` is never `Off` (the caller skips wrapping).
 pub struct WrapOpts {
+    /// Explicit inputs mounted after workspace binds and before protected-path masks.
+    pub read_only_inputs: Vec<PathBuf>,
     pub level: SandboxLevel,
     /// Ephemeral HOME inside the namespace: a tmpfs is mounted here and `HOME` is set to it.
     pub home: OsString,
@@ -210,6 +212,7 @@ pub fn ephemeral_home() -> OsString {
 /// Build the full argv for a contained launch: `bwrap … -- <program> <args…>`.
 pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Result<Vec<OsString>> {
     validate_protected_paths(&opts.protected_paths)?;
+    let inputs = validate_read_only_inputs(&opts.read_only_inputs, &opts.protected_paths)?;
     let mut v: Vec<OsString> = vec![OsString::from(bwrap_bin())];
     for f in [
         "--unshare-user",
@@ -286,6 +289,11 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Result<
         v.push(OsString::from("--chdir"));
         v.push(cwd.clone().into_os_string());
     }
+    for input in inputs {
+        v.push(OsString::from("--ro-bind"));
+        v.push(input.clone().into_os_string());
+        v.push(input.into_os_string());
+    }
     for protected in &opts.protected_paths {
         match protected.kind {
             ProtectedHostPathKind::Directory => {
@@ -306,6 +314,71 @@ pub fn wrap_argv(program: &OsStr, args: &[OsString], opts: &WrapOpts) -> Result<
     v.push(program.to_os_string());
     v.extend(args.iter().cloned());
     Ok(v)
+}
+
+/// Resolve explicit inputs without broadening a file mount to its containing directory.
+pub fn validate_read_only_inputs(
+    paths: &[PathBuf],
+    protected: &[ProtectedHostPath],
+) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| {
+            if !path.is_absolute() {
+                return Err(GlassError::SandboxUnavailable(format!(
+                    "read_only_inputs requires an existing absolute path: {}",
+                    path.display()
+                )));
+            }
+            let real = path.canonicalize().map_err(|error| {
+                GlassError::SandboxUnavailable(format!(
+                    "cannot expose input {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if protected.iter().any(|p| {
+                let p = canon(&p.path);
+                real.starts_with(&p) || p.starts_with(&real)
+            }) {
+                return Err(GlassError::SandboxUnavailable(format!(
+                    "input {} overlaps protected Glass files",
+                    path.display()
+                )));
+            }
+            let metadata = real.metadata().map_err(GlassError::Io)?;
+            if !metadata.is_file() && !metadata.is_dir() {
+                return Err(GlassError::SandboxUnavailable(format!(
+                    "input {} must be a regular file or directory",
+                    path.display()
+                )));
+            }
+            Ok(real)
+        })
+        .collect()
+}
+
+/// User-visible filesystem boundaries for a Linux launch; private control/socket roots are omitted.
+pub fn input_visibility(spec: &AppSpec, inputs: &[PathBuf]) -> serde_json::Value {
+    let home = PathBuf::from(ephemeral_home());
+    let cwd = spec.cwd.clone().or_else(|| std::env::current_dir().ok());
+    if spec.sandbox == SandboxLevel::Off {
+        return serde_json::json!({"contained": false, "system_root": "host", "workspace": cwd, "ephemeral_roots": [], "launch_read_only_roots": [], "read_only_inputs": []});
+    }
+    let launch = launch_ro_binds(
+        OsStr::new(&spec.run[0]),
+        &spec.run[1..].iter().map(OsString::from).collect::<Vec<_>>(),
+        &home,
+        cwd.as_deref(),
+    );
+    serde_json::json!({
+        "contained": spec.sandbox != SandboxLevel::Off,
+        "system_root": "read_only",
+        "ephemeral_roots": [home, PathBuf::from("/tmp")],
+        "workspace": cwd,
+        "launch_read_only_roots": launch,
+        "read_only_inputs": inputs.iter().map(|p| canon(p)).collect::<Vec<_>>(),
+        "guidance": "Host HOME and /tmp are hidden except for the workspace, launch paths and read_only_inputs. For a chooser reporting a missing host file, relaunch with its absolute path in read_only_inputs."
+    })
 }
 
 /// Validate protected host paths before a target command is launched.
@@ -629,6 +702,7 @@ mod tests {
 
     fn opts(level: SandboxLevel) -> WrapOpts {
         WrapOpts {
+            read_only_inputs: Vec::new(),
             level,
             home: OsString::from("/home/u"),
             cwd: Some(PathBuf::from("/work")),
@@ -778,6 +852,7 @@ mod tests {
     #[test]
     fn cwd_equal_to_home_skips_bind_but_keeps_chdir() {
         let o = WrapOpts {
+            read_only_inputs: Vec::new(),
             level: SandboxLevel::Default,
             home: OsString::from("/home/u"),
             // cwd == home: the dangerous case
@@ -805,6 +880,7 @@ mod tests {
     #[test]
     fn cwd_subdir_of_home_emits_bind_and_chdir() {
         let o = WrapOpts {
+            read_only_inputs: Vec::new(),
             level: SandboxLevel::Default,
             home: OsString::from("/home/u"),
             // cwd is inside home: normal project-dir case
@@ -832,6 +908,7 @@ mod tests {
     #[test]
     fn cwd_equal_to_tmp_skips_bind_but_keeps_chdir() {
         let o = WrapOpts {
+            read_only_inputs: Vec::new(),
             level: SandboxLevel::Default,
             home: OsString::from("/home/u"),
             // cwd == /tmp: the dangerous case the home-only guard used to miss.

@@ -33,6 +33,14 @@ const A11Y_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// not an attempt count — the old `0..50` sleep-sum understated the real wait.
 const A11Y_GETADDRESS_POLL_BUDGET: Duration = Duration::from_secs(5);
 
+/// Known toolkit diagnostics that establish a reported bus setup failure, not missing semantics.
+pub fn reports_bus_failure(line: &str) -> bool {
+    line.contains("Couldn't connect to accessibility bus:")
+        || line.contains("Unable to connect to the accessibility bus at '")
+        || line.contains("Failed to launch bus:")
+        || line.contains("AT-SPI: Error retrieving accessibility bus address:")
+}
+
 /// A private session bus + AT-SPI registry, torn down on drop.
 pub struct PrivateBus {
     dbus: Child,
@@ -70,6 +78,13 @@ impl PrivateBus {
             .prefix("glass-a11y-")
             .tempdir()
             .map_err(|e| GlassError::Backend(format!("a11y runtime dir: {e}")))?;
+        let app_runtime = runtime_dir.path().join("app-runtime");
+        std::fs::create_dir(&app_runtime).map_err(GlassError::Io)?;
+        std::fs::set_permissions(
+            &app_runtime,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .map_err(GlassError::Io)?;
 
         let session_sock = runtime_dir.path().join("session-bus");
         let config_path = runtime_dir.path().join("session-bus.conf");

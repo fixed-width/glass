@@ -4,6 +4,7 @@ use glass_core::{AppSpec, Frame, SandboxLevel};
 
 fn start_args() -> StartArgs {
     StartArgs {
+        read_only_inputs: Vec::new(),
         _rejected_input_mode: None,
         build: None,
         run: vec!["app".into()],
@@ -178,9 +179,16 @@ fn failed_build_output_is_an_untrusted_sibling_of_the_error() {
     let mut args = start_args();
     args.a11y = Some(false);
     let output = start(&mut glass, &args).unwrap_err();
-    let [OutContent::Text(status), OutContent::Text(diagnostics)] = output.0.as_slice() else {
-        panic!("expected status and diagnostic");
+    let [
+        OutContent::Text(status),
+        OutContent::Text(diagnostics),
+        OutContent::Text(launch),
+    ] = output.0.as_slice()
+    else {
+        panic!("expected status, build output and launch diagnostic");
     };
+    assert_eq!(launch.trust, crate::output::TextTrust::UntrustedApplication);
+    assert!(launch.body.contains("failed_launch"));
     assert_eq!(status.trust, crate::output::TextTrust::Trusted);
     assert!(status.body.contains("exit status: 23"));
     assert!(!status.body.contains("project"));

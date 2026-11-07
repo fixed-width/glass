@@ -10,8 +10,32 @@ impl Glass {
 
     /// Start with an explicit backend, constructing it via the factory.
     pub fn start_on(&mut self, backend: &str, spec: &AppSpec) -> Result<WindowGeometry> {
+        self.start_on_with_inputs(backend, spec, &[])
+    }
+
+    /// Start on a backend with explicit read-only host inputs; unsupported backends refuse them.
+    pub fn start_on_with_inputs(
+        &mut self,
+        backend: &str,
+        spec: &AppSpec,
+        inputs: &[std::path::PathBuf],
+    ) -> Result<WindowGeometry> {
         let t = std::time::Instant::now();
-        let result = self.start_on_inner(backend, spec);
+        self.failed_launch = None;
+        self.failed_launch_logs = None;
+        let result = self.start_on_inner(backend, spec, inputs);
+        if result.is_err() && self.failed_launch.is_none() && self.active.is_none() {
+            self.failed_launch = Some(FailedLaunch {
+                backend: backend.to_owned(),
+                phase: "backend_setup",
+                run: spec.run.clone(),
+                cwd: spec.cwd.clone(),
+                window_hint: spec.window_hint.clone(),
+                timeout_ms: spec.timeout_ms,
+                exit_code: None,
+            });
+            self.failed_launch_logs = Some(LogBuffer::new(self.log_capacity.min(200)));
+        }
         self.emit_audit(
             &crate::audit::Actuation::Launch { spec, backend },
             crate::audit::AuditOutcome::from_core_result(&result),
@@ -20,7 +44,12 @@ impl Glass {
         result
     }
 
-    fn start_on_inner(&mut self, backend: &str, spec: &AppSpec) -> Result<WindowGeometry> {
+    fn start_on_inner(
+        &mut self,
+        backend: &str,
+        spec: &AppSpec,
+        inputs: &[std::path::PathBuf],
+    ) -> Result<WindowGeometry> {
         self.observation_epoch.invalidate();
         // One active session: tear down any current one first.
         if let Some(session) = self.active.as_mut() {
@@ -33,7 +62,43 @@ impl Glass {
         } = (self.factory)(backend)?;
         let protection_mode =
             platform.configure_protected_host_paths(&self.protected_host_paths)?;
-        let geometry = platform.start_app(spec)?;
+        if !inputs.is_empty() && spec.sandbox == SandboxLevel::Off {
+            return Err(GlassError::SandboxUnavailable(
+                "read_only_inputs requires containment; use sandbox:default or strict".into(),
+            ));
+        }
+        platform.configure_read_only_inputs(inputs)?;
+        let geometry = match platform.start_app(spec) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                let _ = platform.stop_app();
+                let mut logs = LogBuffer::new(self.log_capacity.min(200));
+                for (stream, text) in platform.drain_logs() {
+                    logs.push(stream, text.chars().take(4096).collect::<String>());
+                }
+                let (phase, exit_code) = match error.cause() {
+                    GlassError::BuildFailed { .. } => ("build", None),
+                    GlassError::AppNotStarted(_) => ("spawn", None),
+                    GlassError::AccessibilityUnavailable(_) => ("accessibility_setup", None),
+                    GlassError::SandboxUnavailable(_) => ("containment_setup", None),
+                    GlassError::AppExited(code) | GlassError::SandboxedAppExited(code) => {
+                        ("window_discovery", *code)
+                    }
+                    _ => ("window_discovery", None),
+                };
+                self.failed_launch = Some(FailedLaunch {
+                    backend: backend.to_owned(),
+                    phase,
+                    run: spec.run.clone(),
+                    cwd: spec.cwd.clone(),
+                    window_hint: spec.window_hint.clone(),
+                    timeout_ms: spec.timeout_ms,
+                    exit_code,
+                });
+                self.failed_launch_logs = Some(logs);
+                return Err(error);
+            }
+        };
         let host_path_access = match (protection_mode, spec.sandbox) {
             (HostPathProtectionMode::SeparateFilesystem, _) => {
                 HostPathAccess::HostFilesystemUnreachable
@@ -131,6 +196,14 @@ impl Glass {
 
     pub fn geometry(&self) -> Result<WindowGeometry> {
         Ok(self.require_active()?.geometry.clone())
+    }
+
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        self.active.as_ref()?.platform.display_size()
+    }
+
+    pub fn default_backend(&self) -> &str {
+        &self.default_backend
     }
 }
 
@@ -484,6 +557,20 @@ mod tests {
         let (lines, _) = g.logs(0, 10, None, None).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "ready");
+    }
+
+    #[test]
+    fn failed_launch_retains_logs_and_request_without_an_active_session() {
+        let platform = FakePlatform::new(80, 60)
+            .with_logs(vec![(Stream::Stderr, "cannot open helper script")])
+            .failing_start();
+        let mut glass = glass_with(platform);
+        assert!(glass.start(&spec()).is_err());
+        assert!(glass.active_backend().is_none());
+        let (lines, cursor) = glass.logs(0, 10, None, None).unwrap();
+        assert_eq!(lines[0].text, "cannot open helper script");
+        assert!(glass.logs(cursor, 10, None, None).unwrap().0.is_empty());
+        assert_eq!(glass.failed_launch().unwrap().phase, "spawn");
     }
 
     /// A deadline far enough out that nothing in these tests is bounded by it.

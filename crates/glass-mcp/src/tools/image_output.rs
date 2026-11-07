@@ -14,7 +14,13 @@ pub(super) struct ImageOutput {
 
 impl ImageOutput {
     pub fn attach_to(self, result: &mut Value) -> Vec<u8> {
-        if let Some(metadata) = self.metadata {
+        if let Some(mut metadata) = self.metadata {
+            if let Some(capture) = metadata
+                .as_object_mut()
+                .and_then(|fields| fields.remove("capture"))
+            {
+                result["capture"] = capture;
+            }
             result["image"] = metadata;
         }
         self.bytes
@@ -53,17 +59,30 @@ pub(super) fn encode_image(
     max_width: Option<NonZeroU32>,
     max_height: Option<NonZeroU32>,
 ) -> Result<ImageOutput> {
+    let origin = frame
+        .capture
+        .as_ref()
+        .map_or(origin, |capture| (capture.captured.x, capture.captured.y));
     let (width, height) = fit_dimensions(frame.width, frame.height, max_width, max_height)?;
     let resized = (width, height) != (frame.width, frame.height);
-    let metadata = (max_width.is_some() || max_height.is_some()).then(|| {
-        json!({
-            "source": {"x":origin.0,"y":origin.1,"width":frame.width,"height":frame.height},
-            "width":width,"height":height,
-            "scale_x":f64::from(width)/f64::from(frame.width),
-            "scale_y":f64::from(height)/f64::from(frame.height),
-            "resized":resized,"pixel_exact":!resized,"encoding":"lossless_webp"
-        })
-    });
+    let metadata =
+        (max_width.is_some() || max_height.is_some() || frame.capture.is_some()).then(|| {
+            let mut metadata = json!({
+                "source": {"x":origin.0,"y":origin.1,"width":frame.width,"height":frame.height},
+                "width":width,"height":height,
+                "scale_x":f64::from(width)/f64::from(frame.width),
+                "scale_y":f64::from(height)/f64::from(frame.height),
+                "resized":resized,"pixel_exact":!resized,"encoding":"lossless_webp"
+            });
+            if let Some(capture) = &frame.capture {
+                let mut geometry =
+                    json!({"window": capture.window, "requested": capture.requested, "captured": capture.captured, "display": capture.display});
+                geometry["complete"] = json!(capture.complete());
+                geometry["window_complete"] = json!(capture.window_complete());
+                metadata["capture"] = geometry;
+            }
+            metadata
+        });
     let bytes = if resized {
         let expected = (frame.width as usize)
             .checked_mul(frame.height as usize)

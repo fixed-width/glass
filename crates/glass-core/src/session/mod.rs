@@ -113,6 +113,8 @@ pub struct Glass {
     baselines: BaselineStore,
     log_capacity: usize,
     active: Option<ActiveSession>,
+    failed_launch_logs: Option<LogBuffer>,
+    failed_launch: Option<FailedLaunch>,
     audit: Option<Box<dyn crate::audit::AuditSink>>,
     shutdown_hook: Option<Box<dyn FnOnce(Deadline) + Send>>,
     protected_host_paths: Vec<ProtectedHostPath>,
@@ -136,6 +138,8 @@ impl Glass {
             baselines,
             log_capacity: log_capacity.max(1),
             active: None,
+            failed_launch_logs: None,
+            failed_launch: None,
             audit: None,
             shutdown_hook: None,
             protected_host_paths: Vec::new(),
@@ -222,10 +226,31 @@ impl Glass {
         stream: Option<Stream>,
         contains: Option<&str>,
     ) -> Result<(Vec<LogLine>, u64)> {
-        let s = self.active_mut()?;
-        s.pump();
-        Ok(s.logs.read(cursor, max, stream, contains))
+        if let Some(s) = self.active.as_mut() {
+            s.pump();
+            return Ok(s.logs.read(cursor, max, stream, contains));
+        }
+        self.failed_launch_logs
+            .as_ref()
+            .map(|logs| logs.read(cursor, max, stream, contains))
+            .ok_or(GlassError::NoActiveSession)
     }
+
+    pub fn failed_launch(&self) -> Option<&FailedLaunch> {
+        self.failed_launch.as_ref()
+    }
+}
+
+/// Diagnostics retained until the next launch, even when no session was established.
+#[derive(Debug, serde::Serialize)]
+pub struct FailedLaunch {
+    pub backend: String,
+    pub phase: &'static str,
+    pub run: Vec<String>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub window_hint: Option<crate::WindowHint>,
+    pub timeout_ms: u64,
+    pub exit_code: Option<i32>,
 }
 
 /// Build the ignore mask for a comparison over a `frame_w`×`frame_h` frame,

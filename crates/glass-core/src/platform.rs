@@ -292,13 +292,11 @@ pub struct WindowHint {
     pub class: Option<String>,
 }
 
-/// The private a11y bus details a sandboxed/launched app needs, kept together so a caller can't
-/// pass the bus address without also binding its socket dir into the sandbox. `addr` is the private
-/// **session** bus address (for `DBUS_SESSION_BUS_ADDRESS`); `dir` is the per-launch runtime dir
-/// holding the session + at-spi sockets (bound into the sandbox).
+/// Managed session and AT-SPI addresses plus their read-only socket directory.
 #[derive(Clone, Copy, Debug)]
 pub struct A11yBind<'a> {
     pub addr: &'a str,
+    pub a11y_addr: &'a str,
     pub dir: &'a std::path::Path,
 }
 
@@ -337,6 +335,26 @@ pub struct AppSpec {
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
 /// glass-core code depends on a concrete backend. Must stay object-safe.
 pub trait Platform {
+    /// Explain a reported session setup failure when no accessibility tree was found.
+    fn accessibility_health(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Expose exactly these host inputs read-only. Unsupported backends refuse nonempty requests.
+    fn configure_read_only_inputs(&mut self, paths: &[PathBuf]) -> Result<()> {
+        if paths.is_empty() {
+            Ok(())
+        } else {
+            Err(GlassError::SandboxUnavailable(
+                "read_only_inputs is supported only by the Linux X11 and Wayland backends".into(),
+            ))
+        }
+    }
+
+    /// Dimensions of the session display, when available without capture.
+    fn display_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Backend-selected routing; callers do not configure it.
     fn input_route(&self) -> crate::InputRoute {
         crate::InputRoute::SharedDesktop

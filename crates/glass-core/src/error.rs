@@ -82,8 +82,9 @@ pub enum GlassError {
     /// mechanics.
     #[error(
         "app exited (code {0:?}) before its window appeared. The launch was sandboxed, so a file \
-         it needs may be hidden by the ephemeral $HOME or /tmp — set `cwd`, or run with \
-         sandbox:\"off\"."
+         it needs may be hidden by the ephemeral $HOME or /tmp — set `cwd` to the workspace, \
+         or expose the required absolute host paths with `read_only_inputs`. Inspect glass_logs \
+         for the failed launch output."
     )]
     SandboxedAppExited(Option<i32>),
 
@@ -1544,7 +1545,7 @@ mod tests {
     #[test]
     fn sandboxed_app_exited_message_hints_the_remedy() {
         let msg = GlassError::SandboxedAppExited(Some(2)).to_string();
-        assert!(msg.contains("sandbox:\"off\""), "{msg}");
+        assert!(msg.contains("read_only_inputs"), "{msg}");
         assert!(msg.contains("$HOME"), "{msg}");
     }
 

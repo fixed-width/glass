@@ -274,8 +274,6 @@ fn run_scroll_buttons_by(
     Ok(())
 }
 
-use crate::command::build_command;
-
 type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 
 /// The Linux/X11 backend. Connects to an X display, launches and locates the
@@ -289,7 +287,10 @@ pub struct X11Platform {
     display: String,
     child: Option<LaunchedChild>,
     protected_host_paths: Vec<ProtectedHostPath>,
+    a11y_setup_failed: bool,
     window: Option<Window>,
+    discovery_hint: Option<WindowHint>,
+    read_only_inputs: Vec<std::path::PathBuf>,
     logs: LogSink,
     /// The launched app's stdout/stderr readers, dropped in `kill_child`. The app's write ends
     /// are inherited by everything it spawns, so an EOF-only reader parks on a survivor's pipe
@@ -494,7 +495,10 @@ impl X11Platform {
             display,
             child: None,
             protected_host_paths: Vec::new(),
+            a11y_setup_failed: false,
             window: None,
+            discovery_hint: None,
+            read_only_inputs: Vec::new(),
             logs: Arc::new(Mutex::new(Vec::new())),
             taps: Vec::new(),
             xvfb: None,
@@ -639,10 +643,13 @@ impl X11Platform {
             .atom)
     }
 
-    /// Every mapped top-level window matching the app's PID set (the `WindowHint`
-    /// is a startup disambiguator, not a list filter). Dedups `_NET_CLIENT_LIST` ∪
-    /// root children, mirroring `scan_for_window`.
-    fn scan_all_windows(&self, identities: &ProcessIdentitySet) -> Result<Vec<Window>> {
+    /// Mapped top-level windows matching the PID set or optional launch hint.
+    /// Dedups `_NET_CLIENT_LIST` and root children, mirroring `scan_for_window`.
+    fn scan_all_windows(
+        &self,
+        identities: &ProcessIdentitySet,
+        hint: Option<&WindowHint>,
+    ) -> Result<Vec<Window>> {
         let pid_atom = self.intern(b"_NET_WM_PID")?;
         let client_list_atom = self.intern(b"_NET_CLIENT_LIST")?;
         let root_children = self
@@ -662,7 +669,7 @@ impl X11Platform {
             if !seen.insert(win) {
                 continue;
             }
-            if self.window_matches(win, identities, pid_atom, None)? {
+            if self.window_matches(win, identities, pid_atom, hint)? {
                 out.push(win);
             }
         }
@@ -676,6 +683,7 @@ impl X11Platform {
         // sandboxed app can reach the advertised unix:path= sockets.
         let a11y = self.dbus.as_ref().map(|b| glass_core::A11yBind {
             addr: b.session_bus_address(),
+            a11y_addr: b.a11y_bus_address(),
             dir: b.runtime_dir(),
         });
         let status_pipe = match spec.sandbox {
@@ -688,7 +696,7 @@ impl X11Platform {
                 })?)
             }
         };
-        let mut cmd = build_command(
+        let mut cmd = crate::command::build_command_with_inputs(
             spec,
             &self.display,
             a11y,
@@ -697,6 +705,7 @@ impl X11Platform {
                 SandboxLevel::Off => &[],
                 SandboxLevel::Default | SandboxLevel::Strict => &self.protected_host_paths,
             },
+            &self.read_only_inputs,
         )?;
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
@@ -776,11 +785,9 @@ impl X11Platform {
                 return Asked::blocked(format!("glass could not reach the X server: {e}"));
             }
         };
-        // `scan_all_windows` is the same enumeration `list_windows` uses, so the set asked to
-        // close is exactly the set glass reports as the app's windows — mapped top-levels whose
-        // `_NET_WM_PID` is in the launched process tree.
+        // Close only process-owned windows; discovery hints may identify unrelated owners.
         let identities = ProcessIdentitySet::from_host_root(root_pid);
-        let wins = match self.scan_all_windows(&identities) {
+        let wins = match self.scan_all_windows(&identities, None) {
             Ok(wins) => wins,
             Err(e) => return Asked::blocked(format!("glass could not enumerate its windows: {e}")),
         };
@@ -974,6 +981,10 @@ impl X11Platform {
             if let Some(child) = self.child.as_mut()
                 && let Ok(Some(status)) = child.child_mut().try_wait()
             {
+                self.logs.lock().expect("log buffer mutex").push((
+                    Stream::Stderr,
+                    format!("glass: launch process exited during window discovery: {status}"),
+                ));
                 return Err(GlassError::app_exited_during_discovery(
                     status.code(),
                     spec.sandbox,
@@ -1324,6 +1335,40 @@ impl X11Platform {
         let rgba = crate::pixels::xdata_to_rgba(&image.data, w, h, bpp)?;
         Frame::new(w, h, rgba)
     }
+
+    fn capture_with_geometry(
+        &self,
+        geo: WindowGeometry,
+        region: Option<&Region>,
+        rect: &crate::coords::ClippedRect,
+    ) -> Result<Frame> {
+        let mut frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+        let (width, height) = self
+            .display_size()
+            .ok_or_else(|| GlassError::CaptureFailed("display size unavailable".into()))?;
+        frame.capture = Some(glass_core::CaptureGeometry {
+            requested: region.copied().unwrap_or(Region {
+                x: 0,
+                y: 0,
+                width: geo.width,
+                height: geo.height,
+            }),
+            captured: Region {
+                x: (i64::from(rect.sx) - i64::from(geo.x)) as u32,
+                y: (i64::from(rect.sy) - i64::from(geo.y)) as u32,
+                width: rect.w,
+                height: rect.h,
+            },
+            window: geo,
+            display: Region {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+        });
+        Ok(frame)
+    }
 }
 
 /// The diagnostic for a capture that was clipped to the display, or `None` when the whole
@@ -1488,6 +1533,20 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
 }
 
 impl Platform for X11Platform {
+    fn configure_read_only_inputs(&mut self, paths: &[std::path::PathBuf]) -> Result<()> {
+        self.read_only_inputs =
+            glass_sandbox_linux::validate_read_only_inputs(paths, &self.protected_host_paths)?;
+        Ok(())
+    }
+
+    fn display_size(&self) -> Option<(u32, u32)> {
+        let screen = &self.conn.setup().roots[self.screen_num];
+        Some((
+            u32::from(screen.width_in_pixels),
+            u32::from(screen.height_in_pixels),
+        ))
+    }
+
     fn input_route(&self) -> glass_core::InputRoute {
         if self.xvfb.is_some() {
             glass_core::InputRoute::Isolated
@@ -1518,6 +1577,8 @@ impl Platform for X11Platform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        self.a11y_setup_failed = false;
+        self.discovery_hint = spec.window_hint.clone();
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never the host
@@ -1588,7 +1649,7 @@ impl Platform for X11Platform {
                 return Err(GlassError::deadline_not_started("capture"));
             }
             // Capture from ROOT so separate override-redirect popovers are included.
-            let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+            let frame = self.capture_with_geometry(geo, region, &rect)?;
             dispatch.mark();
             Ok(frame)
         })
@@ -1608,7 +1669,10 @@ impl Platform for X11Platform {
                 .map(|child| ProcessIdentitySet::from_host_root(child.ownership_root()))
                 .unwrap_or_default();
             let target = id.0 as Window;
-            if !self.scan_all_windows(&identities)?.contains(&target) {
+            if !self
+                .scan_all_windows(&identities, self.discovery_hint.as_ref())?
+                .contains(&target)
+            {
                 return Err(GlassError::WindowNotFound);
             }
             let geo = self.geometry_of(target)?;
@@ -1623,7 +1687,7 @@ impl Platform for X11Platform {
             if deadline.has_passed() {
                 return Err(GlassError::deadline_not_started("window capture"));
             }
-            let frame = self.capture_screen_rect(rect.sx, rect.sy, rect.w, rect.h)?;
+            let frame = self.capture_with_geometry(geo, region, &rect)?;
             dispatch.mark();
             Ok(frame)
         })
@@ -1845,7 +1909,9 @@ impl Platform for X11Platform {
 
     fn list_windows_by(&mut self, deadline: Deadline) -> Result<Vec<WindowInfo>> {
         self.run_window_call_by(deadline, "X11 window list", |platform, dispatch| {
-            platform.require_window()?; // no active app -> WindowNotFound, not an empty list
+            if platform.child.is_none() {
+                return Err(GlassError::WindowNotFound);
+            }
             let identities = platform
                 .child
                 .as_ref()
@@ -1859,12 +1925,18 @@ impl Platform for X11Platform {
             let active = platform.window;
             dispatch.mark();
             let mut out = Vec::new();
-            for win in platform.scan_all_windows(&identities)? {
+            for win in platform.scan_all_windows(&identities, platform.discovery_hint.as_ref())? {
                 out.push(WindowInfo {
                     id: WindowId(win as u64),
                     title: platform.window_name(win),
                     class: platform.window_class(win).map(|(_instance, class)| class),
-                    geometry: platform.geometry_of(win)?,
+                    geometry: match platform.geometry_of_raw(win) {
+                        Ok(geometry) => geometry,
+                        Err(error) if is_window_gone(&error) => continue,
+                        Err(error) => {
+                            return Err(GlassError::Backend(format!("window geometry: {error}")));
+                        }
+                    },
                     active: Some(win) == active,
                 });
             }
@@ -1886,7 +1958,10 @@ impl Platform for X11Platform {
             }
             let target = id.0 as Window;
             dispatch.mark();
-            if !platform.scan_all_windows(&identities)?.contains(&target) {
+            if !platform
+                .scan_all_windows(&identities, platform.discovery_hint.as_ref())?
+                .contains(&target)
+            {
                 return Err(GlassError::WindowNotFound);
             }
             let previous = platform.window;
@@ -1914,7 +1989,19 @@ impl Platform for X11Platform {
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-        std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
+        let logs = std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"));
+        self.a11y_setup_failed |= logs
+            .iter()
+            .any(|(_, line)| glass_dbus_linux::reports_bus_failure(line));
+        logs
+    }
+
+    fn accessibility_health(&self) -> Result<()> {
+        if self.a11y_setup_failed {
+            Err(GlassError::AccessibilityUnavailable("the launched process reported an accessibility bus setup failure; inspect glass_logs for the underlying error and remove conflicting DBUS_SESSION_BUS_ADDRESS, AT_SPI_BUS_ADDRESS or XDG_RUNTIME_DIR overrides".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn app_pid(&self) -> Option<u32> {
@@ -3227,7 +3314,7 @@ mod display_tests {
         let dialog = x.window().owned_by(4242).named("dialog").create();
         let _stranger = x.window().owned_by(OTHER_PID).named("stranger").create();
         let mut found = plat
-            .scan_all_windows(&ProcessIdentitySet::from_pairs([(4242, None)]))
+            .scan_all_windows(&ProcessIdentitySet::from_pairs([(4242, None)]), None)
             .expect("scan");
         found.sort_unstable();
         let mut want = vec![main, dialog];
@@ -3245,7 +3332,7 @@ mod display_tests {
         let win = x.window().owned_by(4242).create();
         x.set_client_list(&[win]);
         assert_eq!(
-            plat.scan_all_windows(&ProcessIdentitySet::from_pairs([(4242, None)]))
+            plat.scan_all_windows(&ProcessIdentitySet::from_pairs([(4242, None)]), None)
                 .expect("scan"),
             vec![win]
         );
@@ -4230,6 +4317,75 @@ mod display_tests {
     }
 
     #[test]
+    #[ignore = "starts a private Xvfb; needs Xvfb"]
+    fn closing_selected_helper_preserves_hint_windows_without_pid_properties() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let child = spawn_stand_in();
+        let pid = child.id();
+        platform.child = Some(LaunchedChild::Direct(child));
+        platform.discovery_hint = Some(WindowHint {
+            title: Some("Canvas".into()),
+            class: None,
+        });
+        let parent = x.window().named("Canvas").watching_input().create();
+        let editor = x.window().named("Canvas").create();
+        let chooser = x.window().named("external chooser").owned_by(pid).create();
+        platform.window = Some(parent);
+        assert_eq!(platform.list_windows().unwrap().len(), 3);
+        platform.select_window(WindowId(chooser as u64)).unwrap();
+        x.destroy(chooser);
+        assert!(matches!(
+            platform.capture_frame(None),
+            Err(GlassError::WindowNotFound)
+        ));
+        assert!(platform.window.is_none());
+        let windows = platform.list_windows().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.id == WindowId(editor as u64))
+        );
+        platform
+            .capture_window(WindowId(parent as u64), None)
+            .unwrap();
+        platform.select_window(WindowId(parent as u64)).unwrap();
+        platform.send_key(&KeyEvent::Text("a".into())).unwrap();
+        assert!(
+            x.drain_events(Duration::from_millis(50))
+                .iter()
+                .any(|event| matches!(event, x11rb::protocol::Event::KeyPress(_)))
+        );
+        assert_eq!(platform.capture_frame(None).unwrap().width, 200);
+    }
+
+    #[test]
+    #[ignore = "starts a private Xvfb; needs Xvfb"]
+    fn capture_geometry_reports_left_and_right_clipping_and_visible_windows() {
+        let x = TestX::sized("320x240x24");
+        let mut platform = x.platform();
+        for (x_pos, width, complete, captured_x) in [
+            (-20, 100, false, 20),
+            (280, 100, false, 0),
+            (20, 100, true, 0),
+        ] {
+            let window = x.window().at(x_pos, 10).sized(width, 50).create();
+            platform.window = Some(window);
+            let frame = platform.capture_frame(None).unwrap();
+            let capture = frame.capture.unwrap();
+            assert_eq!(capture.complete(), complete);
+            assert_eq!(capture.captured.x, captured_x);
+            assert_eq!(capture.requested.width, u32::from(width));
+            assert_eq!(capture.captured.width, frame.width);
+            assert_eq!(capture.display.width, 320);
+            x.destroy(window);
+        }
+        platform.window = Some(x.window().at(400, 0).create());
+        assert!(platform.capture_frame(None).is_err());
+    }
+
+    #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
     fn list_expiry_before_x_dispatch_does_not_close_the_connection() {
         let x = TestX::start();
@@ -4658,13 +4814,30 @@ mod display_tests {
         let pid = child.id();
         plat.child = Some(LaunchedChild::Direct(child));
         let polite = x.window().owned_by(pid).accepting_delete().create();
+        let unrelated = x.window().named("Hint match").accepting_delete().create();
+        plat.discovery_hint = Some(WindowHint {
+            title: Some("Hint match".into()),
+            class: None,
+        });
         plat.window = Some(polite);
+        assert!(
+            plat.list_windows()
+                .unwrap()
+                .iter()
+                .any(|window| window.id == WindowId(unrelated as u64))
+        );
 
         let asked = plat.request_close(pid);
         assert!(asked.any(), "the app's window should have been asked");
+        let event = x
+            .next_event(Duration::from_secs(2))
+            .expect("the owned window receives the request");
         assert!(
-            x.next_event(Duration::from_secs(2)).is_some(),
-            "the request must actually reach the window"
+            matches!(event, x11rb::protocol::Event::ClientMessage(message) if message.window == polite)
+        );
+        assert!(
+            x.next_event(Duration::from_millis(50)).is_none(),
+            "hint matches outside the process tree must not be closed"
         );
     }
 

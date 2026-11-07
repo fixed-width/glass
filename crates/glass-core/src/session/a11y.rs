@@ -200,7 +200,15 @@ impl Glass {
         pids.dedup();
         let generation = epoch.generation();
         let acc = s.accessibility.as_mut().ok_or(GlassError::AxUnsupported)?;
-        let mut tree = acc.snapshot(&ctx)?;
+        let mut tree = match acc.snapshot(&ctx) {
+            Ok(tree) => tree,
+            Err(error @ GlassError::AccessibilityNotReady(_)) => {
+                s.pump();
+                s.platform.accessibility_health()?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let reader_scope = acc.observation_scope();
         tree.assign_ids();
         if deadline.has_passed() {

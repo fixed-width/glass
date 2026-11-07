@@ -178,26 +178,31 @@ fn sampling_matches_the_documented_pixel_center_at_exact_boundaries() {
 fn malformed_frames_fail_without_allocating_from_invalid_dimensions() {
     for frame in [
         Frame {
+            capture: None,
             width: 0,
             height: 1,
             pixels: vec![],
         },
         Frame {
+            capture: None,
             width: 1,
             height: 0,
             pixels: vec![],
         },
         Frame {
+            capture: None,
             width: 2,
             height: 2,
             pixels: vec![0; 4],
         },
         Frame {
+            capture: None,
             width: 2,
             height: 2,
             pixels: vec![0; 20],
         },
         Frame {
+            capture: None,
             width: u32::MAX,
             height: u32::MAX,
             pixels: vec![],
@@ -460,6 +465,7 @@ fn bounded_batch_preserves_terminal_metadata_and_failure_after_one_input() {
             .with_frames(vec![
                 Frame::solid(4, 4, [1, 2, 3, 255]),
                 Frame {
+                    capture: None,
                     width: 4,
                     height: 4,
                     pixels: vec![0; 4],

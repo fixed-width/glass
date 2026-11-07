@@ -175,7 +175,9 @@ fn bus_err(e: impl std::fmt::Display) -> GlassError {
 /// Carried by [`GlassError::AccessibilityNotReady`].
 fn no_app_tree_message(pids: &[u32]) -> String {
     format!(
-        "the launched app (pid {pids:?}) isn't publishing an accessibility tree. If it should, \
+        "no accessibility tree for the launched app (pid {pids:?}) was found on the session's \
+         reachable accessibility bus. A launch wrapper or environment override may have routed \
+         the app to a different bus; check glass_logs for bus startup errors. If it should publish, \
          enable accessibility in your UI toolkit (e.g. AccessKit for egui/winit, or your GTK/Qt \
          a11y); some apps (games, canvas) intentionally don't — use the pixel loop (screenshot / \
          click / diff) there instead."

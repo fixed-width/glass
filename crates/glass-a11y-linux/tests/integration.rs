@@ -132,6 +132,93 @@ fn focus_fixture_spec() -> AppSpec {
 }
 
 #[test]
+#[ignore = "needs private Xvfb, AT-SPI, Bubblewrap and GTK4"]
+fn contained_gtk_keeps_accessibility_through_a_nested_session_bus() {
+    let mut glass = glass_x11_with_a11y();
+    let mut spec = fixture_spec();
+    let fixture = spec.run[1].clone();
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("session.conf");
+    std::fs::write(
+        &config,
+        r#"<busconfig>
+<type>session</type><listen>unix:tmpdir=/tmp</listen>
+<policy context="default"><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy>
+</busconfig>"#,
+    )
+    .unwrap();
+    spec.sandbox = glass_core::SandboxLevel::Default;
+    spec.run = vec![
+        "dbus-run-session".into(),
+        format!("--config-file={}", config.display()),
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        r#"set -eu
+test "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700
+mkdir "$XDG_RUNTIME_DIR/dconf"
+if touch "$XDG_RUNTIME_DIR/../control-write-probe" 2>/dev/null; then exit 3; fi
+exec python3 "$1"
+"#
+        .into(),
+        "sh".into(),
+        fixture,
+        config.to_string_lossy().into_owned(),
+    ];
+    if let Err(error) = glass.start(&spec) {
+        panic!("{error}; logs: {:?}", glass.logs(0, 100, None, None));
+    }
+    let result = glass.wait_for_element(&glass_core::WaitElementParams {
+        name: Some("Save".into()),
+        description: None,
+        role: None,
+        value: None,
+        value_contains: None,
+        condition: glass_core::ElementCondition::Appears,
+        interval_ms: 100,
+        timeout_ms: 5000,
+    });
+    let _ = glass.stop();
+    assert!(result.unwrap().matched);
+}
+
+#[test]
+#[ignore = "needs private Xvfb, AT-SPI and GTK4"]
+fn a_reported_bus_startup_failure_is_not_diagnosed_as_missing_publication() {
+    let mut glass = glass_x11_with_a11y();
+    let mut spec = fixture_spec();
+    spec.env.push((
+        "AT_SPI_BUS_ADDRESS".into(),
+        "unix:path=/nonexistent/glass-triage-bus".into(),
+    ));
+    if let Err(error) = glass.start(&spec) {
+        panic!("{error}; logs: {:?}", glass.logs(0, 100, None, None));
+    }
+    let result = glass.wait_for_element(&glass_core::WaitElementParams {
+        name: Some("Save".into()),
+        description: None,
+        role: None,
+        value: None,
+        value_contains: None,
+        condition: glass_core::ElementCondition::Appears,
+        interval_ms: 100,
+        timeout_ms: 1500,
+    });
+    let logs = glass.logs(0, 100, None, None).unwrap();
+    let repeated = glass.a11y_snapshot(None);
+    let _ = glass.stop();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, glass_core::GlassError::AccessibilityUnavailable(_)),
+        "{error}; logs: {logs:?}"
+    );
+    assert!(matches!(
+        repeated,
+        Err(glass_core::GlassError::AccessibilityUnavailable(_))
+    ));
+}
+
+#[test]
 #[ignore = "needs private Xvfb, AT-SPI, and GTK3; run via scripts/test-a11y.sh"]
 fn cross_window_occlusion_refuses_covers_but_allows_input_shaped_holes() {
     use glass_core::{

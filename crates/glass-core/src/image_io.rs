@@ -84,6 +84,7 @@ mod tests {
         // can be constructed directly (bypassing Frame::new's guard). Encoding
         // it must error, not panic on the overflowing multiply.
         let frame = Frame {
+            capture: None,
             width: u32::MAX,
             height: u32::MAX,
             pixels: vec![0; 16],

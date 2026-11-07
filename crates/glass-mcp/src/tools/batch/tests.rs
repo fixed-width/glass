@@ -470,6 +470,7 @@ fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFix
     start_tool(
         &mut glass,
         &StartArgs {
+            read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
             build: None,
             run: vec!["app".into()],
@@ -550,6 +551,7 @@ fn deadline_a11y_glass_with_tree_behavior(
     start_tool(
         &mut glass,
         &StartArgs {
+            read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
             build: None,
             run: vec!["app".into()],
@@ -1049,6 +1051,7 @@ fn run_delayed_terminal_screenshot() -> ToolOutput {
             settle: None,
             diff: None,
             screenshot: Some(ScreenshotArgs {
+                require_full: false,
                 max_width: None,
                 max_height: None,
                 region: None,
@@ -1086,6 +1089,7 @@ fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
         vec![Deadline::UNBOUNDED, Deadline::UNBOUNDED]
     );
     let screenshot_args = ScreenshotArgs {
+        require_full: false,
         max_width: None,
         max_height: None,
         region: None,
@@ -1347,6 +1351,7 @@ fn ordinary_terminal_error_returned_after_deadline_is_sequence_deadline_exceeded
             settle: None,
             diff: None,
             screenshot: Some(ScreenshotArgs {
+                require_full: false,
                 max_width: None,
                 max_height: None,
                 region: None,
@@ -1979,6 +1984,7 @@ fn unknown_mutation_failure_remains_conservatively_attempted() {
 fn started(platform: FakePlatform) -> Glass {
     let mut g = glass_with(platform);
     let a = StartArgs {
+        read_only_inputs: Vec::new(),
         _rejected_input_mode: None,
         build: None,
         run: vec!["app".into()],
@@ -2004,6 +2010,7 @@ fn started_a11y_tree(platform: FakePlatform, tree: AxTree) -> Glass {
 
 fn started_a11y_session(mut g: Glass) -> Glass {
     let a = StartArgs {
+        read_only_inputs: Vec::new(),
         _rejected_input_mode: None,
         build: None,
         run: vec!["app".into()],
@@ -3630,6 +3637,7 @@ fn then_screenshot_appends_image() {
                 settle: None,
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    require_full: false,
                     max_width: None,
                     max_height: None,
                     region: None,
@@ -3857,6 +3865,7 @@ fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    require_full: false,
                     max_width: None,
                     max_height: None,
                     region: None,
@@ -3921,6 +3930,7 @@ fn terminal_failure_marks_later_observations_unexecuted() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    require_full: false,
                     max_width: None,
                     max_height: None,
                     region: None,
@@ -3998,6 +4008,7 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
                 }),
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    require_full: false,
                     max_width: None,
                     max_height: None,
                     region: None,
@@ -4060,6 +4071,7 @@ fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() 
                 settle: None,
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    require_full: false,
                     max_width: None,
                     max_height: None,
                     region: None,
@@ -4091,6 +4103,7 @@ fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() 
 fn then_shape_remains_backward_compatible() {
     let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
     let screenshot_args = ScreenshotArgs {
+        require_full: false,
         max_width: None,
         max_height: None,
         region: None,
@@ -4172,6 +4185,7 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    require_full: false,
                     max_width: None,
                     max_height: None,
                     region: None,

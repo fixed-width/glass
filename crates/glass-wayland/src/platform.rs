@@ -40,7 +40,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1:
 use std::collections::HashMap;
 
 use crate::clipboard::remaining_timespec;
-use crate::command::{LogSink, build_sway_command_with_status, sway_config};
+use crate::command::{LogSink, build_sway_command_with_status};
 use crate::input::evdev_button;
 use crate::swayipc::{Ipc, Window as SwayWindow};
 
@@ -212,6 +212,8 @@ pub struct WaylandPlatform {
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
     dbus: Option<glass_dbus_linux::PrivateBus>,
     protected_host_paths: Vec<ProtectedHostPath>,
+    a11y_setup_failed: bool,
+    read_only_inputs: Vec<PathBuf>,
 }
 
 impl WaylandPlatform {
@@ -224,6 +226,8 @@ impl WaylandPlatform {
             clipboard_owner: None,
             dbus: None,
             protected_host_paths: Vec::new(),
+            a11y_setup_failed: false,
+            read_only_inputs: Vec::new(),
         })
     }
 
@@ -1615,6 +1619,7 @@ fn bring_up_session(
     spec: &AppSpec,
     a11y: Option<glass_core::A11yBind>,
     protected_host_paths: &[ProtectedHostPath],
+    inputs: &[PathBuf],
     deadline: Instant,
 ) -> Result<(ActiveSession, WindowGeometry)> {
     let runtime_dir = tempfile::Builder::new()
@@ -1636,12 +1641,13 @@ fn bring_up_session(
     let config = runtime_dir.path().join("sway.cfg");
     std::fs::write(
         &config,
-        sway_config(
+        crate::command::sway_config_with_inputs(
             spec,
             runtime_dir.path(),
             a11y.map(|a| a.dir),
             status_fd,
             protected_host_paths,
+            inputs,
         )?,
     )
     .map_err(GlassError::Io)?;
@@ -1653,6 +1659,11 @@ fn bring_up_session(
         a11y.map(|a| a.addr),
         status_fd,
     )?;
+    if let Some(bus) = a11y
+        && !spec.env.iter().any(|(key, _)| key == "AT_SPI_BUS_ADDRESS")
+    {
+        cmd.env("AT_SPI_BUS_ADDRESS", bus.a11y_addr);
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = cmd
         .spawn()
@@ -2389,6 +2400,16 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
 }
 
 impl Platform for WaylandPlatform {
+    fn configure_read_only_inputs(&mut self, paths: &[PathBuf]) -> Result<()> {
+        self.read_only_inputs =
+            glass_sandbox_linux::validate_read_only_inputs(paths, &self.protected_host_paths)?;
+        Ok(())
+    }
+
+    fn display_size(&self) -> Option<(u32, u32)> {
+        self.active.as_ref().map(|s| s.output_size)
+    }
+
     fn input_route(&self) -> glass_core::InputRoute {
         glass_core::InputRoute::Isolated
     }
@@ -2410,6 +2431,7 @@ impl Platform for WaylandPlatform {
     }
 
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
+        self.a11y_setup_failed = false;
         glass_sandbox_linux::validate_protected_paths(&self.protected_host_paths)?;
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
 
@@ -2439,6 +2461,7 @@ impl Platform for WaylandPlatform {
         let result = launch_with_retry(deadline, spec.timeout_ms, |deadline| {
             let a11y = self.dbus.as_ref().map(|b| glass_core::A11yBind {
                 addr: b.session_bus_address(),
+                a11y_addr: b.a11y_bus_address(),
                 dir: b.runtime_dir(),
             });
             bring_up_session(
@@ -2447,6 +2470,7 @@ impl Platform for WaylandPlatform {
                 spec,
                 a11y,
                 &self.protected_host_paths,
+                &self.read_only_inputs,
                 deadline,
             )
         });
@@ -2503,6 +2527,19 @@ impl Platform for WaylandPlatform {
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         run_wayland_call_by(deadline, "capture", |dispatch| {
             let session = self.active.as_mut().ok_or(GlassError::NoActiveSession)?;
+            let identifier = session.active.as_ref().ok_or(GlassError::WindowNotFound)?;
+            dispatch.mark();
+            let current = session
+                .ipc
+                .windows_by(deadline)?
+                .into_iter()
+                .find(|window| &window.identifier == identifier)
+                .ok_or(GlassError::WindowNotFound)?;
+            session.active_rect = rect_to_geom(&current.rect);
+            session.geometry = session.active_rect.clone();
+            if let Some(region) = region {
+                region.check_fits(session.geometry.width, session.geometry.height)?;
+            }
             session.state.capture = CaptureScratch::default();
             let qh = session.queue.handle();
 
@@ -2576,7 +2613,30 @@ impl Platform for WaylandPlatform {
 
             // The captured buffer already matches the requested region, so no CPU crop.
             let rgba = crate::pixels::to_rgba(pool.mmap(), format, w, h, stride)?;
-            Frame::new(w, h, rgba)
+            let mut frame = Frame::new(w, h, rgba)?;
+            let window = session.active_rect.clone();
+            frame.capture = Some(glass_core::CaptureGeometry {
+                requested: region.copied().unwrap_or(Region {
+                    x: 0,
+                    y: 0,
+                    width: window.width,
+                    height: window.height,
+                }),
+                captured: Region {
+                    x: (i64::from(cx.max(0)) - i64::from(window.x)) as u32,
+                    y: (i64::from(cy.max(0)) - i64::from(window.y)) as u32,
+                    width: w,
+                    height: h,
+                },
+                window,
+                display: Region {
+                    x: 0,
+                    y: 0,
+                    width: session.output_size.0,
+                    height: session.output_size.1,
+                },
+            });
+            Ok(frame)
         })
     }
 
@@ -2914,7 +2974,19 @@ impl Platform for WaylandPlatform {
     }
 
     fn drain_logs(&mut self) -> Vec<(Stream, String)> {
-        std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"))
+        let logs = std::mem::take(&mut *self.logs.lock().expect("log buffer mutex"));
+        self.a11y_setup_failed |= logs
+            .iter()
+            .any(|(_, line)| glass_dbus_linux::reports_bus_failure(line));
+        logs
+    }
+
+    fn accessibility_health(&self) -> Result<()> {
+        if self.a11y_setup_failed {
+            Err(GlassError::AccessibilityUnavailable("the launched process reported an accessibility bus setup failure; inspect glass_logs for the underlying error and remove conflicting DBUS_SESSION_BUS_ADDRESS, AT_SPI_BUS_ADDRESS or XDG_RUNTIME_DIR overrides".into()))
+        } else {
+            Ok(())
+        }
     }
 
     /// The app's process subtree. The child we spawn is **sway**, which launches
@@ -3006,6 +3078,8 @@ mod pure_tests {
             clipboard_owner: None,
             dbus: None,
             protected_host_paths: Vec::new(),
+            a11y_setup_failed: false,
+            read_only_inputs: Vec::new(),
         };
         let events = [
             PointerEvent::Click {
@@ -5661,6 +5735,30 @@ mod session_tests {
         assert_eq!(px[3], 255, "opaque");
     }
 
+    #[test]
+    #[ignore = "starts a private compositor; needs sway and Mesa"]
+    fn capture_refuses_a_closed_selected_window_instead_of_reading_its_old_rectangle() {
+        let mut session = Launch::new().start_mapped();
+        session.platform().capture_frame(None).unwrap();
+        let con = session.windows()[0].con_id;
+        session
+            .platform()
+            .active
+            .as_mut()
+            .unwrap()
+            .ipc
+            .run_command(&format!("[con_id={con}] kill"))
+            .unwrap();
+        session.until("the selected window to close", |session| {
+            session.windows().is_empty()
+        });
+        assert!(matches!(
+            session.platform().capture_frame(None),
+            Err(GlassError::WindowNotFound)
+        ));
+        assert!(session.platform().list_windows().unwrap().is_empty());
+    }
+
     /// How long a suspended compositor stays suspended if nothing resumes it. Both budget
     /// brackets cap at 15s, so anything bounded by either is over first.
     const SUSPENSION: Duration = Duration::from_secs(30);
@@ -5755,16 +5853,15 @@ mod session_tests {
             elapsed < SUSPENSION * 2 / 3,
             "the capture waited the compositor out rather than bounding it: {elapsed:?}"
         );
-        // The other end of the bracket: the fast capture tests cannot tell a 5s budget from a 5ms
-        // one, so a budget cut to nothing would leave them green.
+        // The initial geometry query uses the IPC budget before screencopy begins.
         assert!(
-            elapsed >= Duration::from_secs(2),
-            "the capture budget is no longer generous enough for a compositor under load: \
+            elapsed >= Duration::from_millis(300),
+            "the initial window query budget is no longer generous enough for a compositor under load: \
              {elapsed:?}"
         );
         assert!(
-            err.to_string().contains("no buffer event"),
-            "the capture should report what never arrived: {err}"
+            err.to_string().contains("sway IPC read"),
+            "the capture should report the unresponsive geometry query: {err}"
         );
     }
 
@@ -6104,14 +6201,15 @@ mod session_tests {
     fn a_capture_the_compositor_refuses_is_reported_as_a_failure() {
         let mut s = Launch::new().start_mapped();
         // Far outside the 1280x800 output, so there is nothing for screencopy to copy.
-        let err = s
-            .platform()
-            .capture_frame(Some(&Region {
+        s.platform()
+            .window(&WindowOp::Move {
                 x: 100_000,
                 y: 100_000,
-                width: 64,
-                height: 64,
-            }))
+            })
+            .unwrap();
+        let err = s
+            .platform()
+            .capture_frame(None)
             .expect_err("a region off the output cannot be captured");
         // The message, not the variant: without the `Failed` arm this reports a timeout, which is
         // the same `CaptureFailed` and a different fault.
@@ -6522,6 +6620,8 @@ mod tests {
             clipboard_owner: None,
             dbus: None,
             protected_host_paths: Vec::new(),
+            a11y_setup_failed: false,
+            read_only_inputs: Vec::new(),
         };
 
         let mode = platform
@@ -6540,6 +6640,8 @@ mod tests {
             clipboard_owner: None,
             dbus: None,
             protected_host_paths: Vec::new(),
+            a11y_setup_failed: false,
+            read_only_inputs: Vec::new(),
         };
         let missing = tempfile::tempdir()
             .expect("temporary parent")

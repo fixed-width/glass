@@ -71,6 +71,9 @@ pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScreenshotArgs {
+    /// Fail if the backend cannot prove the entire requested window/region was captured. Independent of preview resizing.
+    #[serde(default)]
+    pub require_full: bool,
     /// Maximum returned image width; shrinks after crop, preserving native comparison pixels.
     #[schemars(range(min = 1, max = 4294967295_u64))]
     pub max_width: Option<NonZeroU32>,
@@ -100,6 +103,9 @@ fn reject_input_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StartArgs {
+    /// Linux X11/Wayland: existing absolute files or directories to expose read-only in containment. Returned paths are canonical. Protected Glass paths remain denied.
+    #[serde(default)]
+    pub read_only_inputs: Vec<String>,
     // Reject cached requests for the unmerged mode without tightening the existing start schema.
     #[serde(
         default,

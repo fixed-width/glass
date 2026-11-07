@@ -7,6 +7,31 @@ pub struct Frame {
     pub height: u32,
     /// Length is always `width * height * 4`.
     pub pixels: Vec<u8>,
+    /// Geometry recorded by the backend during this capture, before preview resizing.
+    pub capture: Option<CaptureGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CaptureGeometry {
+    pub window: crate::WindowGeometry,
+    pub requested: Region,
+    pub captured: Region,
+    pub display: Region,
+}
+
+impl CaptureGeometry {
+    pub fn complete(&self) -> bool {
+        self.requested == self.captured
+    }
+    pub fn window_complete(&self) -> bool {
+        self.captured
+            == (Region {
+                x: 0,
+                y: 0,
+                width: self.window.width,
+                height: self.window.height,
+            })
+    }
 }
 
 /// A window-relative sub-rectangle to crop a captured frame to. Top-left
@@ -94,6 +119,7 @@ impl Frame {
             width,
             height,
             pixels,
+            capture: None,
         })
     }
 
@@ -109,6 +135,7 @@ impl Frame {
             width,
             height,
             pixels,
+            capture: None,
         }
     }
 
@@ -129,7 +156,18 @@ impl Frame {
             let start = (r.y as usize + oy) * src_stride + r.x as usize * 4;
             out.extend_from_slice(&self.pixels[start..start + row_bytes]);
         }
-        Frame::new(r.width, r.height, out)
+        let mut frame = Frame::new(r.width, r.height, out)?;
+        frame.capture = self.capture.as_ref().map(|geometry| {
+            let mut geometry = geometry.clone();
+            geometry.captured = Region {
+                x: geometry.captured.x + r.x,
+                y: geometry.captured.y + r.y,
+                ..*r
+            };
+            geometry.requested = geometry.captured;
+            geometry
+        });
+        Ok(frame)
     }
 }
 

@@ -179,6 +179,7 @@ impl NativePrepare {
         spec: &glass_core::AppSpec,
     ) -> Result<Option<glass_macos::workspace_access::outputs::OutputScope>, PreparationError> {
         self.prepare(&StartArgs {
+            read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
             build: spec.build.clone(),
             run: spec.run.clone(),
