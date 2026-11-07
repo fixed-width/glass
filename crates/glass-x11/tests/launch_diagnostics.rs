@@ -6,10 +6,14 @@ use glass_core::{AppSpec, Backend, BaselineStore, Glass, GlassError, SandboxLeve
 #[ignore = "starts private Xvfb displays and shell processes"]
 fn failed_starts_distinguish_spawn_exit_and_window_timeout_and_retain_output() {
     let directory = tempfile::tempdir().unwrap();
+    let xvfb = glass_x11::Xvfb::start("1280x800x24").expect("private test display");
+    let display = xvfb.display.clone();
+    // Keep Xvfb from resetting between failed launches when the last client disconnects.
+    let _display_connection = glass_x11::X11Platform::connect(Some(&display)).unwrap();
     let mut glass = Glass::new(
-        Box::new(|_| {
+        Box::new(move |_| {
             Ok(Backend::display_only(Box::new(
-                glass_x11::X11Platform::new()?,
+                glass_x11::X11Platform::connect(Some(&display))?,
             )))
         }),
         "x11".into(),
@@ -29,10 +33,10 @@ fn failed_starts_distinguish_spawn_exit_and_window_timeout_and_retain_output() {
         sandbox: SandboxLevel::Off,
         a11y: false,
     };
-    assert!(matches!(
-        glass.start(&spec),
-        Err(GlassError::AppNotStarted(_))
-    ));
+    let error = glass
+        .start(&spec)
+        .expect_err("missing executable must fail");
+    assert!(matches!(error, GlassError::AppNotStarted(_)), "{error}");
     assert_eq!(glass.failed_launch().unwrap().phase, "spawn");
 
     let mut missing_script = spec.clone();
@@ -44,10 +48,10 @@ fn failed_starts_distinguish_spawn_exit_and_window_timeout_and_retain_output() {
             .to_string_lossy()
             .into_owned(),
     ];
-    assert!(matches!(
-        glass.start(&missing_script),
-        Err(GlassError::AppExited(Some(2)))
-    ));
+    let error = glass
+        .start(&missing_script)
+        .expect_err("missing helper must fail");
+    assert!(matches!(error, GlassError::AppExited(Some(2))), "{error}");
     assert!(
         glass
             .logs(0, 100, None, None)
@@ -63,10 +67,8 @@ fn failed_starts_distinguish_spawn_exit_and_window_timeout_and_retain_output() {
         "-c".into(),
         "printf 'stdout evidence\\n'; printf 'stderr evidence\\n' >&2; exit 23".into(),
     ];
-    assert!(matches!(
-        glass.start(&exiting),
-        Err(GlassError::AppExited(Some(23)))
-    ));
+    let error = glass.start(&exiting).expect_err("exited process must fail");
+    assert!(matches!(error, GlassError::AppExited(Some(23))), "{error}");
     let (logs, _) = glass.logs(0, 100, None, None).unwrap();
     assert!(logs.iter().any(|line| line.text == "stdout evidence"));
     assert!(logs.iter().any(|line| line.text == "stderr evidence"));
@@ -78,10 +80,10 @@ fn failed_starts_distinguish_spawn_exit_and_window_timeout_and_retain_output() {
         "-c".into(),
         "printf 'waiting for window\\n'; exec sleep 60".into(),
     ];
-    assert!(matches!(
-        glass.start(&waiting),
-        Err(GlassError::Timeout(200))
-    ));
+    let error = glass
+        .start(&waiting)
+        .expect_err("unpublished window must time out");
+    assert!(matches!(error, GlassError::Timeout(200)), "{error}");
     let (logs, _) = glass.logs(0, 100, None, None).unwrap();
     assert!(logs.iter().any(|line| line.text == "waiting for window"));
     assert!(!logs.iter().any(|line| line.text == "stdout evidence"));
