@@ -1071,7 +1071,16 @@ pub(crate) fn set_value_with(
 pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
     let (frame, marks) = glass.a11y_marks().map_err(|e| e.to_string())?;
     let img = frame_to_webp(&frame).map_err(|e| e.to_string())?;
-    let legend = if marks.is_empty() {
+    Ok(ToolOutput::image_result(
+        "glass_a11y_marks",
+        Some(img),
+        serde_json::json!({ "count": marks.len() }),
+        vec![OutContent::untrusted_observation(&marks_legend(&marks))],
+    ))
+}
+
+fn marks_legend(marks: &[glass_core::Mark]) -> String {
+    if marks.is_empty() {
         "0 interactable elements".to_string()
     } else {
         marks
@@ -1086,13 +1095,7 @@ pub fn a11y_marks(glass: &mut Glass) -> ToolResult {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    };
-    Ok(ToolOutput::image_result(
-        "glass_a11y_marks",
-        Some(img),
-        serde_json::json!({ "count": marks.len() }),
-        vec![OutContent::untrusted_observation(&legend)],
-    ))
+    }
 }
 
 pub(crate) fn parse_button(s: Option<&str>) -> Result<MouseButton, String> {

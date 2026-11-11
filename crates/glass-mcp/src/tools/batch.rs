@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use crate::params::*;
 use crate::tools::{
     BatchToolResult, ContextualError, ContextualToolResult, OutContent, SafeErrorCategory,
-    ToolContext, ToolOutput, click_element_with, click_with, diff_with, drag_with, key_with,
-    mouse_move_with, screenshot_with, scroll_to_element_with, scroll_with, set_value_with,
-    type_text_with, wait_for_element_with, wait_stable_with,
+    ToolContext, ToolOutput, click_element_with, click_with, diff_with, drag_with, gesture_with,
+    key_with, mouse_move_with, screenshot_with, scroll_to_element_with, scroll_with,
+    set_value_with, type_text_with, wait_for_element_with, wait_stable_with,
 };
 
 mod model;
@@ -137,6 +137,7 @@ pub fn do_actions(glass: &mut Glass, a: &DoArgs) -> BatchToolResult {
             Action::Click(args) => click_with(glass, args, context),
             Action::Move(args) => mouse_move_with(glass, args, context),
             Action::Drag(args) => drag_with(glass, args, context),
+            Action::Gesture(args) => gesture_with(glass, args, context),
             Action::Scroll(args) => scroll_with(glass, args, context),
             Action::Type(args) => type_text_with(glass, args, context),
             Action::Key(args) => key_with(glass, args, context),
@@ -439,6 +440,7 @@ impl Action {
             Action::Click(_) => "click",
             Action::Move(_) => "move",
             Action::Drag(_) => "drag",
+            Action::Gesture(_) => "gesture",
             Action::Scroll(_) => "scroll",
             Action::Type(_) => "type",
             Action::Key(_) => "key",

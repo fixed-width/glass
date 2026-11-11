@@ -32,7 +32,12 @@ pub(crate) fn screenshot_with(
     a: &ScreenshotArgs,
     context: ToolContext,
 ) -> ContextualToolResult {
-    let frame = glass
+    if a.annotations.is_some() && a.window_id.is_some() {
+        return Err(ContextualError::validation(
+            "accessibility annotations require the active window; omit window_id".into(),
+        ));
+    }
+    let mut frame = glass
         .screenshot_by(
             a.region.as_ref().map(|r| r.into()),
             a.window_id.map(glass_core::WindowId),
@@ -64,9 +69,25 @@ pub(crate) fn screenshot_with(
         .as_ref()
         .map(|geometry| (geometry.captured.x, geometry.captured.y))
         .unwrap_or_else(|| a.region.as_ref().map_or((0, 0), |r| (r.x, r.y)));
+    let mut extra = Vec::new();
+    let mut mark_count = None;
+    if a.annotations.is_some() {
+        let tree = glass
+            .a11y_resnapshot(context.deadline)
+            .map_err(|error| ContextualError::from_core(error, context))?;
+        let (annotated, marks) = glass_core::marks::render_at(&frame, &tree, origin);
+        frame = annotated;
+        mark_count = Some(marks.len());
+        extra.push(OutContent::untrusted_observation(&super::marks_legend(
+            &marks,
+        )));
+    }
     let img = encode_image(frame, origin, a.max_width, a.max_height)
         .map_err(|e| ContextualError::from_core(e, context))?;
     let mut meta = json!({ "width": img.width, "height": img.height });
+    if let Some(count) = mark_count {
+        meta["count"] = json!(count);
+    }
     if let Some(r) = a.region.as_ref() {
         meta["x"] = json!(r.x);
         meta["y"] = json!(r.y);
@@ -76,7 +97,7 @@ pub(crate) fn screenshot_with(
         "glass_screenshot",
         Some(bytes),
         meta,
-        vec![],
+        extra,
     )))
 }
 
@@ -249,6 +270,25 @@ pub(crate) fn diff_with(
 }
 
 pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
+    if let Some(wait) = &a.wait {
+        if a.max_lines.is_some() {
+            return Err("max_lines is unavailable when waiting for a log match".into());
+        }
+        return super::wait::wait_for_log_as(
+            glass,
+            &WaitForLogArgs {
+                contains: a
+                    .contains
+                    .clone()
+                    .ok_or("wait requires non-empty contains")?,
+                cursor: a.cursor,
+                stream: a.stream.clone(),
+                interval_ms: wait.interval_ms,
+                timeout_ms: wait.timeout_ms,
+            },
+            "glass_logs",
+        );
+    }
     let stream = match a.stream.as_deref() {
         None | Some("both") => None,
         Some("stdout") => Some(Stream::Stdout),
@@ -313,6 +353,137 @@ mod tests {
     }
 
     #[test]
+    fn annotated_screenshot_keeps_legacy_pixels_legend_and_actionable_ids() {
+        let platform =
+            FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let mut glass = glass_with_a11y(platform, fake_tree());
+        start_tool(
+            &mut glass,
+            &serde_json::from_value(json!({"run":["app"]})).unwrap(),
+        )
+        .unwrap();
+        let legacy = crate::tools::a11y_marks(&mut glass).unwrap();
+        let annotated = screenshot(
+            &mut glass,
+            &serde_json::from_value(json!({"annotations":"accessibility"})).unwrap(),
+        )
+        .unwrap();
+        let (OutContent::Image(expected), OutContent::Image(actual)) =
+            (&legacy.0[0], &annotated.0[0])
+        else {
+            panic!("expected image-first captures")
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(envelope_at(&annotated, 1)["result"]["count"], 1);
+        let OutContent::Text(legend) = &annotated.0[2] else {
+            panic!("missing legend")
+        };
+        assert!(legend.as_str().starts_with(crate::untrusted::NOTE));
+        assert!(legend.as_str().contains("#1 Button \"Save\""));
+        glass.click_element(glass_core::AxNodeId(1)).unwrap();
+    }
+
+    #[test]
+    fn annotated_screenshot_maps_crop_before_preview_resize() {
+        let platform =
+            FakePlatform::new(100, 100).with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+        let mut glass = glass_with_a11y(platform, fake_tree());
+        start_tool(
+            &mut glass,
+            &serde_json::from_value(json!({"run":["app"]})).unwrap(),
+        )
+        .unwrap();
+        let output = screenshot(
+            &mut glass,
+            &serde_json::from_value(json!({
+                "annotations":"accessibility", "max_width":20,
+                "region":{"x":10,"y":10,"width":40,"height":40}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let OutContent::Image(image) = &output.0[0] else {
+            panic!("missing image")
+        };
+        let decoded = glass_core::frame_from_webp(image).unwrap();
+        assert_eq!((decoded.width, decoded.height), (20, 20));
+        assert_eq!(&decoded.pixels[0..4], &[255, 0, 255, 255]);
+        let metadata = envelope_at(&output, 1);
+        assert_eq!(metadata["result"]["image"]["source"]["x"], 10);
+        assert_eq!(metadata["result"]["image"]["scale_x"], 0.5);
+        assert_eq!(metadata["result"]["count"], 1);
+    }
+
+    #[test]
+    fn annotations_reject_background_windows_before_capture_and_require_a_tree() {
+        let captures = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let platform = FakePlatform::new(100, 100)
+            .with_frames(vec![Frame::solid(100, 100, [0, 0, 0, 255])])
+            .with_capture_log(captures.clone());
+        let mut glass = started_with(platform);
+        let args =
+            serde_json::from_value(json!({"annotations":"accessibility", "window_id":7})).unwrap();
+        assert!(
+            screenshot(&mut glass, &args)
+                .unwrap_err()
+                .contains("active window")
+        );
+        assert_eq!(*captures.lock().unwrap(), 0);
+        let args = serde_json::from_value(json!({"annotations":"accessibility"})).unwrap();
+        assert!(screenshot(&mut glass, &args).is_err());
+    }
+
+    #[test]
+    fn log_wait_matches_retained_history_and_keeps_app_text_untrusted() {
+        let mut glass = started_with(FakePlatform::new(10, 10).with_logs(vec![
+            (Stream::Stdout, "old ready"),
+            (Stream::Stderr, "new ready"),
+        ]));
+        let args = serde_json::from_value(json!({
+            "contains":"ready", "stream":"stderr", "cursor":1, "wait":{"timeout_ms":0}
+        }))
+        .unwrap();
+        let output = logs(&mut glass, &args).unwrap();
+        let result = assert_envelope(&output, "glass_logs");
+        assert_eq!(result["matched"], true);
+        assert_eq!(result["cursor"], 2);
+        assert!(result.get("line").is_none());
+        let OutContent::Text(line) = &output.0[1] else {
+            panic!("missing matching line")
+        };
+        assert!(line.as_str().starts_with(crate::untrusted::NOTE));
+        assert!(line.as_str().contains("new ready"));
+        assert!(!line.as_str().contains("old ready"));
+    }
+
+    #[test]
+    fn log_wait_without_cursor_ignores_retained_matches() {
+        let mut glass =
+            started_with(FakePlatform::new(10, 10).with_logs(vec![(Stream::Stdout, "ready")]));
+        let args =
+            serde_json::from_value(json!({"contains":"ready", "wait":{"timeout_ms":0}})).unwrap();
+        let output = logs(&mut glass, &args).unwrap();
+        let result = assert_envelope(&output, "glass_logs");
+        assert_eq!(result["matched"], false);
+        assert_eq!(result["cursor"], 1);
+        assert!(result["note"].as_str().is_some());
+        assert_eq!(output.0.len(), 1);
+    }
+
+    #[test]
+    fn log_wait_rejects_missing_predicates_and_paging() {
+        let mut glass = started_with(FakePlatform::new(10, 10));
+        for raw in [
+            json!({"wait":{}}),
+            json!({"contains":" ","wait":{}}),
+            json!({"contains":"ready","max_lines":1,"wait":{}}),
+        ] {
+            let args = serde_json::from_value(raw).unwrap();
+            assert!(logs(&mut glass, &args).is_err());
+        }
+    }
+
+    #[test]
     fn bounded_screenshot_reports_native_crop_and_returned_pixels() {
         let frame = Frame::new(8, 6, (0..48).flat_map(|n| [n, 0, 0, 255]).collect()).unwrap();
         let captures = std::sync::Arc::new(std::sync::Mutex::new(0));
@@ -357,6 +528,7 @@ mod tests {
         let out = screenshot(
             &mut g,
             &ScreenshotArgs {
+                annotations: None,
                 require_full: false,
                 max_width: None,
                 max_height: None,
@@ -439,6 +611,7 @@ mod tests {
             [5, 6, 7, 255],
         )]));
         let a = ScreenshotArgs {
+            annotations: None,
             require_full: false,
             max_width: None,
             max_height: None,
@@ -473,6 +646,7 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = ScreenshotArgs {
+            annotations: None,
             require_full: false,
             max_width: None,
             max_height: None,
@@ -498,6 +672,7 @@ mod tests {
             [0, 0, 0, 255],
         )]));
         let a = ScreenshotArgs {
+            annotations: None,
             require_full: false,
             max_width: None,
             max_height: None,
@@ -879,6 +1054,7 @@ mod tests {
         let out = logs(
             &mut g,
             &LogsArgs {
+                wait: None,
                 cursor: None,
                 max_lines: None,
                 stream: None,
@@ -910,6 +1086,7 @@ mod tests {
     fn logs_rejects_bad_stream() {
         let mut g = started_with(FakePlatform::new(10, 10));
         let a = LogsArgs {
+            wait: None,
             cursor: None,
             max_lines: None,
             stream: Some("weird".into()),
@@ -1110,6 +1287,7 @@ mod tests {
         let out = screenshot(
             &mut g,
             &ScreenshotArgs {
+                annotations: None,
                 require_full: false,
                 max_width: None,
                 max_height: None,

@@ -60,7 +60,7 @@ A `✗` prints the exact remedy.
 **Claude Code:**
 
 ```powershell
-claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
+claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool-profile lean
 ```
 
 **Claude Desktop / a project `.mcp.json`:** use the absolute path —
@@ -69,7 +69,8 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
 {
   "mcpServers": {
     "glass": {
-      "command": "C:\\Users\\YOU\\bin\\glass-mcp.exe"
+      "command": "C:\\Users\\YOU\\bin\\glass-mcp.exe",
+      "args": ["--tool-profile", "lean"]
     }
   }
 }

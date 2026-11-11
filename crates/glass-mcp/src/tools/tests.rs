@@ -1786,6 +1786,7 @@ fn production_application_text_conduits_have_explicit_trust_roles() {
     let logs = logs(
         &mut ordinary,
         &LogsArgs {
+            wait: None,
             cursor: None,
             max_lines: None,
             stream: None,

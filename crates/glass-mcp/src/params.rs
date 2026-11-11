@@ -71,6 +71,8 @@ pub fn ignore_regions(args: Option<&[RegionArgs]>) -> Vec<Region> {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScreenshotArgs {
+    /// "accessibility" overlays numbered elements and a legend; active window only.
+    pub annotations: Option<ScreenshotAnnotations>,
     /// Fail if the backend cannot prove the entire requested window/region was captured. Independent of preview resizing.
     #[serde(default)]
     pub require_full: bool,
@@ -84,6 +86,13 @@ pub struct ScreenshotArgs {
     pub region: Option<RegionArgs>,
     /// Observe this current glass_list_windows ID without selecting it; omit for active window.
     pub window_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum ScreenshotAnnotations {
+    Accessibility,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -542,6 +551,8 @@ pub struct DiffArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct LogsArgs {
+    /// Wait for non-empty contains; omit cursor for future lines, use 0 for retained history. max_lines is unavailable while waiting.
+    pub wait: Option<LogWaitArgs>,
     /// Resume from a prior returned cursor; omit for oldest buffered line.
     pub cursor: Option<u64>,
     /// Line cap (default 200). Returned cursor resumes at the first unread line.
@@ -552,6 +563,15 @@ pub struct LogsArgs {
     pub contains: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(inline)]
+pub struct LogWaitArgs {
+    /// Poll interval (default 100ms).
+    pub interval_ms: Option<u64>,
+    /// Give up after this long (default 10000ms); returns matched:false.
+    pub timeout_ms: Option<u64>,
+}
+
 /// One action in a `glass_do` sequence. Internally tagged by `action`; each
 /// variant carries the same fields as the standalone tool.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -560,6 +580,7 @@ pub enum Action {
     Click(ClickArgs),
     Move(MoveArgs),
     Drag(DragArgs),
+    Gesture(GestureArgs),
     Scroll(ScrollArgs),
     Type(TypeArgs),
     Key(KeyArgs),

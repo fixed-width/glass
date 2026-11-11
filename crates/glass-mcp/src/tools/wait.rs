@@ -253,6 +253,14 @@ pub fn wait_for_region(glass: &mut Glass, a: &WaitForRegionArgs) -> ToolResult {
 }
 
 pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
+    wait_for_log_as(glass, a, "glass_wait_for_log")
+}
+
+pub(super) fn wait_for_log_as(
+    glass: &mut Glass,
+    a: &WaitForLogArgs,
+    tool: &'static str,
+) -> ToolResult {
     if a.contains.trim().is_empty() {
         return Err("`contains` must be a non-empty substring".into());
     }
@@ -288,7 +296,7 @@ pub fn wait_for_log(glass: &mut Glass, a: &WaitForLogArgs) -> ToolResult {
         }
         None => vec![],
     };
-    Ok(ToolOutput::result_with("glass_wait_for_log", result, extra))
+    Ok(ToolOutput::result_with(tool, result, extra))
 }
 
 #[cfg(test)]

@@ -152,16 +152,34 @@ pub(crate) fn drag_with(
 }
 
 pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
+    standalone(
+        "glass_gesture",
+        gesture_with(glass, a, ToolContext::UNBOUNDED),
+    )
+}
+
+pub(crate) fn validate_gesture_args(a: &GestureArgs) -> Result<(), ContextualError> {
     let n = a.pointers.len();
     if n < 2 {
-        return Err("glass_gesture needs 2+ pointers; use glass_drag for a single pointer".into());
-    }
-    if n > glass_core::MAX_GESTURE_POINTERS {
-        return Err(format!(
-            "too many pointers ({n}); max is {}",
-            glass_core::MAX_GESTURE_POINTERS
+        return Err(ContextualError::validation(
+            "gesture needs 2+ pointers; use a drag action for a single pointer".into(),
         ));
     }
+    if n > glass_core::MAX_GESTURE_POINTERS {
+        return Err(ContextualError::validation(format!(
+            "too many pointers ({n}); max is {}",
+            glass_core::MAX_GESTURE_POINTERS
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn gesture_with(
+    glass: &mut Glass,
+    a: &GestureArgs,
+    context: ToolContext,
+) -> ContextualToolResult {
+    validate_gesture_args(a)?;
     let pointers = a
         .pointers
         .iter()
@@ -173,12 +191,18 @@ pub fn gesture(glass: &mut Glass, a: &GestureArgs) -> ToolResult {
         })
         .collect();
     glass
-        .pointer(&PointerEvent::Gesture {
-            pointers,
-            duration_ms: a.duration_ms.unwrap_or(250).min(10_000),
-        })
-        .map_err(|error| super::core_error_message("glass_gesture", error))?;
-    Ok(ToolOutput::result("glass_gesture", serde_json::json!({})))
+        .pointer_by(
+            &PointerEvent::Gesture {
+                pointers,
+                duration_ms: a.duration_ms.unwrap_or(250).min(10_000),
+            },
+            context.deadline,
+        )
+        .map_err(|error| ContextualError::from_caller_bound(error, context))?;
+    Ok(ContextualOutput::immediate(ToolOutput::result(
+        "glass_gesture",
+        serde_json::json!({}),
+    )))
 }
 
 pub fn scroll(glass: &mut Glass, a: &ScrollArgs) -> ToolResult {

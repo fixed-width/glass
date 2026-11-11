@@ -1259,6 +1259,7 @@ mod tests {
         tools::screenshot(
             &mut g,
             &ScreenshotArgs {
+                annotations: None,
                 require_full: false,
                 max_width: None,
                 max_height: None,

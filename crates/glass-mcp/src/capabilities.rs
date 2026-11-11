@@ -87,7 +87,7 @@ pub(crate) const OPERATION_TOOLS: &[(&str, &[&str])] = &[
             "glass_do",
         ],
     ),
-    ("multi_touch", &["glass_gesture"]),
+    ("multi_touch", &["glass_gesture", "glass_do"]),
     ("clipboard", &["glass_clipboard_get", "glass_clipboard_set"]),
     (
         "accessibility",
@@ -95,6 +95,7 @@ pub(crate) const OPERATION_TOOLS: &[(&str, &[&str])] = &[
             "glass_find_elements",
             "glass_a11y_snapshot",
             "glass_a11y_marks",
+            "glass_screenshot",
             "glass_click_element",
             "glass_set_value",
             "glass_wait_for_element",

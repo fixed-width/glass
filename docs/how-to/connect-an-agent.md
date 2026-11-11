@@ -30,13 +30,13 @@ Register the binary; your client spawns it and talks over stdin/stdout.
 **Claude Code:**
 
 ```bash
-claude mcp add glass --scope user -- /absolute/path/to/glass-mcp
+claude mcp add glass --scope user -- /absolute/path/to/glass-mcp --tool-profile lean
 ```
 
 For Windows shared-desktop operation, point at the `.exe`:
 
 ```powershell
-claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
+claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool-profile lean
 ```
 
 **Generic MCP client (JSON config):**
@@ -45,7 +45,8 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
 {
   "mcpServers": {
     "glass": {
-      "command": "/absolute/path/to/glass-mcp"
+      "command": "/absolute/path/to/glass-mcp",
+      "args": ["--tool-profile", "lean"]
     }
   }
 }
@@ -55,11 +56,12 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe"
 add glass under `mcpServers` (the same shape as the generic config above), then reload the MCP
 servers (or restart Antigravity).
 
-For a smaller tool inventory, add `"args": ["--tool-profile", "lean"]` beside `command`.
-The default full inventory remains available; lean uses `glass_do` for actions, including single
-steps. See [tool profiles](../reference/tools.md#tool-profiles) for the included tools and wait semantics.
+These new configurations select the 17-tool lean inventory. Lean uses `glass_do` for actions,
+including single steps and gestures, `glass_screenshot` annotations for numbered elements, and
+`glass_logs` with `wait` for log predicates. Use `--tool-profile full` for standalone tools. See
+[tool profiles](../reference/tools.md#tool-profiles) for the included tools and wait semantics.
 
-**Codex CLI:** `codex mcp add glass -- /absolute/path/to/glass-mcp` — or add a `[mcp_servers.glass]`
+**Codex CLI:** `codex mcp add glass -- /absolute/path/to/glass-mcp --tool-profile lean` — or add a `[mcp_servers.glass]`
 table with `command` / `args` to `~/.codex/config.toml`.
 
 **GitHub Copilot:** add glass under `servers` in the client's MCP config — VS Code via *MCP: Open
@@ -74,6 +76,9 @@ override a default — the specific variables are in [reference/environment.md](
 
 When glass runs as a network server (`glass-mcp serve --http`), register its URL instead of a command.
 The Windows tray app (`glass-mcp desktop open` or `serve --tray`) serves the same HTTP transport.
+
+For a manually launched HTTP server, use `glass-mcp serve --http --tool-profile lean`.
+The client uses the inventory selected by the server; an HTTP registration cannot change it.
 
 Start Glass before connecting the agent. If Glass is not running, the connection fails; start it
 and reconnect or reload the MCP connection as required by your client. If the Windows tray is
@@ -111,7 +116,7 @@ For shared-desktop operation on macOS, prefer the HTTP endpoint that the menu-ba
 
 ```bash
 claude mcp add glass --scope user -- \
-  /Applications/GlassMcp.app/Contents/MacOS/glass-mcp
+  /Applications/GlassMcp.app/Contents/MacOS/glass-mcp --tool-profile lean
 ```
 
 — but a stdio server is launched by, and attributed to, your MCP client, so the macOS permission
