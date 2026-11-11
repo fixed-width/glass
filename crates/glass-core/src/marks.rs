@@ -443,6 +443,89 @@ mod tests {
     }
 
     #[test]
+    fn render_at_preserves_the_complete_box_and_chip_at_an_asymmetric_offset() {
+        let frame = Frame::solid(50, 50, [7, 11, 13, 255]);
+        let tree = tree_of(node(
+            0,
+            AxRole::Button,
+            "Save",
+            Some(AxRect {
+                x: 19,
+                y: 25,
+                width: 11,
+                height: 17,
+            }),
+        ));
+        let (actual, legend) = render_at(&frame, &tree, (7, 9));
+        let mut expected = frame.clone();
+        draw_mark(
+            &mut expected,
+            AxRect {
+                x: 12,
+                y: 16,
+                width: 11,
+                height: 17,
+            },
+            1,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(legend.len(), 1);
+        assert_eq!(legend[0].id, AxNodeId(1));
+    }
+
+    #[test]
+    fn render_at_clips_partial_elements_at_every_capture_edge() {
+        let frame = Frame::solid(50, 50, [7, 11, 13, 255]);
+        let cases = [
+            ((2, 25, 20, 17), (0, 16, 15, 17)),
+            ((19, 2, 11, 20), (12, 0, 11, 13)),
+            ((50, 25, 30, 17), (43, 16, 7, 17)),
+            ((19, 50, 11, 30), (12, 41, 11, 9)),
+            ((2, 2, u32::MAX, u32::MAX), (0, 0, 50, 50)),
+        ];
+        for ((x, y, width, height), (ex, ey, ew, eh)) in cases {
+            let bounds = AxRect {
+                x,
+                y,
+                width,
+                height,
+            };
+            let tree = tree_of(node(0, AxRole::Button, "Save", Some(bounds)));
+            let (actual, legend) = render_at(&frame, &tree, (7, 9));
+            let mut expected = frame.clone();
+            draw_mark(
+                &mut expected,
+                AxRect {
+                    x: ex,
+                    y: ey,
+                    width: ew,
+                    height: eh,
+                },
+                1,
+            );
+            assert_eq!(actual, expected, "window-relative bounds: {bounds}");
+            assert_eq!(legend.len(), 1, "window-relative bounds: {bounds}");
+        }
+    }
+
+    #[test]
+    fn render_at_omits_elements_separated_from_or_touching_either_capture_axis() {
+        for (origin, size) in [
+            ((40, 0), (20, 40)),
+            ((0, 40), (40, 20)),
+            ((30, 0), (20, 40)),
+            ((0, 26), (40, 20)),
+            ((0, 0), (10, 40)),
+            ((0, 0), (40, 10)),
+        ] {
+            let frame = Frame::solid(size.0, size.1, [7, 11, 13, 255]);
+            let (actual, legend) = render_at(&frame, &tree(), origin);
+            assert!(legend.is_empty(), "origin: {origin:?}, size: {size:?}");
+            assert_eq!(actual, frame, "origin: {origin:?}, size: {size:?}");
+        }
+    }
+
+    #[test]
     fn render_at_omits_elements_outside_the_capture() {
         let frame = Frame::solid(20, 20, [0, 0, 0, 255]);
         for origin in [(40, 40), (u32::MAX, u32::MAX)] {
