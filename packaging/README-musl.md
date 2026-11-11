@@ -70,7 +70,7 @@ tears down the headless display to prove it starts.
 **Claude Code:**
 
 ```bash
-claude mcp add glass --scope user -- ~/.local/bin/glass-mcp
+claude mcp add glass --scope user -- ~/.local/bin/glass-mcp --tool-profile lean
 ```
 
 **Claude Desktop / a project `.mcp.json`:** use the absolute path —
@@ -79,7 +79,8 @@ claude mcp add glass --scope user -- ~/.local/bin/glass-mcp
 {
   "mcpServers": {
     "glass": {
-      "command": "/home/YOU/.local/bin/glass-mcp"
+      "command": "/home/YOU/.local/bin/glass-mcp",
+      "args": ["--tool-profile", "lean"]
     }
   }
 }

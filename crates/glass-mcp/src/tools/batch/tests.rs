@@ -1051,6 +1051,7 @@ fn run_delayed_terminal_screenshot() -> ToolOutput {
             settle: None,
             diff: None,
             screenshot: Some(ScreenshotArgs {
+                annotations: None,
                 require_full: false,
                 max_width: None,
                 max_height: None,
@@ -1089,6 +1090,7 @@ fn standalone_handlers_use_unbounded_context_and_keep_wire_shape() {
         vec![Deadline::UNBOUNDED, Deadline::UNBOUNDED]
     );
     let screenshot_args = ScreenshotArgs {
+        annotations: None,
         require_full: false,
         max_width: None,
         max_height: None,
@@ -1276,6 +1278,67 @@ fn sequence_uses_one_absolute_deadline_for_every_action() {
 }
 
 #[test]
+fn gesture_runs_in_order_under_the_sequence_deadline() {
+    let (mut glass, deadlines, events) = deadline_glass(DeadlineBehavior::Normal, vec![]);
+    let gesture = parsed_action(
+        r#"{"action":"gesture","pointers":[
+        {"from":{"x":30,"y":40},"to":{"x":10,"y":40}},
+        {"from":{"x":50,"y":40},"to":{"x":70,"y":40}}
+    ]}"#,
+    );
+    let output = do_actions(
+        &mut glass,
+        &do_args(vec![click(1, 1), gesture, click(2, 2)], 1000),
+    )
+    .unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["click(1,1)", "gesture(2)", "click(2,2)"]
+    );
+    assert_eq!(
+        envelope_at(&output, 0)["result"]["steps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let seen = deadlines.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert_ne!(seen[0], Deadline::UNBOUNDED);
+    assert!(seen.iter().all(|deadline| *deadline == seen[0]));
+}
+
+#[test]
+fn invalid_gesture_preflight_prevents_earlier_mutations() {
+    let (mut glass, _, events) = deadline_glass(DeadlineBehavior::Normal, vec![]);
+    let gesture = parsed_action(r#"{"action":"gesture","pointers":[]}"#);
+    let output = do_actions(&mut glass, &do_args(vec![click(1, 1), gesture], 1000)).unwrap_err();
+    assert_eq!(error_code(output), "invalid_sequence");
+    assert!(events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn terminal_annotations_share_the_sequence_deadline_with_accessibility() {
+    let (mut glass, platform_deadlines, a11y_deadlines) =
+        deadline_a11y_glass(vec![Frame::solid(100, 100, [0, 0, 0, 255])]);
+    let args = serde_json::from_value(json!({
+        "actions":[{"action":"key","chord":"Tab"}],
+        "then":{"screenshot":{"annotations":"accessibility"}}, "timeout_ms":1000
+    }))
+    .unwrap();
+    do_actions(&mut glass, &args).unwrap();
+    let platform = platform_deadlines.lock().unwrap();
+    let accessibility = a11y_deadlines.lock().unwrap();
+    assert!(!accessibility.is_empty());
+    assert_ne!(platform[0], Deadline::UNBOUNDED);
+    assert!(
+        accessibility
+            .iter()
+            .all(|deadline| *deadline == platform[0])
+    );
+}
+
+#[test]
 fn late_action_is_failed_and_later_actions_are_unexecuted() {
     let (mut g, _, events) = deadline_glass(DeadlineBehavior::CompleteLate, vec![]);
     let err = do_actions(
@@ -1351,6 +1414,7 @@ fn ordinary_terminal_error_returned_after_deadline_is_sequence_deadline_exceeded
             settle: None,
             diff: None,
             screenshot: Some(ScreenshotArgs {
+                annotations: None,
                 require_full: false,
                 max_width: None,
                 max_height: None,
@@ -3637,6 +3701,7 @@ fn then_screenshot_appends_image() {
                 settle: None,
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    annotations: None,
                     require_full: false,
                     max_width: None,
                     max_height: None,
@@ -3865,6 +3930,7 @@ fn terminal_steps_report_settle_diff_screenshot_in_fixed_order() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    annotations: None,
                     require_full: false,
                     max_width: None,
                     max_height: None,
@@ -3930,6 +3996,7 @@ fn terminal_failure_marks_later_observations_unexecuted() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    annotations: None,
                     require_full: false,
                     max_width: None,
                     max_height: None,
@@ -4008,6 +4075,7 @@ fn terminal_sequence_deadline_keeps_all_action_steps_completed() {
                 }),
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    annotations: None,
                     require_full: false,
                     max_width: None,
                     max_height: None,
@@ -4071,6 +4139,7 @@ fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() 
                 settle: None,
                 diff: None,
                 screenshot: Some(ScreenshotArgs {
+                    annotations: None,
                     require_full: false,
                     max_width: None,
                     max_height: None,
@@ -4103,6 +4172,7 @@ fn terminal_window_screenshot_uses_sequence_deadline_and_rejects_late_success() 
 fn then_shape_remains_backward_compatible() {
     let frame = Frame::solid(2, 2, [1, 2, 3, 255]);
     let screenshot_args = ScreenshotArgs {
+        annotations: None,
         require_full: false,
         max_width: None,
         max_height: None,
@@ -4185,6 +4255,7 @@ fn terminal_content_blocks_reference_images_and_notes_in_response_order() {
                     ignore: None,
                 }),
                 screenshot: Some(ScreenshotArgs {
+                    annotations: None,
                     require_full: false,
                     max_width: None,
                     max_height: None,

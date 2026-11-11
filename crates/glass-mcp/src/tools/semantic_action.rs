@@ -172,6 +172,7 @@ pub(crate) fn validate_action(action: &Action) -> Result<(), ContextualError> {
         Action::Click(args) => super::input::validate_click_args(args).map(|_| ()),
         Action::Move(_) => Ok(()),
         Action::Drag(args) => super::input::validate_drag_args(args).map(|_| ()),
+        Action::Gesture(args) => super::input::validate_gesture_args(args),
         Action::Scroll(args) => super::input::validate_scroll_args(args).map(|_| ()),
         Action::Type(args) => validate_type_args(args).map(|_| ()),
         Action::Key(args) => super::input::validate_key_args(args),

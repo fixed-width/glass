@@ -55,19 +55,32 @@ const FONT_3X5: [[u8; 5]; 10] = [
 /// `frame`. Returns the annotated frame and the legend, in ascending-id (DFS) order.
 /// Nodes without bounds or with zero area are skipped; all drawing is clipped.
 pub fn render(frame: &Frame, tree: &AxTree) -> (Frame, Vec<Mark>) {
+    render_view(frame, tree, None)
+}
+
+/// Render elements intersecting a frame captured at window-relative `origin`.
+pub fn render_at(frame: &Frame, tree: &AxTree, origin: (u32, u32)) -> (Frame, Vec<Mark>) {
+    render_view(frame, tree, Some(origin))
+}
+
+fn render_view(frame: &Frame, tree: &AxTree, origin: Option<(u32, u32)>) -> (Frame, Vec<Mark>) {
     let mut out = frame.clone();
     let mut legend = Vec::new();
-    collect(&tree.root, &mut out, &mut legend);
+    collect(&tree.root, &mut out, &mut legend, origin);
     (out, legend)
 }
 
-fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
+fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>, origin: Option<(u32, u32)>) {
     if node.role.is_interactable()
         && let Some(b) = node.bounds
         && b.width > 0
         && b.height > 0
+        && let Some(bounds) = match origin {
+            Some(origin) => captured_bounds(b, frame, origin),
+            None => Some(b),
+        }
     {
-        draw_mark(frame, b, node.id.0);
+        draw_mark(frame, bounds, node.id.0);
         legend.push(Mark {
             id: node.id,
             role: node.role,
@@ -81,8 +94,27 @@ fn collect(node: &AxNode, frame: &mut Frame, legend: &mut Vec<Mark>) {
         });
     }
     for child in &node.children {
-        collect(child, frame, legend);
+        collect(child, frame, legend, origin);
     }
+}
+
+fn captured_bounds(bounds: AxRect, frame: &Frame, origin: (u32, u32)) -> Option<AxRect> {
+    let x = i64::from(bounds.x) - i64::from(origin.0);
+    let y = i64::from(bounds.y) - i64::from(origin.1);
+    let right = (x + i64::from(bounds.width)).min(i64::from(frame.width).min(i64::from(i32::MAX)));
+    let bottom =
+        (y + i64::from(bounds.height)).min(i64::from(frame.height).min(i64::from(i32::MAX)));
+    let left = x.max(0);
+    let top = y.max(0);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(AxRect {
+        x: left as i32,
+        y: top as i32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
 }
 
 fn draw_mark(frame: &mut Frame, b: AxRect, id: u32) {
@@ -396,6 +428,28 @@ mod tests {
         assert_eq!(legend[0].label, Some(MarkLabel::Name("Save".into())));
         assert_eq!(px(&out, 10, 10), OUTLINE);
         assert_eq!(px(&out, 10, 40), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn render_at_translates_window_bounds_without_changing_ids() {
+        let tree = tree();
+        let frame = Frame::solid(40, 40, [0, 0, 0, 255]);
+        let (out, legend) = render_at(&frame, &tree, (5, 5));
+        assert_eq!(px(&out, 5, 5), OUTLINE);
+        assert_eq!(px(&out, 24, 20), OUTLINE);
+        assert_eq!(px(&out, 30, 30), [0, 0, 0, 255]);
+        assert_eq!(legend[0].id, AxNodeId(1));
+        assert_eq!(tree.root.children[0].bounds.unwrap().x, 10);
+    }
+
+    #[test]
+    fn render_at_omits_elements_outside_the_capture() {
+        let frame = Frame::solid(20, 20, [0, 0, 0, 255]);
+        for origin in [(40, 40), (u32::MAX, u32::MAX)] {
+            let (out, legend) = render_at(&frame, &tree(), origin);
+            assert!(legend.is_empty());
+            assert_eq!(out, frame);
+        }
     }
 
     #[test]

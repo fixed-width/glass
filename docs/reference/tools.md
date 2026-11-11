@@ -12,15 +12,19 @@ supports, see [reference/platforms.md](platforms.md).
 
 ## Tool profiles
 
-The default **full** profile exposes all 31 tools below. Start with `glass-mcp --tool-profile lean`
-or `glass-mcp serve --http --tool-profile lean` for a smaller, fixed 20-tool inventory. Full remains
+The default **full** profile exposes all 32 tools below. For new agent configurations, use
+`glass-mcp --tool-profile lean` or `glass-mcp serve --http --tool-profile lean` for a fixed 17-tool
+inventory. Full remains
 the default for existing configurations; `--tool-profile full` selects it explicitly.
 
-Lean keeps lifecycle, discovery, observation, diagnostics, windows, clipboard and gestures. It uses
+Lean keeps lifecycle, discovery, observation, diagnostics, windows and clipboard. It uses
 `glass_do` for individual actions as well as known sequences, omitting these standalone tools:
 `glass_click`, `glass_move`, `glass_drag`, `glass_scroll`, `glass_type`, `glass_key`,
 `glass_click_element`, `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`, and
-`glass_wait_stable`. All other tools in this reference are included. For example, press Return with:
+`glass_wait_stable`, `glass_gesture`, `glass_a11y_marks`, `glass_wait_for_log`, and the experimental
+`glass_a11y_snapshot_diff`. Gestures use the `gesture` action; numbered screenshots use
+`glass_screenshot` with `annotations:"accessibility"`; log waits use `glass_logs` with `wait:{}`.
+All other tools in this reference are included. For example, press Return with:
 
 ```json
 {"actions":[{"action":"key","chord":"Return"}]}
@@ -268,6 +272,10 @@ completion, or stability.
 
 - `region` (`{ x, y, width, height }`, window-relative) — capture just this rectangle; omit for the
   whole window. Vision cost scales with pixel area, so a tight region is a recurring token saving.
+- `annotations` (string) — `"accessibility"` overlays numbered accessibility boxes and an untrusted
+  text legend, refreshing the IDs used by `click_element`. Active window only; cannot combine with
+  `window_id`. Errors without an accessibility tree. Cropping and preview sizing still apply;
+  annotation coordinates are mapped to the captured region before resizing.
 - `window_id` (integer) — capture this window (id from `glass_list_windows`) instead of the active
   one, without changing which window subsequent ops target. Omit for the active window.
 - `require_full` (boolean, default false) — refuse a clipped capture or a backend that cannot prove
@@ -276,7 +284,9 @@ completion, or stability.
   see [image size controls](#image-size-controls). Omit both for native pixels.
 
 Returns `{width, height}` — the returned image dimensions — plus native `x, y` (the region's origin)
-when `region` was given. Supplying a size bound also adds `image` metadata.
+when `region` was given. Supplying a size bound also adds `image` metadata. Accessibility annotations
+add `count` and an untrusted legend for elements intersecting the captured region. Boxes follow
+toolkit geometry; inspect action results before relying on a marked target.
 On Linux, `capture` reports `complete`, `window_complete`, the full screen-relative `window`
 rectangle, window-relative `requested` and `captured` rectangles, and the `display` rectangle.
 These describe native pixels independently of preview resizing. `image.source` uses the actual
@@ -464,6 +474,8 @@ takes the same `region`.
 
 ### `glass_wait_for_log`
 
+Full-profile standalone form. Lean uses `glass_logs` with `contains` and `wait:{}`.
+
 Wait for a log line containing `contains`, starting at the chosen cursor.
 
 After an action has returned, use `glass_logs` to inspect buffered output, or pass `cursor:0`
@@ -606,6 +618,8 @@ Move the pointer to window-relative coordinates.
 
 ### `glass_gesture`
 
+Full-profile standalone form. Lean uses the same fields in a `glass_do` `gesture` action.
+
 Perform a multi-touch gesture: 2–10 pointers, each a straight `from→to` segment, all down together
 at `t=0` and up at `duration_ms`. Pinch = two pointers toward/apart; rotate = two on an arc;
 two-finger swipe = two parallel segments; a `from==to` pointer is held in place. Multi-touch isn't
@@ -641,8 +655,8 @@ cannot use variables, references to earlier results, interpolation, branching, l
 dynamically generated actions.
 
 - `actions` (array, **required**, 1–64 items) — each item uses one discriminator: `click`, `move`,
-  `drag`, `scroll`, `type`, `key`, `settle`, `click_element`, `set_value`, `wait_for_element`, or
-  `scroll_to_element`. Each action reuses the fields of its standalone tool, including per-action
+  `drag`, `gesture`, `scroll`, `type`, `key`, `settle`, `click_element`, `set_value`,
+  `wait_for_element`, or `scroll_to_element`. Each action reuses the fields of its standalone tool, including per-action
   `return` where the standalone tool supports it. A `settle` action uses `interval_ms`,
   `settle_frames`, `tolerance`, `timeout_ms`, `stability_region`, and `ignore`; it targets the active
   window and does not return an image.
@@ -909,6 +923,8 @@ The external interaction client includes a strict receiver in `tools/interaction
 
 ### `glass_a11y_marks`
 
+Full-profile standalone form. Lean uses `glass_screenshot` with `annotations:"accessibility"`.
+
 Screenshot of the active window with a numbered Set-of-Mark box on each interactable element, plus a
 text legend (`#<id> <Role> "<name>"`). An element with no name but a description is labelled from it
 and rendered as `#<id> <Role> desc="<description>"`, the same spelling the snapshot outline uses, so
@@ -1147,22 +1163,34 @@ Store / notarized) can't be redirected and returns Unsupported.
 
 ### `glass_logs`
 
-Read captured stdout/stderr log lines with a resumable cursor.
+Read captured stdout/stderr log lines with a resumable cursor, or wait for a matching line.
 
-Use this to inspect output from an action that has already returned. To verify a future
-occurrence with `glass_wait_for_log`, drain the buffered pages and save the final cursor
-before performing the action. A page limited by `max_lines` can leave older output unread.
+Use this to inspect output from an action that has already returned. To verify a future occurrence,
+drain the buffered pages and save the final cursor before performing the action. A page limited by
+`max_lines` can leave older output unread.
 
 - `contains` (string) — return only lines containing this substring.
 - `stream` (string) — `"stdout"`, `"stderr"`, or `"both"` (default).
 - `cursor` (integer) — resume from this cursor.
 - `max_lines` (integer, `u32`) — cap the number of lines returned.
+- `wait` (object) — wait for a non-empty `contains` substring. Optional `timeout_ms` defaults to
+  10000 and `interval_ms` to 100. An empty object uses both defaults. While waiting, omitted `cursor`
+  watches future lines only; `cursor:0` includes retained history. `max_lines` is rejected in wait
+  mode, which returns at most one matching line. Omit `wait` for the existing immediate paged read.
 
 Returns `{cursor}` — resume a later call from here; the matched lines themselves (each
 `{seq, stream, text}`) ride as an untrusted sibling text block, since log output is app-controlled.
 After a failed launch, logs remain readable without an active session and the result includes
 `failed_launch` discovery criteria and phase. Retention ends at the next launch attempt; failed
 launch logs retain at most 200 lines, each capped at 4096 characters.
+
+With `wait`, returns `{matched, cursor, elapsed_ms}`, plus the optional diagnostic `note` described
+under `glass_wait_for_log`. The matching line is an untrusted sibling object `{seq, stream, text}`;
+on timeout, `matched:false` and no line. Waiting requires an active session.
+
+```json
+{"contains":"Saved", "cursor":42, "wait":{"timeout_ms":5000}}
+```
 
 ### `glass_doctor`
 
@@ -1248,9 +1276,9 @@ from. In full, the links are:
 
 - **input** → `glass_type`, `glass_click`, `glass_key`, `glass_drag`, `glass_scroll`,
   `glass_move`, `glass_do`
-- **multi_touch** → `glass_gesture`
+- **multi_touch** → `glass_gesture`, `glass_do`
 - **clipboard** → `glass_clipboard_get`, `glass_clipboard_set`
-- **accessibility** → `glass_find_elements`, `glass_a11y_snapshot`, `glass_a11y_marks`,
+- **accessibility** → `glass_find_elements`, `glass_a11y_snapshot`, `glass_a11y_marks`, `glass_screenshot`,
   `glass_click_element`, `glass_set_value`, `glass_wait_for_element`, `glass_scroll_to_element`
 - **window_move_resize** → `glass_window`
 

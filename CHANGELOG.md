@@ -21,6 +21,9 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- `glass_screenshot` supports numbered accessibility annotations, `glass_logs` supports waiting
+  for matching lines, and `glass_do` supports multi-touch gestures. The lean profile exposes these
+  through 17 tools; full retains all standalone tools. New stdio registration examples select lean.
 - Linux launches accept `read_only_inputs` for files outside the workspace and report filesystem
   visibility and display size. Screenshots report capture completeness and accept `require_full`.
 - Preview Windows development on a separate desktop, so agents can work without interrupting you.

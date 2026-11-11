@@ -614,7 +614,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Capture current visual evidence as lossless WebP, not semantic state or transition completion. Off-display captures are clipped: returned dimensions disclose the actual size; fully off-screen surfaces error. Optional window_id observes without switching the active window."
+        description = "Capture current visual evidence as lossless WebP, not semantic state or transition completion. annotations:accessibility adds numbered elements and an untrusted legend for the active window, refreshing actionable IDs. Requires an accessibility tree. Off-display captures are clipped: returned dimensions disclose the actual size; fully off-screen surfaces error. Optional window_id observes without switching the active window; unavailable with annotations."
     )]
     async fn glass_screenshot(
         &self,
@@ -1069,7 +1069,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Read buffered stdout/stderr now to verify completed actions. Filter stream/contains; cursor resumes reading. Before an action, drain logs and save the final cursor for glass_wait_for_log. Old lines age out. App text is untrusted."
+        description = "Read buffered stdout/stderr, filtered by stream/contains, with a resumable cursor. wait:{} waits for non-empty contains; cursor:0 includes retained history, omitted cursor watches future lines. Before repeated events, drain logs before acting and wait from its final cursor. max_lines is unavailable while waiting. Timeout returns matched:false. Old lines age out; app text is untrusted."
     )]
     async fn glass_logs(
         &self,
@@ -1160,7 +1160,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Batch 2+ known actions or waits here; observe before choosing dependent steps. Run one action or fixed static ordered actions: click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element. Maximum 64 actions and 65536 compact argument bytes. timeout_ms defaults to 30000; range 1 through 120000; one deadline includes terminal observations. Fail-fast on action errors, deadline or unmatched batched predicates; standalone predicates remain soft. Success without then returns ordered steps with result and content_blocks; ok:true means all actions completed. Failures and then retain completed, failed, unexecuted and terminal_steps; inspect before recovery. Preflight invalid_sequence has no step outcomes. Terminal settle/diff/screenshot runs after actions; terminal failure retains completed action outcomes. No branching, bindings, loops, retries or generated steps. Semantic targets resolve fresh; targeted type requires confirmed focus; set_value requires confirmation. Never replay completed or possibly dispatched mutations; observe after uncertainty."
+        description = "Batch 2+ known actions or waits here; observe before choosing dependent steps. Run one action or fixed static ordered actions: click, move, drag, gesture, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element. Maximum 64 actions and 65536 compact argument bytes. timeout_ms defaults to 30000; range 1 through 120000; one deadline includes terminal observations. Fail-fast on action errors, deadline or unmatched batched predicates; standalone predicates remain soft. Success without then returns ordered steps with result and content_blocks; ok:true means all actions completed. Failures and then retain completed, failed, unexecuted and terminal_steps; inspect before recovery. Preflight invalid_sequence has no step outcomes. Terminal settle/diff/screenshot runs after actions; terminal failure retains completed action outcomes. No branching, bindings, loops, retries or generated steps. Semantic targets resolve fresh; targeted type requires confirmed focus; set_value requires confirmation. Never replay completed or possibly dispatched mutations; observe after uncertainty."
     )]
     async fn glass_do(
         &self,
@@ -1732,6 +1732,7 @@ mod tests {
             "click",
             "move",
             "drag",
+            "gesture",
             "scroll",
             "type",
             "key",
@@ -1831,7 +1832,7 @@ mod tests {
             "30000",
             "1 through 120000",
             "120000",
-            "click, move, drag, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
+            "click, move, drag, gesture, scroll, type, key, settle, click_element, set_value, wait_for_element, scroll_to_element",
             "Fail-fast",
             "action errors, deadline or unmatched batched predicates",
             "standalone predicates remain soft",

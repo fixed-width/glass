@@ -63,7 +63,9 @@ pub enum RunMode {
 /// address (only used for [`RunMode::Http`]).
 pub fn registration_line(mode: RunMode, app_bin: &str, addr: &str) -> String {
     match mode {
-        RunMode::Stdio => format!("claude mcp add glass --scope user -- {app_bin}"),
+        RunMode::Stdio => {
+            format!("claude mcp add glass --scope user -- {app_bin} --tool-profile lean")
+        }
         RunMode::Http => format!("claude mcp add --transport http glass http://{addr}/"),
     }
 }
@@ -1225,6 +1227,7 @@ mod tests {
         );
         assert!(line.contains("/Applications/GlassMcp.app/Contents/MacOS/glass-mcp"));
         assert!(line.contains("mcp add glass"));
+        assert!(line.ends_with("--tool-profile lean"));
     }
 
     #[test]
