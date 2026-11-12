@@ -410,6 +410,25 @@ pub(crate) fn checked_scale(density: f64) -> Result<f64> {
 }
 
 impl Platform for IosPlatform {
+    fn recording_supported(&self) -> bool {
+        true
+    }
+
+    fn start_recording(
+        &mut self,
+        options: glass_core::RecordingOptions,
+        deadline: Deadline,
+    ) -> Result<Box<dyn glass_core::Recording>> {
+        if self.app.is_none() {
+            return Err(GlassError::NoActiveSession);
+        }
+        crate::recording::start(
+            self.target.simctl().clone(),
+            self.target.udid().to_owned(),
+            options,
+            deadline,
+        )
+    }
     fn input_route(&self) -> glass_core::InputRoute {
         glass_core::InputRoute::Isolated
     }

@@ -67,6 +67,35 @@ pub async fn run_configured(
     tool_profile: crate::tool_profile::ToolProfile,
     trace: Option<crate::trace::TraceConfig>,
 ) -> anyhow::Result<()> {
+    run_with_evidence(
+        http,
+        addr,
+        token_file,
+        sink,
+        report,
+        tool_profile,
+        EvidenceConfig {
+            trace,
+            recordings: None,
+        },
+    )
+    .await
+}
+
+pub struct EvidenceConfig {
+    pub trace: Option<crate::trace::TraceConfig>,
+    pub recordings: Option<crate::recordings::RecordingConfig>,
+}
+
+pub async fn run_with_evidence(
+    http: bool,
+    addr: Option<String>,
+    token_file: Option<String>,
+    sink: Option<Box<dyn glass_core::AuditSink>>,
+    report: crate::audit::AuditReport,
+    tool_profile: crate::tool_profile::ToolProfile,
+    evidence: EvidenceConfig,
+) -> anyhow::Result<()> {
     // Delegate to the audited resolver (token precedence + exposure rules + its tests stay
     // the single source of truth); just reconstruct its flag form from clap's typed args.
     let mut argv: Vec<String> = Vec::new();
@@ -86,7 +115,8 @@ pub async fn run_configured(
     })
     .map_err(|e| anyhow::anyhow!("glass serve: {e}"))?;
     cfg.tool_profile = tool_profile;
-    cfg.trace = trace;
+    cfg.trace = evidence.trace;
+    cfg.recordings = evidence.recordings;
 
     // Fail-closed exposure rule (spec D4) — refuse a network-exposed bind without a token.
     check_exposure(&cfg)?;
@@ -188,8 +218,14 @@ pub async fn run_on_until(
     report: crate::audit::AuditReport,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let server =
-        GlassServer::new_configured(glass, report, cfg.tool_profile, cfg.trace.as_ref(), "http")?;
+    let server = GlassServer::new_with_recordings(
+        glass,
+        report,
+        cfg.tool_profile,
+        cfg.trace.as_ref(),
+        "http",
+        cfg.recordings.as_ref(),
+    )?;
     run_server_on_until(listener, cfg, server, shutdown).await
 }
 
@@ -357,6 +393,7 @@ mod tests {
             token: token.map(String::from),
             tool_profile: Default::default(),
             trace: None,
+            recordings: None,
         }
     }
 

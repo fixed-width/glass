@@ -3,7 +3,7 @@ use glass_mcp::cli::{Cli, Command, TraceCommand};
 use glass_mcp::launch::NoArgLaunch;
 use glass_mcp::{
     boot, launch, onboarding, run_debug_checklist, run_debug_grants, run_doctor, run_env,
-    run_status, run_stdio_configured, run_uninstall, setup,
+    run_status, run_stdio_with_recordings, run_uninstall, setup,
 };
 
 #[tokio::main]
@@ -65,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
     }
     let audit_log = cli.audit_log;
     let tool_profile = cli.tool_profile;
+    let recordings = cli
+        .record_dir
+        .map(glass_mcp::recordings::RecordingConfig::new)
+        .transpose()?;
     let trace = cli
         .trace_dir
         .map(|directory| glass_mcp::trace::TraceConfig::new(directory, cli.trace_max_bytes))
@@ -133,7 +137,14 @@ async fn main() -> anyhow::Result<()> {
             NoArgLaunch::StdioServe => {
                 let (sink, report) =
                     glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                run_stdio_configured(boot(sink), report, tool_profile, trace.as_ref()).await
+                run_stdio_with_recordings(
+                    boot(sink),
+                    report,
+                    tool_profile,
+                    trace.as_ref(),
+                    recordings.as_ref(),
+                )
+                .await
             }
         },
         Some(Command::Doctor { deep, json, color }) => {
@@ -175,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(anyhow::Error::msg)?;
                         cfg.tool_profile = tool_profile;
                         cfg.trace = trace;
+                        cfg.recordings = recordings;
                         glass_mcp::windows_environment::tray::run(
                             cfg,
                             audit_log.as_deref(),
@@ -215,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow::anyhow!("glass serve --menubar: {e}"))?;
                         cfg.tool_profile = tool_profile;
                         cfg.trace = trace;
+                        cfg.recordings = recordings;
                         glass_mcp::menubar::run(cfg)
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -225,14 +238,14 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     let (sink, report) =
                         glass_mcp::audit::resolve(audit_log.as_deref(), |k| std::env::var(k).ok())?;
-                    glass_mcp::serve::run_configured(
+                    glass_mcp::serve::run_with_evidence(
                         http,
                         addr,
                         token_file,
                         sink,
                         report,
                         tool_profile,
-                        trace,
+                        glass_mcp::serve::EvidenceConfig { trace, recordings },
                     )
                     .await
                 }

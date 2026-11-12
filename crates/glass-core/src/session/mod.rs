@@ -31,6 +31,7 @@ mod find;
 mod input;
 mod lifecycle;
 mod observation;
+mod recording;
 mod semantic_action;
 mod wait;
 mod window;
@@ -119,6 +120,7 @@ pub struct Glass {
     shutdown_hook: Option<Box<dyn FnOnce(Deadline) + Send>>,
     protected_host_paths: Vec<ProtectedHostPath>,
     observation_epoch: ObservationEpoch,
+    recordings: crate::recording::Recordings,
 }
 
 impl Glass {
@@ -144,6 +146,7 @@ impl Glass {
             shutdown_hook: None,
             protected_host_paths: Vec::new(),
             observation_epoch: ObservationEpoch::default(),
+            recordings: crate::recording::Recordings::default(),
         }
     }
 

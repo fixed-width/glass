@@ -50,6 +50,7 @@ impl Glass {
         spec: &AppSpec,
         inputs: &[std::path::PathBuf],
     ) -> Result<WindowGeometry> {
+        self.finish_recording_for_stop(Deadline::from_millis(15_000));
         self.observation_epoch.invalidate();
         // One active session: tear down any current one first.
         if let Some(session) = self.active.as_mut() {
@@ -156,6 +157,7 @@ impl Glass {
     }
 
     fn stop_inner(&mut self) -> Result<()> {
+        self.finish_recording_for_stop(Deadline::from_millis(15_000));
         self.observation_epoch.invalidate();
         let mut s = self.active.take().ok_or(GlassError::NoActiveSession)?;
         s.platform.stop_app()
@@ -180,6 +182,7 @@ impl Glass {
 
     /// Tear down the session and host hook, retaining any target-stop error.
     pub fn shutdown_report(&mut self, deadline: Deadline) -> Result<()> {
+        self.finish_recording_for_stop(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE));
         self.observation_epoch.invalidate();
         let outcome = if let Some(mut s) = self.active.take() {
             s.platform

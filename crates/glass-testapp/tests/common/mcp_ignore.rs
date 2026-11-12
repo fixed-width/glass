@@ -98,6 +98,7 @@ pub async fn assert_blink_region_e2e(testapp: &str, backend: &str, start_timeout
             token: Some("e2e".into()),
             tool_profile: Default::default(),
             trace: None,
+            recordings: None,
         };
         let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
     });

@@ -40,6 +40,10 @@ pub struct Cli {
     /// Maximum retained trace bytes, including metadata (default 268435456).
     #[arg(long, global = true, requires = "trace_dir", value_parser = clap::value_parser!(u64).range(1048576..=2147483648))]
     pub trace_max_bytes: Option<u64>,
+
+    /// Retain explicitly selected workflow videos in this existing private directory.
+    #[arg(long, global = true, value_name = "DIRECTORY")]
+    pub record_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]

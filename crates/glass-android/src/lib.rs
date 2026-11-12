@@ -18,6 +18,7 @@ mod input;
 mod logs;
 mod parse;
 mod platform;
+mod recording;
 mod screencap;
 mod sdk;
 mod target;

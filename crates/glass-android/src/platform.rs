@@ -335,6 +335,28 @@ fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
 }
 
 impl Platform for AndroidPlatform {
+    fn recording_supported(&self) -> bool {
+        true
+    }
+
+    fn start_recording(
+        &mut self,
+        options: glass_core::RecordingOptions,
+        deadline: Deadline,
+    ) -> Result<Box<dyn glass_core::Recording>> {
+        self.running()?;
+        let pixels = self
+            .adb()
+            .run_bytes_until(["exec-out", "screencap"], deadline)?;
+        let frame = decode_screencap(&pixels)?;
+        let window = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+        crate::recording::start(self.resolved_adb(), window, options, deadline)
+    }
     fn input_route(&self) -> glass_core::InputRoute {
         glass_core::InputRoute::Isolated
     }

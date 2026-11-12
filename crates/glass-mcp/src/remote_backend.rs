@@ -674,6 +674,7 @@ mod tests {
             token: None,
             tool_profile: crate::tool_profile::ToolProfile::Full,
             trace: None,
+            recordings: None,
         };
         let task = tokio::spawn(crate::serve::run_server_on_until(
             listener,

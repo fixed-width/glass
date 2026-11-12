@@ -23,6 +23,7 @@ const LEAN_TOOLS: &[&str] = &[
     "glass_find_elements",
     "glass_list_windows",
     "glass_logs",
+    "glass_record",
     "glass_screenshot",
     "glass_select_window",
     "glass_start",

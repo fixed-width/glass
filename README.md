@@ -124,7 +124,7 @@ Then [connect glass to your agent](docs/how-to/connect-an-agent.md) and run `gla
 the environment. New here? Follow [the tutorial](docs/tutorial/first-drive.md) for a guaranteed first
 success.
 
-For new agent configurations, use `glass-mcp --tool-profile lean` for 17 tools, with actions through
+For new agent configurations, use `glass-mcp --tool-profile lean` for 18 tools, with actions through
 `glass_do`, annotated screenshots and optional log waits. The full toolbox remains the compatible
 binary default. Inspect either inventory without
 starting a session using `glass-mcp tools --json`; see [tool profiles](docs/reference/tools.md#tool-profiles).

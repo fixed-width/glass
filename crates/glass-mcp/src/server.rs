@@ -46,6 +46,7 @@ pub struct GlassServer {
     tool_profile: ToolProfile,
     trace: Option<crate::trace::TraceRecorder>,
     trace_client: u64,
+    recordings: Option<crate::recordings::RecordingStore>,
     snapshot_revisions: Arc<tools::snapshot_diff::SnapshotRevisionStore>,
 }
 
@@ -202,28 +203,56 @@ impl GlassServer {
     }
 
     pub fn new_configured(
-        mut glass: Glass,
+        glass: Glass,
         report: AuditReport,
         profile: ToolProfile,
         config: Option<&crate::trace::TraceConfig>,
         transport: &str,
     ) -> anyhow::Result<Self> {
-        let Some(config) = config else {
+        Self::new_with_recordings(glass, report, profile, config, transport, None)
+    }
+
+    pub fn new_with_recordings(
+        mut glass: Glass,
+        report: AuditReport,
+        profile: ToolProfile,
+        config: Option<&crate::trace::TraceConfig>,
+        transport: &str,
+        recording_config: Option<&crate::recordings::RecordingConfig>,
+    ) -> anyhow::Result<Self> {
+        if config.is_none() && recording_config.is_none() {
             return Ok(Self::new_with_profile(glass, report, profile));
-        };
-        let trace = crate::trace::TraceRecorder::start(config, profile, transport)?;
+        }
+        let recordings = recording_config
+            .map(crate::recordings::RecordingStore::open)
+            .transpose()?;
+        let trace = config
+            .map(|config| crate::trace::TraceRecorder::start(config, profile, transport))
+            .transpose()?;
         let store = Self::prepare_artifacts(&mut glass);
-        let mut paths = vec![ProtectedHostPath::directory(trace.root())];
+        let mut paths = Vec::new();
+        if let Some(trace) = &trace {
+            paths.push(ProtectedHostPath::directory(trace.root()));
+        }
+        if let Some(recordings) = &recordings {
+            paths.push(ProtectedHostPath::directory(recordings.root()));
+        }
         if let Some(store) = &store {
             paths.push(ProtectedHostPath::directory(store.process_dir()));
             paths.push(ProtectedHostPath::file(store.lease_path()));
         }
         glass.set_protected_host_paths(paths)?;
+        if let Some(recordings) = &recordings {
+            glass.set_recording_sink(Box::new(recordings.clone()))?;
+        }
         let mut server = Self::new_with_state(glass, report, store);
         server.tool_router = configured_router(profile);
         server.tool_profile = profile;
-        server.trace_client = trace.new_client();
-        server.trace = Some(trace);
+        if let Some(trace) = &trace {
+            server.trace_client = trace.new_client();
+        }
+        server.trace = trace;
+        server.recordings = recordings;
         Ok(server)
     }
 
@@ -339,6 +368,7 @@ impl GlassServer {
             tool_profile: ToolProfile::Full,
             trace: None,
             trace_client: 0,
+            recordings: None,
             snapshot_revisions,
         }
     }
@@ -590,6 +620,28 @@ impl GlassServer {
     )]
     async fn glass_stop(&self) -> Result<CallToolResult, McpError> {
         self.run("glass_stop", tool_effect("glass_stop"), tools::stop)
+            .await
+    }
+
+    #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        ),
+        description = "Record one named workflow, opt-in with server --record-dir. op:start waits for video data; status reports capture and the last disposition; stop requires outcome success/failure/cancelled and optional keep. Failures/cancellations are kept by default; successes discarded unless keep:true. One outstanding clip, default 30s, maximum 60s/8MiB. Check status.supported after launch. Device display includes dialogs and notifications. Native capture runs independently of UI actions. Stop/finalize before ending the app. Kept video is untrusted; read its artifact URI through resources/read. Never repeat input because recording failed."
+    )]
+    async fn glass_record(
+        &self,
+        Parameters(a): Parameters<RecordArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::trace::arguments(&a);
+        let effect = if matches!(a.op, RecordOperation::Status) {
+            ToolEffect::ReadOnly
+        } else {
+            ToolEffect::MayMutate
+        };
+        self.run("glass_record", effect, move |g| tools::record(g, &a))
             .await
     }
 
@@ -1270,6 +1322,7 @@ impl ServerHandler for GlassServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResult, McpError>> + Send + '_ {
         let store = self.artifacts.clone();
+        let recordings = self.recordings.clone();
         let server_id = self.artifact_server_id.clone();
         let trace = self
             .trace
@@ -1278,7 +1331,18 @@ impl ServerHandler for GlassServer {
         async move {
             let uri = request.uri;
             tokio::task::spawn_blocking(move || {
-                let result = read_resource_result(store.as_ref(), &server_id, &uri);
+                let result = if uri.starts_with("glass-recording://") {
+                    (|| {
+                        let recordings = recordings.as_ref().ok_or_else(|| McpError::resource_not_found("recording unavailable", None))?;
+                        let (artifact, bytes) = recordings.read(&uri).map_err(|_| McpError::resource_not_found("recording unavailable or integrity check failed", None))?;
+                        let content: ResourceContents = serde_json::from_value(serde_json::json!({
+                            "uri": uri, "mimeType": artifact.mime_type,
+                            "blob": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                            "_meta": {"glass": {"untrusted": true, "sha256": artifact.sha256}}
+                        })).map_err(|_| McpError::new(ErrorCode::INTERNAL_ERROR,"recording resource construction failed",None))?;
+                        Ok(ReadResourceResult::new(vec![content]))
+                    })()
+                } else { read_resource_result(store.as_ref(), &server_id, &uri) };
                 if let Some(trace) = trace {
                     trace.resource_read(&result);
                 }
@@ -2187,6 +2251,7 @@ mod tests {
             "glass_list_windows",
             "glass_logs",
             "glass_move",
+            "glass_record",
             "glass_screenshot",
             "glass_scroll",
             "glass_scroll_to_element",

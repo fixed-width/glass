@@ -59,6 +59,7 @@ way it does? The explanations.
 - [Accessibility roles by platform](reference/a11y-roles.md) — which roles each backend can produce
 - [Audit log](reference/audit-log.md) — the JSONL record schema and redaction
 - [Session trace](reference/session-trace.md) — capture scope, bounds, format and offline commands
+- [Workflow video](how-to/record-workflow-video.md) — record and retain a named Android or Simulator workflow
 
 ## Explanation — understand why
 

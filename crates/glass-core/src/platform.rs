@@ -335,6 +335,21 @@ pub struct AppSpec {
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
 /// glass-core code depends on a concrete backend. Must stay object-safe.
 pub trait Platform {
+    /// Whether this backend implements independent workflow video capture.
+    fn recording_supported(&self) -> bool {
+        false
+    }
+
+    fn start_recording(
+        &mut self,
+        _options: crate::RecordingOptions,
+        _deadline: crate::Deadline,
+    ) -> Result<Box<dyn crate::Recording>> {
+        Err(GlassError::UnsupportedOperation {
+            operation: "workflow recording".into(),
+            reason: "this backend has no recording adapter".into(),
+        })
+    }
     /// Explain a reported session setup failure when no accessibility tree was found.
     fn accessibility_health(&self) -> Result<()> {
         Ok(())

@@ -6,6 +6,32 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::num::NonZeroU32;
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecordArgs {
+    pub op: RecordOperation,
+    pub name: Option<String>,
+    pub max_duration_ms: Option<u64>,
+    pub outcome: Option<RecordOutcome>,
+    pub keep: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordOperation {
+    Start,
+    Status,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordOutcome {
+    Success,
+    Failure,
+    Cancelled,
+}
+
 pub(crate) const MAX_CLICK_COUNT: u32 = glass_core::MAX_CLICK_COUNT;
 
 #[cfg(test)]

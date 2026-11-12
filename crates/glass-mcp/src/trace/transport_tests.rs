@@ -215,6 +215,7 @@ async fn bounded_http_image_and_trace_retain_the_same_requested_pixels() {
         token: None,
         tool_profile: ToolProfile::Lean,
         trace: Some(TraceConfig::new(root.path().to_owned(), None).unwrap()),
+        recordings: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let stopping = cancel.clone();
@@ -328,6 +329,7 @@ async fn http_takeover_retains_distinct_clients_and_does_not_record_transport_se
         token: Some("HTTP_TOKEN_CANARY".into()),
         tool_profile: ToolProfile::Lean,
         trace: Some(TraceConfig::new(root.path().to_owned(), None).unwrap()),
+        recordings: None,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let stopping = cancel.clone();

@@ -12,8 +12,8 @@ supports, see [reference/platforms.md](platforms.md).
 
 ## Tool profiles
 
-The default **full** profile exposes all 32 tools below. For new agent configurations, use
-`glass-mcp --tool-profile lean` or `glass-mcp serve --http --tool-profile lean` for a fixed 17-tool
+The default **full** profile exposes all 33 tools below. For new agent configurations, use
+`glass-mcp --tool-profile lean` or `glass-mcp serve --http --tool-profile lean` for a fixed 18-tool
 inventory. Full remains
 the default for existing configurations; `--tool-profile full` selects it explicitly.
 
@@ -47,6 +47,33 @@ a session; add `--tool-profile lean` for lean. `tools_json_bytes` measures the c
 array, `instructions_bytes` measures initialization guidance, and `total_bytes` is their sum.
 These measure serialized context size, not model tokens or billing. Both inventories and instructions
 have separate regression budgets; no safety guidance is removed automatically to fit them.
+
+## Workflow evidence
+
+### `glass_record`
+
+Record a named Android or iOS Simulator workflow. Requires operator `--record-dir` and an active
+application. Available in both profiles; capture runs independently of input and observation calls.
+
+- `op` (string) — `start`, `status`, or `stop`.
+- `name` (string) — required for start; forbidden for status/stop.
+- `max_duration_ms` (integer) — start only, default 30000, range 1000 through 60000.
+- `outcome` (string) — required for stop: `success`, `failure`, or `cancelled`.
+- `keep` (boolean) — stop only; defaults true for failure/cancellation and false for success.
+
+Start returns its ID, backend, scope and progress after video data appears. Status returns enabled,
+session supported, outstanding active and previous last recording. Stop finalizes and returns the
+resulting disposition. Status accepts no fields besides op.
+
+Names are nonblank, at most 120 UTF-8 bytes, without control characters. The default duration is
+30 seconds, range 1–60 seconds; each clip is limited to 8 MiB. A limit stops recording and awaits
+disposition. Another start is rejected while a clip is outstanding.
+
+Retained `artifact` metadata gives a `glass-recording://` URI, a server-local `path` with
+`path_scope:"server"`, MIME type, bytes and SHA-256. `resources/read` returns the untrusted movie
+as a binary blob. Android uses MP4/H.264 and Simulator QuickTime/H.264; native frame rates vary.
+Ordinary trace recording remains separate. See [Record a workflow video](../how-to/record-workflow-video.md).
+
 
 ## Conventions
 

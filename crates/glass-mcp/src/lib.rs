@@ -42,6 +42,7 @@ pub mod onboarding;
 mod output;
 mod output_policy;
 mod params;
+pub mod recordings;
 #[cfg(feature = "network")]
 pub mod serve;
 pub(crate) mod server;
@@ -606,7 +607,21 @@ pub async fn run_stdio_configured(
     profile: tool_profile::ToolProfile,
     config: Option<&trace::TraceConfig>,
 ) -> anyhow::Result<()> {
-    let server = GlassServer::new_configured(glass, report, profile, config, "stdio")?;
+    run_stdio_with_recordings(glass, report, profile, config, None).await
+}
+
+pub async fn run_stdio_with_recordings(
+    glass: Glass,
+    report: crate::audit::AuditReport,
+    profile: tool_profile::ToolProfile,
+    config: Option<&trace::TraceConfig>,
+    recording_config: Option<&recordings::RecordingConfig>,
+) -> anyhow::Result<()> {
+    let server = if recording_config.is_some() {
+        GlassServer::new_with_recordings(glass, report, profile, config, "stdio", recording_config)?
+    } else {
+        GlassServer::new_configured(glass, report, profile, config, "stdio")?
+    };
     let sessions = server.sessions();
     let artifacts = server.artifact_store();
     let trace = server.trace_recorder();

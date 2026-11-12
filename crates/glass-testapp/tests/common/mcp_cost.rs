@@ -59,6 +59,7 @@ pub async fn boot_mcp() -> RunningService<RoleClient, ()> {
             token: Some("vcost".into()),
             tool_profile: Default::default(),
             trace: None,
+            recordings: None,
         };
         let _ = glass_mcp::serve::run_on(listener, cfg, glass, report).await;
     });
