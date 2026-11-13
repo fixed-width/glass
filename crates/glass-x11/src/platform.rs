@@ -1542,7 +1542,72 @@ impl glass_core::ScrollSink for X11ScrollSink<'_> {
     }
 }
 
+impl X11Platform {
+    fn video_capture(&self) -> glass_core::Result<glass_video::CaptureFactory> {
+        let window = self.require_window()?;
+        let display = self.display.clone();
+        let owned_display = self.xvfb.is_some();
+        Ok(Box::new(move || {
+            let mut source = X11Platform::connect(Some(&display))?;
+            source.window = Some(window);
+            Ok(Box::new(move |deadline| {
+                if owned_display {
+                    source.run_window_call_by(deadline, "recording capture", |source, dispatch| {
+                        dispatch.mark();
+                        let geometry = source
+                            .conn
+                            .get_geometry(source.root)
+                            .map_err(|e| GlassError::CaptureFailed(e.to_string()))?
+                            .reply()
+                            .map_err(|e| GlassError::CaptureFailed(e.to_string()))?;
+                        source.capture_screen_rect(
+                            0,
+                            0,
+                            u32::from(geometry.width),
+                            u32::from(geometry.height),
+                        )
+                    })
+                } else {
+                    source.capture_frame_by(None, deadline)
+                }
+            }) as glass_video::CaptureSource)
+        }))
+    }
+}
+
 impl Platform for X11Platform {
+    fn recording_supported(&self) -> bool {
+        true
+    }
+
+    fn recording_scope(&self) -> glass_core::RecordingScope {
+        if self.xvfb.is_some() {
+            glass_core::RecordingScope::OwnedDisplay
+        } else {
+            glass_core::RecordingScope::Window
+        }
+    }
+
+    fn start_recording(
+        &mut self,
+        options: glass_core::RecordingOptions,
+        deadline: glass_core::Deadline,
+    ) -> glass_core::Result<Box<dyn glass_core::Recording>> {
+        glass_video::start(options, deadline, self.video_capture()?)
+    }
+
+    fn rolling_buffer_supported(&self) -> bool {
+        true
+    }
+
+    fn start_rolling_buffer(
+        &mut self,
+        options: glass_core::RollingOptions,
+        deadline: glass_core::Deadline,
+    ) -> glass_core::Result<Box<dyn glass_core::RollingBuffer>> {
+        glass_video::start_buffer(options, deadline, self.video_capture()?)
+    }
+
     fn configure_read_only_inputs(&mut self, paths: &[std::path::PathBuf]) -> Result<()> {
         self.read_only_inputs =
             glass_sandbox_linux::validate_read_only_inputs(paths, &self.protected_host_paths)?;
@@ -2860,6 +2925,38 @@ mod tests {
 mod display_tests {
     use super::*;
     use crate::testx::TestX;
+
+    #[test]
+    #[ignore = "starts an owned private X server; needs Xvfb"]
+    fn owned_display_recording_capture_bounds_a_stalled_server() {
+        let xvfb = crate::xvfb::Xvfb::start("64x48x24").unwrap();
+        let server_pid = xvfb.pid();
+        let mut platform = X11Platform::connect(Some(&xvfb.display)).unwrap();
+        platform.window = Some(platform.root);
+        platform.xvfb = Some(xvfb);
+        assert!(platform.recording_supported() && platform.rolling_buffer_supported());
+        assert_eq!(
+            platform.recording_scope(),
+            glass_core::RecordingScope::OwnedDisplay
+        );
+        let mut capture = platform.video_capture().unwrap()().unwrap();
+        let frame = capture(Deadline::from_millis(1000)).unwrap();
+        assert_eq!((frame.width, frame.height), (64, 48));
+        let paused = PausedXServer::new(server_pid);
+        let started = Instant::now();
+        let answer = capture(Deadline::from_millis(200));
+        let elapsed = started.elapsed();
+        let rescued = paused.resume();
+        assert!(!rescued, "capture waited for the independent server rescue");
+        let error = answer.expect_err("a stalled capture must hit its deadline");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(capture(Deadline::from_millis(500)).is_err());
+    }
 
     #[test]
     #[ignore = "starts an owned private X server; needs Xvfb"]

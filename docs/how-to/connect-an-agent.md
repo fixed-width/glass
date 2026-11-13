@@ -56,7 +56,7 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool
 add glass under `mcpServers` (the same shape as the generic config above), then reload the MCP
 servers (or restart Antigravity).
 
-These new configurations select the 17-tool lean inventory. Lean uses `glass_do` for actions,
+These new configurations select the 18-tool lean inventory. Lean uses `glass_do` for actions,
 including single steps and gestures, `glass_screenshot` annotations for numbered elements, and
 `glass_logs` with `wait` for log predicates. Use `--tool-profile full` for standalone tools. See
 [tool profiles](../reference/tools.md#tool-profiles) for the included tools and wait semantics.

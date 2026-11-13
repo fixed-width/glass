@@ -505,6 +505,7 @@ async fn oversized_snapshot_link_reads_exact_resource_over_http() {
                 token: None,
                 tool_profile: Default::default(),
                 trace: None,
+                recordings: None,
             },
             server,
             async move { shutdown.cancelled().await },

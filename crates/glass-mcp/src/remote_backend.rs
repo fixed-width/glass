@@ -123,6 +123,58 @@ fn node(value: Value) -> Result<Option<AxNodeId>> {
 }
 
 impl<C: Connection + 'static> Platform for RemotePlatform<C> {
+    fn rolling_buffer_supported(&self) -> bool {
+        lock(&self.0)
+            .is_ok_and(|state| state.properties.buffer_supported && state.healthy && !state.closed)
+    }
+
+    fn start_rolling_buffer(
+        &mut self,
+        options: RollingOptions,
+        deadline: Deadline,
+    ) -> Result<Box<dyn RollingBuffer>> {
+        options.validate()?;
+        let id = options.id.clone();
+        match lock(&self.0)?.call(Operation::BufferStart(options), deadline)? {
+            Value::BufferProgress(progress) => Ok(Box::new(RemoteBuffer {
+                shared: Arc::clone(&self.0),
+                id,
+                last: Mutex::new(progress),
+                finished: false,
+            })),
+            _ => Err(wrong_response()),
+        }
+    }
+    fn recording_supported(&self) -> bool {
+        lock(&self.0).is_ok_and(|state| {
+            state.properties.recording_supported && !state.closed && state.healthy
+        })
+    }
+
+    fn recording_scope(&self) -> RecordingScope {
+        lock(&self.0)
+            .map(|state| state.properties.recording_scope)
+            .unwrap_or(RecordingScope::Window)
+    }
+
+    fn start_recording(
+        &mut self,
+        options: RecordingOptions,
+        deadline: Deadline,
+    ) -> Result<Box<dyn Recording>> {
+        options.validate()?;
+        let id = options.id.clone();
+        match lock(&self.0)?.call(Operation::RecordStart(options), deadline)? {
+            Value::RecordingProgress(progress) => Ok(Box::new(RemoteRecording {
+                shared: Arc::clone(&self.0),
+                id,
+                last: Mutex::new(progress),
+                finished: false,
+            })),
+            _ => Err(wrong_response()),
+        }
+    }
+
     fn input_route(&self) -> InputRoute {
         lock(&self.0)
             .map(|state| state.properties.input_route)
@@ -243,7 +295,7 @@ impl<C: Connection + 'static> Platform for RemotePlatform<C> {
         if state.log_failure.is_some() {
             return Vec::new();
         }
-        match state.call(Operation::Logs, Deadline::from_millis(100)) {
+        match state.call(Operation::Logs, Deadline::from_millis(1000)) {
             Ok(Value::Logs(value)) => value,
             Ok(_) => {
                 let error = wrong_response();
@@ -285,6 +337,245 @@ impl<C: Connection + 'static> Platform for RemotePlatform<C> {
         match lock(&self.0)?.call(Operation::Occluded(point), deadline)? {
             Value::Bool(value) => Ok(value),
             _ => Err(wrong_response()),
+        }
+    }
+}
+
+struct RemoteRecording<C: Connection> {
+    shared: Arc<Mutex<Shared<C>>>,
+    id: String,
+    last: Mutex<RecordingProgress>,
+    finished: bool,
+}
+
+impl<C: Connection> Recording for RemoteRecording<C> {
+    fn progress(&self) -> RecordingProgress {
+        if self.finished
+            && let Ok(last) = self.last.lock()
+        {
+            return last.clone();
+        }
+        let observed = lock(&self.shared).and_then(|mut state| {
+            state.call(
+                Operation::RecordProgress(self.id.clone()),
+                Deadline::from_millis(1000),
+            )
+        });
+        let result = match observed {
+            Ok(Value::RecordingProgress(progress)) => progress,
+            failure => {
+                let mut progress =
+                    self.last
+                        .lock()
+                        .map(|last| last.clone())
+                        .unwrap_or(RecordingProgress {
+                            state: RecordingState::Failed,
+                            elapsed_ms: 0,
+                            bytes: 0,
+                            reason: None,
+                        });
+                progress.state = RecordingState::Failed;
+                progress.reason = Some(match failure {
+                    Err(error) => error.to_string(),
+                    _ => wrong_response().to_string(),
+                });
+                progress
+            }
+        };
+        if let Ok(mut last) = self.last.lock() {
+            *last = result.clone();
+        }
+        result
+    }
+
+    fn finish(&mut self, keep: bool, deadline: Deadline) -> Result<RecordedVideo> {
+        if self.finished {
+            return Err(GlassError::Backend("recording already finalized".into()));
+        }
+        self.finished = true;
+        let result = lock(&self.shared)?.call(
+            Operation::RecordFinish {
+                id: self.id.clone(),
+                keep,
+            },
+            deadline,
+        )?;
+        let Value::Video {
+            format,
+            progress,
+            data,
+        } = result
+        else {
+            return Err(wrong_response());
+        };
+        let video = decode_video(format, progress, data)?;
+        if let Ok(mut last) = self.last.lock() {
+            *last = video.progress.clone();
+        }
+        Ok(video)
+    }
+}
+
+fn decode_video(
+    format: RecordingFormat,
+    progress: RecordingProgress,
+    data: String,
+) -> Result<RecordedVideo> {
+    if data.len() as u64 > recording::RECORDING_MAX_BYTES.div_ceil(3) * 4 {
+        return Err(GlassError::Backend(
+            "private recording exceeds the byte limit".into(),
+        ));
+    }
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+        .map_err(|error| GlassError::Backend(format!("invalid private recording: {error}")))?;
+    if data.len() as u64 > recording::RECORDING_MAX_BYTES {
+        return Err(GlassError::Backend(
+            "private recording exceeds the byte limit".into(),
+        ));
+    }
+    Ok(RecordedVideo {
+        format,
+        progress,
+        data,
+    })
+}
+
+struct RemoteBuffer<C: Connection> {
+    shared: Arc<Mutex<Shared<C>>>,
+    id: String,
+    last: Mutex<RollingProgress>,
+    finished: bool,
+}
+
+fn decode_buffered(value: Value) -> Result<BufferedVideo> {
+    let Value::BufferedVideo {
+        window,
+        format,
+        progress,
+        data,
+    } = value
+    else {
+        return Err(wrong_response());
+    };
+    Ok(BufferedVideo {
+        window,
+        video: decode_video(format, progress, data)?,
+    })
+}
+
+impl<C: Connection> RollingBuffer for RemoteBuffer<C> {
+    fn progress(&self) -> RollingProgress {
+        if self.finished
+            && let Ok(last) = self.last.lock()
+        {
+            return last.clone();
+        }
+        let observed = lock(&self.shared).and_then(|mut state| {
+            state.call(
+                Operation::BufferProgress(self.id.clone()),
+                Deadline::from_millis(3000),
+            )
+        });
+        let progress = match observed {
+            Ok(Value::BufferProgress(progress)) => progress,
+            other => {
+                let mut progress = self
+                    .last
+                    .lock()
+                    .map(|p| p.clone())
+                    .unwrap_or(RollingProgress {
+                        state: RollingState::Failed,
+                        elapsed_ms: 0,
+                        retained_ms: 0,
+                        bytes: 0,
+                        pending_bytes: 0,
+                        truncated: true,
+                        reason: None,
+                        pending: None,
+                    });
+                progress.state = RollingState::Failed;
+                progress.reason = Some(match other {
+                    Err(error) => error.to_string(),
+                    _ => wrong_response().to_string(),
+                });
+                progress
+            }
+        };
+        if let Ok(mut last) = self.last.lock() {
+            *last = progress.clone();
+        }
+        progress
+    }
+    fn mark(&mut self, clip_id: &str, tail_ms: u64, deadline: Deadline) -> Result<RollingWindow> {
+        match lock(&self.shared)?.call(
+            Operation::BufferMark {
+                id: self.id.clone(),
+                clip_id: clip_id.into(),
+                tail_ms,
+            },
+            deadline,
+        )? {
+            Value::BufferWindow(window) => Ok(window),
+            _ => Err(wrong_response()),
+        }
+    }
+    fn save(&mut self, deadline: Deadline) -> Result<BufferedVideo> {
+        decode_buffered(lock(&self.shared)?.call(Operation::BufferSave(self.id.clone()), deadline)?)
+    }
+    fn stop(&mut self, keep: bool, deadline: Deadline) -> Result<Option<BufferedVideo>> {
+        if self.finished {
+            return Err(GlassError::Backend("buffer already stopped".into()));
+        }
+        let result = lock(&self.shared)?.call(
+            Operation::BufferStop {
+                id: self.id.clone(),
+                keep,
+            },
+            deadline,
+        )?;
+        self.finished = true;
+        if let Ok(mut last) = self.last.lock() {
+            last.state = RollingState::Stopped;
+        }
+        match result {
+            Value::Unit => Ok(None),
+            other => decode_buffered(other).map(Some),
+        }
+    }
+}
+
+impl<C: Connection> Drop for RemoteBuffer<C> {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Ok(mut state) = lock(&self.shared)
+            && state.healthy
+            && !state.closed
+        {
+            let _ = state.call(
+                Operation::BufferStop {
+                    id: self.id.clone(),
+                    keep: false,
+                },
+                Deadline::from_millis(3000),
+            );
+        }
+    }
+}
+
+impl<C: Connection> Drop for RemoteRecording<C> {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Ok(mut state) = lock(&self.shared)
+            && state.healthy
+            && !state.closed
+        {
+            let _ = state.call(
+                Operation::RecordFinish {
+                    id: self.id.clone(),
+                    keep: false,
+                },
+                Deadline::from_millis(1000),
+            );
         }
     }
 }
@@ -368,6 +659,298 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Reader;
+    struct NativeBuffer {
+        events: Arc<Mutex<Vec<String>>>,
+        pending: Option<RollingWindow>,
+    }
+    impl RollingBuffer for NativeBuffer {
+        fn progress(&self) -> RollingProgress {
+            RollingProgress {
+                state: RollingState::Buffering,
+                elapsed_ms: 2000,
+                retained_ms: 1000,
+                bytes: 5,
+                pending_bytes: 5,
+                truncated: false,
+                reason: None,
+                pending: self.pending.clone(),
+            }
+        }
+        fn mark(&mut self, id: &str, tail_ms: u64, _: Deadline) -> Result<RollingWindow> {
+            let window = RollingWindow {
+                id: id.into(),
+                start_ms: 1000,
+                end_ms: 2000 + tail_ms,
+                marked_at_ms: 2000,
+                captured_until_ms: 2000,
+                bytes: 5,
+                ready: true,
+                truncated: false,
+                reason: None,
+            };
+            self.pending = Some(window.clone());
+            Ok(window)
+        }
+        fn save(&mut self, _: Deadline) -> Result<BufferedVideo> {
+            self.events.lock().unwrap().push("buffer_save".into());
+            let window = self
+                .pending
+                .take()
+                .ok_or_else(|| GlassError::Backend("no pending window".into()))?;
+            Ok(BufferedVideo {
+                window,
+                video: RecordedVideo {
+                    format: RecordingFormat::Mp4,
+                    data: b"video".to_vec(),
+                    progress: RecordingProgress {
+                        state: RecordingState::Finalized,
+                        elapsed_ms: 1000,
+                        bytes: 5,
+                        reason: None,
+                    },
+                },
+            })
+        }
+        fn stop(&mut self, keep: bool, deadline: Deadline) -> Result<Option<BufferedVideo>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("buffer_stop:{keep}"));
+            if keep && self.pending.is_some() {
+                self.save(deadline).map(Some)
+            } else {
+                self.pending = None;
+                Ok(None)
+            }
+        }
+    }
+    fn buffered_local(events: Arc<Mutex<Vec<String>>>) -> Local {
+        let mut platform = FakePlatform::new(4, 4);
+        platform.stop_events = Some(Arc::clone(&events));
+        platform.buffer = Some(Box::new(NativeBuffer {
+            events,
+            pending: None,
+        }));
+        Local {
+            dispatcher: Dispatcher::new(platform, Reader),
+            closes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    fn buffer_options() -> RollingOptions {
+        RollingOptions {
+            id: "a".repeat(32),
+            history_ms: 1000,
+            max_bytes: recording::RECORDING_MAX_BYTES,
+        }
+    }
+
+    #[test]
+    fn private_buffer_round_trips_marks_export_and_continued_capture() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = backend(buffered_local(Arc::clone(&events))).unwrap();
+        assert!(backend.platform.rolling_buffer_supported());
+        let mut buffer = backend
+            .platform
+            .start_rolling_buffer(buffer_options(), Deadline::from_millis(1000))
+            .unwrap();
+        let window = buffer
+            .mark(&"b".repeat(32), 100, Deadline::from_millis(1000))
+            .unwrap();
+        assert_eq!(window.end_ms, 2100);
+        let exported = buffer.save(Deadline::from_millis(1000)).unwrap();
+        assert_eq!(exported.video.data, b"video");
+        assert_eq!(exported.window.id, "b".repeat(32));
+        assert!(buffer.progress().pending.is_none());
+        assert!(
+            buffer
+                .stop(true, Deadline::from_millis(1000))
+                .unwrap()
+                .is_none()
+        );
+        backend.platform.stop_app().unwrap();
+    }
+
+    #[test]
+    fn private_buffer_identity_and_capture_exclusion_refuse_without_disposition() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut local = buffered_local(Arc::clone(&events));
+        local
+            .call(
+                Operation::BufferStart(buffer_options()),
+                Deadline::UNBOUNDED,
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(
+            local
+                .call(
+                    Operation::RecordStart(recording_options()),
+                    Deadline::UNBOUNDED
+                )
+                .unwrap()
+                .result
+                .is_err()
+        );
+        assert!(
+            local
+                .call(
+                    Operation::BufferStop {
+                        id: "c".repeat(32),
+                        keep: false
+                    },
+                    Deadline::UNBOUNDED
+                )
+                .unwrap()
+                .result
+                .is_err()
+        );
+        local
+            .call(Operation::Stop, Deadline::UNBOUNDED)
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(*events.lock().unwrap(), vec!["buffer_stop:false", "stop"]);
+    }
+
+    #[test]
+    fn dropped_remote_buffer_cancels_its_own_capture() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = backend(buffered_local(Arc::clone(&events))).unwrap();
+        let buffer = backend
+            .platform
+            .start_rolling_buffer(buffer_options(), Deadline::UNBOUNDED)
+            .unwrap();
+        drop(buffer);
+        assert_eq!(*events.lock().unwrap(), vec!["buffer_stop:false"]);
+        backend.platform.stop_app().unwrap();
+    }
+
+    struct NativeVideo(Arc<Mutex<Vec<String>>>);
+    impl Recording for NativeVideo {
+        fn progress(&self) -> RecordingProgress {
+            RecordingProgress {
+                state: RecordingState::Recording,
+                elapsed_ms: 12,
+                bytes: 5,
+                reason: None,
+            }
+        }
+        fn finish(&mut self, keep: bool, _: Deadline) -> Result<RecordedVideo> {
+            self.0.lock().unwrap().push(format!("record_finish:{keep}"));
+            let mut progress = self.progress();
+            progress.state = RecordingState::Finalized;
+            Ok(RecordedVideo {
+                format: RecordingFormat::Mp4,
+                progress,
+                data: if keep { b"video".to_vec() } else { vec![] },
+            })
+        }
+    }
+
+    fn recording_local(events: Arc<Mutex<Vec<String>>>) -> Local {
+        let mut platform = FakePlatform::new(4, 4).with_event_log(Arc::clone(&events));
+        platform.stop_events = Some(Arc::clone(&events));
+        platform.recorder = Some(Box::new(NativeVideo(events)));
+        Local {
+            dispatcher: Dispatcher::new(platform, Reader),
+            closes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn recording_options() -> RecordingOptions {
+        RecordingOptions {
+            id: "123456789012345678901234567890ab".into(),
+            max_duration_ms: 1000,
+            max_bytes: recording::RECORDING_MAX_BYTES,
+        }
+    }
+
+    #[test]
+    fn private_recording_round_trips_identity_progress_and_bounded_binary_payload() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = backend(recording_local(Arc::clone(&events))).unwrap();
+        assert!(backend.platform.recording_supported());
+        assert_eq!(
+            backend.platform.recording_scope(),
+            RecordingScope::OwnedDisplay
+        );
+        let mut recording = backend
+            .platform
+            .start_recording(recording_options(), Deadline::from_millis(1000))
+            .unwrap();
+        assert_eq!(recording.progress().bytes, 5);
+        backend
+            .platform
+            .send_key(&KeyEvent::Chord("Return".into()))
+            .unwrap();
+        let video = recording.finish(true, Deadline::from_millis(1000)).unwrap();
+        assert_eq!(video.data, b"video");
+        assert_eq!(video.progress.state, RecordingState::Finalized);
+        assert_eq!(recording.progress().state, RecordingState::Finalized);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.as_str() == "record_finish:true")
+                .count(),
+            1
+        );
+        backend.platform.stop_app().unwrap();
+    }
+
+    #[test]
+    fn private_worker_rejects_other_recording_ids_and_discards_before_app_stop() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut local = recording_local(Arc::clone(&events));
+        local
+            .call(
+                Operation::RecordStart(recording_options()),
+                Deadline::UNBOUNDED,
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(
+            local
+                .call(
+                    Operation::RecordFinish {
+                        id: "ffffffffffffffffffffffffffffffff".into(),
+                        keep: false
+                    },
+                    Deadline::UNBOUNDED
+                )
+                .unwrap()
+                .result
+                .is_err()
+        );
+        local
+            .call(Operation::Stop, Deadline::UNBOUNDED)
+            .unwrap()
+            .result
+            .unwrap();
+        let events = events.lock().unwrap();
+        let record = events
+            .iter()
+            .position(|e| e == "record_finish:false")
+            .unwrap();
+        let stop = events.iter().position(|e| e == "stop").unwrap();
+        assert!(record < stop);
+    }
+
+    #[test]
+    fn dropping_a_remote_recording_disposes_only_its_native_handle() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut backend = backend(recording_local(Arc::clone(&events))).unwrap();
+        let recording = backend
+            .platform
+            .start_recording(recording_options(), Deadline::from_millis(1000))
+            .unwrap();
+        drop(recording);
+        assert_eq!(*events.lock().unwrap(), vec!["record_finish:false"]);
+        backend.platform.stop_app().unwrap();
+    }
     impl Accessibility for Reader {
         fn snapshot(&mut self, _ctx: &AxContext) -> Result<AxTree> {
             Ok(AxTree::new(AxNode {
@@ -565,6 +1148,36 @@ mod tests {
     }
 
     struct LostLogs(Local);
+    struct SlowLogs(Local);
+    impl Connection for SlowLogs {
+        fn call(&mut self, operation: Operation, deadline: Deadline) -> Result<Response> {
+            if matches!(operation, Operation::Logs) {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            self.0.call(operation, deadline)
+        }
+        fn close(&mut self, deadline: Deadline) -> Result<()> {
+            self.0.close(deadline)
+        }
+    }
+
+    #[test]
+    fn a_busy_private_worker_log_read_preserves_the_next_input_connection() {
+        let mut backend = backend(SlowLogs(local())).unwrap();
+        assert!(
+            backend
+                .platform
+                .drain_logs()
+                .iter()
+                .all(|(_, text)| !text.contains("worker log read failed"))
+        );
+        backend
+            .platform
+            .send_key(&KeyEvent::Chord("Return".into()))
+            .unwrap();
+        backend.platform.stop_app().unwrap();
+    }
+
     impl Connection for LostLogs {
         fn call(&mut self, operation: Operation, deadline: Deadline) -> Result<Response> {
             if matches!(operation, Operation::Logs) {
@@ -674,6 +1287,7 @@ mod tests {
             token: None,
             tool_profile: crate::tool_profile::ToolProfile::Full,
             trace: None,
+            recordings: None,
         };
         let task = tokio::spawn(crate::serve::run_server_on_until(
             listener,

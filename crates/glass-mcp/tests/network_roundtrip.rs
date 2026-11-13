@@ -46,6 +46,7 @@ async fn start_server_with_profile(
         token: token.map(String::from),
         tool_profile: profile,
         trace: None,
+        recordings: None,
     };
     let glass = glass_mcp::boot(None);
     let report = glass_mcp::audit::report_from_config(None, |_| None);
@@ -70,8 +71,9 @@ async fn lean_http_exposes_batch_and_refuses_omitted_tools() {
         start_server_with_profile(Some("tok"), glass_mcp::tool_profile::ToolProfile::Lean).await;
     let client = ().serve(client_transport(&server.url, Some("tok"))).await.unwrap();
     let inventory = client.list_all_tools().await.unwrap();
-    assert_eq!(inventory.len(), 17);
+    assert_eq!(inventory.len(), 18);
     assert!(inventory.iter().any(|tool| tool.name == "glass_do"));
+    assert!(inventory.iter().any(|tool| tool.name == "glass_record"));
     assert!(!inventory.iter().any(|tool| tool.name == "glass_key"));
     let omitted = client
         .call_tool(

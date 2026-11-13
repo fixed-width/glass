@@ -25,6 +25,7 @@ mod injector;
 mod logs;
 mod platform;
 mod pointer;
+mod recording;
 mod simctl;
 mod target;
 

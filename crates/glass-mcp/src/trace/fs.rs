@@ -6,10 +6,10 @@ use anyhow::{Context, ensure};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, DirBuilder, OpenOptions};
 
-pub(super) struct Lease(File);
+pub(crate) struct Lease(File);
 
 impl Lease {
-    pub(super) fn try_lock(file: File) -> anyhow::Result<Self> {
+    pub(crate) fn try_lock(file: File) -> anyhow::Result<Self> {
         fs4::FileExt::try_lock(&file)?;
         Ok(Self(file))
     }
@@ -22,7 +22,7 @@ impl Drop for Lease {
     }
 }
 
-pub(super) fn open_directory(path: &Path) -> anyhow::Result<Dir> {
+pub(crate) fn open_directory(path: &Path) -> anyhow::Result<Dir> {
     ensure!(path.is_absolute(), "expected an absolute directory");
     let mut base = std::path::PathBuf::new();
     let mut directory = None;
@@ -42,7 +42,7 @@ pub(super) fn open_directory(path: &Path) -> anyhow::Result<Dir> {
     directory.context("a filesystem root is not an owned directory")
 }
 
-pub(super) fn check_owner(dir: &Dir) -> anyhow::Result<()> {
+pub(crate) fn check_owner(dir: &Dir) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt;
@@ -66,7 +66,7 @@ pub(super) fn check_owner(dir: &Dir) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn same_directory(first: &Dir, second: &Dir) -> anyhow::Result<bool> {
+pub(crate) fn same_directory(first: &Dir, second: &Dir) -> anyhow::Result<bool> {
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt;
@@ -82,7 +82,7 @@ pub(super) fn same_directory(first: &Dir, second: &Dir) -> anyhow::Result<bool> 
     .map_err(|_| anyhow::anyhow!("cannot compare directory identities"))
 }
 
-pub(super) fn create_directory(parent: &Dir, name: &str) -> anyhow::Result<Dir> {
+pub(crate) fn create_directory(parent: &Dir, name: &str) -> anyhow::Result<Dir> {
     valid_name(name)?;
     let builder = DirBuilder::new();
     #[cfg(unix)]
@@ -102,7 +102,7 @@ pub(super) fn create_directory(parent: &Dir, name: &str) -> anyhow::Result<Dir> 
     Ok(child)
 }
 
-pub(super) fn valid_name(name: &str) -> anyhow::Result<()> {
+pub(crate) fn valid_name(name: &str) -> anyhow::Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 128
@@ -115,7 +115,7 @@ pub(super) fn valid_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn create_file(dir: &Dir, name: &str) -> anyhow::Result<File> {
+pub(crate) fn create_file(dir: &Dir, name: &str) -> anyhow::Result<File> {
     valid_name(name)?;
     let mut options = OpenOptions::new();
     options
@@ -139,7 +139,7 @@ pub(super) fn create_file(dir: &Dir, name: &str) -> anyhow::Result<File> {
     Ok(file)
 }
 
-pub(super) fn open_file(dir: &Dir, name: &str, writable: bool) -> anyhow::Result<File> {
+pub(crate) fn open_file(dir: &Dir, name: &str, writable: bool) -> anyhow::Result<File> {
     valid_name(name)?;
     let mut options = OpenOptions::new();
     options
@@ -168,7 +168,7 @@ pub(super) fn open_file(dir: &Dir, name: &str, writable: bool) -> anyhow::Result
     Ok(file)
 }
 
-pub(super) fn read_bounded(dir: &Dir, name: &str, limit: u64) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn read_bounded(dir: &Dir, name: &str, limit: u64) -> anyhow::Result<Vec<u8>> {
     let file = open_file(dir, name, false)?;
     ensure!(
         file.metadata()?.len() <= limit,
@@ -183,7 +183,7 @@ pub(super) fn read_bounded(dir: &Dir, name: &str, limit: u64) -> anyhow::Result<
     Ok(bytes)
 }
 
-pub(super) fn write_atomic(dir: &Dir, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(dir: &Dir, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let temporary = format!("pending-{}", crate::artifacts::new_server_id());
     let result = (|| {
         let mut file = create_file(dir, &temporary)?;

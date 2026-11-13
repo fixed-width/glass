@@ -62,6 +62,9 @@ pub fn run(owner: u32) -> anyhow::Result<()> {
                 Err(error) => {
                     if let Ok(request) = incoming.recv() {
                         let properties = Properties {
+                            recording_supported: false,
+                            buffer_supported: false,
+                            recording_scope: glass_core::RecordingScope::ApplicationWindows,
                             input_route: glass_core::InputRoute::SharedDesktop,
                             input: glass_core::InputCapabilities::unknown(),
                             app_pid: None,

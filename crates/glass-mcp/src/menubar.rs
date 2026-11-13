@@ -123,12 +123,13 @@ mod macos {
             // CLI flag to thread through. Fail-closed: an unopenable audit log aborts here.
             let (sink, report) = crate::audit::resolve(None, |k| std::env::var(k).ok())?;
             let glass = crate::boot(sink);
-            let server = crate::server::GlassServer::new_configured(
+            let server = crate::server::GlassServer::new_with_recordings(
                 glass,
                 report,
                 cfg.tool_profile,
                 cfg.trace.as_ref(),
                 "http",
+                cfg.recordings.as_ref(),
             )?;
 
             tokio::spawn(async move {

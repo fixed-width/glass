@@ -16,6 +16,7 @@ glass-core.workspace = true
 glass-exec-unix.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+rustix.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 tonic.workspace = true
 prost.workspace = true

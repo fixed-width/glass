@@ -335,6 +335,32 @@ fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
 }
 
 impl Platform for AndroidPlatform {
+    fn recording_supported(&self) -> bool {
+        true
+    }
+
+    fn recording_scope(&self) -> glass_core::RecordingScope {
+        glass_core::RecordingScope::DeviceDisplay
+    }
+
+    fn start_recording(
+        &mut self,
+        options: glass_core::RecordingOptions,
+        deadline: Deadline,
+    ) -> Result<Box<dyn glass_core::Recording>> {
+        self.running()?;
+        let pixels = self
+            .adb()
+            .run_bytes_until(["exec-out", "screencap"], deadline)?;
+        let frame = decode_screencap(&pixels)?;
+        let window = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+        crate::recording::start(self.resolved_adb(), window, options, deadline)
+    }
     fn input_route(&self) -> glass_core::InputRoute {
         glass_core::InputRoute::Isolated
     }
@@ -646,6 +672,19 @@ mod platform_tests {
     use crate::adb::{Answer, FakeAdb};
     use crate::target::AttachedDevice;
     use glass_core::{MouseButton, SandboxLevel};
+
+    #[test]
+    fn device_video_support_and_scope_are_available_without_device_calls() {
+        let fake = FakeAdb::new(&[]);
+        let platform = platform_over(&fake);
+        assert!(platform.recording_supported());
+        assert!(!platform.rolling_buffer_supported());
+        assert_eq!(
+            platform.recording_scope(),
+            glass_core::RecordingScope::DeviceDisplay
+        );
+        assert!(fake.calls().is_empty());
+    }
 
     /// Two on-screen windows for the app — a dialog on top of its main activity — plus windows
     /// owned by other packages, as `dumpsys window windows` really lays them out.

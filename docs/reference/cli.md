@@ -25,6 +25,8 @@ client's filesystem.
   contain sensitive data, in a new child of an existing private directory.
 - `--trace-max-bytes <bytes>` — per-process trace allowance, default 256 MiB; requires `--trace-dir`.
   See [session trace](session-trace.md) for bounds, exclusions and ownership requirements.
+- `--record-dir <absolute-directory>` — enable explicitly selected workflow videos in an existing
+  private directory. Android and iOS Simulator only. See [workflow video](../how-to/record-workflow-video.md).
 
 ## `serve`
 
@@ -38,6 +40,7 @@ Serve MCP over the network (Streamable HTTP) instead of stdio.
 - `--audit-log <path>` — as above.
 - `--tool-profile full|lean` — as above, including menu-bar mode.
 - `--trace-dir` and `--trace-max-bytes` — as above, including menu-bar mode.
+- `--record-dir` — as above, including menu-bar mode.
 
 Loopback binds need no token; see [how-to/run-over-the-network.md](../how-to/run-over-the-network.md).
 Remote HTTP clients must read `glass-artifact://` links with MCP `resources/read`; they must not try

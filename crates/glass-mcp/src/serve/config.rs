@@ -9,6 +9,7 @@ pub struct ServeConfig {
     pub token: Option<String>,
     pub tool_profile: crate::tool_profile::ToolProfile,
     pub trace: Option<crate::trace::TraceConfig>,
+    pub recordings: Option<crate::recordings::RecordingConfig>,
 }
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7300";
@@ -90,6 +91,7 @@ pub fn parse_args(
         token,
         tool_profile: Default::default(),
         trace: None,
+        recordings: None,
     })
 }
 
@@ -165,6 +167,7 @@ mod tests {
             token: token.map(String::from),
             tool_profile: Default::default(),
             trace: None,
+            recordings: None,
         }
     }
 

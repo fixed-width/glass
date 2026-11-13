@@ -14,6 +14,26 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::time::Duration;
 
+pub(crate) struct BlockedRecordingSink {
+    pub entered: std::sync::mpsc::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
+}
+
+impl crate::RecordingSink for BlockedRecordingSink {
+    fn next_id(&self) -> Result<String> {
+        Ok("123456789012345678901234567890ab".into())
+    }
+    fn save(
+        &mut self,
+        _: &crate::RecordingSummary,
+        _: &crate::RecordedVideo,
+    ) -> Result<crate::RecordingArtifact> {
+        self.entered.send(()).unwrap();
+        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        Err(GlassError::Backend("storage stalled".into()))
+    }
+}
+
 /// Every `capture_window(id, region)` call `FakePlatform` recorded, for
 /// asserting it (not `capture_frame`) was used, and with what arguments.
 pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;
@@ -33,6 +53,8 @@ pub(crate) type PidDeadlineLog = Arc<Mutex<Vec<Deadline>>>;
 /// Scriptable in-memory backend for testing the session manager.
 #[derive(Default)]
 pub(crate) struct FakePlatform {
+    rolling: Option<Box<dyn crate::RollingBuffer>>,
+    rolling_support: bool,
     geometry: WindowGeometry,
     frames: VecDeque<Frame>,
     pending_logs: Vec<(Stream, String)>,
@@ -107,6 +129,11 @@ pub(crate) struct FakePlatform {
 }
 
 impl FakePlatform {
+    pub(crate) fn with_rolling_buffer(mut self, buffer: Box<dyn crate::RollingBuffer>) -> Self {
+        self.rolling = Some(buffer);
+        self.rolling_support = true;
+        self
+    }
     pub(crate) fn with_geometry_error_at(mut self, read: usize) -> Self {
         self.geometry_error_at = Some(read);
         self
@@ -327,6 +354,18 @@ impl FakePlatform {
 }
 
 impl Platform for FakePlatform {
+    fn rolling_buffer_supported(&self) -> bool {
+        self.rolling_support
+    }
+    fn start_rolling_buffer(
+        &mut self,
+        _options: crate::RollingOptions,
+        _deadline: Deadline,
+    ) -> Result<Box<dyn crate::RollingBuffer>> {
+        self.rolling
+            .take()
+            .ok_or_else(|| GlassError::Backend("fake buffer unavailable".into()))
+    }
     fn pointer_window_occluded_by(
         &mut self,
         point: (i32, i32),

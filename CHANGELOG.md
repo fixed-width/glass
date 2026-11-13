@@ -21,9 +21,16 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Desktop workflow video can keep bounded recent history in memory. Explicit incident marks include preceding history and a result tail, merge when overlapping, and save through the existing protected recording store while buffering continues. Unmarked history is discarded.
+
+- Workflow recording now supports desktop backends, including private Wayland/Xvfb and Windows child displays, app-filtered macOS capture, and shared-desktop window capture. Movies use bounded software H.264 encoding and keep the existing workflow retention controls.
+
+- Opt-in Android and iOS Simulator workflow video through `--record-dir` and `glass_record`, with
+  bounded clips, keep/discard outcomes, persistent movie metadata and video resource reads.
+
 - `glass_screenshot` supports numbered accessibility annotations, `glass_logs` supports waiting
   for matching lines, and `glass_do` supports multi-touch gestures. The lean profile exposes these
-  through 17 tools; full retains all standalone tools. New stdio registration examples select lean.
+  through 18 tools; full retains all standalone tools. New stdio registration examples select lean.
 - Linux launches accept `read_only_inputs` for files outside the workspace and report filesystem
   visibility and display size. Screenshots report capture completeness and accept `require_full`.
 - Preview Windows development on a separate desktop, so agents can work without interrupting you.
@@ -32,6 +39,8 @@ internal refactors, CI, or test-only changes.
   [Windows setup guide](docs/how-to/windows-separate-desktop.md).
 
 ### Fixed
+
+- Windows private environments stream large worker responses, including workflow movies, without stalling the pipe, and preserve completed replies after an operation spends its deadline.
 
 - Stopping recorded macOS apps off your desktop allows more time for exit confirmation and
   reserves time for forced termination within short deadlines. No signal is sent after an

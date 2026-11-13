@@ -62,17 +62,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
         run: rustup show
-      - name: Add musl target
-        run: rustup target add x86_64-unknown-linux-musl
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: .
       - name: Build (gnu)
         run: cargo build --release -p glass-mcp --locked
       - name: Build (musl, static)
-        run: cargo build --release -p glass-mcp --target x86_64-unknown-linux-musl --locked
+        run: ./scripts/build-musl.sh --release
       - name: Package
         run: |
           set -euo pipefail

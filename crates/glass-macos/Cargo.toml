@@ -124,6 +124,7 @@ serde = { version = "1", features = ["derive"] }
 # feature set) out of the build entirely. Each list was derived and verified empirically
 # on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
+glass-video.workspace = true
 aes = { version = "0.8.4", features = ["zeroize"] }
 crypto-bigint = { version = "0.6.1", features = ["alloc", "zeroize"] }
 getrandom = "0.3"

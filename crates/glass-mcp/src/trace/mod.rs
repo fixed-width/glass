@@ -3,7 +3,7 @@
 mod capture;
 mod config;
 mod format;
-mod fs;
+pub(crate) mod fs;
 mod inspect;
 mod recorder;
 mod store;
