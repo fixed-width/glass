@@ -14,6 +14,26 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
 pub(crate) use std::time::Duration;
 
+pub(crate) struct BlockedRecordingSink {
+    pub entered: std::sync::mpsc::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
+}
+
+impl crate::RecordingSink for BlockedRecordingSink {
+    fn next_id(&self) -> Result<String> {
+        Ok("123456789012345678901234567890ab".into())
+    }
+    fn save(
+        &mut self,
+        _: &crate::RecordingSummary,
+        _: &crate::RecordedVideo,
+    ) -> Result<crate::RecordingArtifact> {
+        self.entered.send(()).unwrap();
+        self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        Err(GlassError::Backend("storage stalled".into()))
+    }
+}
+
 /// Every `capture_window(id, region)` call `FakePlatform` recorded, for
 /// asserting it (not `capture_frame`) was used, and with what arguments.
 pub(crate) type CaptureWindowLog = Arc<Mutex<Vec<(WindowId, Option<Region>)>>>;

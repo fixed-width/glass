@@ -50,13 +50,21 @@ impl Glass {
         spec: &AppSpec,
         inputs: &[std::path::PathBuf],
     ) -> Result<WindowGeometry> {
-        self.finish_recording_for_stop(Deadline::from_millis(15_000));
+        let recording = self.finalize_recording_for_stop(Deadline::from_millis(15_000));
         self.observation_epoch.invalidate();
         // One active session: tear down any current one first.
-        if let Some(session) = self.active.as_mut() {
-            session.platform.stop_app()?;
+        let stopped = if let Some(session) = self.active.as_mut() {
+            session.platform.stop_app()
+        } else {
+            Ok(())
+        };
+        if stopped.is_ok() {
+            self.active.take();
         }
-        self.active.take();
+        if let Some(recording) = recording {
+            let _ = self.persist_recording(recording);
+        }
+        stopped?;
         let Backend {
             mut platform,
             accessibility,
@@ -157,11 +165,18 @@ impl Glass {
     }
 
     fn stop_inner(&mut self) -> Result<()> {
-        self.finish_recording_for_stop(Deadline::from_millis(15_000));
+        let recording = self.finalize_recording_for_stop(Deadline::from_millis(15_000));
         self.observation_epoch.invalidate();
-        let mut s = self.active.take().ok_or(GlassError::NoActiveSession)?;
-        s.platform.stop_app()
-        // `s` drops here, tearing down the spawned backend (Xvfb/sway).
+        let outcome = if let Some(mut s) = self.active.take() {
+            s.platform.stop_app()
+            // `s` drops here, tearing down the spawned backend (Xvfb/sway).
+        } else {
+            Err(GlassError::NoActiveSession)
+        };
+        if let Some(recording) = recording {
+            let _ = self.persist_recording(recording);
+        }
+        outcome
     }
 
     /// Best-effort teardown of **all** active sessions for process exit. Idempotent:
@@ -182,17 +197,24 @@ impl Glass {
 
     /// Tear down the session and host hook, retaining any target-stop error.
     pub fn shutdown_report(&mut self, deadline: Deadline) -> Result<()> {
-        self.finish_recording_for_stop(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE));
+        let stop_deadline = deadline.reserving(crate::TEARDOWN_HOOK_RESERVE);
+        // A native recorder that consumes its budget must still leave time to stop the target.
+        let recording = self.finalize_recording_for_stop(
+            stop_deadline.reserving(std::time::Duration::from_secs(1)),
+        );
         self.observation_epoch.invalidate();
         let outcome = if let Some(mut s) = self.active.take() {
-            s.platform
-                .stop_app_by(deadline.reserving(crate::TEARDOWN_HOOK_RESERVE))
+            s.platform.stop_app_by(stop_deadline)
             // `s` drops here: the backend (Xvfb/sway/Job) is torn down.
         } else {
             Ok(())
         };
         if let Some(hook) = self.shutdown_hook.take() {
             hook(deadline);
+        }
+        // Filesystem persistence cannot delay stopping the target or releasing its environment.
+        if let Some(recording) = recording {
+            let _ = self.persist_recording(recording);
         }
         outcome
     }

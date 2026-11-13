@@ -240,4 +240,115 @@ mod tests {
         bytes.extend(atom(b"moov", b"index"));
         assert!(validate_video(&bytes).is_err());
     }
+
+    #[test]
+    fn validates_each_independent_option_and_accepts_exact_limits() {
+        let valid = RecordingOptions {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            max_duration_ms: 1000,
+            max_bytes: RECORDING_MAX_BYTES,
+        };
+        for id in ["short", "g123456789abcdef0123456789abcdef"] {
+            assert!(
+                RecordingOptions {
+                    id: id.into(),
+                    ..valid.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for duration in [0, 999, RECORDING_MAX_DURATION_MS + 1] {
+            assert!(
+                RecordingOptions {
+                    max_duration_ms: duration,
+                    ..valid.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for bytes in [0, RECORDING_MAX_BYTES + 1] {
+            assert!(
+                RecordingOptions {
+                    max_bytes: bytes,
+                    ..valid.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for duration in [1000, RECORDING_MAX_DURATION_MS] {
+            for bytes in [1, RECORDING_MAX_BYTES] {
+                assert!(
+                    RecordingOptions {
+                        max_duration_ms: duration,
+                        max_bytes: bytes,
+                        ..valid.clone()
+                    }
+                    .validate()
+                    .is_ok()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_format_and_scope_names_match_the_wire_contract() {
+        for (format, extension, mime) in [
+            (RecordingFormat::Mp4, "mp4", "video/mp4"),
+            (RecordingFormat::QuickTime, "mov", "video/quicktime"),
+        ] {
+            assert_eq!(format.extension(), extension);
+            assert_eq!(format.mime_type(), mime);
+        }
+        for (scope, name) in [
+            (RecordingScope::DeviceDisplay, "device_display"),
+            (RecordingScope::OwnedDisplay, "owned_display"),
+            (RecordingScope::ApplicationWindows, "application_windows"),
+            (RecordingScope::Window, "window"),
+        ] {
+            assert_eq!(scope.as_str(), name);
+            assert_eq!(serde_json::to_value(scope).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn accepts_wide_boxes_empty_padding_and_media_extending_to_eof() {
+        let mut bytes = atom(b"free", b"");
+        for (kind, payload) in [(b"ftyp", b"isom"), (b"moov", b"indx")] {
+            bytes.extend(1_u32.to_be_bytes());
+            bytes.extend(kind);
+            bytes.extend(20_u64.to_be_bytes());
+            bytes.extend(payload);
+        }
+        bytes.extend(0_u32.to_be_bytes());
+        bytes.extend(b"mdatframe");
+        assert!(validate_video(&bytes).is_ok());
+        for end in 8..16 {
+            assert!(validate_video(&bytes[8..8 + end]).is_err());
+        }
+        let mut malformed = bytes.clone();
+        malformed[16..24].copy_from_slice(&15_u64.to_be_bytes());
+        assert!(validate_video(&malformed).is_err());
+        malformed[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(validate_video(&malformed).is_err());
+    }
+
+    #[test]
+    fn every_required_box_needs_a_payload_and_short_boxes_are_rejected() {
+        for empty in [b"ftyp", b"moov", b"mdat"] {
+            let bytes: Vec<_> = [b"ftyp", b"moov", b"mdat"]
+                .into_iter()
+                .flat_map(|kind| atom(kind, if kind == empty { b"" } else { b"data" }))
+                .collect();
+            assert!(validate_video(&bytes).is_err(), "{empty:?}");
+        }
+        let mut bytes = atom(b"ftyp", b"isom");
+        bytes.extend(atom(b"moov", b"indx"));
+        bytes.extend(atom(b"mdat", b"data"));
+        bytes.extend(4_u32.to_be_bytes());
+        bytes.extend(b"free");
+        assert!(validate_video(&bytes).is_err());
+    }
 }

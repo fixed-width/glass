@@ -102,3 +102,61 @@ pub(crate) struct ActiveBuffer {
     pub handle: Box<dyn RollingBuffer>,
     pub pending: Option<RecordingSummary>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_history_and_inherits_recording_identity_and_byte_limits() {
+        let valid = RollingOptions {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            history_ms: 1000,
+            max_bytes: crate::recording::RECORDING_MAX_BYTES,
+        };
+        for history in [1000, BUFFER_MAX_HISTORY_MS] {
+            assert!(
+                RollingOptions {
+                    history_ms: history,
+                    ..valid.clone()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for history in [0, 999, BUFFER_MAX_HISTORY_MS + 1] {
+            assert!(
+                RollingOptions {
+                    history_ms: history,
+                    ..valid.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            RollingOptions {
+                id: "bad".into(),
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RollingOptions {
+                max_bytes: 0,
+                ..valid.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RollingOptions {
+                max_bytes: crate::recording::RECORDING_MAX_BYTES + 1,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

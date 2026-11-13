@@ -4436,6 +4436,50 @@ mod session_tests {
 
     use super::*;
     use crate::testw::{Launch, READY_LINE};
+
+    #[test]
+    #[ignore = "starts a private headless compositor; needs sway and Mesa"]
+    fn recording_uses_an_independent_capture_of_the_owned_display() {
+        let mut session = Launch::new().start_mapped();
+        let platform = session.platform();
+        assert!(platform.recording_supported() && platform.rolling_buffer_supported());
+        assert_eq!(
+            platform.recording_scope(),
+            glass_core::RecordingScope::OwnedDisplay
+        );
+        let size = platform.display_size().unwrap();
+        let mut capture = platform.video_capture().unwrap()().unwrap();
+        for _ in 0..2 {
+            let frame = capture(Deadline::from_millis(2000)).unwrap();
+            assert_eq!((frame.width, frame.height), size);
+            assert_eq!(
+                frame.pixels.len(),
+                frame.width as usize * frame.height as usize * 4
+            );
+        }
+        let error = capture(Deadline::from_millis(0)).unwrap_err();
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+    }
+
+    #[test]
+    #[ignore = "starts a private headless compositor; needs sway and Mesa"]
+    fn recording_capture_obeys_its_deadline_when_the_compositor_stalls() {
+        let mut session = Launch::new().start_mapped();
+        let platform = session.platform();
+        let mut capture = platform.video_capture().unwrap()().unwrap();
+        let pid = platform.session_compositor_pid().unwrap();
+        let suspended = Suspended::process(pid);
+        let started = Instant::now();
+        let answer = capture(Deadline::from_millis(200));
+        let elapsed = started.elapsed();
+        drop(suspended);
+        assert!(answer.is_err());
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+    }
+
     use x11rb::protocol::xproto::{
         GetInputFocusReply, GetWindowAttributesReply, MapState, QueryTreeReply, Setup, WindowClass,
     };

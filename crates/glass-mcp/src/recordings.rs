@@ -300,16 +300,17 @@ mod tests {
     #[test]
     fn refuses_symlinks_writable_roots_and_rebound_directories() {
         let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join("root");
+        let parent_path = parent.path().canonicalize().unwrap();
+        let root = parent_path.join("root");
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(RecordingStore::open(&RecordingConfig::new(root.clone()).unwrap()).is_err());
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let alias = parent.path().join("link");
+        let alias = parent_path.join("link");
         symlink(&root, &alias).unwrap();
         assert!(RecordingStore::open(&RecordingConfig::new(alias).unwrap()).is_err());
         let store = RecordingStore::open(&RecordingConfig::new(root.clone()).unwrap()).unwrap();
-        std::fs::rename(&root, parent.path().join("moved")).unwrap();
+        std::fs::rename(&root, parent_path.join("moved")).unwrap();
         std::fs::create_dir(&root).unwrap();
         assert!(store.next_id().is_err());
     }

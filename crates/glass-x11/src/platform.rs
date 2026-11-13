@@ -1552,7 +1552,8 @@ impl X11Platform {
             source.window = Some(window);
             Ok(Box::new(move |deadline| {
                 if owned_display {
-                    source.run_window_call_by(deadline, "recording capture", |source, _| {
+                    source.run_window_call_by(deadline, "recording capture", |source, dispatch| {
+                        dispatch.mark();
                         let geometry = source
                             .conn
                             .get_geometry(source.root)
@@ -2924,6 +2925,38 @@ mod tests {
 mod display_tests {
     use super::*;
     use crate::testx::TestX;
+
+    #[test]
+    #[ignore = "starts an owned private X server; needs Xvfb"]
+    fn owned_display_recording_capture_bounds_a_stalled_server() {
+        let xvfb = crate::xvfb::Xvfb::start("64x48x24").unwrap();
+        let server_pid = xvfb.pid();
+        let mut platform = X11Platform::connect(Some(&xvfb.display)).unwrap();
+        platform.window = Some(platform.root);
+        platform.xvfb = Some(xvfb);
+        assert!(platform.recording_supported() && platform.rolling_buffer_supported());
+        assert_eq!(
+            platform.recording_scope(),
+            glass_core::RecordingScope::OwnedDisplay
+        );
+        let mut capture = platform.video_capture().unwrap()().unwrap();
+        let frame = capture(Deadline::from_millis(1000)).unwrap();
+        assert_eq!((frame.width, frame.height), (64, 48));
+        let paused = PausedXServer::new(server_pid);
+        let started = Instant::now();
+        let answer = capture(Deadline::from_millis(200));
+        let elapsed = started.elapsed();
+        let rescued = paused.resume();
+        assert!(!rescued, "capture waited for the independent server rescue");
+        let error = answer.expect_err("a stalled capture must hit its deadline");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched)
+        );
+        assert!(capture(Deadline::from_millis(500)).is_err());
+    }
 
     #[test]
     #[ignore = "starts an owned private X server; needs Xvfb"]

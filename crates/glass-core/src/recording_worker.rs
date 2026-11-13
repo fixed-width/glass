@@ -253,6 +253,101 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control() -> RecordingControl {
+        RecordingControl(Arc::new(Shared {
+            options: options(),
+            stop: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            keep: AtomicBool::new(true),
+            started: Mutex::new(None),
+            progress: Mutex::new(RecordingProgress {
+                state: RecordingState::Recording,
+                elapsed_ms: 0,
+                bytes: 0,
+                reason: None,
+            }),
+            ready: Mutex::new(None),
+        }))
+    }
+
+    #[test]
+    fn byte_pressure_stops_before_the_movie_allowance_is_exhausted() {
+        let control = control();
+        let threshold = control.options().max_bytes - 256 * 1024;
+        control.observe_bytes(threshold - 1);
+        assert_eq!(control.progress().bytes, threshold - 1);
+        assert!(!control.should_stop());
+        control.observe_bytes(threshold);
+        assert!(control.should_stop());
+        let progress = control.mark_finalized();
+        assert_eq!(progress.state, RecordingState::Limited);
+        assert_eq!(progress.reason.as_deref(), Some("byte_limit"));
+    }
+
+    #[test]
+    fn elapsed_capture_time_is_live_only_until_a_terminal_state() {
+        let control = control();
+        assert_eq!(control.elapsed_ms(), 0);
+        control.ready();
+        *control.0.started.lock().unwrap() = Some(Instant::now() - Duration::from_millis(100));
+        assert!((100..1000).contains(&control.progress().elapsed_ms));
+        let finalized = control.mark_finalized();
+        assert_eq!(finalized.state, RecordingState::Finalized);
+        *control.0.started.lock().unwrap() = Some(Instant::now() - Duration::from_millis(150));
+        assert_eq!(control.progress().elapsed_ms, finalized.elapsed_ms);
+        assert!(!control.should_stop());
+    }
+
+    #[test]
+    fn failures_and_limits_keep_their_reason_after_finalization() {
+        let failed = control();
+        failed.ready();
+        failed.fail("display disconnected");
+        assert!(failed.should_stop());
+        let progress = failed.mark_finalized();
+        assert_eq!(progress.state, RecordingState::Failed);
+        assert_eq!(progress.reason.as_deref(), Some("display disconnected"));
+        let limited = control();
+        limited.limit("native duration limit");
+        assert!(limited.should_stop());
+        assert_eq!(limited.mark_finalized().state, RecordingState::Limited);
+        assert_eq!(
+            limited.progress().reason.as_deref(),
+            Some("native duration limit")
+        );
+    }
+
+    #[test]
+    fn duration_limit_and_explicit_keep_or_discard_reach_the_worker() {
+        let timed = control();
+        timed.ready();
+        *timed.0.started.lock().unwrap() = Some(Instant::now() - Duration::from_millis(1000));
+        assert!(timed.should_stop());
+        assert_eq!(timed.progress().reason.as_deref(), Some("duration_limit"));
+        for keep in [false, true] {
+            let mut worker =
+                start_recording_worker(options(), Deadline::from_millis(1000), |control| {
+                    control.ready();
+                    while !control.should_stop() {
+                        std::thread::yield_now();
+                    }
+                    Ok(RecordedVideo {
+                        format: crate::RecordingFormat::Mp4,
+                        progress: control.mark_finalized(),
+                        data: if control.keep() { vec![1] } else { vec![] },
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                worker
+                    .finish(keep, Deadline::from_millis(1000))
+                    .unwrap()
+                    .data,
+                if keep { vec![1] } else { vec![] }
+            );
+        }
+    }
     fn options() -> RecordingOptions {
         RecordingOptions {
             id: "123456789012345678901234567890ab".into(),

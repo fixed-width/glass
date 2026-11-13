@@ -1,5 +1,6 @@
+use super::recording::FinishedRecording;
 use super::*;
-use crate::recording::{RECORDING_MAX_BYTES, validate_video};
+use crate::recording::RECORDING_MAX_BYTES;
 use crate::rolling::*;
 use crate::{
     BufferedVideo, RecordingMark, RecordingOutcome, RecordingProgress, RecordingState,
@@ -163,12 +164,9 @@ impl Glass {
             marks: Vec::new(),
             window: None,
         });
-        if pending
-            .outcome
-            .is_none_or(|old| outcome_rank(outcome) > outcome_rank(old))
-        {
-            pending.outcome = Some(outcome);
-        }
+        pending.outcome = Some(pending.outcome.map_or(outcome, |previous| {
+            std::cmp::max_by_key(previous, outcome, |o| outcome_rank(*o))
+        }));
         pending.marks.push(RecordingMark {
             name: name.into(),
             outcome,
@@ -180,39 +178,24 @@ impl Glass {
         Ok(Some(pending))
     }
 
-    fn persist_buffered(
+    fn finished_buffered(
         &mut self,
         mut summary: RecordingSummary,
         captured: BufferedVideo,
-    ) -> Result<RecordingSummary> {
-        let result = (|| {
-            if captured.window.id != summary.id {
-                return Err(error("buffer clip identity mismatch"));
-            }
-            summary.progress = captured.video.progress.clone();
-            summary.window = Some(captured.window);
-            if captured.video.data.len() as u64 > RECORDING_MAX_BYTES {
-                return Err(error("recording exceeds the clip byte limit"));
-            }
-            validate_video(&captured.video.data)?;
-            summary.kept = true;
-            summary.artifact = Some(
-                self.recordings
-                    .sink
-                    .as_mut()
-                    .ok_or_else(|| error("recording storage unavailable"))?
-                    .save(&summary, &captured.video)?,
-            );
-            summary.kept = true;
-            Ok(())
-        })();
-        if let Err(failure) = &result {
-            summary.kept = false;
+    ) -> Result<FinishedRecording> {
+        if captured.window.id != summary.id {
+            let failure = error("buffer clip identity mismatch");
             summary.progress.state = RecordingState::Failed;
             summary.progress.reason = Some(failure.to_string());
+            self.recordings.last = Some(summary);
+            return Err(failure);
         }
-        self.recordings.last = Some(summary.clone());
-        result.map(|()| summary)
+        summary.progress = captured.video.progress.clone();
+        summary.window = Some(captured.window);
+        Ok(FinishedRecording {
+            summary,
+            video: Some(captured.video),
+        })
     }
 
     pub fn save_rolling_buffer(&mut self, deadline: Deadline) -> Result<RecordingSummary> {
@@ -229,7 +212,8 @@ impl Glass {
         match buffer.handle.save(deadline) {
             Ok(captured) => {
                 buffer.pending = None;
-                self.persist_buffered(summary, captured)
+                let finished = self.finished_buffered(summary, captured)?;
+                self.persist_recording(finished)
             }
             Err(failure) => {
                 let mut failed = summary;
@@ -246,6 +230,17 @@ impl Glass {
         keep: Option<bool>,
         deadline: Deadline,
     ) -> Result<RecordingStatus> {
+        if let Some(finished) = self.finalize_rolling_buffer(keep, deadline)? {
+            self.persist_recording(finished)?;
+        }
+        Ok(self.recording_status())
+    }
+
+    pub(super) fn finalize_rolling_buffer(
+        &mut self,
+        keep: Option<bool>,
+        deadline: Deadline,
+    ) -> Result<Option<FinishedRecording>> {
         let mut buffer = self
             .recordings
             .buffer
@@ -254,29 +249,27 @@ impl Glass {
         let keep = keep.unwrap_or(true);
         let captured = buffer.handle.stop(keep, deadline);
         match (captured, buffer.pending) {
-            (Ok(Some(video)), Some(summary)) => {
-                self.persist_buffered(summary, video)?;
-            }
+            (Ok(Some(video)), Some(summary)) => self.finished_buffered(summary, video).map(Some),
             (Ok(None), Some(mut summary)) if !keep => {
                 summary.progress.state = RecordingState::Discarded;
-                self.recordings.last = Some(summary);
+                Ok(Some(FinishedRecording {
+                    summary,
+                    video: None,
+                }))
             }
-            (Ok(None), None) => {}
+            (Ok(None), None) => Ok(None),
             (Err(failure), pending) => {
                 if let Some(mut summary) = pending {
                     summary.progress.state = RecordingState::Failed;
                     summary.progress.reason = Some(failure.to_string());
                     self.recordings.last = Some(summary);
                 }
-                return Err(failure);
+                Err(failure)
             }
-            _ => {
-                return Err(error(
-                    "native buffer disposition did not match the pending clip",
-                ));
-            }
+            _ => Err(error(
+                "native buffer disposition did not match the pending clip",
+            )),
         }
-        Ok(self.recording_status())
     }
 }
 

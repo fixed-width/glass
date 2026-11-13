@@ -124,8 +124,10 @@ until the operator removes them. A limit stops capture, not application work. St
 limit or recording failure; inspect it before another recording.
 
 Stop recording before stopping the application for the best chance of retaining the complete
-outcome. `glass_stop`, application replacement, and server shutdown attempt to finalize and keep an
-outstanding clip as interrupted evidence before device teardown. Process shutdown has a short
+outcome. `glass_stop`, application replacement, and server shutdown attempt to finalize an
+outstanding clip as interrupted evidence before device teardown, then persist it after target
+cleanup. Shutdown hooks also run before persistence, so stalled video storage cannot delay cleanup.
+Process shutdown has a short
 shared cleanup deadline; a stalled recorder or disconnected device may leave no retained movie.
 Recording failure never repeats input or prevents application cleanup.
 If the Android device becomes unreachable, its recorder may continue until the native duration

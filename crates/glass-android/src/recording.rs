@@ -31,11 +31,16 @@ pub(crate) fn start(
         ));
     }
     start_recording_worker(options, deadline, move |control| {
-        record(adb, window, control)
+        record(adb, window, control, Instant::now)
     })
 }
 
-fn record(adb: Adb, window: WindowGeometry, control: RecordingControl) -> Result<RecordedVideo> {
+fn record(
+    adb: Adb,
+    window: WindowGeometry,
+    control: RecordingControl,
+    clock: impl FnMut() -> Instant,
+) -> Result<RecordedVideo> {
     let folder = format!("/data/local/tmp/glass-video-{}", control.options().id);
     let movie = format!("{folder}/clip.mp4");
     let pidfile = format!("{folder}/pid");
@@ -44,7 +49,7 @@ fn record(adb: Adb, window: WindowGeometry, control: RecordingControl) -> Result
     let outcome = if control.cancelled() {
         Err(GlassError::Backend("recording cancelled".into()))
     } else {
-        record_in(&adb, &window, &control, &movie, &pidfile)
+        record_in(&adb, &window, &control, &movie, &pidfile, clock)
     };
     if outcome.is_err()
         && let Ok(pid) = adb.run_until(["shell", "cat", &pidfile], Deadline::from_millis(500))
@@ -64,17 +69,23 @@ fn record(adb: Adb, window: WindowGeometry, control: RecordingControl) -> Result
     outcome
 }
 
+fn recording_dimensions(window: &WindowGeometry) -> (u32, u32) {
+    let scale = 1280.0 / f64::from(window.width.max(window.height).max(1));
+    let scale = scale.min(1.0);
+    let width = ((f64::from(window.width) * scale) as u32 / 2 * 2).max(2);
+    let height = ((f64::from(window.height) * scale) as u32 / 2 * 2).max(2);
+    (width, height)
+}
+
 fn record_in(
     adb: &Adb,
     window: &WindowGeometry,
     control: &RecordingControl,
     movie: &str,
     pidfile: &str,
+    mut clock: impl FnMut() -> Instant,
 ) -> Result<RecordedVideo> {
-    let scale = 1280.0 / f64::from(window.width.max(window.height).max(1));
-    let scale = scale.min(1.0);
-    let width = ((f64::from(window.width) * scale) as u32 / 2 * 2).max(2);
-    let height = ((f64::from(window.height) * scale) as u32 / 2 * 2).max(2);
+    let (width, height) = recording_dimensions(window);
     let seconds = control.options().max_duration_ms.div_ceil(1000);
     // The identifier is validated hexadecimal; the resolved device, never caller shell text, owns the PID.
     let script = format!(
@@ -93,7 +104,7 @@ fn record_in(
             .spawn()
             .map_err(|e| GlassError::Backend(format!("start Android screenrecord: {e}")))?,
     );
-    let startup = Instant::now();
+    let startup = clock();
     let mut ready = false;
     let mut pid = None;
     let mut stopping = None;
@@ -137,7 +148,7 @@ fn record_in(
                 ready = true;
             }
         }
-        if !ready && startup.elapsed() > Duration::from_secs(12) {
+        if !ready && clock().saturating_duration_since(startup) >= Duration::from_secs(12) {
             if let Some(pid) = pid {
                 let _ = stop_guest(adb, pid, movie, Deadline::from_millis(500));
             }
@@ -150,9 +161,11 @@ fn record_in(
                 GlassError::Backend("screenrecord did not disclose its owned PID".into())
             })?;
             stop_guest(adb, pid, movie, Deadline::from_millis(1000))?;
-            stopping = Some(Instant::now());
+            stopping = Some(clock());
         }
-        if stopping.is_some_and(|start| start.elapsed() > Duration::from_secs(4)) {
+        if stopping
+            .is_some_and(|start| clock().saturating_duration_since(start) >= Duration::from_secs(4))
+        {
             return Err(GlassError::Backend(
                 "Android recorder did not finalize after SIGINT".into(),
             ));
@@ -247,3 +260,7 @@ mod tests {
         assert!(!fake.called("pkill"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "recording_tests.rs"]
+mod native_tests;
