@@ -84,6 +84,7 @@ pub use logbuf::{LogBuffer, LogLine, Stream};
 pub mod platform;
 pub mod recording;
 pub mod recording_worker;
+pub mod rolling;
 pub use platform::{
     A11yBind, AppSpec, HostPathAccess, HostPathProtectionMode, KeyEvent, MAX_CLICK_COUNT,
     MAX_GESTURE_POINTERS, MAX_SCROLL_NOTCHES, MouseButton, Platform, PointerEvent,
@@ -93,8 +94,12 @@ pub use platform::{
 };
 pub use recording::{
     RecordedVideo, Recording, RecordingArtifact, RecordingFormat, RecordingOptions,
-    RecordingOutcome, RecordingProgress, RecordingSink, RecordingState, RecordingStatus,
-    RecordingSummary,
+    RecordingOutcome, RecordingProgress, RecordingScope, RecordingSink, RecordingState,
+    RecordingStatus, RecordingSummary,
+};
+pub use rolling::{
+    BufferedVideo, RecordingMark, RollingBuffer, RollingOptions, RollingProgress, RollingState,
+    RollingSummary, RollingWindow,
 };
 
 pub mod deadline;

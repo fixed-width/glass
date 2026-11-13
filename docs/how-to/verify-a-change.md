@@ -29,14 +29,18 @@ The fix is to name the target.
 
 ## Cover the Windows code from Linux
 
+Desktop recording builds bundled C++ sources, including during metadata checks. Install a
+MinGW C++ cross toolchain and configure Cargo's target `CC`/`CXX` before these checks. Native
+Windows builds use the installed Visual C++ toolchain.
+
 ```bash
 rustup target add x86_64-pc-windows-gnu
 
 cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets --locked -- -D warnings
 ```
 
-That needs no linker and no Windows machine: `cargo check` and `cargo clippy` emit metadata and
-never link.
+That needs no Windows machine: `cargo check` and `cargo clippy` emit Rust metadata without linking
+a final executable, while native dependencies still need their target compiler and archiver.
 
 To actually *run* the Windows-target tests you need a cross-linker and wine (Debian/Ubuntu:
 `sudo apt install gcc-mingw-w64 wine`):
@@ -60,6 +64,9 @@ Three things to know before trusting the result:
   clean result without compiling anything.
 
 ## Cover the macOS code from Linux
+
+The bundled encoder also needs a Darwin C++ cross toolchain and SDK. If those are unavailable,
+run the checks on a Mac; adding the Rust target alone is insufficient.
 
 ```bash
 rustup target add x86_64-apple-darwin

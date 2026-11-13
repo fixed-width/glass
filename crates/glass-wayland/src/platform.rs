@@ -216,6 +216,8 @@ pub struct WaylandPlatform {
     read_only_inputs: Vec<PathBuf>,
 }
 
+mod recording;
+
 impl WaylandPlatform {
     pub fn new() -> Result<Self> {
         let sway = resolve_sway()?;
@@ -2399,7 +2401,50 @@ impl glass_core::ScrollSink for WaylandScrollSink<'_> {
     }
 }
 
+impl WaylandPlatform {
+    fn video_capture(&self) -> glass_core::Result<glass_video::CaptureFactory> {
+        let socket = self
+            .active
+            .as_ref()
+            .ok_or(GlassError::NoActiveSession)?
+            .socket_path
+            .clone();
+        Ok(Box::new(move || {
+            let mut source = recording::Capture::connect(&socket)?;
+            Ok(Box::new(move |deadline| source.frame(deadline)) as glass_video::CaptureSource)
+        }))
+    }
+}
+
 impl Platform for WaylandPlatform {
+    fn recording_supported(&self) -> bool {
+        true
+    }
+
+    fn recording_scope(&self) -> glass_core::RecordingScope {
+        glass_core::RecordingScope::OwnedDisplay
+    }
+
+    fn start_recording(
+        &mut self,
+        options: glass_core::RecordingOptions,
+        deadline: glass_core::Deadline,
+    ) -> glass_core::Result<Box<dyn glass_core::Recording>> {
+        glass_video::start(options, deadline, self.video_capture()?)
+    }
+
+    fn rolling_buffer_supported(&self) -> bool {
+        true
+    }
+
+    fn start_rolling_buffer(
+        &mut self,
+        options: glass_core::RollingOptions,
+        deadline: glass_core::Deadline,
+    ) -> glass_core::Result<Box<dyn glass_core::RollingBuffer>> {
+        glass_video::start_buffer(options, deadline, self.video_capture()?)
+    }
+
     fn configure_read_only_inputs(&mut self, paths: &[PathBuf]) -> Result<()> {
         self.read_only_inputs =
             glass_sandbox_linux::validate_read_only_inputs(paths, &self.protected_host_paths)?;

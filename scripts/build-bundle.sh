@@ -23,9 +23,6 @@ MUSL="x86_64-unknown-linux-musl"
 command -v zip >/dev/null   || { echo "error: 'zip' is required"   >&2; exit 1; }
 command -v strip >/dev/null || { echo "error: 'strip' is required" >&2; exit 1; }
 
-# Ensure the musl std target is present ("for if we don't have one"); no-op if so.
-rustup target add "$MUSL"
-
 mkdir -p "$OUT"
 
 # bundle <name> <cargo-target-or-empty> <readme-file> <built-binary-path> [extra-cargo-flags...]
@@ -33,7 +30,9 @@ bundle() {
   local name="$1" tgt="$2" readme="$3" bin="$4"
   shift 4
   echo "==> building $name"
-  if [ -n "$tgt" ]; then
+  if [ "$tgt" = "$MUSL" ]; then
+    ./scripts/build-musl.sh --release "$@"
+  elif [ -n "$tgt" ]; then
     cargo build --release --target "$tgt" -p glass-mcp "$@"
   else
     cargo build --release -p glass-mcp "$@"

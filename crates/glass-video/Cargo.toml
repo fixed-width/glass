@@ -1,0 +1,17 @@
+[package]
+name = "glass-video"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+glass-core.workspace = true
+image.workspace = true
+openh264 = { version = "0.9.8", default-features = false, features = ["source"] }
+mp4 = "0.14"
+bytes = "1"
+
+[lints]
+workspace = true

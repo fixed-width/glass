@@ -7,7 +7,10 @@ use crate::recording::{
 
 impl Glass {
     pub fn set_recording_sink(&mut self, sink: Box<dyn RecordingSink>) -> Result<()> {
-        if self.active.is_some() || self.recordings.active.is_some() {
+        if self.active.is_some()
+            || self.recordings.active.is_some()
+            || self.recordings.buffer.is_some()
+        {
             return Err(GlassError::ProtectedPathsWhileActive);
         }
         self.recordings.sink = Some(sink);
@@ -28,6 +31,11 @@ impl Glass {
                 .is_some_and(|s| s.platform.recording_supported()),
             active,
             last: self.recordings.last.clone(),
+            buffer_supported: self
+                .active
+                .as_ref()
+                .is_some_and(|s| s.platform.rolling_buffer_supported()),
+            buffer: self.rolling_summary(),
         }
     }
 
@@ -55,6 +63,11 @@ impl Glass {
                 "a recording already awaits stop and disposition".into(),
             ));
         }
+        if self.recordings.buffer.is_some() {
+            return Err(GlassError::Backend(
+                "stop the rolling buffer before starting a scoped recording".into(),
+            ));
+        }
         let session = self.active.as_ref().ok_or(GlassError::NoActiveSession)?;
         if !session.platform.recording_supported() {
             return Err(GlassError::UnsupportedOperation {
@@ -77,11 +90,13 @@ impl Glass {
             id,
             name: name.to_owned(),
             backend: session.backend.clone(),
-            scope: "device_display".into(),
+            scope: session.platform.recording_scope().as_str().into(),
             progress: handle.progress(),
             outcome: None,
             kept: false,
             artifact: None,
+            marks: Vec::new(),
+            window: None,
         };
         self.recordings.active = Some(ActiveRecording {
             summary: summary.clone(),
@@ -141,6 +156,9 @@ impl Glass {
     }
 
     pub(super) fn finish_recording_for_stop(&mut self, deadline: Deadline) {
+        if self.recordings.buffer.is_some() {
+            let _ = self.stop_rolling_buffer(None, deadline);
+        }
         if self.recordings.active.is_some() {
             let _ = self.stop_recording(RecordingOutcome::Interrupted, Some(true), deadline);
         }

@@ -52,14 +52,23 @@ have separate regression budgets; no safety guidance is removed automatically to
 
 ### `glass_record`
 
-Record a named Android or iOS Simulator workflow. Requires operator `--record-dir` and an active
+Record a named workflow on the active backend. Requires operator `--record-dir` and an active
 application. Available in both profiles; capture runs independently of input and observation calls.
 
-- `op` (string) — `start`, `status`, or `stop`.
-- `name` (string) — required for start; forbidden for status/stop.
+- `op` (string) — `start`, `status`, `stop`, `buffer_start`, `mark`, `save`, or `buffer_stop`.
+- `name` (string) — required for start/mark; forbidden for other operations.
 - `max_duration_ms` (integer) — start only, default 30000, range 1000 through 60000.
-- `outcome` (string) — required for stop: `success`, `failure`, or `cancelled`.
-- `keep` (boolean) — stop only; defaults true for failure/cancellation and false for success.
+- `outcome` (string) — required for stop/mark: `success`, `failure`, or `cancelled`.
+- `keep` (boolean) — stop/mark retention defaults true for failure/cancellation and false for success; buffer_stop defaults true for pending marked evidence.
+- `history_ms` (integer) — buffer_start only; default 10000, range 1000 through 30000.
+- `tail_ms` (integer) — mark only; default 2000, range 0 through 5000.
+
+For rolling history, mark requires name and outcome, with optional keep. buffer_start accepts only
+history_ms; save accepts only op; buffer_stop accepts optional keep and saves pending marked evidence
+by default. Status reports `buffer_supported` and `buffer`. Desktop backends support buffering;
+mobile backends support scoped clips. Kept overlapping marks merge before save, with at most 32
+marks and a 60-second/8-MiB movie. Unmarked history is discarded. Scoped and rolling captures are
+exclusive. See the workflow guide for bounds, keyframe boundaries and lifecycle behavior.
 
 Start returns its ID, backend, scope and progress after video data appears. Status returns enabled,
 session supported, outstanding active and previous last recording. Stop finalizes and returns the
@@ -71,7 +80,7 @@ disposition. Another start is rejected while a clip is outstanding.
 
 Retained `artifact` metadata gives a `glass-recording://` URI, a server-local `path` with
 `path_scope:"server"`, MIME type, bytes and SHA-256. `resources/read` returns the untrusted movie
-as a binary blob. Android uses MP4/H.264 and Simulator QuickTime/H.264; native frame rates vary.
+as a binary blob. Desktop and Android use MP4/H.264 and Simulator QuickTime/H.264. Scope and timing are described in the workflow guide.
 Ordinary trace recording remains separate. See [Record a workflow video](../how-to/record-workflow-video.md).
 
 

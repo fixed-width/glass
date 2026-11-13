@@ -335,9 +335,29 @@ pub struct AppSpec {
 /// The OS/display-server seam. Backends (e.g. `glass-x11`) implement this; no
 /// glass-core code depends on a concrete backend. Must stay object-safe.
 pub trait Platform {
+    fn rolling_buffer_supported(&self) -> bool {
+        false
+    }
+
+    fn start_rolling_buffer(
+        &mut self,
+        _options: crate::RollingOptions,
+        _deadline: crate::Deadline,
+    ) -> Result<Box<dyn crate::RollingBuffer>> {
+        Err(GlassError::UnsupportedOperation {
+            operation: "rolling video history".into(),
+            reason: "this backend has no encoded rolling-buffer adapter".into(),
+        })
+    }
+
     /// Whether this backend implements independent workflow video capture.
     fn recording_supported(&self) -> bool {
         false
+    }
+
+    /// The capture surface used by this backend's recording adapter.
+    fn recording_scope(&self) -> crate::RecordingScope {
+        crate::RecordingScope::Window
     }
 
     fn start_recording(

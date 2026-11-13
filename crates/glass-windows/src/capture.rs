@@ -24,6 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::IsIconic;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame as WgcFrame;
 use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::monitor::Monitor;
+use windows_capture::settings::GraphicsCaptureItemType;
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -76,11 +78,18 @@ fn wgc_one_frame_by(
     deadline: Deadline,
     dispatch: &crate::WindowsDispatch,
 ) -> Result<FramePayload> {
+    wgc_item_frame_by(Window::from_raw_hwnd(hwnd.0), deadline, dispatch)
+}
+
+fn wgc_item_frame_by<T: TryInto<GraphicsCaptureItemType> + Send + 'static>(
+    item: T,
+    deadline: Deadline,
+    dispatch: &crate::WindowsDispatch,
+) -> Result<FramePayload> {
     let (tx, rx): (Sender<FramePayload>, Receiver<FramePayload>) = channel();
 
-    let window = Window::from_raw_hwnd(hwnd.0);
     let settings = Settings::new(
-        window,
+        item,
         CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
@@ -111,6 +120,25 @@ fn wgc_one_frame_by(
             "WGC delivered no frame: {error}"
         ))),
     }
+}
+
+/// Capture a monitor from within the authenticated private child session only.
+pub(crate) fn capture_private_display_by(raw: isize, deadline: Deadline) -> Result<Frame> {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    crate::run_windows_call_by(deadline, "recording capture", |dispatch| {
+        // SAFETY: MonitorFromWindow only queries the live window's containing monitor.
+        let monitor =
+            unsafe { MonitorFromWindow(crate::util::raw_to_hwnd(raw), MONITOR_DEFAULTTONEAREST) };
+        if monitor.0.is_null() {
+            return Err(GlassError::CaptureFailed(
+                "private recording monitor unavailable".into(),
+            ));
+        }
+        let (mut bgra, w, h) =
+            wgc_item_frame_by(Monitor::from_raw_hmonitor(monitor.0), deadline, dispatch)?;
+        crate::pixels::bgra_to_rgba(&mut bgra);
+        Frame::new(w, h, bgra)
+    })
 }
 
 /// Capture `hwnd` as an RGBA `Frame`, optionally cropped (window-relative).

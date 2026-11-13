@@ -7,7 +7,28 @@ pub const RECORDING_MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub const RECORDING_DEFAULT_DURATION_MS: u64 = 30_000;
 pub const RECORDING_MAX_DURATION_MS: u64 = 60_000;
 
-#[derive(Clone, Debug)]
+/// The surface included in a workflow movie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingScope {
+    DeviceDisplay,
+    OwnedDisplay,
+    ApplicationWindows,
+    Window,
+}
+
+impl RecordingScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceDisplay => "device_display",
+            Self::OwnedDisplay => "owned_display",
+            Self::ApplicationWindows => "application_windows",
+            Self::Window => "window",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordingOptions {
     pub id: String,
     pub max_duration_ms: u64,
@@ -109,6 +130,10 @@ pub struct RecordingSummary {
     pub outcome: Option<RecordingOutcome>,
     pub kept: bool,
     pub artifact: Option<RecordingArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<crate::RecordingMark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<crate::RollingWindow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,6 +142,8 @@ pub struct RecordingStatus {
     pub supported: bool,
     pub active: Option<RecordingSummary>,
     pub last: Option<RecordingSummary>,
+    pub buffer_supported: bool,
+    pub buffer: Option<crate::RollingSummary>,
 }
 
 pub trait RecordingSink: Send {
@@ -135,6 +162,7 @@ pub(crate) struct ActiveRecording {
 
 #[derive(Default)]
 pub(crate) struct Recordings {
+    pub buffer: Option<crate::rolling::ActiveBuffer>,
     pub sink: Option<Box<dyn RecordingSink>>,
     pub active: Option<ActiveRecording>,
     pub last: Option<RecordingSummary>,

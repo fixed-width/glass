@@ -690,7 +690,56 @@ fn session_input_support(
     }
 }
 
+impl MacosPlatform {
+    fn video_capture(&self) -> glass_core::Result<glass_video::CaptureFactory> {
+        permissions::preflight()?;
+        let pid = self.active_pid()?;
+        let origin = crate::private_session::work::read_lifetime(pid)
+            .map_err(|e| GlassError::Backend(format!("recording process identity: {e}")))?;
+        Ok(Box::new(move || {
+            let mut display = None;
+            Ok(Box::new(move |deadline| {
+                if crate::private_session::work::read_lifetime(pid).ok() != Some(origin) {
+                    return Err(GlassError::AppExited(None));
+                }
+                let (frame, id) =
+                    crate::capture::capture_application_by(pid as i32, display, deadline)?;
+                display = Some(id);
+                Ok(frame)
+            }) as glass_video::CaptureSource)
+        }))
+    }
+}
+
 impl Platform for MacosPlatform {
+    fn recording_supported(&self) -> bool {
+        true
+    }
+
+    fn recording_scope(&self) -> glass_core::RecordingScope {
+        glass_core::RecordingScope::ApplicationWindows
+    }
+
+    fn start_recording(
+        &mut self,
+        options: glass_core::RecordingOptions,
+        deadline: glass_core::Deadline,
+    ) -> glass_core::Result<Box<dyn glass_core::Recording>> {
+        glass_video::start(options, deadline, self.video_capture()?)
+    }
+
+    fn rolling_buffer_supported(&self) -> bool {
+        true
+    }
+
+    fn start_rolling_buffer(
+        &mut self,
+        options: glass_core::RollingOptions,
+        deadline: glass_core::Deadline,
+    ) -> glass_core::Result<Box<dyn glass_core::RollingBuffer>> {
+        glass_video::start_buffer(options, deadline, self.video_capture()?)
+    }
+
     fn input_route(&self) -> glass_core::InputRoute {
         if crate::private_session::attached() {
             glass_core::InputRoute::Isolated

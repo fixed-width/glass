@@ -21,6 +21,8 @@ For Linux-specific display/compositor and containment setup, see
 
 ## 1. System requirements
 
+- The C++ runtime (`libstdc++6` on Debian/Ubuntu) for bundled desktop video encoding.
+
 - **Linux, x86-64**, with **glibc ≥ 2.39** (Ubuntu 24.04+, Debian 13+, Fedora 40+,
   or newer). Check yours:
 

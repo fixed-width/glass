@@ -14,6 +14,8 @@ pub struct RecordArgs {
     pub max_duration_ms: Option<u64>,
     pub outcome: Option<RecordOutcome>,
     pub keep: Option<bool>,
+    pub history_ms: Option<u64>,
+    pub tail_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -22,6 +24,10 @@ pub enum RecordOperation {
     Start,
     Status,
     Stop,
+    BufferStart,
+    Mark,
+    Save,
+    BufferStop,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]

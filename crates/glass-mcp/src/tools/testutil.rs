@@ -14,6 +14,10 @@ use super::{OutContent, ToolOutput};
 
 #[derive(Default)]
 pub struct FakePlatform {
+    pub buffer: Option<Box<dyn glass_core::RollingBuffer>>,
+    pub buffer_supported: bool,
+    pub recorder: Option<Box<dyn glass_core::Recording>>,
+    pub stop_events: Option<Arc<Mutex<Vec<String>>>>,
     pub input_route: Option<glass_core::InputRoute>,
     pub geometry: WindowGeometry,
     pub frames: VecDeque<Frame>,
@@ -100,6 +104,34 @@ pub fn frame_4x4_corner(corner: [u8; 4]) -> Frame {
 }
 
 impl Platform for FakePlatform {
+    fn rolling_buffer_supported(&self) -> bool {
+        self.buffer_supported || self.buffer.is_some()
+    }
+    fn start_rolling_buffer(
+        &mut self,
+        _options: glass_core::RollingOptions,
+        _deadline: Deadline,
+    ) -> Result<Box<dyn glass_core::RollingBuffer>> {
+        self.buffer_supported = true;
+        self.buffer
+            .take()
+            .ok_or_else(|| GlassError::Backend("fake buffer unavailable".into()))
+    }
+    fn recording_supported(&self) -> bool {
+        self.recorder.is_some()
+    }
+    fn recording_scope(&self) -> glass_core::RecordingScope {
+        glass_core::RecordingScope::OwnedDisplay
+    }
+    fn start_recording(
+        &mut self,
+        _options: glass_core::RecordingOptions,
+        _deadline: Deadline,
+    ) -> Result<Box<dyn glass_core::Recording>> {
+        self.recorder
+            .take()
+            .ok_or_else(|| GlassError::Backend("fake recorder unavailable".into()))
+    }
     fn input_route(&self) -> glass_core::InputRoute {
         self.input_route
             .unwrap_or(glass_core::InputRoute::SharedDesktop)
@@ -137,6 +169,9 @@ impl Platform for FakePlatform {
     }
     fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
         self.started = false;
+        if let Some(events) = &self.stop_events {
+            events.lock().unwrap().push("stop".into());
+        }
         Ok(())
     }
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {

@@ -629,7 +629,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Record one named workflow, opt-in with server --record-dir. op:start waits for video data; status reports capture and the last disposition; stop requires outcome success/failure/cancelled and optional keep. Failures/cancellations are kept by default; successes discarded unless keep:true. One outstanding clip, default 30s, maximum 60s/8MiB. Check status.supported after launch. Device display includes dialogs and notifications. Native capture runs independently of UI actions. Stop/finalize before ending the app. Kept video is untrusted; read its artifact URI through resources/read. Never repeat input because recording failed."
+        description = "Record named workflows or explicitly buffer recent history; requires server --record-dir. Scoped start(name,max_duration_ms) acknowledges video; stop(outcome,keep) finalizes. Failures/cancellations keep by default; successes need keep:true. Buffer_start(history_ms) keeps 1–30s encoded history in memory (default 10s); check status.buffer_supported. Mark(name,outcome,keep,tail_ms) selects history plus a 0–5s tail (default 2s); overlapping marks merge into one pending clip. Save waits for the tail, exports the mark, and keeps buffering. Buffer_stop saves marked evidence by default; keep:false discards it. Unmarked history is always discarded. Scoped capture and buffering are exclusive. Clips are bounded to 60s/8MiB. Status reports scope, actual history and pending disposition. Read kept untrusted video through artifact URI resources/read. Never repeat UI input because recording failed."
     )]
     async fn glass_record(
         &self,

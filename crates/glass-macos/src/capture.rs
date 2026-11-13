@@ -23,6 +23,7 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
 };
+use objc2_foundation::NSArray;
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
@@ -37,6 +38,150 @@ use crate::scwindow::{find_on_screen_window, find_on_screen_window_by_id};
 /// completing). Generous relative to observed sub-second round trips — this covers a wedged
 /// completion handler, not normal latency.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Capture only this application's windows on its initial display, including separate dialogs.
+pub(crate) fn capture_application_by(
+    pid: i32,
+    display_id: Option<u32>,
+    deadline: Deadline,
+) -> Result<(Frame, u32)> {
+    crate::ffi::app_kit_init();
+    if deadline.has_passed() {
+        return Err(GlassError::deadline_not_started("recording capture"));
+    }
+    let (tx, rx) = mpsc::channel();
+    let content_block = RcBlock::new(
+        move |content_ptr: *mut SCShareableContent, err_ptr: *mut NSError| {
+            if content_ptr.is_null() {
+                let _ = tx.send(Err(crate::ffi::classify_null_result(
+                    err_ptr,
+                    "recording content unavailable",
+                )));
+                return;
+            }
+            // SAFETY: ScreenCaptureKit keeps content and its members live throughout this callback.
+            let content = unsafe { &*content_ptr };
+            let mut windows = Vec::new();
+            // SAFETY: getters inspect objects retained by this callback's shareable content.
+            unsafe {
+                for window in content.windows().iter() {
+                    if window.isOnScreen()
+                        && window
+                            .owningApplication()
+                            .is_some_and(|app| app.processID() == pid)
+                    {
+                        windows.push(window.frame());
+                    }
+                }
+            }
+            if windows.is_empty() {
+                let _ = tx.send(Err(GlassError::WindowNotFound));
+                return;
+            }
+            // SAFETY: these arrays and members remain retained within the callback.
+            let (display, application) = unsafe {
+                let display = content
+                    .displays()
+                    .iter()
+                    .filter(|d| display_id.is_none_or(|id| d.displayID() == id))
+                    .max_by(|a, b| {
+                        let area = |rect: CGRect| {
+                            windows
+                                .iter()
+                                .map(|window| intersection_area(*window, rect))
+                                .sum::<f64>()
+                        };
+                        area(a.frame()).total_cmp(&area(b.frame()))
+                    });
+                let application = content
+                    .applications()
+                    .iter()
+                    .find(|app| app.processID() == pid);
+                (display, application)
+            };
+            let (Some(display), Some(application)) = (display, application) else {
+                let _ = tx.send(Err(GlassError::WindowNotFound));
+                return;
+            };
+            // SAFETY: plain getters on this callback's retained display.
+            let (id, extent) = unsafe { (display.displayID(), display.frame()) };
+            if !windows
+                .iter()
+                .any(|window| intersection_area(*window, extent) > 0.0)
+            {
+                let _ = tx.send(Err(GlassError::CaptureFailed(
+                    "application left the recording display".into(),
+                )));
+                return;
+            }
+            let applications = NSArray::from_retained_slice(&[application]);
+            let excluded = NSArray::<SCWindow>::new();
+            // SAFETY: all filter inputs are live framework objects with no external mutable aliases.
+            let filter = unsafe {
+                SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
+                    SCContentFilter::alloc(),
+                    &display,
+                    &applications,
+                    &excluded,
+                )
+            };
+            // SAFETY: the newly allocated configuration is uniquely owned within this callback.
+            let config = unsafe {
+                let config = SCStreamConfiguration::new();
+                let scale = filter.pointPixelScale() as f64;
+                let width = extent.size.width * scale;
+                let height = extent.size.height * scale;
+                let fit = (1280.0 / width.max(height)).min(1.0);
+                config.setWidth((width * fit).max(2.0) as usize);
+                config.setHeight((height * fit).max(2.0) as usize);
+                config.setShowsCursor(false);
+                config
+            };
+            let images = tx.clone();
+            let image_block =
+                RcBlock::new(move |image_ptr: *mut CGImage, err_ptr: *mut NSError| {
+                    let result = if image_ptr.is_null() {
+                        Err(crate::ffi::classify_null_result(
+                            err_ptr,
+                            "recording image unavailable",
+                        ))
+                    } else {
+                        // SAFETY: the framework keeps this image live for the duration of the callback.
+                        rgba_frame_from_cgimage(unsafe { &*image_ptr }).map(|frame| (frame, id))
+                    };
+                    let _ = images.send(result);
+                });
+            // SAFETY: the completion block uses the documented screenshot callback ABI.
+            unsafe {
+                SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                    &filter,
+                    &config,
+                    Some(&image_block),
+                );
+            }
+        },
+    );
+    // SAFETY: the completion block uses the documented shareable-content callback ABI.
+    unsafe {
+        SCShareableContent::getShareableContentWithCompletionHandler(&content_block);
+    }
+    let (wait, _) = deadline.budget(CAPTURE_TIMEOUT, Instant::now());
+    let result = rx
+        .recv_timeout(wait)
+        .map_err(|e| GlassError::CaptureFailed(format!("recording capture: {e}")))?;
+    if deadline.has_passed() {
+        return Err(GlassError::caller_deadline_elapsed("recording capture"));
+    }
+    result
+}
+
+fn intersection_area(a: CGRect, b: CGRect) -> f64 {
+    let width =
+        (a.origin.x + a.size.width).min(b.origin.x + b.size.width) - a.origin.x.max(b.origin.x);
+    let height =
+        (a.origin.y + a.size.height).min(b.origin.y + b.size.height) - a.origin.y.max(b.origin.y);
+    width.max(0.0) * height.max(0.0)
+}
 
 /// Capture the first on-screen window owned by one of `pids` as an RGBA8 [`Frame`],
 /// optionally cropped to a window-relative `region`. Returns

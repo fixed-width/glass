@@ -13,8 +13,9 @@ cargo build --release -p glass-mcp        # → target/release/glass-mcp
 ```
 
 glass pins a stable Rust toolchain in `rust-toolchain.toml`, which rustup installs automatically on the
-first build — there's no toolchain to choose. On every platform the build also needs **`cmake` and a
-C compiler** on `PATH`: the TLS stack behind `glass-mcp update` compiles `aws-lc-sys` from C sources
+first build — there's no toolchain to choose. On every platform the build also needs **`cmake` plus
+C and C++ compilers** on `PATH`: the TLS stack behind `glass-mcp update` compiles `aws-lc-sys` from C sources,
+and desktop workflow recording compiles the bundled OpenH264 encoder
 (`apt install cmake build-essential`, or the equivalent for your distro). On **macOS**, building
 additionally needs the Xcode Command Line Tools (the notarized `.dmg` does not):
 
@@ -31,6 +32,19 @@ To confirm the environment the build needs is set up, run
 On Linux and Windows the built binary is all you need — return to the [Linux](setup-linux.md) or
 [Windows](setup-windows.md) setup guide to install the runtime deps and connect an agent. macOS needs
 the signing + LaunchAgent steps below.
+
+## Static Linux package
+
+The musl build needs a musl C++ toolchain as well as Rust. Use the pinned Docker builder shared
+with release CI:
+
+```bash
+./scripts/build-musl.sh --release
+# → target/x86_64-unknown-linux-musl/release/glass-mcp
+```
+
+Docker must be available. The builder mounts the source read-only and stores build output and
+its Cargo cache under `target` (or `CARGO_TARGET_DIR`).
 
 ## macOS: sign the app and run it as a LaunchAgent
 

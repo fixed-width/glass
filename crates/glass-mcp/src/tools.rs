@@ -21,12 +21,50 @@ pub(crate) mod snapshot_diff;
 pub type ToolResult = Result<ToolOutput, String>;
 
 pub(crate) fn record(glass: &mut Glass, args: &RecordArgs) -> ToolResult {
+    let duration = args.max_duration_ms.is_some();
+    let history = args.history_ms.is_some();
+    let tail = args.tail_ms.is_some();
+    match args.op {
+        RecordOperation::Start | RecordOperation::Stop if history || tail => {
+            return Err("scoped recording does not accept history_ms or tail_ms".into());
+        }
+        RecordOperation::BufferStart
+            if args.name.is_some()
+                || duration
+                || args.outcome.is_some()
+                || args.keep.is_some()
+                || tail =>
+        {
+            return Err("buffer_start accepts only op and history_ms".into());
+        }
+        RecordOperation::Mark if duration || history => {
+            return Err("mark does not accept max_duration_ms or history_ms".into());
+        }
+        RecordOperation::Save
+            if args.name.is_some()
+                || duration
+                || args.outcome.is_some()
+                || args.keep.is_some()
+                || history
+                || tail =>
+        {
+            return Err("save accepts only op".into());
+        }
+        RecordOperation::BufferStop
+            if args.name.is_some() || duration || args.outcome.is_some() || history || tail =>
+        {
+            return Err("buffer_stop accepts only op and keep".into());
+        }
+        _ => {}
+    }
     let value = match args.op {
         RecordOperation::Status => {
             if args.name.is_some()
                 || args.max_duration_ms.is_some()
                 || args.outcome.is_some()
                 || args.keep.is_some()
+                || history
+                || tail
             {
                 return Err("recording status accepts only op".into());
             }
@@ -63,6 +101,33 @@ pub(crate) fn record(glass: &mut Glass, args: &RecordArgs) -> ToolResult {
                 .map_err(|error| core_error_message("glass_record", error))?;
             serde_json::to_value(summary)
         }
+        RecordOperation::BufferStart => serde_json::to_value(
+            glass
+                .start_rolling_buffer(args.history_ms)
+                .map_err(|error| core_error_message("glass_record", error))?,
+        ),
+        RecordOperation::Mark => {
+            let name = args.name.as_deref().ok_or("mark requires name")?;
+            let outcome = match args.outcome.ok_or("mark requires outcome")? {
+                RecordOutcome::Failure => glass_core::RecordingOutcome::Failure,
+                RecordOutcome::Cancelled => glass_core::RecordingOutcome::Cancelled,
+                RecordOutcome::Success => glass_core::RecordingOutcome::Success,
+            };
+            let pending = glass
+                .mark_rolling_buffer(name, outcome, args.keep, args.tail_ms)
+                .map_err(|error| core_error_message("glass_record", error))?;
+            Ok(serde_json::json!({"kept":pending.is_some(),"pending":pending}))
+        }
+        RecordOperation::Save => serde_json::to_value(
+            glass
+                .save_rolling_buffer(glass_core::Deadline::from_millis(20_000))
+                .map_err(|error| core_error_message("glass_record", error))?,
+        ),
+        RecordOperation::BufferStop => serde_json::to_value(
+            glass
+                .stop_rolling_buffer(args.keep, glass_core::Deadline::from_millis(20_000))
+                .map_err(|error| core_error_message("glass_record", error))?,
+        ),
     }
     .map_err(|e| format!("recording metadata: {e}"))?;
     Ok(ToolOutput::result("glass_record", value))

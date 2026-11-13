@@ -8,7 +8,8 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 |---|:--:|:--:|:--:|:--:|:--:|
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ † | ✓ § | ✓ ‡ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb § | ✓ AX |
-| Named workflow video (`--record-dir`) | – | – | ✓ native MP4/H.264 | ✓ native QuickTime/H.264 | – |
+| Named workflow video (`--record-dir`) | ✓ MP4/H.264 | ✓ MP4/H.264 | ✓ native MP4/H.264 | ✓ native QuickTime/H.264 | ✓ app-window MP4/H.264 |
+| Encoded rolling history | ✓ | ✓ | – | – | ✓ |
 | Semantic state coverage | All selector states, plus focus and editable | All selector states, plus focus and editable | UIAutomator: all except expanded; companion schema 2: no selected or expanded | Enabled, checkable, and editable; no reliable visible, selected, expanded, or focused proof | Enabled, checkable, focus, and editable; no universal visible, selected, or expanded proof |
 | Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
 | Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |

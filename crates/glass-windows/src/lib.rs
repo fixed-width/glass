@@ -227,6 +227,7 @@ mod backend {
         private_host_paths: Vec<ProtectedHostPath>,
         containment_journal: Option<Arc<dyn crate::containment::ContainmentJournal>>,
         provider_settings: Option<crate::containment::ProviderSettings>,
+        record_private_display: bool,
     }
 
     impl WindowsPlatform {
@@ -241,7 +242,14 @@ mod backend {
                 private_host_paths: Vec::new(),
                 containment_journal: None,
                 provider_settings: None,
+                record_private_display: false,
             })
+        }
+
+        /// Enable display capture only after authenticating this worker's private child session.
+        pub fn with_private_recording_display(mut self) -> Self {
+            self.record_private_display = true;
+            self
         }
 
         pub fn with_containment_journal(
@@ -351,7 +359,88 @@ mod backend {
         }
     }
 
+    impl WindowsPlatform {
+        fn video_capture(&self) -> glass_core::Result<glass_video::CaptureFactory> {
+            let raw = self.active_hwnd.ok_or(GlassError::WindowNotFound)?;
+            let private = self.record_private_display;
+            let mut pid = 0;
+            // SAFETY: this read-only query writes one PID to a live stack variable.
+            if unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                    crate::util::raw_to_hwnd(raw),
+                    Some(&mut pid),
+                )
+            } == 0
+            {
+                return Err(GlassError::WindowNotFound);
+            }
+            let origin = crate::desktop::ProcessIdentity::read(pid)
+                .map_err(|e| GlassError::Backend(format!("recording process identity: {e}")))?;
+            Ok(Box::new(move || {
+                Ok(Box::new(move |deadline| {
+                    let mut current = 0;
+                    // SAFETY: this read-only query writes one PID to a live stack variable.
+                    let thread = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                            crate::util::raw_to_hwnd(raw),
+                            Some(&mut current),
+                        )
+                    };
+                    if thread == 0
+                        || current != pid
+                        || !origin.is_current().map_err(|e| {
+                            GlassError::Backend(format!("recording process identity: {e}"))
+                        })?
+                    {
+                        return Err(GlassError::WindowNotFound);
+                    }
+                    if private {
+                        crate::capture::capture_private_display_by(raw, deadline)
+                    } else {
+                        crate::capture::capture_window_by(
+                            crate::util::raw_to_hwnd(raw),
+                            None,
+                            deadline,
+                        )
+                    }
+                }) as glass_video::CaptureSource)
+            }))
+        }
+    }
+
     impl Platform for WindowsPlatform {
+        fn recording_supported(&self) -> bool {
+            true
+        }
+
+        fn recording_scope(&self) -> glass_core::RecordingScope {
+            if self.record_private_display {
+                glass_core::RecordingScope::OwnedDisplay
+            } else {
+                glass_core::RecordingScope::Window
+            }
+        }
+
+        fn start_recording(
+            &mut self,
+            options: glass_core::RecordingOptions,
+            deadline: glass_core::Deadline,
+        ) -> glass_core::Result<Box<dyn glass_core::Recording>> {
+            glass_video::start(options, deadline, self.video_capture()?)
+        }
+
+        fn rolling_buffer_supported(&self) -> bool {
+            true
+        }
+
+        fn start_rolling_buffer(
+            &mut self,
+            options: glass_core::RollingOptions,
+            deadline: glass_core::Deadline,
+        ) -> glass_core::Result<Box<dyn glass_core::RollingBuffer>> {
+            glass_video::start_buffer(options, deadline, self.video_capture()?)
+        }
+
         fn input_capabilities(&self) -> glass_core::InputCapabilities {
             glass_core::InputCapabilities::uniform(
                 glass_core::CapabilityStatus::supported(),

@@ -241,6 +241,8 @@ mod tests {
             outcome: Some(RecordingOutcome::Failure),
             kept: true,
             artifact: None,
+            marks: Vec::new(),
+            window: None,
         }
     }
     fn video() -> RecordedVideo {

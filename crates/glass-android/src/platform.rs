@@ -339,6 +339,10 @@ impl Platform for AndroidPlatform {
         true
     }
 
+    fn recording_scope(&self) -> glass_core::RecordingScope {
+        glass_core::RecordingScope::DeviceDisplay
+    }
+
     fn start_recording(
         &mut self,
         options: glass_core::RecordingOptions,

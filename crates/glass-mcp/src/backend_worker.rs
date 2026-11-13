@@ -4,7 +4,7 @@ use base64::Engine;
 use glass_core::*;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Request {
@@ -22,6 +22,24 @@ pub(crate) enum Operation {
     Configure(Vec<ProtectedHostPath>),
     Start(AppSpec),
     Stop,
+    RecordStart(RecordingOptions),
+    RecordProgress(String),
+    BufferStart(RollingOptions),
+    BufferProgress(String),
+    BufferMark {
+        id: String,
+        clip_id: String,
+        tail_ms: u64,
+    },
+    BufferSave(String),
+    BufferStop {
+        id: String,
+        keep: bool,
+    },
+    RecordFinish {
+        id: String,
+        keep: bool,
+    },
     Capture(Option<Region>),
     CaptureWindow(WindowId, Option<Region>),
     Pointer(PointerEvent),
@@ -75,6 +93,9 @@ impl Context {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Properties {
+    pub recording_supported: bool,
+    pub buffer_supported: bool,
+    pub recording_scope: RecordingScope,
     pub input_route: InputRoute,
     pub input: InputCapabilities,
     pub app_pid: Option<u32>,
@@ -86,6 +107,20 @@ pub(crate) struct Properties {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Value {
+    BufferProgress(RollingProgress),
+    BufferWindow(RollingWindow),
+    BufferedVideo {
+        window: RollingWindow,
+        format: RecordingFormat,
+        progress: RecordingProgress,
+        data: String,
+    },
+    RecordingProgress(RecordingProgress),
+    Video {
+        format: RecordingFormat,
+        progress: RecordingProgress,
+        data: String,
+    },
     Unit,
     Geometry(WindowGeometry),
     Protection(HostPathProtectionMode),
@@ -148,6 +183,8 @@ pub(crate) fn deadline(expires_ns: Option<u64>) -> Result<Deadline> {
 }
 
 pub(crate) struct Dispatcher<P, A> {
+    buffer: Option<(String, Box<dyn RollingBuffer>)>,
+    recording: Option<(String, Box<dyn Recording>)>,
     platform: P,
     accessibility: A,
 }
@@ -155,6 +192,8 @@ pub(crate) struct Dispatcher<P, A> {
 impl<P: Platform, A: Accessibility> Dispatcher<P, A> {
     pub(crate) fn new(platform: P, accessibility: A) -> Self {
         Self {
+            buffer: None,
+            recording: None,
             platform,
             accessibility,
         }
@@ -162,6 +201,9 @@ impl<P: Platform, A: Accessibility> Dispatcher<P, A> {
 
     fn properties(&self) -> Properties {
         Properties {
+            recording_supported: self.platform.recording_supported(),
+            buffer_supported: self.platform.rolling_buffer_supported(),
+            recording_scope: self.platform.recording_scope(),
             input_route: self.platform.input_route(),
             input: self.platform.input_capabilities(),
             app_pid: self.platform.app_pid(),
@@ -220,8 +262,100 @@ impl<P: Platform, A: Accessibility> Dispatcher<P, A> {
                 .platform
                 .configure_protected_host_paths(&paths)
                 .map(Value::Protection),
-            Operation::Start(spec) => self.platform.start_app(&spec).map(Value::Geometry),
-            Operation::Stop => self.platform.stop_app_by(deadline).map(|()| Value::Unit),
+            Operation::Start(spec) => {
+                self.discard_buffer(deadline)?;
+                self.discard_recording(deadline)?;
+                self.platform.start_app(&spec).map(Value::Geometry)
+            }
+            Operation::Stop => self.stop(deadline).map(|()| Value::Unit),
+            Operation::RecordStart(options) => {
+                if self.recording.is_some() || self.buffer.is_some() {
+                    return Err(GlassError::Backend(
+                        "a private recording already awaits disposition".into(),
+                    ));
+                }
+                options.validate()?;
+                let id = options.id.clone();
+                let handle = self.platform.start_recording(options, deadline)?;
+                let progress = handle.progress();
+                self.recording = Some((id, handle));
+                Ok(Value::RecordingProgress(progress))
+            }
+            Operation::BufferStart(options) => {
+                if self.recording.is_some() || self.buffer.is_some() {
+                    return Err(GlassError::Backend(
+                        "a private capture is already active".into(),
+                    ));
+                }
+                options.validate()?;
+                let id = options.id.clone();
+                let handle = self.platform.start_rolling_buffer(options, deadline)?;
+                let progress = handle.progress();
+                self.buffer = Some((id, handle));
+                Ok(Value::BufferProgress(progress))
+            }
+            Operation::BufferProgress(id) => {
+                Ok(Value::BufferProgress(self.buffer_handle(&id)?.progress()))
+            }
+            Operation::BufferMark {
+                id,
+                clip_id,
+                tail_ms,
+            } => self
+                .buffer_handle(&id)?
+                .mark(&clip_id, tail_ms, deadline)
+                .map(Value::BufferWindow),
+            Operation::BufferSave(id) => {
+                let captured = self.buffer_handle(&id)?.save(deadline)?;
+                buffered_video(captured)
+            }
+            Operation::BufferStop { id, keep } => {
+                self.buffer_handle(&id)?;
+                let (_, mut handle) = self
+                    .buffer
+                    .take()
+                    .ok_or_else(|| GlassError::Backend("private buffer unavailable".into()))?;
+                match handle.stop(keep, deadline)? {
+                    Some(video) => buffered_video(video),
+                    None => Ok(Value::Unit),
+                }
+            }
+            Operation::RecordProgress(id) => {
+                let (active, handle) = self.recording.as_ref().ok_or_else(|| {
+                    GlassError::Backend("private recording is unavailable".into())
+                })?;
+                if *active != id {
+                    return Err(GlassError::Backend(
+                        "private recording identity mismatch".into(),
+                    ));
+                }
+                Ok(Value::RecordingProgress(handle.progress()))
+            }
+            Operation::RecordFinish { id, keep } => {
+                if !self
+                    .recording
+                    .as_ref()
+                    .is_some_and(|(active, _)| *active == id)
+                {
+                    return Err(GlassError::Backend(
+                        "private recording identity mismatch".into(),
+                    ));
+                }
+                let (_, mut handle) = self.recording.take().ok_or_else(|| {
+                    GlassError::Backend("private recording is unavailable".into())
+                })?;
+                let video = handle.finish(keep, deadline)?;
+                if video.data.len() as u64 > recording::RECORDING_MAX_BYTES {
+                    return Err(GlassError::Backend(
+                        "private recording exceeds the byte limit".into(),
+                    ));
+                }
+                Ok(Value::Video {
+                    format: video.format,
+                    progress: video.progress,
+                    data: base64::engine::general_purpose::STANDARD.encode(video.data),
+                })
+            }
             Operation::Capture(region) => self
                 .platform
                 .capture_frame_by(region.as_ref(), deadline)
@@ -284,8 +418,59 @@ impl<P: Platform, A: Accessibility> Dispatcher<P, A> {
     }
 
     pub(crate) fn stop(&mut self, deadline: Deadline) -> Result<()> {
-        self.platform.stop_app_by(deadline)
+        let buffer = self.discard_buffer(deadline);
+        let recording = self.discard_recording(deadline).and(buffer);
+        let stopped = self.platform.stop_app_by(deadline);
+        match (recording, stopped) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(primary), Err(cleanup)) => Err(GlassError::cleanup_failed(
+                "stopping private recorder and app",
+                primary,
+                cleanup,
+            )),
+        }
     }
+
+    fn buffer_handle(&mut self, id: &str) -> Result<&mut Box<dyn RollingBuffer>> {
+        let (active, handle) = self
+            .buffer
+            .as_mut()
+            .ok_or_else(|| GlassError::Backend("private buffer unavailable".into()))?;
+        if active != id {
+            return Err(GlassError::Backend(
+                "private buffer identity mismatch".into(),
+            ));
+        }
+        Ok(handle)
+    }
+
+    fn discard_buffer(&mut self, deadline: Deadline) -> Result<()> {
+        if let Some((_, mut handle)) = self.buffer.take() {
+            handle.stop(false, deadline)?;
+        }
+        Ok(())
+    }
+
+    fn discard_recording(&mut self, deadline: Deadline) -> Result<()> {
+        if let Some((_, mut handle)) = self.recording.take() {
+            handle.finish(false, deadline)?;
+        }
+        Ok(())
+    }
+}
+
+fn buffered_video(captured: BufferedVideo) -> Result<Value> {
+    if captured.video.data.len() as u64 > recording::RECORDING_MAX_BYTES {
+        return Err(GlassError::Backend(
+            "private buffer clip exceeds byte limit".into(),
+        ));
+    }
+    Ok(Value::BufferedVideo {
+        window: captured.window,
+        format: captured.video.format,
+        progress: captured.video.progress,
+        data: base64::engine::general_purpose::STANDARD.encode(captured.video.data),
+    })
 }
 
 fn image(frame: Frame) -> Result<Value> {

@@ -25,6 +25,7 @@ mod a11y;
 mod a11y_poll;
 mod admission;
 mod baseline;
+mod buffer;
 mod capture;
 mod clipboard;
 mod find;

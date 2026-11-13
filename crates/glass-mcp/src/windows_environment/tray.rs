@@ -177,12 +177,13 @@ pub async fn run(
     root.write("intent.json", &launch)?;
     root.write("options.json", &serde_json::json!({"version":1,"instance":instance,"hidden":startup_launch && manager.mode()?.is_some()}))?;
     let (sink, report) = crate::audit::resolve(audit, |key| std::env::var(key).ok())?;
-    let server = crate::server::GlassServer::new_configured(
+    let server = crate::server::GlassServer::new_with_recordings(
         crate::boot_with_desktop(sink, manager.clone()),
         report,
         cfg.tool_profile,
         cfg.trace.as_ref(),
         "http",
+        cfg.recordings.as_ref(),
     )?;
     glass_windows::desktop::protect_stdio_inheritance()?;
     let mut helper = Command::new(runtime::helper(&base)?)

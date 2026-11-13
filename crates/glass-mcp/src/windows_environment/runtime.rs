@@ -788,6 +788,9 @@ impl Runtime {
                     version: backend_worker::VERSION,
                     id: state.next_id,
                     properties: Properties {
+                        recording_supported: false,
+                        buffer_supported: false,
+                        recording_scope: glass_core::RecordingScope::OwnedDisplay,
                         input_route: InputRoute::Isolated,
                         input: glass_core::InputCapabilities::unknown(),
                         app_pid: None,

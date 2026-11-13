@@ -114,8 +114,9 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
     let work = std::sync::Arc::new(
         super::work::Work::open(&root, instance, true)?.context("container ownership journal")?,
     );
-    let mut platform =
-        glass_windows::WindowsPlatform::new()?.with_containment_journal(work.clone());
+    let mut platform = glass_windows::WindowsPlatform::new()?
+        .with_containment_journal(work.clone())
+        .with_private_recording_display();
     let protected =
         ProtectedHostPath::directory(path.parent().context("desktop state root has no parent")?);
     platform.configure_protected_host_paths(std::slice::from_ref(&protected))?;
@@ -185,6 +186,7 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
             if let Operation::Configure(paths) = &mut request.operation {
                 if idle {
                     let mut platform = glass_windows::WindowsPlatform::new()?
+                        .with_private_recording_display()
                         .with_containment_journal(work.clone())
                         .with_provider_settings(provider_settings.clone());
                     platform.configure_protected_host_paths(std::slice::from_ref(&protected))?;
@@ -196,7 +198,6 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
                 idle = false;
                 apply_launch_context(spec, &context);
             }
-            let deadline = backend_worker::deadline(request.expires_ns)?;
             let mut response = dispatcher.handle(request);
             if is_stop && response.result.is_ok() && !work.complete()? {
                 response.result = Err(glass_core::GlassError::Backend(
@@ -206,16 +207,7 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
             if is_stop && response.result.is_ok() {
                 idle = true;
             }
-            pipe.write_frame(
-                &serde_json::to_vec(&response)?,
-                Deadline::at(
-                    std::time::Instant::now()
-                        + deadline
-                            .remaining()
-                            .unwrap_or(std::time::Duration::from_secs(5))
-                            .min(std::time::Duration::from_secs(5)),
-                ),
-            )?;
+            write_response(&mut pipe, &response)?;
         }
         Ok(())
     })();
@@ -234,10 +226,74 @@ fn run_inner(path: &Path, instance: &str) -> Result<()> {
     serving
 }
 
+fn write_response(pipe: &mut LocalPipe, response: &backend_worker::Response) -> Result<()> {
+    // Preserve a completed outcome even when dispatch consumed its operation budget.
+    pipe.write_frame(&serde_json::to_vec(response)?, Deadline::from_millis(5000))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use glass_core::{AppSpec, SandboxLevel};
+
+    #[test]
+    fn completed_error_receipt_survives_the_operations_expired_budget() {
+        let name = format!(
+            "glass-desktop-tests-receipt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let mut server = LocalPipe::listen(&name).unwrap();
+        let client = std::thread::spawn(move || {
+            LocalPipe::connect(&name, Deadline::from_millis(2000)).unwrap()
+        });
+        server
+            .accept(
+                &ProcessIdentity::current().unwrap(),
+                Deadline::from_millis(2000),
+            )
+            .unwrap();
+        let mut client = client.join().unwrap();
+        let operation = Deadline::from_millis(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(operation.has_passed());
+        let response = backend_worker::Response {
+            version: backend_worker::VERSION,
+            id: 17,
+            properties: backend_worker::Properties {
+                recording_supported: true,
+                buffer_supported: true,
+                recording_scope: glass_core::RecordingScope::OwnedDisplay,
+                input_route: glass_core::InputRoute::Isolated,
+                input: glass_core::InputCapabilities::unknown(),
+                app_pid: None,
+                window: None,
+                window_handle: None,
+                scope_basis: None,
+                coverage: glass_core::AxStateCoverage::NONE,
+            },
+            result: Err(
+                glass_core::GlassError::caller_deadline_elapsed("pointer input").after_dispatch(),
+            ),
+        };
+        write_response(&mut server, &response).unwrap();
+        let bytes = client.read_frame(Deadline::from_millis(2000)).unwrap();
+        let receipt: backend_worker::Response = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt.id, 17);
+        assert_eq!(
+            receipt.result.err().unwrap().bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
+        assert!(server.is_healthy() && client.is_healthy());
+        client
+            .write_frame(b"next request", Deadline::from_millis(2000))
+            .unwrap();
+        assert_eq!(
+            server.read_frame(Deadline::from_millis(2000)).unwrap(),
+            b"next request"
+        );
+    }
 
     fn spec(cwd: Option<&str>) -> AppSpec {
         AppSpec {

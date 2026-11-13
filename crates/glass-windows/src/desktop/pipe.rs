@@ -24,6 +24,7 @@ use windows::Win32::System::Pipes::{
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
 const MAX_FRAME: usize = 128 * 1024 * 1024;
+const WRITE_CHUNK: usize = 16 * 1024;
 
 fn failure(operation: &str, error: impl std::fmt::Display) -> GlassError {
     GlassError::Backend(format!("Windows desktop pipe {operation}: {error}"))
@@ -221,10 +222,17 @@ impl LocalPipe {
                 ));
             }
             let mut count = 0;
+            // Oversized nonblocking writes can return zero until the whole buffer fits.
+            let end = (written + WRITE_CHUNK).min(frame.len());
             // SAFETY: the remaining bytes are live, and nonblocking mode bounds the OS call.
-            if let Err(error) =
-                unsafe { WriteFile(self.raw(), Some(&frame[written..]), Some(&mut count), None) }
-            {
+            if let Err(error) = unsafe {
+                WriteFile(
+                    self.raw(),
+                    Some(&frame[written..end]),
+                    Some(&mut count),
+                    None,
+                )
+            } {
                 self.healthy = false;
                 return Err(failure("write", error));
             }
@@ -375,6 +383,31 @@ mod tests {
                 .expect("read response"),
             b"answer"
         );
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_pipe_buffer_streams_while_its_peer_reads() {
+        let (mut server, mut client) = pair();
+        let payload: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+        let expected = payload.clone();
+        let writer = std::thread::spawn(move || {
+            let result = server.write_frame(&payload, Deadline::from_millis(3000));
+            (server, result)
+        });
+        let received = client.read_frame(Deadline::from_millis(4000));
+        let (mut server, result) = writer.join().unwrap();
+        result.unwrap();
+        assert_eq!(received.unwrap(), expected);
+        let reverse = expected.clone();
+        let writer = std::thread::spawn(move || {
+            let result = client.write_frame(&reverse, Deadline::from_millis(3000));
+            (client, result)
+        });
+        let received = server.read_frame(Deadline::from_millis(4000));
+        let (client, result) = writer.join().unwrap();
+        result.unwrap();
+        assert_eq!(received.unwrap(), expected);
+        assert!(server.is_healthy() && client.is_healthy());
     }
 
     #[test]

@@ -26,6 +26,15 @@ struct Shared {
 pub struct RecordingControl(Arc<Shared>);
 
 impl RecordingControl {
+    /// Preserve a failed capture's valid prefix for explicit disposition.
+    pub fn fail(&self, reason: &str) {
+        if let Ok(mut progress) = self.0.progress.lock() {
+            progress.state = RecordingState::Failed;
+            progress.reason = Some(reason.to_owned());
+            progress.elapsed_ms = self.elapsed_ms();
+        }
+        self.0.stop.store(true, Ordering::Release);
+    }
     pub fn limit(&self, reason: &str) {
         if let Ok(mut progress) = self.0.progress.lock() {
             progress.state = RecordingState::Limited;
