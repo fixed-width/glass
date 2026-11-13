@@ -217,23 +217,56 @@ mod tests {
     fn native_process_acknowledges_a_frame_and_finalizes_on_sigint() {
         let root = tempfile::tempdir().unwrap();
         let program = root.path().join("simctl");
+        let mut expected = Vec::new();
+        for (kind, data) in [
+            (b"ftyp", b"qt  ".as_slice()),
+            (b"mdat", b"frame".as_slice()),
+            (b"moov", b"index".as_slice()),
+        ] {
+            expected.extend(((data.len() + 8) as u32).to_be_bytes());
+            expected.extend(kind);
+            expected.extend(data);
+        }
+        fs::write(program.with_extension("mov"), &expected).unwrap();
         fs::write(
             &program,
-            r#"#!/usr/bin/python3
-import signal,struct,sys,time
-from pathlib import Path
-def atom(kind,data):return struct.pack('>I',len(data)+8)+kind+data
-Path(sys.argv[-1]).write_bytes(atom(b'ftyp',b'qt  ')+atom(b'mdat',b'frame')+atom(b'moov',b'index'))
-signal.signal(signal.SIGINT,lambda *args:sys.exit(0))
-print('Recording started',file=sys.stderr,flush=True)
-while True:time.sleep(.01)
+            r#"#!/bin/sh
+[ "$1" = --glass-probe ] && exit 0
+[ "$#" -eq 7 ] || exit 64
+[ "$1 $2 $3 $4 $5 $6" = 'simctl io owned-udid recordVideo --codec=h264 --mask=black' ] || exit 64
+trap 'printf stopped > "$0.stopped"; exit 0' INT
+cp "$0.mov" "$7" || exit
+printf 'Recording started\n' >&2
+remaining=1000
+while [ "$remaining" -gt 0 ] && kill -0 "$PPID" 2>/dev/null; do
+    sleep .01
+    remaining=$((remaining - 1))
+done
+exit 70
 "#,
         )
         .unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        // Finish fixture setup before measuring the recorder, including transient exec races.
+        let runnable_by = Instant::now() + Duration::from_secs(5);
+        loop {
+            match Command::new(&program).arg("--glass-probe").status() {
+                Ok(status) => {
+                    assert!(status.success());
+                    break;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < runnable_by =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("recorder fixture is not executable: {error}"),
+            }
+        }
         let options = RecordingOptions {
             id: "123456789012345678901234567890ab".into(),
-            max_duration_ms: 1000,
+            max_duration_ms: 30_000,
             max_bytes: 8 * 1024 * 1024,
         };
         let mut handle = start(
@@ -249,6 +282,11 @@ while True:time.sleep(.01)
         );
         let video = handle.finish(true, Deadline::from_millis(3000)).unwrap();
         glass_core::recording::validate_video(&video.data).unwrap();
+        assert_eq!(video.data, expected);
+        assert_eq!(
+            fs::read_to_string(program.with_extension("stopped")).unwrap(),
+            "stopped"
+        );
         assert_eq!(video.format, RecordingFormat::QuickTime);
         assert_eq!(video.progress.bytes, video.data.len() as u64);
     }
