@@ -210,8 +210,7 @@ Containment details are in [Containment and sandboxing](../explanation/containme
 A build or unit-test pass does not establish live capture/input on another platform.
 [Verify a change](../how-to/verify-a-change.md) gives the contributor commands and prerequisites.
 
-The Linux GUI integration baseline is Ubuntu 24.04 with GTK 4.14. Ubuntu 26.04 / GTK 4.22 is not
-qualified: current Rust bindings reject AT-SPI's
-[`ATSPI_ROLE_SWITCH` (`130`)](https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/enum.Role.html),
-and the newer GL renderer no longer matches the legacy black-frame control test. These are
-runtime/toolkit compatibility limits; compiling on the newer host does not establish GUI support there.
+The Linux GUI integration and coverage jobs follow `ubuntu-latest`. Accessibility supports newer
+AT-SPI roles without rejecting the entire tree; GTK switches retain the existing Linux `CheckBox`
+representation. Portable sway's private library path is confined to the compositor, while target
+applications use their original or explicitly requested library path.

@@ -15,7 +15,7 @@ use glass_core::{
     normalize_name, read_back_confirms, write_took_no_effect,
 };
 
-use crate::mapping::{map_role, map_states};
+use crate::mapping::{map_role, map_states, role_from_wire};
 
 /// Every bounded call runs on a fresh detached thread: this reader drives an async API with
 /// `block_on`, which panics inside the caller's tokio runtime. The cap is what stops a wedged bus
@@ -165,6 +165,11 @@ fn run_pointer_target_at(
     rt.block_on(pointer_target_at_async(ctx, target, point))
 }
 
+async fn read_role(proxy: &AccessibleProxy<'_>) -> zbus::Result<atspi_common::Role> {
+    let value: u32 = proxy.inner().call("GetRole", &()).await?;
+    Ok(role_from_wire(value))
+}
+
 fn bus_err(e: impl std::fmt::Display) -> GlassError {
     GlassError::AccessibilityUnavailable(format!("accessibility bus error: {e}"))
 }
@@ -295,7 +300,7 @@ async fn set_value_async(
     let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
 
     // Verify role + name against the fingerprint (guards a stale id / mirror drift).
-    let role = map_role(node.get_role().await.map_err(bus_err)?);
+    let role = map_role(read_role(&node).await.map_err(bus_err)?);
     let name = nonempty(node.name().await.unwrap_or_default());
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
@@ -581,7 +586,7 @@ async fn walk(
     // error path `join!` completes all seven before bailing — the same result, at the cost of a
     // few reads on a snapshot that was already failing.
     let (role_res, raw_role_res, name_res, description_res, state_res, bounds, child_refs_res) = tokio::join!(
-        proxy.get_role(),
+        read_role(proxy),
         proxy.get_role_name(),
         proxy.name(),
         proxy.description(),
@@ -1160,7 +1165,8 @@ async fn containing_window_root(
         }
         seen.push(current.clone());
         let proxy = pointer_accessible(conn, &current).await?;
-        let role = pointer_bus_call(ctx.deadline, "target ancestor role", proxy.get_role()).await?;
+        let role =
+            pointer_bus_call(ctx.deadline, "target ancestor role", read_role(&proxy)).await?;
         if is_window_coordinate_root(role) {
             window = Some(current.clone());
         }
@@ -1200,7 +1206,8 @@ async fn first_interactable_ancestor(
             return Err(pointer_reference_error("cyclic ancestor references"));
         }
         let parent_proxy = pointer_accessible(conn, &parent).await?;
-        let role = pointer_bus_call(ctx.deadline, "ancestor role", parent_proxy.get_role()).await?;
+        let role =
+            pointer_bus_call(ctx.deadline, "ancestor role", read_role(&parent_proxy)).await?;
         if map_role(role).is_interactable() {
             return Ok(Some(parent));
         }
@@ -1241,7 +1248,7 @@ async fn classify_pointer_hit(
         }
         seen.push(current.clone());
         let current_proxy = pointer_accessible(conn, &current).await?;
-        let role = pointer_bus_call(ctx.deadline, "hit role", current_proxy.get_role()).await?;
+        let role = pointer_bus_call(ctx.deadline, "hit role", read_role(&current_proxy)).await?;
         if map_role(role).is_interactable() {
             return Ok(PointerHit::Other);
         }
@@ -1294,7 +1301,7 @@ async fn pointer_hit_once(
     .ok_or(GlassError::AxElementChanged(target.id.0))?;
     let target_proxy = pointer_accessible(conn, &target_ref).await?;
     let role =
-        map_role(pointer_bus_call(ctx.deadline, "target role", target_proxy.get_role()).await?);
+        map_role(pointer_bus_call(ctx.deadline, "target role", read_role(&target_proxy)).await?);
     let name = nonempty(pointer_bus_call(ctx.deadline, "target name", target_proxy.name()).await?);
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
@@ -1553,7 +1560,7 @@ async fn invoke_async(
     let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
     // Verify role + name against the fingerprint (guards a stale id / mirror drift) —
     // same gate as set_value_async.
-    let role = map_role(node.get_role().await.map_err(bus_err)?);
+    let role = map_role(read_role(&node).await.map_err(bus_err)?);
     let name = nonempty(node.name().await.unwrap_or_default());
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
@@ -1597,7 +1604,7 @@ async fn focus_async(
         .await?
         .ok_or(GlassError::AxElementChanged(target.id.0))?;
     let node = node_ref.as_accessible_proxy(&conn).await.map_err(bus_err)?;
-    let role = map_role(node.get_role().await.map_err(bus_err)?);
+    let role = map_role(read_role(&node).await.map_err(bus_err)?);
     let name = nonempty(node.name().await.unwrap_or_default());
     if !target.matches(role, name.as_deref()) {
         return Err(GlassError::AxElementChanged(target.id.0));
@@ -1956,19 +1963,77 @@ mod tests {
     struct ParentProperty {
         name: String,
         path: zbus::zvariant::OwnedObjectPath,
-        role: atspi_common::Role,
+        role: u32,
     }
 
     #[zbus::interface(name = "org.a11y.atspi.Accessible")]
     impl ParentProperty {
         fn get_role(&self) -> u32 {
-            self.role as u32
+            self.role
         }
 
         #[zbus(property)]
         fn parent(&self) -> (String, zbus::zvariant::OwnedObjectPath) {
             (self.name.clone(), self.path.clone())
         }
+    }
+
+    #[test]
+    #[ignore = "starts a private D-Bus; run via scripts/test-a11y.sh"]
+    fn role_reads_accept_switch_and_future_wire_values() {
+        use atspi_common::Role;
+        let bus = glass_dbus_linux::PrivateBus::start().expect("private bus");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let service = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let client = zbus::connection::Builder::address(bus.a11y_bus_address())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            for (wire, expected) in [
+                (Role::Button as u32, Role::Button),
+                (130, Role::CheckBox),
+                (u32::MAX, Role::Unknown),
+            ] {
+                let path = format!("/role_{wire}");
+                service
+                    .object_server()
+                    .at(
+                        path.clone(),
+                        ParentProperty {
+                            name: service.unique_name().unwrap().as_str().into(),
+                            path: "/org/a11y/atspi/null".try_into().unwrap(),
+                            role: wire,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let object = ObjectRefOwned::new(ObjectRef::Owned {
+                    name: service.unique_name().unwrap().clone().into(),
+                    path: path.try_into().unwrap(),
+                });
+                let proxy = object.as_accessible_proxy(&client).await.unwrap();
+                assert_eq!(
+                    read_role(&proxy).await.unwrap(),
+                    expected,
+                    "wire role {wire}"
+                );
+            }
+            let missing = ObjectRefOwned::new(ObjectRef::Owned {
+                name: service.unique_name().unwrap().clone().into(),
+                path: "/missing_role".try_into().unwrap(),
+            });
+            let proxy = missing.as_accessible_proxy(&client).await.unwrap();
+            assert!(read_role(&proxy).await.is_err());
+        });
     }
 
     #[test]
@@ -2005,7 +2070,7 @@ mod tests {
                         ParentProperty {
                             name: name.into(),
                             path: parent.try_into().unwrap(),
-                            role,
+                            role: role as u32,
                         },
                     )
                     .await
@@ -2070,7 +2135,7 @@ mod tests {
                 service.object_server().at(node_path, ParentProperty {
                     name: name.into(),
                     path: path.try_into().unwrap(),
-                    role: atspi_common::Role::Panel,
+                    role: atspi_common::Role::Panel as u32,
                 }).await.unwrap();
                 let proxy = AccessibleProxy::builder(&client)
                     .cache_properties(zbus::proxy::CacheProperties::No)

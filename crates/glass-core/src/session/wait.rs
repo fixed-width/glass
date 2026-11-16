@@ -593,14 +593,6 @@ impl Glass {
             sequence_deadline.budget(std::time::Duration::from_millis(params.timeout_ms), start);
         let action_deadline = Deadline::at(start + effective_duration);
         let geo = self.geometry()?;
-        // Return a match once scrolling can't improve its visibility: it has an on-screen
-        // clickable center, or its bounds are unknown (scrolling won't populate a
-        // `bounds: None` a backend couldn't read).
-        let ready = |info: &ElementInfo| match info.bounds {
-            Some(b) => b.clamped_center(geo.width, geo.height).is_some(),
-            None => true,
-        };
-
         // One pre-sweep snapshot serves four jobs: early return if already visible,
         // direction inference, anchor derivation, and seeding the saturation outline.
         let first_read_uses_sequence = params.timeout_ms == 0;
@@ -654,7 +646,9 @@ impl Glass {
             timed_out_by,
         };
 
-        if let Some(info) = found0.filter(|i| ready(i)) {
+        if let Some(info) = found0
+            && self.scroll_match_ready(&info, &geo, first_read_deadline)?
+        {
             return Ok(outcome(true, Some(info), 0, false, None));
         }
 
@@ -701,7 +695,11 @@ impl Glass {
                 else {
                     return Ok(outcome(false, None, steps, reversed, Some(whose)));
                 };
-                if let Some(info) = found.filter(|i| ready(i)) {
+                if let Some(info) = found
+                    && self
+                        .scroll_match_ready(&info, &geo, action_deadline)
+                        .map_err(after_scroll_dispatch)?
+                {
                     return Ok(outcome(true, Some(info), steps, reversed, None));
                 }
                 // No change in the a11y tree ⇒ the container did not advance ⇒ this
@@ -714,6 +712,36 @@ impl Glass {
             }
         }
         Ok(outcome(false, None, steps, true, None))
+    }
+
+    fn scroll_match_ready(
+        &mut self,
+        info: &ElementInfo,
+        geometry: &WindowGeometry,
+        deadline: Deadline,
+    ) -> Result<bool> {
+        let Some(bounds) = info.bounds else {
+            return Ok(true);
+        };
+        let Some(point) = bounds.clamped_center(geometry.width, geometry.height) else {
+            return Ok(false);
+        };
+        let target = AxTarget {
+            id: info.id,
+            role: info.role,
+            name: info.name.clone(),
+            bounds: info.bounds,
+            value: info.value.clone(),
+        };
+        match self.probe_semantic_pointer(&target, point, deadline) {
+            Ok(hit) => Ok(hit != crate::PointerHit::Other),
+            Err(error)
+                if deadline.has_passed() && error.bound_owner() == Some(crate::Whose::Caller) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Snapshot the current view once; return the matched element (if the selector is
@@ -2878,6 +2906,167 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, GlassError::AxUnsupported));
+    }
+
+    struct ScrollHitAccessibility {
+        hits: std::collections::VecDeque<Result<crate::PointerHit>>,
+    }
+
+    impl Accessibility for ScrollHitAccessibility {
+        fn snapshot(&mut self, _: &AxContext) -> Result<AxTree> {
+            Ok(fake_tree())
+        }
+
+        fn pointer_target_at(
+            &mut self,
+            _: &AxContext,
+            _: &AxTarget,
+            _: (i32, i32),
+        ) -> Result<crate::PointerHit> {
+            self.hits.pop_front().expect("unexpected hit test")
+        }
+    }
+
+    #[test]
+    fn scroll_to_element_does_not_stop_on_a_realized_but_clipped_row() {
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100).with_scroll_log(scrolls.clone()),
+            Box::new(ScrollHitAccessibility {
+                hits: std::collections::VecDeque::from([
+                    Ok(crate::PointerHit::Other),
+                    Ok(crate::PointerHit::AcceptedAncestor),
+                ]),
+            }),
+        );
+        g.start(&spec()).unwrap();
+        let out = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1000,
+            })
+            .unwrap();
+        assert_eq!(
+            (out.matched, out.steps, scrolls.lock().unwrap().len()),
+            (true, 1, 1)
+        );
+    }
+
+    #[test]
+    fn scroll_to_element_propagates_a_hit_read_failure_before_scrolling() {
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100).with_scroll_log(scrolls.clone()),
+            Box::new(ScrollHitAccessibility {
+                hits: std::collections::VecDeque::from([Err(
+                    GlassError::AccessibilityUnavailable("hit read failed".into()),
+                )]),
+            }),
+        );
+        g.start(&spec()).unwrap();
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1000,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("hit read failed"));
+        assert!(scrolls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scroll_to_element_hit_failure_after_input_preserves_dispatch_provenance() {
+        let scrolls = Arc::new(Mutex::new(Vec::new()));
+        let mut g = glass_with_backend(
+            FakePlatform::new(100, 100).with_scroll_log(scrolls.clone()),
+            Box::new(ScrollHitAccessibility {
+                hits: std::collections::VecDeque::from([
+                    Ok(crate::PointerHit::Other),
+                    Err(GlassError::deadline_not_started("post-scroll hit read")),
+                ]),
+            }),
+        );
+        g.start(&spec()).unwrap();
+        let error = g
+            .scroll_to_element(&ScrollToElementParams {
+                name: Some("Save".into()),
+                description: None,
+                role: None,
+                value_contains: None,
+                direction: Some(ScrollDirection::Down),
+                anchor: None,
+                step: SCROLL_TO_DEFAULT_STEP,
+                timeout_ms: 1000,
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(crate::BoundDispatch::MayHaveDispatched)
+        );
+        assert_eq!(scrolls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scroll_to_element_keeps_hit_probe_expiry_soft_and_preserves_deadline_owner() {
+        struct SlowHit;
+        impl Accessibility for SlowHit {
+            fn snapshot(&mut self, _: &AxContext) -> Result<AxTree> {
+                Ok(fake_tree())
+            }
+            fn pointer_target_at(
+                &mut self,
+                _: &AxContext,
+                _: &AxTarget,
+                _: (i32, i32),
+            ) -> Result<crate::PointerHit> {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Err(GlassError::caller_deadline_elapsed("scripted hit read"))
+            }
+        }
+        for (timeout_ms, sequence_ms, expected) in [
+            (50, None, crate::Whose::Callee),
+            (1000, Some(50), crate::Whose::Caller),
+        ] {
+            let scrolls = Arc::new(Mutex::new(Vec::new()));
+            let mut g = glass_with_backend(
+                FakePlatform::new(100, 100).with_scroll_log(scrolls.clone()),
+                Box::new(SlowHit),
+            );
+            g.start(&spec()).unwrap();
+            let sequence = sequence_ms
+                .map(Deadline::from_millis)
+                .unwrap_or(Deadline::UNBOUNDED);
+            let outcome = g
+                .scroll_to_element_by(
+                    &ScrollToElementParams {
+                        name: Some("Save".into()),
+                        description: None,
+                        role: None,
+                        value_contains: None,
+                        direction: Some(ScrollDirection::Down),
+                        anchor: None,
+                        step: SCROLL_TO_DEFAULT_STEP,
+                        timeout_ms,
+                    },
+                    sequence,
+                )
+                .unwrap();
+            assert!(!outcome.matched);
+            assert_eq!(outcome.timed_out_by, Some(expected));
+            assert!(scrolls.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

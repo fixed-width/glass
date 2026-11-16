@@ -451,21 +451,33 @@ impl Glass {
                 ),
                 planned => {
                     let point = match planned {
-                        Some(super::semantic_action::PlannedPointerInput::Click { point }) => {
-                            *point
-                        }
-                        _ => (bounds.x, bounds.y),
+                        Some(super::semantic_action::PlannedPointerInput::Click { point }) => point
+                            .0
+                            .checked_sub(container.x)
+                            .zip(point.1.checked_sub(container.y)),
+                        _ => bounds
+                            .x
+                            .checked_sub(container.x)
+                            .zip(bounds.y.checked_sub(container.y))
+                            .and_then(|(x, y)| {
+                                crate::AxRect { x, y, ..bounds }
+                                    .clamped_center(popover_geo.width, popover_geo.height)
+                            }),
                     };
-                    self.pointer_inner_by(
-                        &PointerEvent::Click {
-                            x: point.0 - container.x,
-                            y: point.1 - container.y,
-                            button: MouseButton::Left,
-                            count: 1,
-                            modifiers: vec![],
-                        },
-                        deadline,
-                    )
+                    point
+                        .ok_or(GlassError::AxElementNotClickable(id.0))
+                        .and_then(|(x, y)| {
+                            self.pointer_inner_by(
+                                &PointerEvent::Click {
+                                    x,
+                                    y,
+                                    button: MouseButton::Left,
+                                    count: 1,
+                                    modifiers: vec![],
+                                },
+                                deadline,
+                            )
+                        })
                 }
             };
             // Restore focus even after expiry; temporary selection already makes failure
@@ -2850,9 +2862,7 @@ mod tests {
 
         g.click_element(globex_id).unwrap();
 
-        // Item at x=70 inside a container at x=40 is 30 in; y is unchanged from the validated
-        // fixture at 248 - 194.
-        assert_eq!(clicks.lock().unwrap().last().copied(), Some((30, 54)));
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((70, 67)));
     }
 
     #[test]
@@ -2985,8 +2995,8 @@ mod tests {
         );
         assert_eq!(
             clicks.lock().unwrap().last().copied(),
-            Some((20, 54)),
-            "click lands at (Globex.bounds - List.bounds), per the validated algorithm"
+            Some((60, 67)),
+            "click lands at the item centre translated into the popover container"
         );
         assert_eq!(
             *select_log.lock().unwrap(),
@@ -3015,7 +3025,7 @@ mod tests {
             ClickMethod::Pointer { .. }
         ));
 
-        assert_eq!(clicks.lock().unwrap().last().copied(), Some((20, 54)));
+        assert_eq!(clicks.lock().unwrap().last().copied(), Some((60, 67)));
         assert_eq!(
             *select_log.lock().unwrap(),
             vec![WindowId(2), WindowId(1)],

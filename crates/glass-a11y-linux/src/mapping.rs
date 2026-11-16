@@ -4,6 +4,15 @@
 use atspi_common::{Role, State, StateSet};
 use glass_core::{AxRole, AxStates};
 
+pub(crate) fn role_from_wire(value: u32) -> Role {
+    // GTK 4.14 exposed switches as CheckBox, so retain that contract for ATSPI_ROLE_SWITCH (2.56+).
+    if value == 130 {
+        Role::CheckBox
+    } else {
+        Role::try_from(value).unwrap_or(Role::Unknown)
+    }
+}
+
 /// Map an AT-SPI role to the normalized `AxRole`; unmapped roles become
 /// `AxRole::Other` (the caller keeps the raw AT-SPI role-name string alongside).
 pub(crate) fn map_role(role: Role) -> AxRole {
@@ -79,19 +88,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_gtk_switch_is_a_checkbox_here_unlike_the_other_backends() {
-        // Measured, not inferred: `tests/integration.rs::set_value_toggles_switch` locates the
-        // fixture's real `Gtk.Switch` as a `CheckBox`, and passes. AT-SPI has no switch role at all
-        // (atspi's `Role` has `ToggleButton` and `CheckBox`, nothing between), and GTK4 publishes a
-        // switch as a check box — indistinguishable here from a real checkbox, so glass cannot
-        // normalize it the way the subrole lets macOS and iOS.
-        //
-        // Do not "fix" this by mapping `Role::ToggleButton` to something else or by special-casing
-        // switches: `reader::toggle_state_flag` picks `State::Pressed` for `ToggleButton` and
-        // `State::Checked` otherwise, so a switch re-roled to `ToggleButton` would have `set_value`
-        // poll a flag a GtkSwitch never sets.
+    fn gtk_switch_roles_keep_the_checkbox_contract() {
         assert_eq!(map_role(Role::CheckBox), AxRole::CheckBox);
+        assert_eq!(map_role(role_from_wire(130)), AxRole::CheckBox);
         assert_eq!(map_role(Role::ToggleButton), AxRole::ToggleButton);
+    }
+
+    #[test]
+    fn known_wire_roles_keep_their_identity() {
+        for value in 0..=Role::PushButtonMenu as u32 {
+            assert_eq!(role_from_wire(value) as u32, value);
+        }
+    }
+
+    #[test]
+    fn future_wire_roles_are_other() {
+        assert_eq!(map_role(role_from_wire(u32::MAX)), AxRole::Other);
     }
 
     #[test]

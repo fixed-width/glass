@@ -1528,7 +1528,10 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
             sandbox: level,
             a11y: true,
         })
-        .unwrap_or_else(|e| panic!("wayland a11y launch ({level:?}): {e}"));
+        .unwrap_or_else(|e| {
+            let logs = glass.logs(0, usize::MAX, None, None);
+            panic!("wayland a11y launch ({level:?}): {e}; logs: {logs:?}")
+        });
     await_a11y_ready(&mut glass);
     let outline = glass
         .a11y_snapshot(None)

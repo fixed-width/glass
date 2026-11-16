@@ -1143,10 +1143,11 @@ as for `glass_click_element`.
 ### `glass_scroll_to_element`
 
 Scroll a container on **either axis** until an accessibility element is **on-screen**, then
-return it as text. The element must be actually visible (intersecting the viewport), not merely
-present in the a11y tree — so the returned `id` is usable with `glass_click_element` even for a
-non-virtualized container (a horizontal toolbar) whose off-screen items are always in the tree.
-Errors if the app exposes no accessibility tree.
+return it as text. Known bounds must provide a point within the window. When a backend's hit test
+identifies another control at that point, scrolling continues; this avoids returning a realized
+row that is still outside its viewport. An inconclusive hit test does not prove the point clear.
+Missing bounds retain the existing match-without-scrolling behaviour. Errors if the app exposes
+no accessibility tree.
 
 - `name` (string) — substring of the target's accessible name (selector).
 - `description` (string) — substring of the target's accessible description (selector), useful

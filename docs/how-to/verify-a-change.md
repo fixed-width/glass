@@ -117,9 +117,9 @@ not evidence of delivered input or desktop isolation.
 
 ## Integration suites (Linux)
 
-The GUI integration jobs use Ubuntu 24.04 with GTK 4.14. Their role and rendering assertions depend
-on that toolkit baseline; the portable build/lint/unit job continues to use `ubuntu-latest`.
-Newer GTK stacks need separate runtime qualification before moving the integration jobs.
+The GUI integration and coverage jobs follow `ubuntu-latest`, including its current GTK/AT-SPI
+stack. Renderer checks verify the selected Cairo/default or explicit GL backend; they do not
+require GL rendering to fail on a particular toolkit version.
 
 `#[ignore]`d, so the ordinary `cargo test` never starts them. Each self-starts what it needs.
 On Debian/Ubuntu, install the full AT-SPI suite's fixtures with

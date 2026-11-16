@@ -1269,7 +1269,7 @@ impl Glass {
         Ok(dimensions)
     }
 
-    fn probe_semantic_pointer(
+    pub(super) fn probe_semantic_pointer(
         &mut self,
         target: &AxTarget,
         point: (i32, i32),

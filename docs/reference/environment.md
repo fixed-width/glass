@@ -61,10 +61,10 @@ don't leave the window black:
 | `QT_X11_NO_MITSHM` | `1` | Qt (X11 widgets) |
 | `QT_QUICK_BACKEND` | `software` | Qt Quick / QML |
 
-The sandbox isolates the SysV IPC namespace, so X11 MIT-SHM can't attach to Glass' X server — and
-GTK4's GL renderer, even the software fallback it lands on without a GPU, needs MIT-SHM to present,
-so an unset default leaves the window black. These defaults select a renderer that presents without
-MIT-SHM; each is ignored by toolkits that don't read it. Unlike the `GLASS_*` variables elsewhere in
+The sandbox isolates the SysV IPC namespace, so X11 MIT-SHM cannot attach to Glass's X server.
+Older GTK GL renderers can leave the window black in that setup; newer GTK can render through GL
+successfully. These defaults retain a software path across toolkit versions; each is ignored by
+toolkits that do not read it. Unlike the `GLASS_*` variables elsewhere in
 this file, Glass *sets* these for the launched app rather than reading them, so they don't appear in
 `glass-mcp env`.
 

@@ -13,15 +13,12 @@ use common::Xvfb;
 use glass_core::{AppSpec, Platform, SandboxLevel, Stream};
 use glass_x11::X11Platform;
 
-const TASKS_DEMO: &str = concat!(
+const RENDERER_PROBE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../examples/tasks-demo/tasks_demo.py"
+    "/tests/fixtures/renderer_probe.py"
 );
 
-/// Fail loudly if this host can't run the GTK4 demo (python3 + PyGObject + the GTK 4 typelib).
-/// A hard requirement, not a silent skip: CI installs the packages, and a green pass here must
-/// mean the rendering was actually verified. The dep-free wiring is covered by the backend unit
-/// tests in `glass-x11`/`glass-wayland`.
+/// CI installs the GTK runtime, so missing prerequisites fail rather than skip rendering checks.
 fn require_gtk4() {
     let ok = Command::new("python3")
         .args([
@@ -37,10 +34,10 @@ fn require_gtk4() {
     );
 }
 
-fn demo_spec(env: Vec<(String, String)>) -> AppSpec {
+fn renderer_spec(env: Vec<(String, String)>) -> AppSpec {
     AppSpec {
         build: None,
-        run: vec!["python3".into(), TASKS_DEMO.into()],
+        run: vec!["python3".into(), RENDERER_PROBE.into()],
         cwd: None,
         env,
         window_hint: None,
@@ -102,18 +99,42 @@ fn fmt_logs(logs: &[(Stream, String)]) -> String {
         .join("\n")
 }
 
+fn renderer_logs(p: &mut X11Platform) -> Vec<(Stream, String)> {
+    let started = Instant::now();
+    let mut logs = Vec::new();
+    while started.elapsed() < Duration::from_secs(6) {
+        logs.extend(p.drain_logs());
+        if logs.iter().any(|(_, line)| line.starts_with("RENDERER ")) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    logs
+}
+
+fn reported_renderer(logs: &[(Stream, String)], requested: &str, suffix: &str) -> bool {
+    let prefix = format!("RENDERER requested={requested} actual=");
+    logs.iter()
+        .any(|(_, line)| line.starts_with(&prefix) && line.to_ascii_lowercase().ends_with(suffix))
+}
+
 #[test]
 #[ignore = "requires Xvfb + python3-gi/GTK 4; run via ./scripts/test-x11.sh"]
 fn gtk4_app_renders_under_default_sandbox() {
     require_gtk4();
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    p.start_app(&demo_spec(vec![]))
+    p.start_app(&renderer_spec(vec![]))
         .unwrap_or_else(|e| panic!("start_app failed: {e}"));
-    // With the injected GSK_RENDERER=cairo default, GTK4 presents via plain X and renders.
+    let mut logs = renderer_logs(&mut p);
     let outcome = poll_render(&mut p, Duration::from_secs(15));
-    let logs = p.drain_logs();
-    p.stop_app().ok();
+    logs.extend(p.drain_logs());
+    p.stop_app().expect("stop renderer probe");
+    assert!(
+        reported_renderer(&logs, "cairo", "cairorenderer"),
+        "GTK did not select the default Cairo renderer:\n{}",
+        fmt_logs(&logs)
+    );
     assert!(
         matches!(outcome, RenderOutcome::Rendered),
         "GTK4 app did not render under default containment — the software-render default was not \
@@ -124,30 +145,23 @@ fn gtk4_app_renders_under_default_sandbox() {
 
 #[test]
 #[ignore = "requires Xvfb + python3-gi/GTK 4; run via ./scripts/test-x11.sh"]
-fn gtk4_gl_renderer_stays_black_under_sandbox() {
+fn gtk4_renderer_override_selects_gl_under_sandbox() {
     require_gtk4();
     let xvfb = Xvfb::start();
     let mut p = X11Platform::connect(Some(&xvfb.display)).unwrap();
-    // Force the GL renderer, overriding the injected cairo default. Under containment X11 MIT-SHM
-    // can't attach (bwrap's --unshare-ipc), so the GL path can't present a frame — reproducing the
-    // black window the fix targets, and proving an explicit spec.env entry overrides the default.
-    p.start_app(&demo_spec(vec![("GSK_RENDERER".into(), "gl".into())]))
+    p.start_app(&renderer_spec(vec![("GSK_RENDERER".into(), "gl".into())]))
         .unwrap_or_else(|e| panic!("start_app failed: {e}"));
-    let outcome = poll_render(&mut p, Duration::from_secs(6));
-    let logs = p.drain_logs();
-    p.stop_app().ok();
-    match outcome {
-        RenderOutcome::Blank => {} // Expected: window is alive but stays black.
-        RenderOutcome::Rendered => panic!(
-            "GTK4 GL renderer unexpectedly rendered under containment — the fixture no longer \
-             reproduces the black-frame failure the fix guards against; revisit the fix's \
-             necessity. App output:\n{}",
-            fmt_logs(&logs)
-        ),
-        RenderOutcome::NoCapture => panic!(
-            "capture never succeeded — the GL-forced app likely crashed instead of rendering \
-             black, so this test can't confirm the black-frame behavior. App output:\n{}",
-            fmt_logs(&logs)
-        ),
-    }
+    let logs = renderer_logs(&mut p);
+    let frame = p.capture_frame(None);
+    p.stop_app().expect("stop renderer probe");
+    assert!(
+        frame.is_ok(),
+        "GL override produced no capturable window:\n{}",
+        fmt_logs(&logs)
+    );
+    assert!(
+        reported_renderer(&logs, "gl", "glrenderer"),
+        "GTK did not select the explicitly requested GL renderer:\n{}",
+        fmt_logs(&logs)
+    );
 }
