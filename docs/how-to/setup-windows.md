@@ -1,4 +1,4 @@
-# Set up glass on Windows
+# Set up Glass on Windows
 
 The Windows backend drives apps on the **interactive desktop** (Windows.Graphics.Capture, SendInput,
 UI Automation), so run it in a normal logged-in session — not a non-interactive service / Session 0.
@@ -9,13 +9,14 @@ the same HTTP MCP endpoint. Off-desktop details are in the [preview guide](windo
 
 ## System requirements
 
-Windows 10 or 11, x86-64. Nothing else to install to *run* the binary: `glass-mcp.exe` statically
+Windows 10 version 1903 (build 18362) or later, or Windows 11; x86-64.
+Nothing else to install to *run* the binary: `glass-mcp.exe` statically
 links the Visual C++ runtime, so **no Visual C++ Redistributable is needed** (the Universal CRT is a
 built-in Windows component). Full requirements are in [reference/platforms.md](../reference/platforms.md).
 
 ## Containment runtime
 
-glass sandboxes every launched app by default, fail-closed — with no provider available, `glass_start`
+Glass sandboxes every launched app by default, fail-closed — with no provider available, `glass_start`
 errors rather than running the app unconfined (see
 [explanation/containment.md](../explanation/containment.md)).
 
@@ -51,16 +52,15 @@ copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
 add the directory via Windows' Environment Variables settings and open a new terminal, or
 copy `glass-mcp.exe` into a directory that's already on `PATH` instead.
 
-If you want to hack on glass or are on an architecture with no published asset,
+If you want to hack on Glass or are on an architecture with no published asset,
 [build from source](build-from-source.md) instead.
 
 Subsequent upgrades can use `glass-mcp update` instead of repeating these steps by hand.
 
-> **First run — SmartScreen.** The prebuilt `glass-mcp.exe` is Authenticode-signed (publisher: **Fixed
-> Width LLC**). Windows may still show Microsoft Defender SmartScreen's "Windows protected your PC" on
-> first download until the certificate builds reputation; if it does, click **More info → Run anyway**.
-> This is a publisher-trust prompt, not a permission request — glass needs no permission grants on Windows
-> ([why](../explanation/windows-permissions.md)).
+> **First run — SmartScreen.** Release CI signs `glass-mcp.exe` when signing credentials are configured;
+> an unsigned build can also be published. Inspect the downloaded executable's signature and publisher
+> before accepting a distribution prompt. SmartScreen is separate from Glass runtime access;
+> see [the Windows access model](../explanation/windows-permissions.md).
 
 ## Verify
 
@@ -96,24 +96,24 @@ Wait for **Ready**, then [register its HTTP endpoint with your agent](connect-an
 The default URL is `http://127.0.0.1:7300/`, and changing desktop choice keeps that URL. For example,
 ask your agent:
 
-> "Use glass to launch `charmap.exe` and take a screenshot."
+> "Use Glass to launch `charmap.exe` and take a screenshot."
 
 Direct stdio remains available for shared-desktop compatibility using `--desktop shared`.
 
 Use a classic single-process app like `charmap` or `mspaint` for a first test — some packaged Store
-apps (including the Windows 11 `notepad`) launch out-of-process and hand off, which glass sees as the
+apps (including the Windows 11 `notepad`) launch out-of-process and hand off, which Glass sees as the
 launched process exiting.
 
 ## Desktop interaction
 
-Native input uses the interactive desktop and can move your pointer or change focus. Read the active
+In **On your desktop** mode, native input can move your pointer or change focus. Read the active
 session's `glass_capabilities` report with `scope: "session"` for input support and desktop
 interference. A virtual display driver provides a monitor, not an isolated pointer or keyboard.
 The existing launch-context requirements continue to apply; there is no new input-mode setting.
 
 ## Headless capture — a virtual display driver
 
-glass captures the interactive console session the GPU composes. A box with a physical monitor (or a
+Glass captures the interactive console session the GPU composes. A box with a physical monitor (or a
 dummy/headless display plug) already has a display to capture; a box with **no monitor** — a CI runner,
 a server, a remote VM — may have no composited display, so WGC has nothing to grab.
 
@@ -126,7 +126,7 @@ signed). Install it (elevated PowerShell, after trusting its signing certificate
 pnputil /add-driver C:\path\to\MttVDD.inf /install
 ```
 
-Once installed, the virtual monitor is part of the interactive session, so **glass picks it up
+Once installed, the virtual monitor is part of the interactive session, so **Glass picks it up
 automatically** — no glass configuration.
 
 > **Headless ≠ isolated.** A virtual display driver makes Windows headless-*capable*; it does **not**
@@ -136,7 +136,7 @@ automatically** — no glass configuration.
 ## VM / strong-isolation tier
 
 For isolation beyond Sandboxie, run **glass-mcp itself inside a VM** alongside the app it drives, and
-reach it from your host's agent over glass's [network transport](run-over-the-network.md). Two flavours
+reach it from your host's agent over Glass' [network transport](run-over-the-network.md). Two flavours
 (templates in [`packaging/windows-sandbox/README.md`](../../packaging/windows-sandbox/README.md)):
 
 - **Windows Sandbox (`glass.wsb`)** — ephemeral, one-double-click. Requires Windows

@@ -17,7 +17,7 @@ and Wayland (headless sway) on Linux, Windows (WGC/SendInput), Android (native a
 emulator over `adb`, host-OS-agnostic; clipboard + high-fidelity input via an optional
 on-device companion agent), iOS (native apps in the Simulator over `xcrun simctl`; capture,
 logs, clipboard, plus input and the accessibility tree via `idb_companion`, multi-touch
-gestures excepted), macOS (ScreenCaptureKit
+limited to two-finger pinch with a compatible companion), macOS (ScreenCaptureKit
 capture, CGEvent input, AXUIElement
 windows/logs, accessibility tree, clipboard (isolated + working under containment for
 apps not built with hardened runtime, via a `DYLD_INSERT_LIBRARIES` swizzle shim;
@@ -31,7 +31,10 @@ backends (`glass-x11`, `glass-wayland`, `glass-windows`, `glass-android`, `glass
 Simulator backend over `xcrun simctl`), `glass-macos`), the a11y readers
 (`glass-a11y-linux`, `glass-a11y-windows`, `glass-a11y-macos`; the Android `uiautomator`
 reader lives in `glass-android`), `glass-sandbox-linux`, `glass-sandbox-macos`, the `glass-mcp` server binary, and the
-`glass-testapp` fixture. `glass-android` also holds the host-side client + lifecycle for two
+`glass-testapp` fixture. `glass-video` supplies bounded desktop video encoding and rolling history;
+the shared Unix helper crates cover process, pipe, sandbox and D-Bus plumbing. The egui fixtures
+are a separate, workspace-excluded Cargo project. `glass-android` also holds the host-side client
+and lifecycle for two
 optional on-device companions — an `app_process` agent (clipboard + high-fidelity input) and an
 `AccessibilityService` (Compose-rich a11y tree + high-fidelity `set_value`); both live in the
 separate repo `github.com/fixed-width/glass-android-agent`, driven over `adb forward`.
@@ -45,21 +48,23 @@ results only, preserve worker outcomes after cancellation, and keep trace-off MC
 
 ```bash
 cargo build
-cargo test --workspace                    # needs nothing installed; anything wanting a
-                                          # display or device is #[ignore]d
+cargo test --workspace                    # Linux/Windows: no live display or device needed
 cargo clippy --workspace --all-targets -- -D warnings   # lint gate — keep clean
-cargo test -p glass-x11 -- --include-ignored      # + its 74 Xvfb-backed unit tests
-cargo test -p glass-wayland -- --include-ignored  # + its 64 sway-backed unit tests
+cargo test -p glass-x11 -- --include-ignored      # + Xvfb-backed unit tests
+cargo test -p glass-wayland -- --include-ignored  # + sway-backed unit tests
 ./scripts/test-x11.sh [name]              # X11 integration suite (self-starts Xvfb)
 ./scripts/test-wayland.sh [name]          # Wayland suite (needs sway >=1.12)
 ./scripts/test-a11y.sh [name]             # AT-SPI suite
 ```
 The workspace is pinned to stable Rust via `rust-toolchain.toml`.
+Builds need the native compiler dependencies in [Build from source](docs/how-to/build-from-source.md).
+On macOS use `cargo test --workspace --lib --locked` plus `./scripts/test-macos.sh`; native
+integration binaries require a separately granted GUI context.
 
 Those cover Linux. They do **not** compile `cfg(target_os = "macos")` or `cfg(windows)` code, so on
 a change to a platform crate they report clean without having looked at it —
-[docs/how-to/verify-a-change.md](docs/how-to/verify-a-change.md) has the per-target commands that
-do, most of which run from any host.
+[docs/how-to/verify-a-change.md](docs/how-to/verify-a-change.md) has the per-target commands and
+native cross-toolchain requirements.
 
 ## Git workflow
 

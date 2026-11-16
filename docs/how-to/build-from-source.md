@@ -1,4 +1,4 @@
-# Build glass from source
+# Build Glass from source
 
 End users don't need this: Linux and Windows releases attach prebuilt binaries, and macOS ships a
 notarized `.dmg` ([setup-macos.md](setup-macos.md)). This guide is for **contributors** and anyone
@@ -6,13 +6,7 @@ running an unreleased checkout.
 
 ## Build (all platforms)
 
-```bash
-git clone https://github.com/fixed-width/glass
-cd glass
-cargo build --release -p glass-mcp        # → target/release/glass-mcp
-```
-
-glass pins a stable Rust toolchain in `rust-toolchain.toml`, which rustup installs automatically on the
+Glass pins a stable Rust toolchain in `rust-toolchain.toml`, which rustup installs automatically on the
 first build — there's no toolchain to choose. On every platform the build also needs **`cmake` plus
 C and C++ compilers** on `PATH`: the TLS stack behind `glass-mcp update` compiles `aws-lc-sys` from C sources,
 and desktop workflow recording compiles the bundled OpenH264 encoder
@@ -26,7 +20,20 @@ xcode-select --install
 The `objc2-*` crates that bind Cocoa/CoreGraphics/CoreFoundation need the macOS SDK and `clang` the
 CLT provides at their build-time link step; without it, `cargo build` fails there.
 
-To confirm the environment the build needs is set up, run
+On **Windows**, use Rust's MSVC host toolchain and install Visual Studio Build Tools with
+**Desktop development with C++**, plus CMake available to the build shell. The Windows release
+pipeline uses this toolchain; MinGW is used only for the cross-checks described in
+[Verify a change](verify-a-change.md#cover-the-windows-code-from-linux).
+
+With those prerequisites in place:
+
+```bash
+git clone https://github.com/fixed-width/glass
+cd glass
+cargo build --release --locked -p glass-mcp        # → target/release/glass-mcp
+```
+
+After building, check runtime prerequisites with
 [`glass-mcp doctor`](../reference/cli.md#doctor).
 
 On Linux and Windows the built binary is all you need — return to the [Linux](setup-linux.md) or
@@ -150,7 +157,7 @@ codesign -dvv target/macos-app/GlassMcp.app   # want NO "adhoc" / "not signed"
 ### Grant the permissions and install the LaunchAgent
 
 A permission *request* fired from a terminal command is attributed to the **terminal**, not the app,
-so the reliable path is to run glass as a **LaunchAgent** (its own responsible process) and enable
+so the reliable path is to run Glass as a **LaunchAgent** (its own responsible process) and enable
 `GlassMcp.app` in the two Privacy panes by hand.
 
 1. **Install the LaunchAgent** — fill the shipped plist template with your app path and home directory
@@ -159,13 +166,11 @@ so the reliable path is to run glass as a **LaunchAgent** (its own responsible p
    ```bash
    APP="$PWD/target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp"
    PLIST="$HOME/Library/LaunchAgents/tech.fixedwidth.glass.plist"
+   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/GlassMcp"
    sed -e "s|/Applications/GlassMcp.app/Contents/MacOS/glass-mcp|$APP|" \
        -e "s|/Users/YOU|$HOME|g" \
        packaging/macos/tech.fixedwidth.glass.plist > "$PLIST"
-   # A LaunchAgent's default cwd is the read-only "/"; glass writes capture baselines under its cwd,
-   # so point it at a writable path:
-   /usr/libexec/PlistBuddy -c "Add :WorkingDirectory string $HOME" "$PLIST"
-   mkdir -p "$HOME/Library/Logs/GlassMcp"
+   # The template sets WorkingDirectory to your home; pass glass_start.cwd for your project.
    launchctl bootstrap "gui/$(id -u)" "$PLIST"
    ```
 

@@ -1,8 +1,8 @@
 # The macOS permission model
 
 macOS gates screen capture and input injection behind its privacy system (TCC), and the way those
-grants are recorded shapes how glass is packaged and run on the Mac. Understanding this model explains
-*why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
+grants are recorded shapes how Glass is packaged and run on the Mac. Understanding this model explains
+*why* macOS Glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
 compatible updates can retain existing grants.
 
 Glass needs two grants that must be effective in the process running its backend:
@@ -23,9 +23,9 @@ bundle id and macOS treats it as a new app that needs a fresh grant. This is exa
 grant is keyed to never changes.
 
 **Who launches the process matters.** A bare `ssh user@mac 'glass-mcp …'` shell is attributed to
-`sshd`, which cannot hold a grant. Running glass as a **LaunchAgent** in your own login session makes
-`launchd` its parent instead — giving glass its own grantable, responsible process. That is the whole
-reason macOS glass runs as a LaunchAgent rather than a binary you `ssh` in and start.
+`sshd`, which cannot hold a grant. Running Glass as a **LaunchAgent** in your own login session makes
+`launchd` its parent instead — giving Glass its own grantable, responsible process. That is the whole
+reason macOS Glass runs as a LaunchAgent rather than a binary you `ssh` in and start.
 
 ## Fresh checks after permission changes
 
@@ -88,6 +88,18 @@ Interrupted permission recovery checks recorded process births, the machine's bo
 previous private login's lifetime. A surviving process or a retained login session can conservatively
 defer recovery. Glass preserves the journal and reports the incomplete cleanup rather than restoring
 access while earlier work may still be running.
+
+## Workspace access in the separate account
+
+The requested workspace is shared read/write for the run. Existing executable search paths and
+existing file/directory arguments receive read access; unrelated environment values are not treated
+as file-sharing requests. Temporary access is recorded before changes and restored after owned work
+has stopped. Generated files may belong to the development account; Glass preserves your edit
+access in the selected workspace, including files atomically moved in from temporary storage.
+File contents and modes are preserved. Unreadable files, explicit access denials, surviving work
+or an unavailable filesystem can defer cleanup; Glass reports that failure and keeps its recovery
+journal for retry. Account homes, keychains and credentials are not copied.
+Default Seatbelt containment and protected artifact/trace paths still apply.
 
 ## Administrator authorisation and manual control
 

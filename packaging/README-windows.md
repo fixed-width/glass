@@ -1,144 +1,66 @@
-# glass — Windows (x86-64)
+# Glass — Windows x86-64
 
-**glass** is an MCP server that lets an AI coding agent drive native GUI apps: it
-launches an app, screenshots what's on screen, clicks and types into it, reads its
-logs, and detects visual changes — so the agent can build and debug a GUI on its own
-instead of asking you "does this look right?".
+Glass is an MCP server for driving external native GUI apps. It needs Windows 10 version 1903
+(build 18362) or later, or Windows 11, and a usable
+signed-in graphical session. The executable statically links the Visual C++ runtime; no separate
+Visual C++ Redistributable is needed.
 
-This is the **Windows x86-64** build. See the project README for the full picture:
-<https://github.com/fixed-width/glass>.
-For Windows-specific setup (containment runtime, network transport, Android-on-Windows),
-see [docs/how-to/setup-windows.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-windows.md).
+Full instructions: [Windows setup](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-windows.md).
 
----
+## Install and check
 
-## 1. System requirements
-
-- **Windows 10 or 11, x86-64.** Nothing else to install: `glass-mcp.exe` statically
-  links the Visual C++ runtime, so **no Visual C++ Redistributable is needed** (the
-  Universal CRT it also relies on is a built-in Windows component). The
-  capture/input/accessibility features use built-in Windows APIs
-  (Windows.Graphics.Capture for screenshots, SendInput for input, UI Automation for
-  the accessibility tree).
-- glass drives apps on the **interactive desktop**, so run it in a normal logged-in
-  session (not a non-interactive service / Session 0).
-- **Containment:** glass **sandboxes every launched app by default**, and that default
-  is *fail-closed* — with no in-OS provider available, `glass_start` errors rather than
-  running the app unconfined. Install [Sandboxie Classic](https://sandboxie-plus.com/downloads)
-  (with its service running) for containment, or set `GLASS_SANDBOX=off` to launch apps
-  unconfined. `glass-mcp doctor`'s `sandbox` section reports this posture.
-
-## 2. Install the binary
-
-Copy `glass-mcp.exe` somewhere on your PATH, e.g. `%USERPROFILE%\bin`:
+From the extracted release directory, copy the executable to a directory on your `PATH`, or use
+its absolute path. For example:
 
 ```powershell
-mkdir $env:USERPROFILE\bin -Force
-copy glass-mcp.exe $env:USERPROFILE\bin\glass-mcp.exe
+New-Item -ItemType Directory -Force "$env:USERPROFILE\bin"
+Copy-Item glass-mcp.exe "$env:USERPROFILE\bin\glass-mcp.exe"
+& "$env:USERPROFILE\bin\glass-mcp.exe" doctor
 ```
 
-> **First run — SmartScreen.** The binary is Authenticode-signed (publisher: **Fixed Width LLC** — you can
-> confirm it in the file's Properties → Digital Signatures). Windows may still show Microsoft Defender
-> SmartScreen's "Windows protected your PC" on first download until the certificate builds reputation; if
-> it does, click **More info → Run anyway**. It's a publisher-trust prompt, not a permission request —
-> glass needs no permission grants on Windows
-> (see [docs/explanation/windows-permissions.md](https://github.com/fixed-width/glass/blob/master/docs/explanation/windows-permissions.md)).
+`%USERPROFILE%\bin` is not on `PATH` by default. Add it through Windows Environment Variables and
+open a new terminal if you want to use `glass-mcp` as a short command.
 
-## 3. Verify your setup
+Install Sandboxie Classic or Plus with its service running for default containment. Classic is
+auto-detected at `%ProgramFiles%\Sandboxie`; use `GLASS_SANDBOXIE_DIR` for another location.
+Without a provider, default/strict launches fail. `sandbox:"off"` explicitly runs an app unconfined.
+Sandboxie virtualises writes; it does not hide files your account can read. Desktop choice is
+separate from containment.
 
-glass ships a built-in checker:
+Release signing depends on the release build configuration. Inspect the downloaded executable's
+signature if Windows displays a publisher or SmartScreen prompt. A distribution prompt is separate
+from runtime access; Windows has no Glass-specific capture or input privacy grants.
+
+## Prepare applications and connect the agent
 
 ```powershell
-glass-mcp doctor
+& "$env:USERPROFILE\bin\glass-mcp.exe" desktop open
 ```
 
-You want the `[windows]` section all `✓` and the summary to say **OK** (exit code 0).
-A `✗` prints the exact remedy.
+In **Application setup…**, choose **On your desktop** or **Off your desktop…**, then **Continue setup**.
+On-desktop input can move your pointer and change focus. The off-desktop preview uses your account
+in a local child session and requires supported Windows hosting, **Start Environment…** and native
+Windows sign-in. Setup reports **Ready** only after the selected environment is usable.
 
-## 4. Register it with your agent (MCP over stdio)
+Copy the MCP endpoint, normally `http://127.0.0.1:7300/`, and register it with an HTTP-capable MCP
+client. Keep Glass running in the system tray. Closing its window hides it; **Quit Glass** stops it.
+**Start with Windows** is optional. An unprepared off-desktop environment refuses app work and never
+falls back to your visible desktop.
 
-**Claude Code:**
+Ask your agent to launch `charmap.exe`, take a screenshot, then stop the app. Packaged Store apps
+can hand off to another process; a classic single-process app is a more predictable first check.
 
-```powershell
-claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool-profile lean
-```
+## Other configurations and updates
 
-**Claude Desktop / a project `.mcp.json`:** use the absolute path —
+- [Agent connection](https://github.com/fixed-width/glass/blob/master/docs/how-to/connect-an-agent.md):
+  HTTP examples and shared-desktop stdio compatibility with `--desktop shared`.
+- [Separate-desktop preview](https://github.com/fixed-width/glass/blob/master/docs/how-to/windows-separate-desktop.md):
+  readiness, viewer controls, recovery and qualification limits.
+- [Network setup](https://github.com/fixed-width/glass/blob/master/docs/how-to/run-over-the-network.md):
+  bearer tokens and tunnels. Non-loopback binds require a token; Glass does not provide TLS.
 
-```json
-{
-  "mcpServers": {
-    "glass": {
-      "command": "C:\\Users\\YOU\\bin\\glass-mcp.exe",
-      "args": ["--tool-profile", "lean"]
-    }
-  }
-}
-```
-
-The windows backend is the default on a Windows host — no `env` block needed.
-
-## 5. Check it works
-
-Restart your agent so it picks up the new MCP server, then ask it something like:
-
-> "Use glass to launch `charmap.exe` and take a screenshot."
-
-(Use a classic single-process app like `charmap` or `mspaint` for a first test —
-some packaged Store apps, including the Windows 11 `notepad`, launch out-of-process
-and hand off, which glass sees as the launched process exiting.)
-
-The agent should get back an image of the app. The tools it now has include
-`glass_start`, `glass_screenshot`, `glass_click`, `glass_type`, `glass_wait_stable`,
-`glass_diff`, `glass_logs`, `glass_a11y_snapshot`, `glass_click_element`, and
-`glass_doctor`.
-
-## 6. Network transport — agent and app on different machines
-
-By default the agent spawns `glass-mcp.exe` directly (stdio). If the agent runs on one
-machine and the Windows app runs on another, use the network transport instead:
-
-| Use | Transport | How |
-|---|---|---|
-| Agent + app on the same machine (default) | stdio | Register `glass-mcp`; the client spawns it. Zero config. |
-| Agent and app on different machines | network | Run `glass-mcp serve --http --addr …` on the Windows machine; point the client at the URL with the bearer token. |
-
-**Token setup** (built-in CSPRNG):
-
-```powershell
-mkdir $env:USERPROFILE\.glass -Force
-glass-mcp gen-token --out $env:USERPROFILE\.glass\token
-glass-mcp serve --http --addr 0.0.0.0:7300 --token-file $env:USERPROFILE\.glass\token
-```
-
-The MCP client supplies the token as `Authorization: Bearer <token>` (check your
-client's docs for the bearer-token / headers field). Binding a non-loopback address
-without a token is refused at startup (fail-closed).
-
-> **Token-file permissions on Windows.** Unlike Linux — where glass forces the token
-> file to owner-only (`0600`) — on Windows the file inherits the **permissions of the
-> folder you write it into**; glass does not yet set an explicit owner-only ACL. Keep
-> `--out` inside your per-user profile (e.g. `%USERPROFILE%\.glass`), whose default
-> permissions already restrict it to you, SYSTEM, and Administrators. **Don't** write
-> the token to a shared, world-readable, or cloud-synced (e.g. OneDrive-backed) folder
-> where other users could read it — or skip the file and pass the token via the
-> `GLASS_TOKEN` environment variable instead.
-
-**Secure over a trusted LAN via SSH tunnel** (Windows 10/11 ship the OpenSSH client):
-
-```powershell
-# On the agent's machine — forward the remote port to your local loopback:
-ssh -L 7300:127.0.0.1:7300 user@windowsbox
-# On the Windows machine — bind loopback only (no token needed for loopback):
-glass-mcp serve --http
-```
-
-Then point the client at `http://127.0.0.1:7300`. The connection is encrypted by SSH;
-glass itself does not own TLS.
-
----
-
-## Problems?
-
-`glass-mcp doctor` diagnoses most setup issues and prints a remedy for each failed
-check. Bug reports and questions: <https://github.com/fixed-width/glass/issues>.
+`glass-mcp update` updates a release executable; restart a running server afterwards. If capture or
+input fails, run `glass-mcp doctor` in the same signed-in session as Glass. A bare SSH/service
+session may have no usable desktop. A virtual monitor enables headless rendering but does not
+isolate input. Report problems with the version and failed checks in a
+[GitHub issue](https://github.com/fixed-width/glass/issues).

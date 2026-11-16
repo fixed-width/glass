@@ -1,4 +1,4 @@
-# Set up glass on Linux
+# Set up Glass on Linux
 
 Linux has two backends — **X11** (the default) and **Wayland** (a headless sway). Both spawn their own
 private headless display, so there is no desktop or window manager to configure. This guide covers
@@ -30,20 +30,21 @@ Use the `…-x86_64-linux-musl.tar.gz` build instead if you need a fully static 
 dependency — Alpine, or any musl distro. It still needs the distro's CA certificates installed
 (`apk add ca-certificates` on Alpine) for `glass-mcp update`: HTTPS verification goes through the
 system trust store, with no built-in certificate bundle to fall back on, so on a bare install
-`update` cannot reach the release endpoint. `update` is the only thing in glass that makes an
+`update` cannot reach the release endpoint. `update` is the only thing in Glass that makes an
 outbound HTTPS request; everything else works without it.
 
 If you are on an architecture with no published asset (an aarch64 host, say),
 [build from source](build-from-source.md) instead; that is also the path if you want to hack on
-glass. The full asset list is in
+Glass. The full asset list is in
 [reference/platforms.md](../reference/platforms.md#release-artifacts).
 
 Subsequent upgrades can use `glass-mcp update` instead of repeating these steps by hand.
 
 ## Prerequisites
 
-glass needs a display dependency for your backend and a containment runtime, both covered below.
-Nothing else — the released binary is self-contained.
+Glass needs a display dependency, a containment runtime and (for ordinary launches) the private
+accessibility-bus tools. The glibc release also needs glibc ≥ 2.39 and the C++ runtime
+(`libstdc++6` on Debian/Ubuntu); the static musl release has no shared-library requirement.
 
 ## X11 (the default)
 
@@ -54,17 +55,17 @@ sudo apt-get install -y xvfb
 # Fedora: sudo dnf install xorg-x11-server-Xvfb   ·   Arch: sudo pacman -S xorg-server-xvfb
 ```
 
-glass spawns its own private display, so `Xvfb` is all you need. The X11 backend takes its display
+Glass spawns its own private display, so no window manager or graphical login is needed. The X11 backend takes its display
 from `GLASS_DISPLAY` (never the ambient `$DISPLAY`):
 
-- **unset (default)** — glass spawns a private headless `Xvfb` on a free display, logs the number to
+- **unset (default)** — Glass spawns a private headless `Xvfb` on a free display, logs the number to
   stderr, and tears it down on exit. Override the size with `GLASS_XVFB_SCREEN` (default
   `1280x800x24`).
 - **`:42`** — attach to a display you manage (see below).
 - **`:0`** — deliberately drive your real desktop. Only happens when you ask for it explicitly.
 
-To watch the default headless display live, point a VNC viewer at the logged number:
-`x11vnc -display :N` plus any VNC viewer (or `Xephyr` for a window).
+To watch a headless display, run a loopback-only VNC server against its logged display number:
+`x11vnc -localhost -display :N`, then connect a VNC viewer locally or through an SSH tunnel.
 
 ### Optional: a persistent display you control
 
@@ -75,7 +76,7 @@ helper manages a sandbox `Xvfb` (defaults to `:42`; size via `GLASS_XVFB_SCREEN`
 ./scripts/sandbox-xvfb.sh start      # also: status | stop | restart
 ```
 
-Then register glass with `"env": { "GLASS_DISPLAY": ":42" }`. To survive logout, run the `Xvfb` at
+Then register Glass with `"env": { "GLASS_DISPLAY": ":42" }`. To survive logout, run the `Xvfb` at
 login via a **systemd user service**:
 
 ```ini
@@ -98,7 +99,7 @@ loginctl enable-linger "$USER"   # optional: keep it up without an active login
 ## Wayland (sway)
 
 Select it per launch with `glass_start`'s `backend: "wayland"`, or default every launch with
-`GLASS_BACKEND=wayland`. For each session glass spawns a **private headless
+`GLASS_BACKEND=wayland`. For each session Glass spawns a **private headless
 [sway](https://swaywm.org)** and runs the app inside it — nothing to set up or keep running, and it
 works on **any** Linux host including GNOME and KDE.
 
@@ -113,9 +114,24 @@ sudo apt-get install -y libegl1 libgl1-mesa-dri   # Debian/Ubuntu
 Override the headless output size with `GLASS_WAYLAND_SCREEN` (default `1280x800`, format `WxH`). sway
 also launches an Xwayland server, so X11-only apps run under this backend too.
 
+Install Xwayland if your sway package does not include it. The host desktop does not need to use
+Wayland; Glass starts its own compositor.
+
+## Accessibility runtime
+
+Normal Linux launches start a private D-Bus and AT-SPI bus for semantic controls. On Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y dbus-bin at-spi2-core
+```
+
+These tools are separate from the accessibility services on your own desktop. Glass discovers
+`at-spi-bus-launcher` in standard installation locations; it need not be on `PATH`. For a canvas
+app with no accessibility tree, `glass_start` can explicitly set `a11y:false` to skip the private bus.
+
 ## Containment runtime
 
-glass sandboxes every launched app by default via
+Glass sandboxes every launched app by default via
 [bubblewrap](https://github.com/containers/bubblewrap), fail-closed (with no sandbox available,
 `glass_start` errors rather than running the app unconfined — see
 [explanation/containment.md](../explanation/containment.md)):

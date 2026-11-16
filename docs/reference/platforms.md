@@ -1,8 +1,12 @@
-<!-- KEEP IN SYNC with the code (and README.md's compact matrix, and CLAUDE.md) whenever capabilities change. -->
+<!-- Canonical platform matrix; keep capability claims aligned with the backend implementations. -->
 
 # Platform support
 
-Where glass stands by OS. **✓** supported · **◑** partial · **–** not supported · **🚧** planned.
+Capabilities of the source on this branch. See the [changelog](../../CHANGELOG.md) for release availability.
+**✓** supported · **◑** partial · **–** unsupported.
+
+Jump to [requirements](#system-requirements), [release assets](#release-artifacts),
+[platform limits](#notes), or [verification coverage](#verification-coverage).
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | iOS (Simulator) | macOS |
 |---|:--:|:--:|:--:|:--:|:--:|
@@ -10,12 +14,9 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb § | ✓ AX |
 | Named workflow video (`--record-dir`) | ✓ MP4/H.264 | ✓ MP4/H.264 | ✓ native MP4/H.264 | ✓ native QuickTime/H.264 | ✓ app-window MP4/H.264 |
 | Encoded rolling history | ✓ | ✓ | – | – | ✓ |
-| Semantic state coverage | All selector states, plus focus and editable | All selector states, plus focus and editable | UIAutomator: all except expanded; companion schema 2: no selected or expanded | Enabled, checkable, and editable; no reliable visible, selected, expanded, or focused proof | Enabled, checkable, focus, and editable; no universal visible, selected, or expanded proof |
-| Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
-| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
-| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
-| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
+| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ app container | ✓ Seatbelt ‡ |
+| Input without desktop interference | ✓ private display | ◑ child session (preview) | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ child session (preview) | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
 
 Input without desktop interference means the agent's pointer and keyboard stay separate from yours.
 It is already provided by owned Linux displays, the Android emulator and the iOS Simulator, using
@@ -24,30 +25,39 @@ Glass-owned isolation guarantee. Shared Windows and unenrolled macOS input can c
 a virtual monitor alone does not isolate input. Running Glass and its target inside a VM provides a
 separate desktop, but the native backend cannot attest isolation from the VM host.
 
-macOS also has [separate-account setup](../how-to/setup-macos.md#apps-off-your-desktop-preview)
-in preview, using a retained real login in the same OS. The app's **Application setup…** window guides
-account creation, enrollment and permissions from one Glass installation. Enrollment applies per normal user and
-`glass-mcp unenroll` restores that user's shared-desktop route. It routes the normal tools to the account,
-with no shared-desktop fallback when enrollment is configured. Setup, worker re-registration and
-development loops have been tested on an Apple Silicon Mac mini without a physical monitor connected,
-using an existing initialized login, including simultaneous physical keyboard/mouse use.
-**Start environment…** has been tested after a real reboot with an initialized account and existing
-permissions, followed by build/interact/rebuild/stop loops in an indexed workspace without account
-switching, reenrollment or repeated privacy grants. Interrupted-client recovery has also been checked.
-The worker requires the development account's graphical login; starting that desktop remains
-user-assisted. Unattended development-desktop startup is not implemented.
-New-account onboarding through Ready and ordinary private app interaction has also been checked;
-a clean macOS installation without prior Glass grants has not been tested. Setup attempts
-identity-checked repair of an idle worker's registration/socket. Desktop startup can reuse a validated
-waiting worker; registration repair retains and reports a running or unbound job. Active application
-work is left intact, and recovery failures are reported.
-The [recovery guide](../how-to/setup-macos.md#recover-a-refused-worker-connection) includes
-manual reenrollment when automatic repair cannot complete.
+## Desktop previews
+
+The [Windows separate-desktop preview](../how-to/windows-separate-desktop.md) routes ordinary
+application work through a retained child session using the same Windows account. It requires
+Windows Remote Desktop hosting entitlement, native sign-in and a prepared resident app. The guide
+records console/RDP, standard-account, restart and refusal qualification. Keep the parent session
+unlocked and connected for GUI input; Home supports on-desktop operation.
+
+The [macOS separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) uses
+one installed signed Glass app and a separate standard account's real Aqua login. Enrollment is
+per normal user; `unenroll` returns that user to shared-desktop use. New-account onboarding, retained
+login, concurrent physical input, interrupted-client recovery and guided startup after a real reboot
+have been checked on an Apple Silicon Mac mini without a physical monitor. Post-reboot checks used
+an initialised account and existing grants; a clean macOS installation without prior Glass privacy
+grants has not been tested. Initial account login and missing privacy consent require user action.
+Startup remains user-assisted; unattended startup is not implemented. Recovery is described in
+[Manage the macOS environment](../how-to/manage-macos-environment.md).
+
+Both previews refuse unavailable environments without switching work onto the user's desktop.
+Desktop readiness and containment are independent.
 
 For the actual active session, use `glass_capabilities` with `scope: "session"`: each input operation
 reports its support and `desktop_interference: "none" | "possible" | "unknown"`. `none` describes
 admitted input dispatch, not app startup, clipboard or filesystem isolation. Setup requirements and
 operation limitations still apply, such as the iOS input companion and US-ASCII typing.
+
+## Semantic action support
+
+| Evidence | Linux (AT-SPI) | Windows (UIA) | Android | iOS (idb) | macOS (AX) |
+| --- | --- | --- | --- | --- | --- |
+| Semantic state coverage | All selector states, plus focus and editable | All selector states, plus focus and editable | UIAutomator: all except expanded; companion schema 2: no selected or expanded | Enabled, checkable, and editable; no reliable visible, selected, expanded, or focused proof | Enabled, checkable, focus, and editable; no universal visible, selected, or expanded proof |
+| Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
+| Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
 
 Occlusion checks use the platform's accessibility hit test. A covering element omitted from that
 tree can still intercept physical input even when the hit test reports the target. Linux retries
@@ -71,15 +81,15 @@ explained in [explanation/backends.md](../explanation/backends.md) and
 [macOS](../how-to/setup-macos.md) · [Android](../how-to/setup-android.md) ·
 [iOS](../how-to/setup-ios.md).
 
-The opt-in [Windows separate-desktop preview](../how-to/windows-separate-desktop.md) routes
-ordinary application input through a retained local child session. It uses the same Windows account.
-
 ## System requirements
 
 - **Linux** — X11 needs `Xvfb`; Wayland needs a discoverable `sway ≥ 1.12 / wlroots ≥ 0.20` plus Mesa
-  software GL. Containment needs bubblewrap with unprivileged user namespaces. See
+  software GL and Xwayland. Containment needs bubblewrap with unprivileged user namespaces;
+  accessibility needs D-Bus and AT-SPI. The glibc release needs glibc ≥ 2.39 and `libstdc++6`;
+  the musl release is statically linked. See
   [how-to/setup-linux.md](../how-to/setup-linux.md).
-- **Windows** — Windows 10 or 11, x86-64. No Visual C++ Redistributable needed (the binary statically
+- **Windows** — Windows 10 version 1903 (build 18362) or later, or Windows 11; x86-64.
+  No Visual C++ Redistributable needed (the binary statically
   links the VC++ runtime; the Universal CRT is built in). Drives apps on the interactive desktop, so
   it needs a logged-in session. No permission grants are required — see
   [explanation/windows-permissions.md](../explanation/windows-permissions.md). Setup:
@@ -90,14 +100,16 @@ ordinary application input through a retained local child session. It uses the s
 - **Android** — emulator-only; developed and tested against **Android 14 (API 34)**. The `adb` backend
   assumes no particular version; the optional on-device companions declare an Android 7.0 (API 24)
   floor. See [how-to/setup-android.md](../how-to/setup-android.md).
-- **iOS** — Simulator-only; **macOS host required** (`xcrun`/`simctl` ship with Xcode). No particular
-  iOS runtime version is assumed — whichever runtime Xcode has downloaded works; real iPhones are out
+- **iOS** — Simulator-only; **macOS host required** (`xcrun`/`simctl` ship with Xcode). Glass does not pin
+  an iOS runtime version; actual input and accessibility depend on Xcode/runtime/companion
+  compatibility. Real iPhones are out
   of scope, matching the Android backend's emulator-only stance. See
   [how-to/setup-ios.md](../how-to/setup-ios.md).
 
 ## Release artifacts
 
-Every tagged release attaches these assets, where `<tag>` is the release tag (e.g. `v0.3.1`):
+Release CI publishes these asset names, where `<tag>` is the release tag (for example `v1.9.0`).
+The macOS job requires signing/notarisation credentials and is skipped when they are absent:
 
 | Platform | Asset |
 |---|---|
@@ -131,7 +143,7 @@ Linux binaries (the bare Windows binary keeps its `.exe`). See
 
 ## Notes
 
-**† Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass
+**† Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and Glass
 manages the AVD (attach a running one, or boot a headless one). Clipboard, high-fidelity input, and
 multi-touch gestures (`glass_gesture`) use the optional on-device agent, and an optional on-device
 AccessibilityService sharpens the a11y tree (Compose) and `glass_set_value`. Without the agent, input
@@ -155,7 +167,7 @@ reader. System windows outside those types and focused covering windows are not 
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
 clipboard, and logs work over `simctl`; pointer/keyboard input (tap, type, swipe, scroll) and the
 accessibility tree (snapshot, click-element, set-value) run over `idb_companion` (`brew install
-idb-companion`), which glass spawns and manages per Simulator. `glass_gesture` actuates a two-finger
+idb-companion`), which Glass spawns and manages per Simulator. `glass_gesture` actuates a two-finger
 pinch, given a companion that implements idb's `HIDPinch`; other multi-touch gestures are refused by
 name. Without `idb_companion` the input and
 accessibility tools return an unsupported error; capture, logs, and clipboard keep working. Window
@@ -164,7 +176,7 @@ device, are always fullscreen. The host-independent logic — device resolution,
 argument construction, JSON→tree mapping, doctor checks — runs in CI; the on-box path (input landing
 at the right coordinate, the a11y tree, clear-then-type) is exercised by `#[ignore]`d integration
 tests on a macOS host with a booted Simulator (no CI wiring on the macOS runner yet). Containment has
-no separate glass-managed step, the same as Android — the Simulator's per-app data container is the
+no separate Glass-managed step, the same as Android — the Simulator's per-app data container is the
 isolation boundary.
 
 The idb accessibility schema does not publish reliable `visible`, `focused`, or `focusable` facts.
@@ -179,30 +191,27 @@ leave occlusion unproven.
 capture, CGEvent input, AXUIElement windows). Containment is Seatbelt (`sandbox_init`): filesystem and
 process are contained at `default`/`strict`, and `strict` additionally blocks outbound network. Under
 containment the clipboard is isolated **and working** for an app not built with Apple's hardened
-runtime; a hardened-runtime app (App Store / notarized) returns `Unsupported`. The opt-in
-[separate-account preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) keeps development
-apps off your desktop in a separate graphical login. This has been tested on an Apple Silicon
-Mac mini without a physical monitor connected, including physical keyboard/mouse coexistence.
-The worker requires the development account's graphical login. Guided post-reboot startup and
-indexed-workspace app loops have been tested with existing grants. New-account onboarding through
-Ready and ordinary app interaction has also been checked on that Mac. A clean macOS installation
-without prior Glass grants has not been tested. Initial login and any missing privacy consent
-require user action; unattended development-desktop startup is not implemented. Containment details are in
-[explanation/containment.md](../explanation/containment.md).
+runtime; a hardened-runtime app (App Store / notarised) returns `Unsupported`. Desktop-choice
+requirements and qualification are listed under [Desktop previews](#desktop-previews).
+Containment details are in [Containment and sandboxing](../explanation/containment.md).
 
-## Status
+<a id="status"></a>
 
-The Linux feature set is implemented and tested across **both** Linux backends (X11 and
-Wayland/wlroots). The **Windows** backend (WGC capture, SendInput, UI Automation) is built and
-CI-tested. An **Android** backend drives native apps in an AVD emulator over `adb` — capture, input,
-logcat, multi-window, a `uiautomator` accessibility tree, a managed AVD (attach-or-boot), and two
-optional on-device companions (an agent for clipboard + high-fidelity input, and an
-AccessibilityService for a Compose-rich a11y tree + high-fidelity `set_value`); built and unit-tested
-in CI and validated on-device. An **iOS** backend drives native apps on an iOS Simulator over `xcrun
-simctl` — capture, clipboard, logs, and a managed Simulator (attach-or-boot, matching the Android
-emulator's model); window support is geometry/focus only. Pointer/keyboard input and the accessibility
-tree run over `idb_companion` (multi-touch is a two-finger pinch only). Its host-independent logic is
-unit-tested in CI; the on-box path against a real Simulator is exercised by `#[ignore]`d integration
-tests on a macOS host. The **macOS** backend
-(ScreenCaptureKit capture, CGEvent input, AXUIElement windows/logs, an AXUIElement accessibility tree,
-and Seatbelt process containment) is built and CI-tested.
+## Verification coverage
+
+| Area | Automated coverage | Native runtime evidence |
+| --- | --- | --- |
+| Linux X11/Wayland | Workspace checks, backend tests and display/accessibility integration suites in CI | Owned Xvfb and headless sway sessions |
+| Windows | Native Windows build, lint and non-interactive tests in CI | Interactive desktop, Sandboxie and child-session checks on a Windows host |
+| macOS | Native build/lint, library tests, packaging and account API checks in CI | Granted Aqua sessions; capture/input integration is separate from the CI library gate |
+| Android | Host-independent tests plus a separate emulator CI workflow | AVD, input and optional-companion suites |
+| iOS | Host-independent device selection, command, parser and doctor tests | Ignored integration suites on a Mac with Simulator and companion; not a routine Simulator CI job |
+
+A build or unit-test pass does not establish live capture/input on another platform.
+[Verify a change](../how-to/verify-a-change.md) gives the contributor commands and prerequisites.
+
+The Linux GUI integration baseline is Ubuntu 24.04 with GTK 4.14. Ubuntu 26.04 / GTK 4.22 is not
+qualified: current Rust bindings reject AT-SPI's
+[`ATSPI_ROLE_SWITCH` (`130`)](https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/enum.Role.html),
+and the newer GL renderer no longer matches the legacy black-frame control test. These are
+runtime/toolkit compatibility limits; compiling on the newer host does not establish GUI support there.

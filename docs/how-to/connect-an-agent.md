@@ -1,15 +1,15 @@
-# Connect glass to your agent
+# Connect Glass to your agent
 
-glass speaks the Model Context Protocol, so you register it with your MCP client once and your agent
-gains the glass tools. glass works with any MCP client; the examples below use Claude Code and a
-generic JSON config. For the verified-host list and what glass needs from a host, see
+Glass speaks the Model Context Protocol, so you register it with your MCP client once and your agent
+gains the Glass tools. Glass works with any MCP client; the examples below use Claude Code and a
+generic JSON config. For the verified-host list and what Glass needs from a host, see
 [Host compatibility](../reference/host-compatibility.md). There are two transports — pick by how
-glass is running.
+Glass is running.
 
 - If your client launches the binary directly (the Linux default or Windows shared-desktop
   compatibility), use **stdio**.
-- If glass runs as a **resident desktop app** (the macOS menu-bar app or Windows system-tray
-  tray app), or the agent and app run on different machines, use **HTTP**.
+- If Glass runs as a **resident desktop app** (the macOS menu-bar app or Windows system-tray
+  app), or the agent and app run on different machines, use **HTTP**.
 
 For the [Windows separate-desktop preview](windows-separate-desktop.md), open Glass with
 `glass-mcp desktop open`, choose **Off your desktop…** in Application setup, then **Start Environment…**,
@@ -20,7 +20,7 @@ across desktop starts and MCP client reconnects. A stdio-only client needs a rel
 Windows tray implementation does not include one.
 
 Once connected, your agent has the tools in [reference/tools.md](../reference/tools.md); run the
-`glass_doctor` tool to confirm the environment is ready. To have your agent drive glass well from the
+`glass_doctor` tool to confirm the environment is ready. To have your agent drive Glass well from the
 first turn, also install the [glass-drive skill](drive-glass-well.md).
 
 ## Over stdio
@@ -36,7 +36,7 @@ claude mcp add glass --scope user -- /absolute/path/to/glass-mcp --tool-profile 
 For Windows shared-desktop operation, point at the `.exe`:
 
 ```powershell
-claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool-profile lean
+claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --desktop shared --tool-profile lean
 ```
 
 **Generic MCP client (JSON config):**
@@ -53,7 +53,7 @@ claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool
 ```
 
 **Antigravity:** open **Settings → Customizations → Open MCP Config** to edit its `mcp_config.json`,
-add glass under `mcpServers` (the same shape as the generic config above), then reload the MCP
+add Glass under `mcpServers` (the same shape as the generic config above), then reload the MCP
 servers (or restart Antigravity).
 
 These new configurations select the 18-tool lean inventory. Lean uses `glass_do` for actions,
@@ -64,17 +64,17 @@ including single steps and gestures, `glass_screenshot` annotations for numbered
 **Codex CLI:** `codex mcp add glass -- /absolute/path/to/glass-mcp --tool-profile lean` — or add a `[mcp_servers.glass]`
 table with `command` / `args` to `~/.codex/config.toml`.
 
-**GitHub Copilot:** add glass under `servers` in the client's MCP config — VS Code via *MCP: Open
+**GitHub Copilot:** add Glass under `servers` in the client's MCP config — VS Code via *MCP: Open
 User Configuration*, JetBrains via the plugin's `mcp.json` — with `"type": "stdio"`, `"command"`,
 `"args"`. You may need to restart the IDE after adding it.
 
-No `env` block is needed: glass uses your host's default backend and, where the host supports it,
+No `env` block is needed: Glass uses your host's default backend and, where the host supports it,
 gives each session its own isolated display with nothing to set up. Add an `env` block only to
 override a default — the specific variables are in [reference/environment.md](../reference/environment.md).
 
 ## Over HTTP
 
-When glass runs as a network server (`glass-mcp serve --http`), register its URL instead of a command.
+When Glass runs as a network server (`glass-mcp serve --http`), register its URL instead of a command.
 The Windows tray app (`glass-mcp desktop open` or `serve --tray`) serves the same HTTP transport.
 
 For a manually launched HTTP server, use `glass-mcp serve --http --tool-profile lean`.
@@ -105,7 +105,7 @@ claude mcp add --transport http glass http://127.0.0.1:7300/
 
 **GitHub Copilot:** the same `servers` entry with `"type": "http"` and `"url"`.
 
-A loopback endpoint (`127.0.0.1`) needs no token. To reach glass from another machine, or to bind a
+A loopback endpoint (`127.0.0.1`) needs no token. To reach Glass from another machine, or to bind a
 non-loopback address, follow [run-over-the-network.md](run-over-the-network.md) for the token and
 tunnel setup.
 
@@ -120,7 +120,7 @@ claude mcp add glass --scope user -- \
 ```
 
 — but a stdio server is launched by, and attributed to, your MCP client, so the macOS permission
-grants must attach to *that* process. The LaunchAgent model exists precisely so glass holds its own
+grants must attach to *that* process. The LaunchAgent model exists precisely so Glass holds its own
 grants; see [the permission model](../explanation/macos-permissions.md) for why.
 
 With the [separate-account preview](setup-macos.md#apps-off-your-desktop-preview), the grant-bearing

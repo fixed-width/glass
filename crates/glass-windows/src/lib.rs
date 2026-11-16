@@ -7,7 +7,7 @@
 //! [`capabilities`] map (whose `accessibility` cell is live; every other cell is constant).
 
 // FFI backend: the OS-touching modules need `unsafe`, so this crate opts out of the workspace
-// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
+// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see AGENTS.md). The pure
 // modules below stay `unsafe`-free by convention.
 #![allow(unsafe_code)]
 

@@ -1,7 +1,7 @@
 # Benchmark and profile the hot paths
 
 Per-frame hot-path micro-benchmarks ([criterion](https://github.com/bheisler/criterion.rs)) live in
-`crates/*/benches/`. This is contributor tooling — you don't need it to use glass.
+`crates/*/benches/`. This is contributor tooling — you don't need it to use Glass.
 
 ```bash
 # core (diff, webp encode/decode) plus the per-backend pixel conversions
@@ -25,7 +25,7 @@ When comparing portable builds, clear local CPU-specific flags (such as `target-
 
 ```bash
 env -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS RUSTFLAGS='' \
-  cargo +stable bench -p glass-core --locked
+  cargo bench -p glass-core --locked
 ```
 
 Profile a hot path as a flamegraph (needs

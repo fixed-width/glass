@@ -1,8 +1,8 @@
 # The Windows access model
 
-macOS gates screen capture and input injection behind its privacy system (TCC), so glass on the Mac
+macOS gates screen capture and input injection behind its privacy system (TCC), so Glass on the Mac
 ships as a signed app plus a LaunchAgent and walks you through two one-time grants. **Windows works
-differently: there are no per-app permissions to grant.** In a normal logged-in session, glass's three
+differently: there are no per-app permissions to grant.** In a normal logged-in session, Glass' three
 core capabilities all work with no consent prompt and nothing to click:
 
 - **Screen capture** (Windows.Graphics.Capture)
@@ -17,21 +17,21 @@ interactive session, supported Windows build, DPI awareness and containment.
 
 ## What actually constrains access on Windows
 
-Three things gate what glass can reach — none of them a privacy-consent dialog.
+Three things gate what Glass can reach — none of them a privacy-consent dialog.
 
 **The interactive session.** Capture and input need a usable signed-in desktop. Glass has been
 tested on console and RDP desktops and in its verified child session. A process in **Session 0** —
 a Windows service, or a bare `ssh user@box` shell — has no rendering desktop, so capture has nothing
-to read. Run glass in a normal
+to read. Run Glass in a normal
 logged-in session (the doctor's `interactive session` check reports this). See
 [how-to/setup-windows.md](../how-to/setup-windows.md).
 
 **Integrity levels (UAC / UIPI).** Windows isolates processes by *integrity level*. A normal
-(medium-integrity) glass process cannot inject input into — or fully automate — a window owned by a
+(medium-integrity) Glass process cannot inject input into — or fully automate — a window owned by a
 **higher-integrity** process, such as an app launched *Run as administrator* or a UAC elevation prompt.
 It also cannot capture the **secure desktop** that hosts UAC prompts, the lock screen, and
 Ctrl+Alt+Del. This is the closest thing Windows has to a "permission," but it is a launch-context
-relationship, not a consent grant: to drive an elevated app, run glass at the same (elevated) integrity
+relationship, not a consent grant: to drive an elevated app, run Glass at the same (elevated) integrity
 so the two processes match. The resident separate-desktop flow keeps application work unelevated;
 its setup helper changes only the machine setting after native approval. A standard account can
 supply a different administrator's credentials in Windows' dialog while retaining ownership of
@@ -39,20 +39,20 @@ the resident, worker, private state and per-user tasks. Most apps run at medium 
 the default works with no special handling.
 
 **SmartScreen and Defender (distribution, not runtime).** These gate *installing* a downloaded binary,
-not *what a running binary may do*. The release `glass-mcp.exe` is Authenticode-signed (publisher: Fixed
-Width LLC), which establishes the publisher; Microsoft Defender SmartScreen may still show "Windows
-protected your PC" on first download until the certificate builds reputation — a publisher-trust prompt,
-not an access grant, cleared with **More info → Run anyway**. See the install steps in
+not the session/integrity relationship used by Glass. Release CI applies Authenticode signing when
+its signing credentials are configured, and can publish unsigned builds otherwise. A signature
+identifies the publisher; SmartScreen can still prompt for a signed download. These distribution
+checks are separate from runtime capture/input access. See the install steps in
 [how-to/setup-windows.md](../how-to/setup-windows.md).
 
 ## Why there's no grant to click
 
 macOS TCC records each grant in a per-app consent database keyed to the app's code-signing identity, so
-the grant must be requested, is snapshotted at launch, and is re-checked on every rebuild. Windows has
+the grant must be requested and a long-lived process can retain a stale view after it changes. Windows has
 no such per-app capability database for capture, input, or UI Automation. Access is decided by *where
 the process runs* — its session and its integrity level — not by a stored per-app decision. Two
 consequences follow: rebuilding or moving `glass-mcp.exe` never re-prompts (there is no grant to lose),
-and glass needs no responsible-process or LaunchAgent gymnastics to hold one — the reasons the macOS
+and Glass needs no responsible-process or LaunchAgent gymnastics to hold one — the reasons the macOS
 build is packaged the way it is simply don't arise on Windows.
 
 For how launched apps are sandboxed on Windows see [explanation/containment.md](containment.md); for the

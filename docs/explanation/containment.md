@@ -1,6 +1,6 @@
 # Containment and sandboxing
 
-glass launches apps it has been told to build and drive — often half-working, sometimes hostile-by-
+Glass launches apps it has been told to build and drive — often half-working, sometimes hostile-by-
 accident code under active development. So it **sandboxes every launched app by default**. This page
 explains the model; the per-OS install steps live in the setup guides, and the exact variables in
 [reference/environment.md](../reference/environment.md).
@@ -22,8 +22,8 @@ One boundary is worth stating plainly: the `sandbox` level governs the **launche
 optional `build` step always runs unsandboxed, with your full developer environment — building is your
 code doing what you asked, whereas the launched app is the thing under test.
 
-Whoever is driving glass picks `sandbox` per launch, but an **operator** — whoever configures the host
-glass runs on — can pin a floor under that choice: `GLASS_SANDBOX_FLOOR` sets the minimum containment
+Whoever is driving Glass picks `sandbox` per launch, but an **operator** — whoever configures the host
+Glass runs on — can pin a floor under that choice: `GLASS_SANDBOX_FLOOR` sets the minimum containment
 level a launch may run at. A launch may still ask for *more* containment than the floor, just never
 less: an omitted `sandbox` is raised to the floor automatically, and an explicit request below the
 floor is refused rather than silently strengthened. The default is `off` — no floor, today's behavior
@@ -38,9 +38,12 @@ Containment has a different implementation per OS:
   user namespaces enabled.
 - **Windows** — [Sandboxie](https://sandboxie-plus.com) (Classic, the free default, or Plus).
 - **Android** — the emulator VM itself; there is no separate containment step.
-- **iOS** — the Simulator itself is the isolation boundary; like Android, there is no separate
-  containment step (and no sandbox crate).
+- **iOS** — the Simulator's per-app data container is the app boundary; there is no separate
+  Glass containment step. The Simulator runs on the Mac rather than in an Android-style VM.
 - **macOS** — the OS's built-in **Seatbelt** sandbox (`sandbox_init`); nothing to install.
+
+On Android and iOS, the `sandbox` argument does not install an additional filesystem or network
+policy. In particular, `strict` does not add Glass-managed network denial on mobile backends.
 
 ## Linux file inputs
 
@@ -64,31 +67,32 @@ filesystem model is deliberately *not* an allowlist of system directories. Inste
 filesystem is readable** (read-only), with one carve-out: your **home directory** (`/Users`) is
 denied, so `~/.ssh` and the rest of your secrets stay hidden. The working directory and the launched
 program's own directory are re-allowed for reads even when they live inside your home, so a project
-checked out under `~/` still works. **Writes** are confined to the working directory plus the usual
-scratch/cache roots (`/private/var/folders`, `/private/tmp`, `/tmp`, `/dev`) — nothing under your home
-is ever write-allowed. `mach-register` is allowed so a sandboxed app can still serve its accessibility
+checked out under `~/` still works. **Writes** are confined to a safely scoped working directory,
+which can be a project under your home, plus scratch/cache roots (`/private/var/folders`,
+`/private/tmp`, `/tmp`, `/dev`). A home root or its ancestor is not re-exposed as a writable workspace.
+`mach-register` is allowed so a sandboxed app can still serve its accessibility
 tree; an app that can't register with the window server would return an empty AX tree.
 
 ## Clipboard isolation
 
-Under `default`/`strict`, the clipboard tools act on a clipboard **isolated from your real one** — the
-app copies and pastes normally, but against a private store glass owns, so driving an app never
-clobbers what you have on your own clipboard.
+Private Linux displays and mobile devices have their own clipboard. Contained Windows and macOS
+apps use a private bridge when supported; a missing bridge returns an unsupported error.
+Attaching an X11 display uses that display's clipboard, so attaching your desktop can affect it.
 
 How that isolation is achieved varies. On the private Xvfb/sway Linux backends the app simply has its
-own display clipboard. On a contained Windows app, glass backs the boxed app's clipboard with its own
+own display clipboard. On a contained Windows app, Glass backs the boxed app's clipboard with its own
 store. On **macOS**, isolation depends on how the target is built: for an app **not** built with
-Apple's hardened runtime — typically a debug or unsigned build, i.e. the app you are developing — glass
+Apple's hardened runtime — typically a debug or unsigned build, i.e. the app you are developing — Glass
 injects a small shim (`DYLD_INSERT_LIBRARIES`) that swizzles `+[NSPasteboard generalPasteboard]` inside
-the app and redirects it to a private, per-session pasteboard glass shares. glass confirms the swizzle
+the app and redirects it to a private, per-session pasteboard Glass shares. Glass confirms the swizzle
 actually took (a sentinel written to the private pasteboard) before routing to it, so a silently-failed
 injection is never mistaken for a working bridge.
 
 An app that runs under the **hardened runtime** (App Store or notarized apps) can't be injected — the
 OS strips `DYLD_INSERT_LIBRARIES` — so the profile denies it the real pasteboard service and the
-clipboard tools return `Unsupported`. That is fail-closed at the profile level, not a silent fall-back
-to the shared system clipboard. Only shared-desktop modes (`GLASS_DISPLAY=:0`, or the Windows/macOS
-backend at `sandbox:off`) touch your real clipboard.
+clipboard tools return `Unsupported`. That is fail-closed at the profile level. On a shared Windows
+or macOS desktop, `sandbox:off` uses the system clipboard. Desktop selection and clipboard
+containment are separate choices.
 
 ## Artifact boundary
 

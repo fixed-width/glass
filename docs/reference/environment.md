@@ -3,13 +3,14 @@
 
 # Environment variables
 
-Every `GLASS_*` variable glass reads, grouped by concern. Each variable has a sensible default, so a
+Operator-facing `GLASS_*` variables, grouped by concern. Test-only and internal child-process
+variables are outside this configuration surface. Each variable has a default, so a
 default install needs none of them; set one only to override a default. `glass-mcp env` prints this
 same list with each variable's current value (see [reference/cli.md](cli.md)); the token
 (`GLASS_TOKEN`) is reported only as `set`/`(unset)`, never printed.
 
-Most variables also have an equivalent per-call argument on `glass_start` (`backend`, `sandbox`) —
-the argument wins when both are present.
+For backend and containment selection, `glass_start.backend` and `glass_start.sandbox` override
+their environment defaults, subject to `GLASS_SANDBOX_FLOOR`.
 
 ## Backend & display
 
@@ -34,7 +35,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_SANDBOX_FLOOR` | Operator-enforced minimum containment level; raises an omitted request, refuses an explicit one below it | `off` (no floor) | all |
 | `GLASS_ARTIFACT_DIR` | Absolute artifact cache-root override; relative paths are rejected | Linux: `$XDG_CACHE_HOME/glass/artifacts`, falling back to `~/.cache/glass/artifacts`; macOS: `~/Library/Caches/glass/artifacts`; Windows: `%LOCALAPPDATA%\glass\artifacts` | all |
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
-| `GLASS_WINDOWS_DESKTOP_STATE_DIR` | Private local directory for Windows desktop configuration and ownership records; changing its path does not grant isolation authority | Local application data under `fixedwidth/glass` | Windows |
+| `GLASS_WINDOWS_DESKTOP_STATE_DIR` | Private local directory for Windows desktop configuration and ownership records; changing its path does not grant isolation authority | `%LOCALAPPDATA%\fixedwidth\glass\windows-desktop` | Windows |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
 | `GLASS_CLIP_SHIM_DLL` | Private-clipboard shim DLL (`glass_clip_shim_windows.dll`) injected into a Sandboxie-boxed app | next to `glass-mcp`, else Layer-2 clipboard isolation is unavailable | Windows |
@@ -44,13 +45,13 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 [explanation/containment.md](../explanation/containment.md).
 
 Glass treats the artifact root as an operator-owned cache container. It does not change an existing
-root's permissions or DACL. Under that root, glass creates one owner-private process directory and
+root's permissions or DACL. Under that root, Glass creates one owner-private process directory and
 lease, and applies owner-private protection to its temporary and final artifact files. Contained
 desktop targets are denied access to the process directory and lease.
 
 ## Rendering under containment (Linux)
 
-When glass launches an app **under containment** (`sandbox` is not `off`) on Linux, it sets
+When Glass launches an app **under containment** (`sandbox` is not `off`) on Linux, it sets
 software-render environment defaults so GPU / shared-memory rendering paths the sandbox blocks
 don't leave the window black:
 
@@ -60,11 +61,11 @@ don't leave the window black:
 | `QT_X11_NO_MITSHM` | `1` | Qt (X11 widgets) |
 | `QT_QUICK_BACKEND` | `software` | Qt Quick / QML |
 
-The sandbox isolates the SysV IPC namespace, so X11 MIT-SHM can't attach to glass's X server — and
+The sandbox isolates the SysV IPC namespace, so X11 MIT-SHM can't attach to Glass' X server — and
 GTK4's GL renderer, even the software fallback it lands on without a GPU, needs MIT-SHM to present,
 so an unset default leaves the window black. These defaults select a renderer that presents without
 MIT-SHM; each is ignored by toolkits that don't read it. Unlike the `GLASS_*` variables elsewhere in
-this file, glass *sets* these for the launched app rather than reading them, so they don't appear in
+this file, Glass *sets* these for the launched app rather than reading them, so they don't appear in
 `glass-mcp env`.
 
 To override one — for example to force a GPU renderer against a display that has one — pass the
@@ -75,7 +76,7 @@ receive none of these defaults.
 
 | Variable | Purpose | Default | Scope |
 |---|---|---|---|
-| `GLASS_SH` | Shell used to run `glass_start`'s `build` command | `sh` (on `PATH`) | all |
+| `GLASS_SH` | Shell used for Linux desktop `glass_start.build` | `sh` (on `PATH`) | Linux desktop |
 | `GLASS_TYPE_DWELL_MS` | Per-key dwell for synthetic typing, to stay ahead of the OS input-pipeline race; raise on a slow/loaded host, lower for speed | `60` | Windows |
 
 ## Linux accessibility
@@ -86,9 +87,9 @@ receive none of these defaults.
 | `GLASS_ATSPI_LAUNCHER` | `at-spi-bus-launcher` binary; forces this one and skips discovery (fails closed if wrong) | auto-discovered (well-known install paths) | Linux |
 
 `GLASS_DBUS_DAEMON` is used only when a launch has a11y enabled — the default; see
-[reference/tools.md](tools.md): glass spawns a private D-Bus session bus and AT-SPI bus per launch
+[reference/tools.md](tools.md): Glass spawns a private D-Bus session bus and AT-SPI bus per launch
 rather than touching your desktop's shared accessibility bus. `GLASS_ATSPI_LAUNCHER` is read on that
-path too, and by `glass doctor` and `glass_capabilities`, which report on the launcher it names.
+path too, and by `glass-mcp doctor` and `glass_capabilities`, which report on the launcher it names.
 
 ## Android
 
@@ -99,15 +100,15 @@ path too, and by `glass doctor` and `glass_capabilities`, which report on the la
 | `GLASS_ANDROID_SERIAL` | Which running emulator to attach to (when several are online) | — | Android |
 | `GLASS_ANDROID_LIFECYCLE` | Set `attach` to force attach-only (never boot an AVD) | attach-or-boot | Android |
 | `GLASS_EMULATOR` | `emulator` binary (else resolved via `ANDROID_SDK_ROOT` / `ANDROID_HOME`) | SDK-resolved | Android |
-| `GLASS_EMULATOR_ARGS` | Extra flags passed when glass boots an emulator | — | Android |
+| `GLASS_EMULATOR_ARGS` | Extra flags passed when Glass boots an emulator | — | Android |
 | `GLASS_EMULATOR_BOOT_TIMEOUT_MS` | Max wait for a booting emulator to reach `sys.boot_completed` | `120000` | Android |
-| `GLASS_EMULATOR_KEEP` | Keep a glass-booted emulator alive past shutdown | off | Android |
+| `GLASS_EMULATOR_KEEP` | Keep a Glass-booted emulator alive past shutdown | off | Android |
 | `GLASS_ANDROID_AGENT_JAR` | Override path to `glass-agent.jar` (on-device agent: clipboard + high-fidelity input) | auto-discovered, else off | Android |
 | `GLASS_ANDROID_AGENT` | Set `off` to force the `adb` input path even when the jar is present | on when jar set | Android |
 | `GLASS_ANDROID_A11Y_APK` | Override path to `glass-a11y.apk` (on-device AccessibilityService) | auto-discovered, else uiautomator | Android |
 | `GLASS_ANDROID_A11Y` | Set `off` to force `uiautomator` even when the APK is present | on when APK set | Android |
 
-The companion files are auto-discovered next to the `glass-mcp` binary or in glass's data dir, so the
+The companion files are auto-discovered next to the `glass-mcp` binary or in Glass' data dir, so the
 easiest setup is to drop `glass-agent.jar` / `glass-a11y.apk` there; the `*_JAR` / `*_APK` vars above only
 override that with an explicit path. Full setup is in [how-to/setup-android.md](../how-to/setup-android.md).
 
@@ -117,10 +118,10 @@ override that with an explicit path. Full setup is in [how-to/setup-android.md](
 |---|---|---|---|
 | `GLASS_IOS_UDID` | Exact Simulator UDID to drive when several are available | the newest booted/available iPhone simulator | iOS |
 | `GLASS_IOS_DEVICE` | Device name to boot when none is running, e.g. `iPhone 17` or `iPad Pro 13-inch` (ignored if `GLASS_IOS_UDID` is set) | the newest available iPhone simulator | iOS |
-| `GLASS_SIMULATOR_KEEP` | Leave a glass-booted iOS Simulator running at shutdown instead of stopping it | stop it | iOS |
+| `GLASS_SIMULATOR_KEEP` | Leave a Glass-booted iOS Simulator running at shutdown instead of stopping it | stop it | iOS |
 | `GLASS_IDB_COMPANION` | Path to the `idb_companion` binary (input + accessibility for the Simulator backend) | the first runnable `idb_companion` on `PATH`, then Homebrew's standard prefixes | iOS |
 
-Attach-or-boot works the same way as the Android group above: glass attaches to an already-booted
+Attach-or-boot works the same way as the Android group above: Glass attaches to an already-booted
 Simulator, or boots the newest available iPhone simulator itself. `GLASS_IOS_DEVICE` names any
 iOS-family simulator (iPhone or iPad); watchOS, tvOS, and visionOS simulators are never eligible,
 whether attaching to an already-booted one or booting one by name. Full setup is in

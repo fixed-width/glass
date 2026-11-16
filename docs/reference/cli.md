@@ -26,17 +26,21 @@ client's filesystem.
 - `--trace-max-bytes <bytes>` — per-process trace allowance, default 256 MiB; requires `--trace-dir`.
   See [session trace](session-trace.md) for bounds, exclusions and ownership requirements.
 - `--record-dir <absolute-directory>` — enable explicitly selected workflow videos in an existing
-  private directory. Android and iOS Simulator only. See [workflow video](../how-to/record-workflow-video.md).
+  private directory. All backends support named clips; desktop backends also support rolling
+  history. See [workflow video](../how-to/record-workflow-video.md).
 
 ## `serve`
 
 Serve MCP over the network (Streamable HTTP) instead of stdio.
 
-- `--http` — use the HTTP transport.
-- `--addr <host:port>` — bind address, e.g. `0.0.0.0:7300`. A non-loopback bind requires a token.
+- `--http` — use the HTTP transport; required unless `--menubar` or `--tray` implies it.
+- `--addr <host:port>` — bind address, default `127.0.0.1:7300`. A non-loopback bind requires a token.
 - `--token-file <path>` — read the bearer token from this file (alternative: `GLASS_TOKEN`).
 - `--menubar` — run as the visible **`glass ●`** menu-bar app (macOS); otherwise the server has
   no menu bar. This does not itself isolate the application desktop.
+- `--tray` — run as the resident Windows system-tray app; implies HTTP and conflicts with
+  `--menubar`. Application setup prepares the selected desktop before app work.
+- `--startup` — Windows tray sign-in startup; requires `--tray` and opens a configured app quietly.
 - `--audit-log <path>` — as above.
 - `--tool-profile full|lean` — as above, including menu-bar mode.
 - `--trace-dir` and `--trace-max-bytes` — as above, including menu-bar mode.
@@ -81,7 +85,7 @@ Generate a cryptographically-random bearer token for the HTTP transport.
 
 ## `doctor`
 
-Check that the environment glass needs is in place — the backend's display dependency, the
+Check that the environment Glass needs is in place — the backend's display dependency, the
 containment runtime, and external tool paths — and print how to fix anything missing. Exits non-zero
 if the default backend can't run (CI-friendly). The agent can run the same checks via the
 `glass_doctor` tool.
@@ -129,14 +133,14 @@ workspace access, recovery and qualification limits.
 
 ## `status`
 
-Report whether glass is running and at what endpoint (reads `/healthz`). Primarily used with the
+Report whether Glass is running and at what endpoint (reads `/healthz`). Primarily used with the
 macOS menu-bar LaunchAgent. An enrolled macOS account also reports whether it is idle, in use or
 disabled, without starting a worker — see [how-to/setup-macos.md](../how-to/setup-macos.md).
 
 ## `update`
 
-Update this binary to the latest published release: resolve the latest tag, download the asset for
-this platform, verify its checksum, and replace this binary in place. Verifies build provenance with
+Available with the default-on `self-update` Cargo feature. Resolve the latest published tag,
+download the asset for this platform, verify its checksum, and replace this binary in place. Verifies build provenance with
 the GitHub CLI (`gh attestation verify`) when it is installed; if `gh` is not on `PATH` the update
 still proceeds, but says so.
 
@@ -177,7 +181,7 @@ plain error message with no JSON.) Its fields:
 - **A from-source build.** A binary built locally (its version carries a `git describe` suffix)
   is not something a release binary should silently replace — rebuild it with `git pull && cargo
   build --release` instead.
-- **macOS.** glass installs there as `GlassMcp.app`, not a bare binary — download the latest `.dmg`
+- **macOS.** Glass installs there as `GlassMcp.app`, not a bare binary — download the latest `.dmg`
   instead (see [how-to/setup-macos.md](../how-to/setup-macos.md)).
 - **An unsupported architecture**, where no release asset is published — build from source instead
   (see [how-to/build-from-source.md](../how-to/build-from-source.md)).
@@ -208,7 +212,7 @@ If the app bundle has already been removed, see
 
 ## `uninstall`
 
-Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
+Stop Glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. For account setup, stop active work first: uninstall restores recoverable
 workspace permissions and removes only Glass’s worker registration with administrator authentication.
 The account, home and app data remain. Use `unenroll` to keep the ordinary startup integration while
@@ -216,7 +220,18 @@ returning to shared-desktop operation. See [how-to/setup-macos.md](../how-to/set
 
 ## `desktop` (Windows preview)
 
-Configure and control the local child desktop: `enable`, `status [--json]`, `show`, `hide`, `stop`,
-`recover`, and `disable`. Status is read-only. Enable and disable may request Windows administrator
-consent for the child-session setting; application workers remain unelevated. Application Stop retains
-the desktop, while environment Stop ends it. See [the Windows separate-desktop guide](../how-to/windows-separate-desktop.md).
+Configure and control the local desktop environment. These commands are available only on Windows.
+
+| Command | Effect |
+| --- | --- |
+| `desktop open` | Open or reuse the resident tray app and Application setup. |
+| `desktop enable` | Configure the separate-desktop setting; complete preparation in the resident app. |
+| `desktop status [--json]` | Read saved configuration and live ownership/readiness without starting anything. |
+| `desktop show` / `desktop hide` | Show or hide the owned child viewer. Hiding retains the environment. |
+| `desktop stop` | End the owned environment while retaining setup. |
+| `desktop recover` | Retry identity-checked cleanup left by an exited owner. |
+| `desktop disable` | Stop owned work and restore the child-session setting changed by Glass. |
+
+Enable and disable may request Windows administrator consent; application workers remain unelevated.
+`glass_stop` ends application work and retains the prepared desktop. **Stop Environment** ends that
+desktop; application requests cannot restart it. See [the Windows separate-desktop guide](../how-to/windows-separate-desktop.md).

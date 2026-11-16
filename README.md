@@ -9,57 +9,42 @@ result, without burning a screenshot on every step.
 A Rust [MCP](https://modelcontextprotocol.io) server that gives an AI coding agent a closed **build →
 see → interact → debug** loop over external native GUI applications.
 
-glass lets an agent launch a GUI app, capture what is on screen, inject mouse and keyboard input, read
+Glass lets an agent launch a GUI app, capture what is on screen, inject mouse and keyboard input, read
 the app's logs, and detect visual changes — so a coding agent can build and debug UI applications
 independently instead of asking the user "does this look right?".
 
-glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
+Glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
 or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** backend, an
 **Android** backend (an AVD emulator, driven over `adb` from any host), an **iOS** backend (native
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
 including a two-finger pinch), and a **macOS** backend, behind a platform-agnostic core.
 
-The same input tools work across backends. Default Linux displays and mobile emulators keep input
-separate from your desktop. Windows shares it; macOS adds a preview of separate-account setup for
-apps off your desktop, alongside its existing shared-desktop setup. `glass_capabilities` with
-`scope: "session"` reports click, scroll and text support and whether each can affect your desktop.
-
-The [macOS account setup](docs/how-to/setup-macos.md#apps-off-your-desktop-preview) uses the normal
-MCP tools and one Glass installation. **Application setup…** guides enrollment, permission handoff and
-live readiness checks, including creating a standard development account with a locally chosen
-password. It needs a real login and Glass privacy grants in that account,
-retained between runs. Enrollment applies to your macOS user; `glass-mcp unenroll` returns to
-shared-desktop use while retaining the app, development account and MCP startup integration.
-Development loops have been tested on an Apple Silicon Mac mini without a physical monitor.
-These runtime checks used an initialized development account and include physical keyboard/mouse
-coexistence, recovery after an interrupted client, and starting its development desktop after a real
-reboot with existing permissions. New-account onboarding has also reached Ready and passed ordinary
-app interaction on that Mac. Initial macOS login and any missing privacy grants require user action;
-setup on a clean macOS installation without prior Glass grants has not been tested. Application setup includes
-**Start environment…** for a missing development desktop, using local account credentials and an
-already enabled macOS Screen Sharing service. This guided post-reboot flow and ordinary
-build/interact/rebuild/stop loops in an indexed workspace have been tested without repeating
-enrollment or permission setup. Unattended development-desktop startup is not implemented.
+Default Linux displays and mobile devices keep input separate from your desktop. Windows and macOS
+also offer opt-in previews for apps **Off your desktop…** through **Application setup…**. Their setup
+requirements and limits are in the [platform reference](docs/reference/platforms.md).
+`glass_capabilities` with `scope: "session"` reports actual click, scroll and text support and
+whether each can affect your desktop.
 
 ## See it
 
-![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)
+![An agent debugging a GTK app under Glass](docs/assets/hero-debug-loop.gif)
 
-An agent building a GUI app runs it under glass, reproduces a bug **from the accessibility tree**
+An agent building a GUI app runs it under Glass, reproduces a bug **from the accessibility tree**
 (no screenshots), fixes the code, and re-verifies — the loop it otherwise can't close on its own.
-[Try it yourself](#try-it-in-60-seconds).
+[Try it yourself](#try-the-debugging-demo-linux).
 
-## Try it in 60 seconds
+<a id="try-it-in-60-seconds"></a>
 
-1. Download glass for your platform from the [Releases page](https://github.com/fixed-width/glass/releases/latest)
-   and [connect it to your agent](docs/how-to/connect-an-agent.md) — glass works with any MCP host
-   ([see which are verified](docs/reference/host-compatibility.md)).
-2. Get the example app — clone this repo, or download
-   [`examples/tasks-demo/tasks_demo.py`](examples/tasks-demo/tasks_demo.py) (on Linux it needs
-   `sudo apt install python3-gi gir1.2-gtk-4.0`).
+## Try the debugging demo (Linux)
+
+1. [Set up Glass on Linux](docs/how-to/setup-linux.md) and
+   [connect it to your agent](docs/how-to/connect-an-agent.md).
+2. Clone this repo and run your agent from the checkout. The demo is
+   [`examples/tasks-demo/tasks_demo.py`](examples/tasks-demo/tasks_demo.py); it needs
+   `sudo apt install python3-gi gir1.2-gtk-4.0`.
 3. Paste this to your agent:
 
-   > Use glass to run `examples/tasks-demo/tasks_demo.py` with accessibility on. There's a bug: clicking
+   > Use Glass to run `examples/tasks-demo/tasks_demo.py` with accessibility on. There's a bug: clicking
    > **Add** doesn't add the typed task. Reproduce it by driving the UI and checking the
    > accessibility tree (don't just screenshot), then find and fix the bug in the code and verify a
    > task actually appears.
@@ -99,7 +84,8 @@ text, so routine checks between screenshots cost no vision tokens. Why the loop 
 To review a run after the app stops, opt into [session evidence recording](docs/how-to/record-session-evidence.md)
 with `--trace-dir`. Glass retains tool inputs and requested results in bounded storage, then
 `glass-mcp trace inspect` and `trace export` validate the trace and package its evidence in a ZIP.
-Recording is off by default; retained app content can contain sensitive data.
+Recording is off by default; retained app content can contain sensitive data. For a movie of a
+selected workflow or recent desktop history, see [Record a workflow video](docs/how-to/record-workflow-video.md).
 
 ## Install at a glance
 
@@ -120,9 +106,9 @@ Every asset is listed in [docs/reference/platforms.md](docs/reference/platforms.
 Prefer to compile, or on an architecture with no published asset? See
 [docs/how-to/build-from-source.md](docs/how-to/build-from-source.md) — it is a single `cargo build`.
 
-Then [connect glass to your agent](docs/how-to/connect-an-agent.md) and run `glass-mcp doctor` to check
-the environment. New here? Follow [the tutorial](docs/tutorial/first-drive.md) for a guaranteed first
-success.
+Then [connect Glass to your agent](docs/how-to/connect-an-agent.md) and run `glass-mcp doctor` to check
+the environment. New here? Follow [the Linux/X11 tutorial](docs/tutorial/first-drive.md) to build,
+drive and verify a small test app.
 
 For new agent configurations, use `glass-mcp --tool-profile lean` for 18 tools, with actions through
 `glass_do`, annotated screenshots and optional log waits. The full toolbox remains the compatible
@@ -131,28 +117,16 @@ starting a session using `glass-mcp tools --json`; see [tool profiles](docs/refe
 
 ## Drive it well — the `glass-drive` skill
 
-glass needs no app integration and no skill to run, but an agent drives it far more reliably with the
-open [glass-drive](docs/how-to/drive-glass-well.md) Agent Skill — it stops the agent spending its first
-turns rediscovering the verify-cheaply-then-look loop. **Installing it is the single highest-leverage
-thing you can add** when pointing an agent at glass.
+The optional [glass-drive](docs/how-to/drive-glass-well.md) Agent Skill teaches semantic targeting,
+batched actions and verification through text before taking another screenshot. Glass needs no app
+integration or skill to run.
 
 ## Platform support
 
-**✓** supported · **◑** partial · **–** not supported · **🚧** planned.
-
-<!-- KEEP IN SYNC with docs/reference/platforms.md (the canonical matrix) and the code. -->
-
-| Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | iOS (Simulator) | macOS |
-|---|:--:|:--:|:--:|:--:|:--:|
-| Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb | ✓ AX |
-| Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ the Simulator | ✓ Seatbelt |
-| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
-
-Full matrix, per-capability detail, and system requirements:
-[docs/reference/platforms.md](docs/reference/platforms.md). Transport is MCP over stdio (default) or
-network HTTP.
+The [platform reference](docs/reference/platforms.md) is the canonical capability matrix, with
+system requirements, mobile companion requirements and desktop preview limits. Capture, input,
+accessibility, clipboard and window management have platform-specific restrictions. Transport is
+MCP over stdio (the binary default) or Streamable HTTP; resident macOS and Windows apps serve HTTP.
 
 ## Documentation
 
@@ -165,4 +139,4 @@ Contributing? [`CONTRIBUTING.md`](CONTRIBUTING.md) has the gates a PR has to pas
 
 ## License
 
-glass is **open core**, licensed **Apache-2.0** — see [`LICENSE-APACHE`](LICENSE-APACHE).
+Glass is **open source**, licensed **Apache-2.0** — see [`LICENSE-APACHE`](LICENSE-APACHE).

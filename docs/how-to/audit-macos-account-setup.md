@@ -176,16 +176,10 @@ Screen Sharing does not eliminate every administrator check in Glass's startup i
 
 ## Remove enrollment by hand
 
-If Glass is available, the supported normal-user command is:
-
-```bash
-/Applications/GlassMcp.app/Contents/MacOS/glass-mcp unenroll
-```
-
-It completes workspace recovery before requesting privileged registration removal. If the app has
-already been removed, follow [Unenroll by hand](setup-macos.md#unenroll-by-hand), including the
-ownership, running-work and permission-journal checks. That procedure retains the development
-account and files. Removing job files alone cannot restore unfinished workspace permission changes.
+Use `glass-mcp unenroll` while the app is installed. If it is unavailable, follow
+[Remove a macOS enrollment manually](remove-macos-enrollment-manually.md), including its account
+identity, running-work and permission-journal checks. Removing job files alone cannot restore
+unfinished workspace access.
 
 ## What does not have a complete manual equivalent
 

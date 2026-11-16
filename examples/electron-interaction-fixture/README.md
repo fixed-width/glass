@@ -12,7 +12,7 @@ npm ci
 npm run package
 ```
 
-`package-lock.json` pins Electron 44.2.0. The build copies its distribution into
+`package-lock.json` pins the Electron runtime version. The build copies its distribution into
 `dist/interaction-fixture-linux`, installs the application under `resources/app`, and produces a
 `fixture-build.json` with the runtime version and every packaged file's digest. Launch
 `dist/interaction-fixture-linux/interaction-fixture`. The distribution includes Electron's license
