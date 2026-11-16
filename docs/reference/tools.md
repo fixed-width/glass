@@ -3,7 +3,7 @@
 
 # Tool reference
 
-Every tool glass exposes to an agent over MCP. Tools are grouped by purpose; within a group each
+Every tool Glass exposes to an agent over MCP. Tools are grouped by purpose; within a group each
 entry gives the tool's parameters, what it returns, and any platform limits.
 
 For the concepts behind these tools — the build→see→interact→debug loop and why the observe tools
@@ -108,13 +108,13 @@ Every tool returns, on success, one leading text content block in a fixed shape:
 
 Each tool's entry below gives its `result` shape as a "Returns" line.
 
-`result` holds only glass-computed or glass-echoed fields — ids, geometry, counts, elapsed times,
+`result` holds only Glass-computed or Glass-echoed fields — ids, geometry, counts, elapsed times,
 matched flags. Bulk text the *target app* controls — the `glass_a11y_snapshot` outline, `glass_logs`
 lines, clipboard text, the `glass_list_windows` array (window titles are app-supplied), the
 `glass_a11y_marks` legend, and the matched element from `glass_wait_for_element` /
 `glass_scroll_to_element` and matched line from `glass_wait_for_log` — never rides inside `result`. It
 follows as its own subsequent content block, wrapped in an untrusted marker, so an app that puts an
-instruction-shaped string in an element name or a log line can't pass it off as glass itself
+instruction-shaped string in an element name or a log line can't pass it off as Glass itself
 instructing the agent.
 
 A capture tool (`glass_screenshot`, `glass_wait_stable` with an image, `glass_a11y_marks`, and
@@ -140,7 +140,7 @@ excluded from text-byte accounting. A response at or below the ceiling is byte-c
 original response: its content and order are unchanged, and it receives no new `result.output`
 metadata.
 
-For an oversized response, glass replaces complete logical text blocks with read-only
+For an oversized response, Glass replaces complete logical text blocks with read-only
 `glass-artifact://` resource links. The links remain in the original block positions, and MCP
 `resources/read` returns the exact omitted text. If the links plus the result envelope cannot fit,
 the response instead contains one whole-response manifest link; that resource uses schema
@@ -281,7 +281,7 @@ reaches it; and an app with no window to ask is terminated immediately — one t
 the request and will not act on it. Toolkit apps opt in; a bare-Xlib one may not.
 
 One reporting limit: on Wayland the compositor performs the ask, and it disconnects a client that
-has no close protocol instead of asking it. glass sees the same thing either way — the window is
+has no close protocol instead of asking it. Glass sees the same thing either way — the window is
 gone — so that case is reported as a clean close rather than as a termination. The X11 backend
 reads the protocol list itself and does distinguish them.
 
@@ -541,7 +541,7 @@ no sibling on timeout. Resume reading from the returned `cursor`.
 ## Input
 
 Every tool in this section returns an empty `result:{}` on success. `ok:true` confirms only that
-glass dispatched the action without an input error; it does not prove runtime state. Verify the
+Glass dispatched the action without an input error; it does not prove runtime state. Verify the
 expected outcome with `glass_wait_for_element` (`name`, `description` and/or `role`, plus
 `value` for exact text or `value_contains` for a substring), `glass_wait_for_region`, or
 `glass_wait_stable`. The one exception is
@@ -614,12 +614,12 @@ Scroll at window-relative coordinates by wheel notches.
 - `dx`, `dy` (integer, range -100–100) — horizontal/vertical scroll in **wheel notches**
   (discrete clicks — normal usage is small integers like 1–5, not pixels). Positive `dy` is
   wheel-down, negative wheel-up; positive `dx` reveals content to the **right**, negative to the
-  left. glass clicks `|dx|`/`|dy|` times. Values outside the safe range are rejected before input
+  left. Glass clicks `|dx|`/`|dy|` times. Values outside the safe range are rejected before input
   dispatch. How an app maps a notch to its view (lines, pixels, zoom) is the app's choice.
 - `modifiers` (array of string) — keys held during the scroll.
 
 > **On touch backends (Android, iOS), `glass_scroll` is a real one-finger swipe — it is *input*,
-> not an inert viewport nudge.** There is no wheel on touch; glass reproduces a scroll as a finger
+> not an inert viewport nudge.** There is no wheel on touch; Glass reproduces a scroll as a finger
 > drag anchored at `x,y`, travelling roughly `notches × 120 px` opposite the wheel direction (the
 > resulting pan is then amplified and made non-linear by the view's fling/deceleration, so it is not
 > a fixed distance per notch). Three things follow:
@@ -670,12 +670,12 @@ arbitrary multi-pointer gestures. The **iOS** backend actuates a **two-finger pi
 whose separation changes — and refuses anything else by name: a rotation, a two-finger pan, a
 stationary pair, three or more pointers, two pointers starting at the same point, or fingers
 starting closer than 8pt from the centre. The pinch is delivered about the midpoint of the two
-start points, so even a gesture that holds one finger still moves both. What glass preserves is the
+start points, so even a gesture that holds one finger still moves both. What Glass preserves is the
 requested scale factor, not the individual finger paths; the delivered factor differs from the
 request by a few percent, and by more as the fingers start closer together. A separation change
 under 5% is refused rather than actuated, because it cannot be told apart from that delivery
 error. On iOS a `duration_ms` of 0 becomes 300ms, matching the backend's swipe default. It also needs an `idb_companion` that implements
-the event — glass reports the binary and its build info if yours does not. Other backends return
+the event — Glass reports the binary and its build info if yours does not. Other backends return
 `Unsupported`.
 
 ### `glass_do`
@@ -833,7 +833,7 @@ rides as an untrusted sibling text block, one line per element:
 `#<id> <Role> "<name>" desc="<description>" (x,y wxh) [states]`; pass an `#id` to
 `glass_click_element`. `desc="…"` carries a secondary label the platform exposes separately from
 the name — help or tooltip text, or the human-readable label where the name is a
-developer-assigned id. It appears only where glass's reader sources that label: the AT-SPI (Linux)
+developer-assigned id. It appears only where Glass' reader sources that label: the AT-SPI (Linux)
 reader reads AT-SPI `Description`, the UI Automation (Windows) reader reads `HelpText`, the AX
 (macOS) reader reads `AXHelp`, else `AXDescription` where `AXTitle` already supplied the name, the
 Android readers read whichever of the element's text and content-description did not become the
@@ -878,7 +878,7 @@ hint but no content description and no resource id has nothing left to name it, 
 unnamed but described, rendering as `#35 TextField desc="Search settings"`, which
 `glass_a11y_marks` labels from that description (see below).
 
-An element whose platform role glass has no mapping for renders as `Other(<native token>)` — e.g.
+An element whose platform role Glass has no mapping for renders as `Other(<native token>)` — e.g.
 `#4 Other(AXDisclosureTriangle) "Details" [enabled]` — so the platform's own token is still
 visible; a bare `Other` means the platform named no token at all.
 
@@ -1171,7 +1171,7 @@ with selectable text. Returns `Unsupported` where the backend can't provide clip
 Linux displays and a contained Windows app, the clipboard is a private box isolated from your real
 system clipboard. In shared-desktop mode (`GLASS_DISPLAY=:0`) or an uncontained backend
 (`sandbox: off`), get/set act on your **real** system clipboard — snapshot with `glass_clipboard_get`
-first to preserve it. On a contained macOS app **not** built with the hardened runtime, glass
+first to preserve it. On a contained macOS app **not** built with the hardened runtime, Glass
 redirects to a private pasteboard it shares (isolated, fully working); a hardened-runtime app (App
 Store / notarized) can't be redirected and returns Unsupported.
 
@@ -1186,11 +1186,11 @@ Write text to the app's clipboard so it can paste it. On success, `result` is `{
 Linux displays and a contained Windows app, the clipboard is a private box isolated from your real
 system clipboard. In shared-desktop mode (`GLASS_DISPLAY=:0`) or an uncontained backend
 (`sandbox: off`), get/set act on your **real** system clipboard — snapshot with `glass_clipboard_get`
-first to preserve it. On a contained macOS app **not** built with the hardened runtime, glass
+first to preserve it. On a contained macOS app **not** built with the hardened runtime, Glass
 redirects to a private pasteboard it shares (isolated, fully working); a hardened-runtime app (App
 Store / notarized) can't be redirected and returns Unsupported.
 
-> **iOS paste-consent:** when the app then reads a pasteboard glass wrote (`glass_clipboard_set` → an
+> **iOS paste-consent:** when the app then reads a pasteboard Glass wrote (`glass_clipboard_set` → an
 > in-app `UIPasteboard` read), iOS raises a SpringBoard consent alert and the *first* read returns
 > nothing. Click **Allow Paste** (it appears in the a11y tree) and retry — the two-step flow is in
 > [setup-ios.md](../how-to/setup-ios.md#clipboard).
@@ -1230,7 +1230,7 @@ on timeout, `matched:false` and no line. Waiting requires an active session.
 
 ### `glass_doctor`
 
-Diagnose the glass environment and report per-check status with a remedy for anything missing. Use
+Diagnose the Glass environment and report per-check status with a remedy for anything missing. Use
 it to self-diagnose a `glass_start` failure.
 
 - `deep` (boolean, default false) — also spawn and tear down the default backend's headless display

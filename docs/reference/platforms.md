@@ -1,8 +1,8 @@
-<!-- KEEP IN SYNC with the code (and README.md's compact matrix, and CLAUDE.md) whenever capabilities change. -->
+<!-- KEEP IN SYNC with the code (and README.md's compact matrix, and AGENTS.md) whenever capabilities change. -->
 
 # Platform support
 
-Where glass stands by OS. **✓** supported · **◑** partial · **–** not supported · **🚧** planned.
+Where Glass stands by OS. **✓** supported · **◑** partial · **–** not supported · **🚧** planned.
 
 | Capability | Linux (X11 + Wayland) | Windows | Android (AVD) | iOS (Simulator) | macOS |
 |---|:--:|:--:|:--:|:--:|:--:|
@@ -14,8 +14,8 @@ Where glass stands by OS. **✓** supported · **◑** partial · **–** not su
 | Explicit native focus | ✓ AT-SPI | ✓ UIA SetFocus | ◑ companion accessibility click; UIAutomator uses pointer focus | – pointer only; focus cannot be confirmed from idb | ✓ AXFocused |
 | Pointer occlusion proof | ✓ AT-SPI hit test | ✓ UIA element-from-point | ◑ companion can reject covering windows; within-window unproven | ◑ idb point query with unique identifiers | ✓ AX element-at-position |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie Classic | ✓ the emulator VM | ✓ the Simulator | ✓ ‡ |
-| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
+| Input without desktop interference | ✓ private display | ◑ child session (preview) | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ child session (preview) | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
 
 Input without desktop interference means the agent's pointer and keyboard stay separate from yours.
 It is already provided by owned Linux displays, the Android emulator and the iOS Simulator, using
@@ -131,7 +131,7 @@ Linux binaries (the bare Windows binary keeps its `.exe`). See
 
 ## Notes
 
-**† Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and glass
+**† Android** is emulator-only. Capture, multi-window, input, and logs work over `adb`, and Glass
 manages the AVD (attach a running one, or boot a headless one). Clipboard, high-fidelity input, and
 multi-touch gestures (`glass_gesture`) use the optional on-device agent, and an optional on-device
 AccessibilityService sharpens the a11y tree (Compose) and `glass_set_value`. Without the agent, input
@@ -155,7 +155,7 @@ reader. System windows outside those types and focused covering windows are not 
 **§ iOS** is Simulator-only — macOS host required (`xcrun`/`simctl` ship with Xcode). Capture,
 clipboard, and logs work over `simctl`; pointer/keyboard input (tap, type, swipe, scroll) and the
 accessibility tree (snapshot, click-element, set-value) run over `idb_companion` (`brew install
-idb-companion`), which glass spawns and manages per Simulator. `glass_gesture` actuates a two-finger
+idb-companion`), which Glass spawns and manages per Simulator. `glass_gesture` actuates a two-finger
 pinch, given a companion that implements idb's `HIDPinch`; other multi-touch gestures are refused by
 name. Without `idb_companion` the input and
 accessibility tools return an unsupported error; capture, logs, and clipboard keep working. Window
@@ -164,7 +164,7 @@ device, are always fullscreen. The host-independent logic — device resolution,
 argument construction, JSON→tree mapping, doctor checks — runs in CI; the on-box path (input landing
 at the right coordinate, the a11y tree, clear-then-type) is exercised by `#[ignore]`d integration
 tests on a macOS host with a booted Simulator (no CI wiring on the macOS runner yet). Containment has
-no separate glass-managed step, the same as Android — the Simulator's per-app data container is the
+no separate Glass-managed step, the same as Android — the Simulator's per-app data container is the
 isolation boundary.
 
 The idb accessibility schema does not publish reliable `visible`, `focused`, or `focusable` facts.

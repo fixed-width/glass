@@ -1,4 +1,4 @@
-# Run glass over the network
+# Run Glass over the network
 
 stdio requires `glass-mcp` to run on the **same machine** as the agent. When the agent and the target
 app are on different machines, run `glass-mcp` as a network server on the app's machine (rmcp
@@ -26,8 +26,8 @@ The client supplies the token as an `Authorization: Bearer <token>` header (chec
 for its bearer-token / headers field). Binding a non-loopback address **without** a token is refused
 at startup — fail-closed. You can pass the token via `GLASS_TOKEN` instead of `--token-file`.
 
-> **Token-file permissions on Windows.** On Linux, glass forces the token file to owner-only
-> (`0600`). On Windows the file inherits the **permissions of the folder** you write it into; glass
+> **Token-file permissions on Windows.** On Linux, Glass forces the token file to owner-only
+> (`0600`). On Windows the file inherits the **permissions of the folder** you write it into; Glass
 > does not yet set an explicit owner-only ACL. Keep `--out` inside your per-user profile (e.g.
 > `%USERPROFILE%\.glass`), whose default permissions already restrict it to you, SYSTEM, and
 > Administrators. **Don't** write it to a shared, world-readable, or cloud-synced (OneDrive-backed)
@@ -45,7 +45,7 @@ ssh -L 7300:127.0.0.1:7300 user@appbox
 glass-mcp serve --http
 ```
 
-Then point the client at `http://127.0.0.1:7300/`. The connection is encrypted by SSH; glass itself
+Then point the client at `http://127.0.0.1:7300/`. The connection is encrypted by SSH; Glass itself
 does not own TLS. (Windows 10/11 ship the OpenSSH client, so the same flow works there.)
 
 Register the resulting endpoint with your client as in [connect-an-agent.md](connect-an-agent.md#over-http).

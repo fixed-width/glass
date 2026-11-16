@@ -1,4 +1,4 @@
-# Set up glass for iOS
+# Set up Glass for iOS
 
 The iOS backend drives a native app on an **iOS Simulator** over `xcrun simctl`. It is
 **macOS-only** — the Simulator only runs on macOS, and `xcrun`/`simctl` ship with Xcode — so
@@ -45,24 +45,24 @@ xcrun simctl create "iPhone glass" "iPhone 17"
 
 ## Attach-or-boot
 
-Like the Android backend, glass prefers to attach: if a Simulator is already booted it uses it;
+Like the Android backend, Glass prefers to attach: if a Simulator is already booted it uses it;
 otherwise it boots the newest available iPhone simulator itself and asks it to shut down again
-when glass exits. The request is handed to CoreSimulator, which takes a few seconds and finishes
-after glass has gone — so `xcrun simctl list devices` can still show it Booted for a moment.
+when Glass exits. The request is handed to CoreSimulator, which takes a few seconds and finishes
+after Glass has gone — so `xcrun simctl list devices` can still show it Booted for a moment.
 
 - `GLASS_IOS_UDID` — drive an exact device by UDID (see `xcrun simctl list devices`).
 - `GLASS_IOS_DEVICE` — boot a device by name, e.g. `"iPhone 17"` or `"iPad Pro 13-inch"`, when
   none is running (ignored if `GLASS_IOS_UDID` is set). Names any iOS-family simulator — iPhone or
   iPad; watchOS, tvOS, and visionOS simulators are not eligible, whether attaching to an
   already-booted one or booting one by name.
-- `GLASS_SIMULATOR_KEEP` — set to keep a glass-booted Simulator running past shutdown instead of
+- `GLASS_SIMULATOR_KEEP` — set to keep a Glass-booted Simulator running past shutdown instead of
   shutting it down.
 
 (All variables: [reference/environment.md](../reference/environment.md).)
 
 ## Launching an app
 
-`glass_start`'s `run[0]` is either a path to a `.app` bundle (glass installs it on the Simulator
+`glass_start`'s `run[0]` is either a path to a `.app` bundle (Glass installs it on the Simulator
 for you) or the bundle id of an app already installed, e.g.:
 
 ```jsonc
@@ -77,7 +77,7 @@ are unsupported, matching a real device).
 ## Input & accessibility
 
 Tapping, typing, swiping, scrolling, and reading the accessibility tree run over
-[`idb_companion`](https://github.com/facebook/idb), Meta's iOS automation companion. glass spawns and
+[`idb_companion`](https://github.com/facebook/idb), Meta's iOS automation companion. Glass spawns and
 manages one per Simulator and shuts it down again on stop; you only need the binary installed:
 
 ```bash
@@ -102,13 +102,13 @@ With `idb_companion` on `PATH`, these tools work against the Simulator:
 
   A pinch also needs an `idb_companion` that implements idb's `HIDPinch` event. As of 2026-08,
   Homebrew ships idb-companion 1.1.8 (built August 2022), which does not; prebuilt newer companions
-  are published on idb's GitHub releases. If yours does not implement it, glass names the binary and
+  are published on idb's GitHub releases. If yours does not implement it, Glass names the binary and
   quotes its `--version` output rather than failing opaquely.
 
 If `idb_companion` isn't installed, the input and accessibility tools return an unsupported error,
 while capture, logs, and clipboard keep working.
 
-glass finds `idb_companion` on `PATH`, and — because a `.app` / LaunchAgent launch runs with a
+Glass finds `idb_companion` on `PATH`, and — because a `.app` / LaunchAgent launch runs with a
 minimal `PATH` that omits Homebrew's bindir — also probes the standard Homebrew locations
 (`/opt/homebrew/bin`, `/usr/local/bin`), so a `brew install` is picked up with no extra setup. It
 takes the first copy it can actually execute, and reports one it cannot (`doctor` then asks for a
@@ -127,7 +127,7 @@ which is exactly `glass_clipboard_set` followed by an in-app paste — iOS raise
 
 1. `glass_clipboard_set { "text": "…" }`, then drive the app control that reads
    `UIPasteboard.general`.
-2. That first read comes back empty and the consent alert appears. glass surfaces it in the
+2. That first read comes back empty and the consent alert appears. Glass surfaces it in the
    accessibility tree — the frontmost app's name briefly blanks to `" "` while SpringBoard's alert is
    up — so `glass_a11y_snapshot`, then `glass_click_element` the **Allow Paste** button.
 3. Drive the control again; the app now reads the value (the grant sticks, so the retry doesn't
@@ -144,8 +144,8 @@ GLASS_BACKEND=ios glass-mcp doctor
 ```
 
 Reports whether full Xcode is active, `simctl` works, an iOS runtime is downloaded, which simulator
-glass would drive (it boots one itself at start unless `GLASS_IOS_UDID` pins a specific device — a
-pin that is not booted is reported as a failure, since glass attaches to it without booting), and
+Glass would drive (it boots one itself at start unless `GLASS_IOS_UDID` pins a specific device — a
+pin that is not booted is reported as a failure, since Glass attaches to it without booting), and
 whether `idb_companion` is installed (for input + accessibility) — each failing
 check comes with its own remedy (the commands above). The `[ios]` section (including the
 `idb_companion` line) also appears when iOS is driven per-call from a server whose default backend is

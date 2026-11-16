@@ -1,6 +1,6 @@
 # Audit log
 
-glass can append a JSONL record of every actuation it performs. It is **opt-in**: pass
+Glass can append a JSONL record of every actuation it performs. It is **opt-in**: pass
 `--audit-log <path>` or set `GLASS_AUDIT_LOG=<path>` (see [reference/environment.md](environment.md)).
 The hook lives in the core actuation path, so no actuation can bypass it. `glass-mcp doctor` reports
 whether auditing is on, the path, and the content mode.

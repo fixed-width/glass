@@ -1,4 +1,4 @@
-# Set up glass on macOS
+# Set up Glass on macOS
 
 On macOS, install a **notarized `.dmg`**. Glass uses a real Aqua login and two macOS privacy
 grants. The existing shared-desktop setup is below; separate-account setup is available as a preview. (Contributors and anyone
@@ -74,7 +74,7 @@ Stop any current Glass application with `glass_stop` before changing its environ
    spent approving administrator authentication does not count against worker startup. While native registration, repair or disable is in progress, finish
    or cancel the macOS authentication dialogue before closing Glass; its cleanup completes as one step.
 6. Connect the agent to the normal Glass endpoint, normally `http://127.0.0.1:7300/`; see
-   [Connect glass to your agent](connect-an-agent.md#over-http). Existing menu-bar integration keeps
+   [Connect Glass to your agent](connect-an-agent.md#over-http). Existing menu-bar integration keeps
    the address it is serving. The agent uses the ordinary build, capture, accessibility, input, logs
    and stop tools while you stay in your normal account.
 
@@ -517,19 +517,19 @@ That's the whole setup. The MCP endpoint is `http://127.0.0.1:7300/` — head to
 Once granted, `GlassMcp.app` runs as a **visible menu-bar app** — look for **`glass ●`** in the menu
 bar. It starts automatically at login (via the LaunchAgent) and its dropdown shows:
 
-- the **served endpoint** (or a notice if another glass is already bound to it),
+- the **served endpoint** (or a notice if another Glass is already bound to it),
 - **Copy endpoint** — copy the MCP endpoint to your clipboard,
 - **Restart** — restart the background agent (e.g. after a fresh grant),
 - **Quit glass** — stop the agent,
-- **Uninstall glass…** — stop glass from starting at login and quit it now (see [Uninstall](#uninstall)).
+- **Uninstall glass…** — stop Glass from starting at login and quit it now (see [Uninstall](#uninstall)).
 
-glass is deliberately never a silent, invisible background process: it holds Screen Recording and
+Glass is deliberately never a silent, invisible background process: it holds Screen Recording and
 Accessibility, so it stays something you can always see and stop. **Quit glass** actually stops it — the
 LaunchAgent won't relaunch it behind your back — until you next log in or relaunch `GlassMcp.app`.
 
 ## Keep the Mac awake
 
-With shared-desktop setup, glass captures and drives the real desktop, so a sleeping or locked display has nothing to grab. On a
+With shared-desktop setup, Glass captures and drives the real desktop, so a sleeping or locked display has nothing to grab. On a
 box you're not actively using, hold it awake and unlocked:
 
 ```bash
@@ -548,22 +548,22 @@ MCP, but it's handy from a terminal. Symlink it once:
 sudo ln -s /Applications/GlassMcp.app/Contents/MacOS/glass-mcp /usr/local/bin/glass-mcp
 ```
 
-Then `glass-mcp status` (is glass running, and at what endpoint) and `glass-mcp doctor` work as plain
+Then `glass-mcp status` (is Glass running, and at what endpoint) and `glass-mcp doctor` work as plain
 commands (see [reference/cli.md](../reference/cli.md)).
 
 ## Uninstall
 
 From the **`glass ●`** menu bar, click **Uninstall glass…** (it confirms first, since uninstalling
-also quits glass). Or from a terminal, `glass-mcp uninstall`. Stop active application work first.
+also quits Glass). Or from a terminal, `glass-mcp uninstall`. Stop active application work first.
 For an enrolled account, uninstall restores recoverable workspace permissions and requests administrator
 authentication to remove its worker registration. It retains the account, home, permissions and app
 data. Your enrollment is removed. To return to shared-desktop use while keeping Glass's startup
 integration, use `glass-mcp unenroll` instead.
 
 Either path also removes
-`~/Library/LaunchAgents/tech.fixedwidth.glass.plist` and boots out the running job, so glass stops
+`~/Library/LaunchAgents/tech.fixedwidth.glass.plist` and boots out the running job, so Glass stops
 starting at login. Neither touches the app bundle — drag `GlassMcp.app` to the Trash afterward to
-remove glass entirely.
+remove Glass entirely.
 
 Run uninstall before deleting the app bundle. If you deleted it while an account was still enrolled,
 follow [unenrolling by hand](#unenroll-by-hand) for the account worker. To also remove the normal

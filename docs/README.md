@@ -1,21 +1,21 @@
-# glass documentation
+# Glass documentation
 
-Organized by what you need right now. New to glass? Start with the tutorial. Setting something up?
-Head to the how-to guides. Looking up a fact? The reference. Want to understand why glass works the
+Organized by what you need right now. New to Glass? Start with the tutorial. Setting something up?
+Head to the how-to guides. Looking up a fact? The reference. Want to understand why Glass works the
 way it does? The explanations.
 
-> **Driving glass with an agent?** Install the [glass-drive skill](how-to/drive-glass-well.md) so your
+> **Driving Glass with an agent?** Install the [glass-drive skill](how-to/drive-glass-well.md) so your
 > agent arrives already knowing the cheap-verify loop, instead of spending its first turns
 > rediscovering it.
 
 ## Tutorial — learn by doing
 
-- [Your first drive](tutorial/first-drive.md) — build glass, point an agent at a test window, and
+- [Your first drive](tutorial/first-drive.md) — build Glass, point an agent at a test window, and
   watch it close the build → see → interact → debug loop (Linux/X11, ~10 minutes).
 
 ## How-to guides — get something done
 
-**Set up glass for your host**
+**Set up Glass for your host**
 
 - [Linux](how-to/setup-linux.md) — X11 and Wayland
 - [Windows](how-to/setup-windows.md)
@@ -27,9 +27,9 @@ way it does? The explanations.
 
 **Connect and drive**
 
-- [Connect glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP
-- [Drive glass well — the glass-drive skill](how-to/drive-glass-well.md)
-- [Run glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
+- [Connect Glass to your agent](how-to/connect-an-agent.md) — stdio and HTTP
+- [Drive Glass well — the glass-drive skill](how-to/drive-glass-well.md)
+- [Run Glass over the network](how-to/run-over-the-network.md) — agent and app on different machines
 - [Capture a smaller image](how-to/capture-a-smaller-image.md) — size bounds and native coordinate mapping
 - [Record and export session evidence](how-to/record-session-evidence.md) — retain requested results for offline review
 - [Drive a native iOS app in the Simulator](how-to/drive-an-ios-app.md) — launch, drive, and verify an iOS app
@@ -50,7 +50,7 @@ way it does? The explanations.
 ## Reference — look up a fact
 
 - [Tools](reference/tools.md) — every `glass_*` tool, its parameters, and platform support
-- [Host compatibility](reference/host-compatibility.md) — which MCP hosts are verified, and what glass needs from any host
+- [Host compatibility](reference/host-compatibility.md) — which MCP hosts are verified, and what Glass needs from any host
 - [Stability and versioning](reference/stability.md) — the semver promise: what's covered from 1.0
 - [Environment variables](reference/environment.md) — every `GLASS_*` variable
 - [CLI](reference/cli.md) — `glass-mcp` subcommands

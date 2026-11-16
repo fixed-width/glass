@@ -81,7 +81,7 @@ Generate a cryptographically-random bearer token for the HTTP transport.
 
 ## `doctor`
 
-Check that the environment glass needs is in place — the backend's display dependency, the
+Check that the environment Glass needs is in place — the backend's display dependency, the
 containment runtime, and external tool paths — and print how to fix anything missing. Exits non-zero
 if the default backend can't run (CI-friendly). The agent can run the same checks via the
 `glass_doctor` tool.
@@ -129,7 +129,7 @@ workspace access, recovery and qualification limits.
 
 ## `status`
 
-Report whether glass is running and at what endpoint (reads `/healthz`). Primarily used with the
+Report whether Glass is running and at what endpoint (reads `/healthz`). Primarily used with the
 macOS menu-bar LaunchAgent. An enrolled macOS account also reports whether it is idle, in use or
 disabled, without starting a worker — see [how-to/setup-macos.md](../how-to/setup-macos.md).
 
@@ -177,7 +177,7 @@ plain error message with no JSON.) Its fields:
 - **A from-source build.** A binary built locally (its version carries a `git describe` suffix)
   is not something a release binary should silently replace — rebuild it with `git pull && cargo
   build --release` instead.
-- **macOS.** glass installs there as `GlassMcp.app`, not a bare binary — download the latest `.dmg`
+- **macOS.** Glass installs there as `GlassMcp.app`, not a bare binary — download the latest `.dmg`
   instead (see [how-to/setup-macos.md](../how-to/setup-macos.md)).
 - **An unsupported architecture**, where no release asset is published — build from source instead
   (see [how-to/build-from-source.md](../how-to/build-from-source.md)).
@@ -208,7 +208,7 @@ If the app bundle has already been removed, see
 
 ## `uninstall`
 
-Stop glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
+Stop Glass from starting at login: remove the LaunchAgent and boot out the running job (macOS). Does
 not remove the app bundle. For account setup, stop active work first: uninstall restores recoverable
 workspace permissions and removes only Glass’s worker registration with administrator authentication.
 The account, home and app data remain. Use `unenroll` to keep the ordinary startup integration while

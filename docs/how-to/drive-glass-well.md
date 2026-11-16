@@ -1,6 +1,6 @@
-# Drive glass well — the `glass-drive` skill
+# Drive Glass well — the `glass-drive` skill
 
-glass works with any MCP agent as-is, with no app integration and no skill required. But an agent
+Glass works with any MCP agent as-is, with no app integration and no skill required. But an agent
 drives it *more reliably* with a little guidance — and without that guidance an agent spends its first
 several turns rediscovering the loop by trial and error. The habits that matter:
 
@@ -21,8 +21,8 @@ npx skills add fixed-width/skills -s glass-drive
 ```
 
 Install it once for your agent and it arrives already knowing the driving loop, instead of learning it
-on your time. It stays optional — glass needs neither the skill nor any app cooperation to run — but
-it is the single highest-leverage thing you can add when pointing an agent at glass.
+on your time. It stays optional — Glass needs neither the skill nor any app cooperation to run — but
+it is the single highest-leverage thing you can add when pointing an agent at Glass.
 
 For the reasoning behind the cheap-verify loop the skill encodes, see
 [the build → see → interact → debug loop](../explanation/the-loop.md); for the tools it reaches for,

@@ -1,6 +1,6 @@
 # Backends and display isolation
 
-glass presents the same tools on every platform, but *where* the app runs and *how* it is captured
+Glass presents the same tools on every platform, but *where* the app runs and *how* it is captured
 differ underneath. That variation is hidden behind a `Platform` seam in `glass-core`: the core stays
 platform-agnostic, and each backend maps the common operations — capture, input, window enumeration —
 to one OS's mechanisms. This is why the MCP tools behave identically across backends and only the
@@ -36,28 +36,28 @@ The setup for each lives in the how-to guides; the support matrix is in
 
 ## Display isolation: keeping the app off your desktop
 
-A recurring goal is that the app glass drives should not land on *your* screen, fighting you for the
+A recurring goal is that the app Glass drives should not land on *your* screen, fighting you for the
 cursor. How well that is achieved is a property of the backend, and it is the sharpest difference
 between them.
 
 On **Linux**, isolation is the default and it is real: each session gets its **own** headless display
-— a private `Xvfb` (X11) or a private `sway` (Wayland) that glass spawns and tears down. The app
-renders into a framebuffer that only glass reads. Nothing appears on your desktop, and there is
+— a private `Xvfb` (X11) or a private `sway` (Wayland) that Glass spawns and tears down. The app
+renders into a framebuffer that only Glass reads. Nothing appears on your desktop, and there is
 nothing to set up or keep running.
 
 This is why the X11 backend **never reads the ambient `$DISPLAY`**. It takes its display only from
-`GLASS_DISPLAY`, so the environment you launch from can't accidentally aim glass at your live desktop.
+`GLASS_DISPLAY`, so the environment you launch from can't accidentally aim Glass at your live desktop.
 Three cases follow from that one rule: unset means a fresh private `Xvfb`; `:N` attaches to a
 persistent display you manage (handy for watching over VNC); and `:0` deliberately drives your real
 desktop — which only ever happens because you asked for it by name.
 
-On **Android**, the emulator provides the same isolation for free: glass can boot a headless AVD that
-is entirely separate from your session. On **iOS**, the Simulator gives the same result: glass boots it
+On **Android**, the emulator provides the same isolation for free: Glass can boot a headless AVD that
+is entirely separate from your session. On **iOS**, the Simulator gives the same result: Glass boots it
 through `simctl` without opening the Simulator app, so the app it drives never appears on your desktop.
 
 On **Windows**, isolation is weaker. There is one interactive desktop, and even a virtual-display
 driver only adds a monitor to *that* desktop rather than walling the app off — for full isolation you
-run glass inside a VM. On **macOS**, shared-desktop setup drives the current Aqua session. The
+run Glass inside a VM. On **macOS**, shared-desktop setup drives the current Aqua session. The
 [account setup preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) routes the same tools
 to a separate account’s retained Aqua login in the same OS.
 
@@ -79,11 +79,11 @@ app, copying through a shared clipboard and filesystem/network access have separ
 
 ## The live-desktop non-goal on Wayland
 
-On X11, pointing glass at your running desktop is a one-line opt-in (`GLASS_DISPLAY=:0`). The Wayland
+On X11, pointing Glass at your running desktop is a one-line opt-in (`GLASS_DISPLAY=:0`). The Wayland
 analog — driving your existing live compositor session — is a deliberate **non-goal**. Wayland has no
 equivalent ambient-display handle; reaching a live session means going through the XDG desktop portal,
 which raises an interactive consent dialog. That is fundamentally unsuited to the unattended,
-agent-driven use glass is built for, so the Wayland backend always spawns its own headless sway
-instead. The upshot is a feature, not a limitation: because the app runs inside the compositor glass
+agent-driven use Glass is built for, so the Wayland backend always spawns its own headless sway
+instead. The upshot is a feature, not a limitation: because the app runs inside the compositor Glass
 spawns, the Wayland backend works on **any** Linux host — including GNOME and KDE desktops, where the
 host's own compositor is simply irrelevant.

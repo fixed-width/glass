@@ -1,6 +1,6 @@
 # Stability and versioning
 
-glass follows [Semantic Versioning](https://semver.org). From **1.0.0** onward, the version number
+Glass follows [Semantic Versioning](https://semver.org). From **1.0.0** onward, the version number
 tells you what a change can do to the surface your agent depends on:
 
 - **Major** (`2.0.0`) — a breaking change to the covered surface below is allowed.
@@ -14,7 +14,7 @@ Before 1.0 (the `0.x` series), any release may change anything. This policy take
 
 ## What is covered
 
-Within a major version, these are stable — glass will not change them incompatibly:
+Within a major version, these are stable — Glass will not change them incompatibly:
 
 - **Tool names** — the `glass_*` tool an agent calls.
 - **Parameters** — each tool's parameter names and types, and which are required.
@@ -42,18 +42,18 @@ These may change in any release, including a patch, and are not a breaking chang
   value still returns an error, a failed capture still fails rather than returning a blank frame — but
   the message text may be reworded to be clearer (including for an agent reading it to self-correct).
 - **Internal timing and performance** — poll intervals, retry counts, how long an operation takes.
-- **Log-line formatting** — the text of glass's own diagnostic logging.
+- **Log-line formatting** — the text of Glass' own diagnostic logging.
 
 ## Notes for agent authors
 
 An MCP agent re-reads the tool list, descriptions, input schemas, and error messages at run time, so
 it adapts to an additive change on its own — a new tool or a new optional parameter needs nothing from
-you. Because an agent reads the *schema and descriptions* (not this changelog), glass signals a
+you. Because an agent reads the *schema and descriptions* (not this changelog), Glass signals a
 deprecation where the agent will see it:
 
 - A deprecated parameter or `result` field is marked `(deprecated: use X)` **in its description**, and
   keeps working — accepted on input, still emitted in output — for at least one minor release before a
-  major removes it. glass will not remove a covered field silently, because an agent reading an absent
+  major removes it. Glass will not remove a covered field silently, because an agent reading an absent
   field as null could misbehave with no error to catch.
 
 If you pin behavior in a skill or prompt (for example, teaching an agent to read `result.matched`),
@@ -68,4 +68,3 @@ tool may be removed, in any release — until it is promoted to stable in a late
 new tool's shape settle against real use before it is locked.
 
 `glass_a11y_snapshot_diff` is **experimental**. Other tools are stable.
-

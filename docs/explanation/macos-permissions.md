@@ -1,8 +1,8 @@
 # The macOS permission model
 
 macOS gates screen capture and input injection behind its privacy system (TCC), and the way those
-grants are recorded shapes how glass is packaged and run on the Mac. Understanding this model explains
-*why* macOS glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
+grants are recorded shapes how Glass is packaged and run on the Mac. Understanding this model explains
+*why* macOS Glass ships as a signed app plus a LaunchAgent rather than a plain binary, and how
 compatible updates can retain existing grants.
 
 Glass needs two grants that must be effective in the process running its backend:
@@ -23,9 +23,9 @@ bundle id and macOS treats it as a new app that needs a fresh grant. This is exa
 grant is keyed to never changes.
 
 **Who launches the process matters.** A bare `ssh user@mac 'glass-mcp …'` shell is attributed to
-`sshd`, which cannot hold a grant. Running glass as a **LaunchAgent** in your own login session makes
-`launchd` its parent instead — giving glass its own grantable, responsible process. That is the whole
-reason macOS glass runs as a LaunchAgent rather than a binary you `ssh` in and start.
+`sshd`, which cannot hold a grant. Running Glass as a **LaunchAgent** in your own login session makes
+`launchd` its parent instead — giving Glass its own grantable, responsible process. That is the whole
+reason macOS Glass runs as a LaunchAgent rather than a binary you `ssh` in and start.
 
 ## Fresh checks after permission changes
 

@@ -1,4 +1,4 @@
-# Contributing to glass
+# Contributing to Glass
 
 ## Build and run
 
@@ -37,7 +37,7 @@ be run locally — it saturates the machine.
 - **Comments carry a fact, not an argument** — one sentence with something the code cannot say for
   itself.
 
-`CLAUDE.md` holds the same invariants in the form an agent working in this repo needs.
+`AGENTS.md` holds the same invariants in the form an agent working in this repo needs.
 
 ## Licensing
 

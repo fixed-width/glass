@@ -2,7 +2,7 @@
 
 A browser tab or an embedded web view is not like the rest of a native UI: the accessibility tree
 for it is built by a web engine (Chromium, WebKit, Gecko) sitting inside the app, on its own
-schedule, not by the toolkit glass reads everywhere else. That difference is why web content gets
+schedule, not by the toolkit Glass reads everywhere else. That difference is why web content gets
 its own page rather than a line in the roles reference.
 
 ## Publication is not tied to the page load
@@ -12,19 +12,19 @@ here spans both outcomes: every engine read on Windows and macOS, and Firefox 15
 published within seconds of the page arriving, while Brave 151 on Linux published a placeholder and
 no tree at all inside the probe's 20 s wait (read 2026-08-24). Where an engine has not published,
 the tree it hands to the OS's accessibility layer is empty or absent no matter how populated the
-rendered page is. glass treats that as something to disclose, not to infer: it reports what it
+rendered page is. Glass treats that as something to disclose, not to infer: it reports what it
 actually read rather than what the DOM the agent can't see suggests should be there.
 
-## What glass does at launch
+## What Glass does at launch
 
-Nothing extra, on every platform. glass never pokes a browser to turn its accessibility on. On
+Nothing extra, on every platform. Glass never pokes a browser to turn its accessibility on. On
 Linux, under the private AT-SPI bus `glass_start` already spawns for every a11y-enabled session,
 Firefox 153 published its page at baseline on both X11 and Wayland; Brave 151 did not, and it
 stayed that way under both candidate levers tried on it: the `GNOME_ACCESSIBILITY=1` /
 `ACCESSIBILITY_ENABLED=1` environment pair, and the `--force-renderer-accessibility`
-command-line flag — which glass cannot inject into an arbitrary app it launches (read
+command-line flag — which Glass cannot inject into an arbitrary app it launches (read
 2026-08-24). On Windows, macOS and Android the engines examined published at baseline against
-the readers glass already runs, with no extra lever pulled to get there.
+the readers Glass already runs, with no extra lever pulled to get there.
 
 ## What an agent sees
 

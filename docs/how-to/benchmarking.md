@@ -1,7 +1,7 @@
 # Benchmark and profile the hot paths
 
 Per-frame hot-path micro-benchmarks ([criterion](https://github.com/bheisler/criterion.rs)) live in
-`crates/*/benches/`. This is contributor tooling — you don't need it to use glass.
+`crates/*/benches/`. This is contributor tooling — you don't need it to use Glass.
 
 ```bash
 # core (diff, webp encode/decode) plus the per-backend pixel conversions

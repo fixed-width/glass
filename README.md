@@ -9,11 +9,11 @@ result, without burning a screenshot on every step.
 A Rust [MCP](https://modelcontextprotocol.io) server that gives an AI coding agent a closed **build →
 see → interact → debug** loop over external native GUI applications.
 
-glass lets an agent launch a GUI app, capture what is on screen, inject mouse and keyboard input, read
+Glass lets an agent launch a GUI app, capture what is on screen, inject mouse and keyboard input, read
 the app's logs, and detect visual changes — so a coding agent can build and debug UI applications
 independently instead of asking the user "does this look right?".
 
-glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
+Glass drives apps as an external black box, so it works with any native GUI app regardless of toolkit
 or language. It has two Linux backends (**X11** and **Wayland**), a **Windows** backend, an
 **Android** backend (an AVD emulator, driven over `adb` from any host), an **iOS** backend (native
 apps in the Simulator over `xcrun simctl`, with input and the accessibility tree via `idb_companion`,
@@ -43,23 +43,23 @@ enrollment or permission setup. Unattended development-desktop startup is not im
 
 ## See it
 
-![An agent debugging a GTK app under glass](docs/assets/hero-debug-loop.gif)
+![An agent debugging a GTK app under Glass](docs/assets/hero-debug-loop.gif)
 
-An agent building a GUI app runs it under glass, reproduces a bug **from the accessibility tree**
+An agent building a GUI app runs it under Glass, reproduces a bug **from the accessibility tree**
 (no screenshots), fixes the code, and re-verifies — the loop it otherwise can't close on its own.
 [Try it yourself](#try-it-in-60-seconds).
 
 ## Try it in 60 seconds
 
-1. Download glass for your platform from the [Releases page](https://github.com/fixed-width/glass/releases/latest)
-   and [connect it to your agent](docs/how-to/connect-an-agent.md) — glass works with any MCP host
+1. Download Glass for your platform from the [Releases page](https://github.com/fixed-width/glass/releases/latest)
+   and [connect it to your agent](docs/how-to/connect-an-agent.md) — Glass works with any MCP host
    ([see which are verified](docs/reference/host-compatibility.md)).
 2. Get the example app — clone this repo, or download
    [`examples/tasks-demo/tasks_demo.py`](examples/tasks-demo/tasks_demo.py) (on Linux it needs
    `sudo apt install python3-gi gir1.2-gtk-4.0`).
 3. Paste this to your agent:
 
-   > Use glass to run `examples/tasks-demo/tasks_demo.py` with accessibility on. There's a bug: clicking
+   > Use Glass to run `examples/tasks-demo/tasks_demo.py` with accessibility on. There's a bug: clicking
    > **Add** doesn't add the typed task. Reproduce it by driving the UI and checking the
    > accessibility tree (don't just screenshot), then find and fix the bug in the code and verify a
    > task actually appears.
@@ -120,7 +120,7 @@ Every asset is listed in [docs/reference/platforms.md](docs/reference/platforms.
 Prefer to compile, or on an architecture with no published asset? See
 [docs/how-to/build-from-source.md](docs/how-to/build-from-source.md) — it is a single `cargo build`.
 
-Then [connect glass to your agent](docs/how-to/connect-an-agent.md) and run `glass-mcp doctor` to check
+Then [connect Glass to your agent](docs/how-to/connect-an-agent.md) and run `glass-mcp doctor` to check
 the environment. New here? Follow [the tutorial](docs/tutorial/first-drive.md) for a guaranteed first
 success.
 
@@ -131,10 +131,10 @@ starting a session using `glass-mcp tools --json`; see [tool profiles](docs/refe
 
 ## Drive it well — the `glass-drive` skill
 
-glass needs no app integration and no skill to run, but an agent drives it far more reliably with the
+Glass needs no app integration and no skill to run, but an agent drives it far more reliably with the
 open [glass-drive](docs/how-to/drive-glass-well.md) Agent Skill — it stops the agent spending its first
 turns rediscovering the verify-cheaply-then-look loop. **Installing it is the single highest-leverage
-thing you can add** when pointing an agent at glass.
+thing you can add** when pointing an agent at Glass.
 
 ## Platform support
 
@@ -147,8 +147,8 @@ thing you can add** when pointing an agent at glass.
 | Capture · input · windows · clipboard · logs | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Accessibility (semantic addressing) | ✓ AT-SPI | ✓ UI Automation | ✓ UIAutomator | ✓ idb | ✓ AX |
 | Containment / sandboxing | ✓ bubblewrap | ✓ Sandboxie | ✓ the emulator VM | ✓ the Simulator | ✓ Seatbelt |
-| Input without desktop interference | ✓ private display | – shared desktop | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
-| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | – VM needed | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
+| Input without desktop interference | ✓ private display | ◑ child session (preview) | ✓ emulator | ✓ Simulator | ◑ separate account (preview) |
+| Display isolation (app off your desktop) | ✓ headless Xvfb / sway | ◑ child session (preview) | ✓ headless emulator | ✓ headless simctl boot | ◑ separate account (preview) |
 
 Full matrix, per-capability detail, and system requirements:
 [docs/reference/platforms.md](docs/reference/platforms.md). Transport is MCP over stdio (default) or
@@ -165,4 +165,4 @@ Contributing? [`CONTRIBUTING.md`](CONTRIBUTING.md) has the gates a PR has to pas
 
 ## License
 
-glass is **open core**, licensed **Apache-2.0** — see [`LICENSE-APACHE`](LICENSE-APACHE).
+Glass is **open source**, licensed **Apache-2.0** — see [`LICENSE-APACHE`](LICENSE-APACHE).

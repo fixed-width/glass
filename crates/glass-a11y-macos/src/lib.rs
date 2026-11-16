@@ -1,7 +1,7 @@
 //! macOS accessibility-tree reader for glass (AXUIElement behind glass-core's Accessibility seam).
 
 // FFI backend: the AXUIElement reader needs `unsafe`, so this crate opts out of the workspace
-// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see CLAUDE.md). The pure
+// `unsafe_code = "deny"`; each site carries a `// SAFETY:` note (see AGENTS.md). The pure
 // modules (`doctor`, `mapping`, `select_diagnostic`) stay `unsafe`-free by convention.
 #![allow(unsafe_code)]
 

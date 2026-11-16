@@ -1,6 +1,6 @@
 # Containment and sandboxing
 
-glass launches apps it has been told to build and drive — often half-working, sometimes hostile-by-
+Glass launches apps it has been told to build and drive — often half-working, sometimes hostile-by-
 accident code under active development. So it **sandboxes every launched app by default**. This page
 explains the model; the per-OS install steps live in the setup guides, and the exact variables in
 [reference/environment.md](../reference/environment.md).
@@ -22,8 +22,8 @@ One boundary is worth stating plainly: the `sandbox` level governs the **launche
 optional `build` step always runs unsandboxed, with your full developer environment — building is your
 code doing what you asked, whereas the launched app is the thing under test.
 
-Whoever is driving glass picks `sandbox` per launch, but an **operator** — whoever configures the host
-glass runs on — can pin a floor under that choice: `GLASS_SANDBOX_FLOOR` sets the minimum containment
+Whoever is driving Glass picks `sandbox` per launch, but an **operator** — whoever configures the host
+Glass runs on — can pin a floor under that choice: `GLASS_SANDBOX_FLOOR` sets the minimum containment
 level a launch may run at. A launch may still ask for *more* containment than the floor, just never
 less: an omitted `sandbox` is raised to the floor automatically, and an explicit request below the
 floor is refused rather than silently strengthened. The default is `off` — no floor, today's behavior
@@ -72,15 +72,15 @@ tree; an app that can't register with the window server would return an empty AX
 ## Clipboard isolation
 
 Under `default`/`strict`, the clipboard tools act on a clipboard **isolated from your real one** — the
-app copies and pastes normally, but against a private store glass owns, so driving an app never
+app copies and pastes normally, but against a private store Glass owns, so driving an app never
 clobbers what you have on your own clipboard.
 
 How that isolation is achieved varies. On the private Xvfb/sway Linux backends the app simply has its
-own display clipboard. On a contained Windows app, glass backs the boxed app's clipboard with its own
+own display clipboard. On a contained Windows app, Glass backs the boxed app's clipboard with its own
 store. On **macOS**, isolation depends on how the target is built: for an app **not** built with
-Apple's hardened runtime — typically a debug or unsigned build, i.e. the app you are developing — glass
+Apple's hardened runtime — typically a debug or unsigned build, i.e. the app you are developing — Glass
 injects a small shim (`DYLD_INSERT_LIBRARIES`) that swizzles `+[NSPasteboard generalPasteboard]` inside
-the app and redirects it to a private, per-session pasteboard glass shares. glass confirms the swizzle
+the app and redirects it to a private, per-session pasteboard Glass shares. Glass confirms the swizzle
 actually took (a sentinel written to the private pasteboard) before routing to it, so a silently-failed
 injection is never mistaken for a working bridge.
 

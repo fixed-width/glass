@@ -1,6 +1,6 @@
 # Measure what the verification loop costs
 
-glass verifies work on the CPU: an accessibility snapshot, a text-only diff (`changed_pct`
+Glass verifies work on the CPU: an accessibility snapshot, a text-only diff (`changed_pct`
 + bbox, no image unless you ask), and `wait_for_*`. The alternative — a screenshot after
 every step — puts an image into the agent's context each time. This page measures the
 difference on one fixed task so you can put a number on it for your own model.
@@ -33,7 +33,7 @@ because `glass_wait_for_log`'s response embeds a wall-clock `elapsed_ms`.
 
 Round-trips, request/response **bytes**, an approximate text-token count
 (`text_bytes ÷ 4`), and for each screenshot its **width × height**. It does **not** convert
-images to tokens — glass is model-agnostic, and a tokenizer is a dependency it declines to
+images to tokens — Glass is model-agnostic, and a tokenizer is a dependency it declines to
 carry. You convert, below.
 
 ## Results

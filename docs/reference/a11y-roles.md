@@ -6,7 +6,7 @@ roles. This page states which roles each backend can produce.
 **A platform switch is a `ToggleButton` — except on Linux.** The platforms disagree about what a
 switch *is*: AppKit calls it a button, UIKit and SwiftUI call it a checkbox, and AT-SPI and UIA have
 no switch role at all. Where the platform marks one — the `AXSwitch` subrole on macOS and iOS, the widget class on
-Android — glass normalizes it to `ToggleButton`, and those three were read back from a real switch
+Android — Glass normalizes it to `ToggleButton`, and those three were read back from a real switch
 to confirm it. Windows maps a toggle-capable button to `ToggleButton`, which is what a WinUI
 `ToggleSwitch` is expected to report, but no switch has been probed there.
 
@@ -15,14 +15,14 @@ from a real checkbox, so it arrives as `CheckBox` and there is no signal to norm
 switch on Linux by name, or accept either role.
 
 Each node also carries the backend's own token — the AT-SPI role, the UIA control type, the AX
-role string, the Android widget class, the iOS role string. When glass has no mapping for a
+role string, the Android widget class, the iOS role string. When Glass has no mapping for a
 token the role is `Other` and the outline shows the token in brackets — `Other(AXDisclosureTriangle)`
 — so nothing is hidden; a `role:` selector just will not match it.
 
 A cell reads:
 
-- `yes` — glass maps a native token to this role.
-- `gap` — closing it is glass's own work. The platform carries the role somewhere glass reads or
+- `yes` — Glass maps a native token to this role.
+- `gap` — closing it is Glass' own work. The platform carries the role somewhere Glass reads or
   could read — a token that arrives unmapped, a documented field the reader ignores, a protocol
   its own companion could send — and the reason names what is there and unread.
 - `absent` — the platform has no such control to expose. iOS has no radio button, Android no tree
@@ -30,7 +30,7 @@ A cell reads:
 - `unmarked` — the control exists and was put on screen, and no reading found a token carrying its
   role: it is drawn but not exposed, or folded into a token meaning something else. The reason
   names what it reported instead.
-- `elsewhere` — the control exists and is exposed, but outside what glass walks. The system status
+- `elsewhere` — the control exists and is exposed, but outside what Glass walks. The system status
   bar belongs to the OS shell, not to the app whose tree is being read.
 
 **`unmarked` is a reading, not a proof.** It says the standard controls were watched on one OS
@@ -65,7 +65,7 @@ now, and the outline only names the token of an element that has none.
 it. On Windows a text editor's edit surface arrives under the same UIA control type, so the two
 are told apart per node by the framework the element reports — Chromium reported `Chrome` and
 Gecko `Gecko` against a stock text editor's `Win32` (read 2026-08-24). A `Document` can arrive
-with no children. glass discloses that case in the snapshot rather than leaving an empty
+with no children. Glass discloses that case in the snapshot rather than leaving an empty
 container to be read as an empty page, and where the walk completed the disclosure asks for a
 fresh snapshot before the pixel path: on an Android WebView the first snapshot after a launch was
 childless and the next held the whole page (read 2026-08-24). On iOS there is no such element to
