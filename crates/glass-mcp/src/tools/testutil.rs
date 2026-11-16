@@ -24,6 +24,7 @@ pub struct FakePlatform {
     pub pending_logs: Vec<(Stream, String)>,
     pub pointer_events: Vec<PointerEvent>,
     pub key_events: Vec<KeyEvent>,
+    pub input_error: Option<GlassError>,
     pub started: bool,
     pub events: Arc<Mutex<Vec<String>>>,
     pub clipboard: String,
@@ -238,6 +239,9 @@ impl Platform for FakePlatform {
             PointerEvent::Gesture { pointers, .. } => format!("gesture({})", pointers.len()),
         });
         self.pointer_events.push(e.clone());
+        if let Some(error) = self.input_error.take() {
+            return Err(error);
+        }
         Ok(())
     }
     fn send_key_by(&mut self, e: &KeyEvent, deadline: Deadline) -> Result<()> {
@@ -249,6 +253,9 @@ impl Platform for FakePlatform {
             KeyEvent::Chord(c) => format!("key({c})"),
         });
         self.key_events.push(e.clone());
+        if let Some(error) = self.input_error.take() {
+            return Err(error);
+        }
         if self.fail_text_dispatch_after_receiving
             && let KeyEvent::Text(text) = e
         {

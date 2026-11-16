@@ -43,11 +43,24 @@ impl AgentClient {
 
     fn call_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
         self.call_with_by(req, deadline, CallFailure::is_transport)
+            .map_err(CallFailure::into_error)
     }
 
     /// Run a side-effecting request, retrying only when the first attempt provably sent nothing.
     fn call_once_sent_by(&self, req: Value, deadline: Deadline) -> Result<Value> {
         self.call_with_by(req, deadline, CallFailure::nothing_sent)
+            .map_err(|failure| match failure {
+                CallFailure::NotSent(mut error) => {
+                    // A connection handshake may have run, but this input did not.
+                    if let GlassError::Bounded { dispatch, .. } = &mut error {
+                        *dispatch = glass_core::BoundDispatch::NotDispatched;
+                    }
+                    error.before_dispatch()
+                }
+                CallFailure::AnswerLost(error) | CallFailure::Refused(error) => {
+                    error.after_dispatch()
+                }
+            })
     }
 
     fn call_with_by(
@@ -55,39 +68,41 @@ impl AgentClient {
         req: Value,
         deadline: Deadline,
         resend: fn(&CallFailure) -> bool,
-    ) -> Result<Value> {
+    ) -> std::result::Result<Value, CallFailure> {
         if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("agent request"));
+            return Err(CallFailure::NotSent(GlassError::deadline_not_started(
+                "agent request",
+            )));
         }
-        let mut conn = self.lock_by(deadline)?;
+        let mut conn = self.lock_by(deadline).map_err(CallFailure::NotSent)?;
         if deadline.has_passed() {
-            return Err(GlassError::deadline_not_started("agent request"));
+            return Err(CallFailure::NotSent(GlassError::deadline_not_started(
+                "agent request",
+            )));
         }
         if conn.ensure_usable().is_err() {
-            *conn = Conn::open_by(self.port, deadline)?;
+            *conn = Conn::open_by(self.port, deadline).map_err(CallFailure::NotSent)?;
         }
         let first = conn
             .call_within(req.clone(), deadline, "agent request")
-            .map_err(|e| CallFailure::NotSent(e).into_error())?;
+            .map_err(CallFailure::NotSent)?;
         match first {
             Ok(v) => Ok(v),
             Err(f) if resend(&f) => {
                 // The agent's accept loop accepts a fresh connection after a drop.
                 if deadline.has_passed() {
-                    return Err(f
-                        .with_error(GlassError::caller_deadline_elapsed("agent request"))
-                        .into_error());
+                    return Err(f.with_error(GlassError::caller_deadline_elapsed("agent request")));
                 }
-                *conn = Conn::open_by(self.port, deadline)?;
+                *conn = Conn::open_by(self.port, deadline).map_err(CallFailure::NotSent)?;
                 if deadline.has_passed() {
-                    return Err(GlassError::deadline_not_started("agent retry"));
+                    return Err(CallFailure::NotSent(GlassError::deadline_not_started(
+                        "agent retry",
+                    )));
                 }
-                let retried = conn
-                    .call_within(req, deadline, "agent retry")
-                    .map_err(|e| CallFailure::NotSent(e).into_error())?;
-                retried.map_err(CallFailure::into_error)
+                conn.call_within(req, deadline, "agent retry")
+                    .map_err(CallFailure::NotSent)?
             }
-            Err(f) => Err(f.into_error()),
+            Err(f) => Err(f),
         }
     }
 
@@ -566,8 +581,10 @@ mod tests {
         (port, requests, connections)
     }
 
-    /// Lose conn1's answer and record any replay accepted on conn2.
-    fn agent_that_loses_one_answer() -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
+    /// Lose one answer and record any replay, optionally after an unsent first attempt.
+    fn agent_that_loses_one_answer(
+        unsent_first: bool,
+    ) -> (u16, CountedRequests, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader};
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
@@ -575,6 +592,11 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_log = Arc::clone(&requests);
         let join = std::thread::spawn(move || {
+            if unsent_first {
+                let (mut unsent, _) = listener.accept().expect("accept unsent connection");
+                writeln!(unsent, "{HELLO}").expect("write unsent connection hello");
+            }
+            let connection = if unsent_first { 2 } else { 1 };
             let (first, _) = listener.accept().expect("accept conn1");
             let mut first_writer = first.try_clone().expect("clone conn1");
             writeln!(first_writer, "{HELLO}").expect("write conn1 hello");
@@ -584,7 +606,10 @@ mod tests {
                 .read_line(&mut line)
                 .expect("read conn1 request");
             let request = serde_json::from_str(&line).expect("conn1 request json");
-            request_log.lock().expect("request log").push((1, request));
+            request_log
+                .lock()
+                .expect("request log")
+                .push((connection, request));
             drop(first_reader);
             drop(first_writer);
 
@@ -605,7 +630,10 @@ mod tests {
                         let request: Value =
                             serde_json::from_str(&line).expect("conn2 request json");
                         let id = request["id"].clone();
-                        request_log.lock().expect("request log").push((2, request));
+                        request_log
+                            .lock()
+                            .expect("request log")
+                            .push((connection + 1, request));
                         writeln!(second_writer, "{}", json!({"id": id, "ok": true}))
                             .expect("answer conn2 replay");
                         return;
@@ -887,9 +915,11 @@ mod tests {
 
         let result = client.key_by("enter", Deadline::from_millis(1_000));
 
-        assert!(
-            result.is_err(),
-            "timeout installation failure was discarded"
+        let error = result.expect_err("timeout installation failure was discarded");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
         );
         assert!(
             requests.lock().expect("request log").is_empty(),
@@ -1010,14 +1040,25 @@ mod tests {
             y: 10,
             t_ms: 0,
         }];
-        for (expected_op, mutation) in [
-            ("pointer", Mutation::Pointer),
-            ("gesture", Mutation::Gesture),
-            ("key", Mutation::Key),
-            ("text", Mutation::Text),
+        for (expected_op, mutation, unsent_first) in [
+            ("pointer", Mutation::Pointer, false),
+            ("gesture", Mutation::Gesture, false),
+            ("key", Mutation::Key, false),
+            ("text", Mutation::Text, false),
+            ("pointer", Mutation::Pointer, true),
+            ("gesture", Mutation::Gesture, true),
+            ("key", Mutation::Key, true),
+            ("text", Mutation::Text, true),
         ] {
-            let (port, requests, join) = agent_that_loses_one_answer();
+            let (port, requests, join) = agent_that_loses_one_answer(unsent_first);
             let client = AgentClient::connect(port).expect("connect");
+            if unsent_first {
+                client
+                    .conn
+                    .lock()
+                    .expect("lock unsent connection")
+                    .inject_write_faults([WriteFault::Zero]);
+            }
 
             let result = match mutation {
                 Mutation::Pointer => client.pointer(&path, "left"),
@@ -1026,11 +1067,16 @@ mod tests {
                 Mutation::Text => client.text("hello"),
             };
 
-            assert!(result.is_err(), "{expected_op} replay hid the lost answer");
+            let error = result.expect_err("a replay must not hide the lost answer");
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::MayHaveDispatched),
+                "{expected_op}: {error}"
+            );
             join.join().expect("fake agent");
             let seen = requests.lock().expect("request log");
             assert_eq!(seen.len(), 1, "{expected_op} was replayed on conn2");
-            assert_eq!(seen[0].0, 1, "{expected_op}");
+            assert_eq!(seen[0].0, if unsent_first { 2 } else { 1 }, "{expected_op}");
             assert_eq!(seen[0].1["op"], expected_op, "{expected_op}");
         }
     }
@@ -1082,6 +1128,11 @@ mod tests {
                 .expect_err("a partially written mutation cannot be reported unsent");
             assert!(
                 first.to_string().contains("agent write"),
+                "{fault:?}: {first}"
+            );
+            assert_eq!(
+                first.bound_dispatch(),
+                Some(glass_core::BoundDispatch::MayHaveDispatched),
                 "{fault:?}: {first}"
             );
             client
@@ -1306,6 +1357,41 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(300));
         assert!(retried.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mutation_reconnect_hello_timeout_preserves_unsent_delivery() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let join = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            writeln!(first, "{HELLO}").unwrap();
+            let (second, _) = listener.accept().unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(180));
+            let mut line = String::new();
+            assert_eq!(BufReader::new(second).read_line(&mut line).unwrap(), 0);
+        });
+
+        let client = AgentClient::connect(port).unwrap();
+        client
+            .conn
+            .lock()
+            .unwrap()
+            .inject_write_faults([WriteFault::Zero]);
+        let error = client.key_by("a", Deadline::from_millis(100)).unwrap_err();
+
+        assert_eq!(error.bound_owner(), Some(glass_core::Whose::Caller));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched),
+            "{error}"
+        );
+        join.join().unwrap();
     }
 
     #[test]

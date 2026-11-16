@@ -1,17 +1,34 @@
 //! Pointer and keyboard tools.
 
-use glass_core::{Glass, KeyEvent, Modifier, MouseButton, PointerEvent};
+use glass_core::{BoundDispatch, Glass, KeyEvent, Modifier, MouseButton, PointerEvent};
 
 use crate::params::*;
 use crate::tools::{
-    BatchToolResult, ContextualError, ContextualOutput, ContextualToolResult, ToolContext,
-    ToolOutput, ToolResult, erase_semantic_context, parse_button, semantic_return_error,
+    BatchToolResult, ContextualError, ContextualOutput, ContextualToolResult, SafeErrorCategory,
+    ToolContext, ToolOutput, ToolResult, erase_semantic_context, parse_button,
+    semantic_return_error,
 };
 
 fn standalone(tool: &'static str, result: ContextualToolResult) -> ToolResult {
-    result
-        .map(|o| o.output)
-        .map_err(|error| error.standalone_message(tool))
+    result.map(|o| o.output).map_err(|mut error| {
+        let uncertain = match error.bound_dispatch {
+            Some(BoundDispatch::NotDispatched) => false,
+            Some(BoundDispatch::MayHaveDispatched) => true,
+            None => matches!(
+                error.category,
+                SafeErrorCategory::TransportFailure
+                    | SafeErrorCategory::ActionDeadlineExceeded
+                    | SafeErrorCategory::SequenceDeadlineExceeded
+                    | SafeErrorCategory::Other
+            ),
+        };
+        if uncertain {
+            error.message.push_str(
+                "; input may already have occurred; inspect the current app state before retrying",
+            );
+        }
+        error.standalone_message(tool)
+    })
 }
 
 pub(crate) fn parse_modifiers(mods: Option<&[String]>) -> Result<Vec<Modifier>, String> {
@@ -361,6 +378,101 @@ mod tests {
     fn assert_ok(out: &ToolOutput, tool: &str) {
         let v = assert_envelope(out, tool);
         assert_eq!(v, serde_json::json!({}), "envelope result: {v}");
+    }
+
+    #[test]
+    fn standalone_inputs_warn_when_delivery_is_possible_or_unknown() {
+        use glass_core::GlassError;
+
+        for tool in ["click", "key"] {
+            for error in [
+                GlassError::Backend("agent closed the connection".into()).after_dispatch(),
+                GlassError::Backend("idb hid timed out after 30s".into()),
+                GlassError::caller_deadline_elapsed("pointer input"),
+                GlassError::input_cleanup_failed(
+                    "releasing keys",
+                    GlassError::Backend("partial input".into()),
+                    GlassError::Backend("release failed".into()),
+                ),
+            ] {
+                let detail = error.to_string();
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let mut g = started_with(FakePlatform {
+                    input_error: Some(error),
+                    ..FakePlatform::new(100, 100).with_event_log(Arc::clone(&events))
+                });
+                let message = match tool {
+                    "click" => click(
+                        &mut g,
+                        &ClickArgs {
+                            x: 10,
+                            y: 20,
+                            button: None,
+                            count: None,
+                            modifiers: None,
+                        },
+                    ),
+                    "key" => key(
+                        &mut g,
+                        &KeyArgs {
+                            chord: "Return".into(),
+                        },
+                    ),
+                    _ => unreachable!(),
+                }
+                .unwrap_err();
+
+                assert!(message.starts_with(&detail), "{message}");
+                assert!(
+                    message.contains("input may already have occurred"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("inspect the current app state before retrying"),
+                    "{message}"
+                );
+                assert_eq!(events.lock().unwrap().len(), 1, "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_input_preflight_errors_do_not_warn_about_delivery() {
+        use glass_core::GlassError;
+
+        for error in [
+            GlassError::Backend("timeout installation failed".into()).before_dispatch(),
+            GlassError::deadline_not_started("key input"),
+            GlassError::NoActiveSession,
+        ] {
+            let detail = error.to_string();
+            let mut g = started_with(FakePlatform {
+                input_error: Some(error),
+                ..FakePlatform::new(100, 100)
+            });
+            assert_eq!(
+                key(
+                    &mut g,
+                    &KeyArgs {
+                        chord: "Return".into()
+                    }
+                )
+                .unwrap_err(),
+                detail
+            );
+        }
+        let mut g = started();
+        let error = key(
+            &mut g,
+            &KeyArgs {
+                chord: "hyper+x".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            !error.contains("input may already have occurred"),
+            "{error}"
+        );
     }
 
     #[test]

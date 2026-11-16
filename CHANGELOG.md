@@ -40,6 +40,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Standalone pointer and key tools warn when input may already have occurred and ask callers to
+  inspect the app before retrying. Android agent input preserves delivery uncertainty after a lost
+  reply without replaying the request.
 - Linux accessibility reads accept newer AT-SPI roles, including GTK switches, while preserving
   their existing `CheckBox` selectors and checked-state handling.
 - Native Wayland apps retain their requested library paths instead of inheriting the portable
