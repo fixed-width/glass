@@ -1535,6 +1535,40 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn dropping_the_last_registry_owner_kills_and_reaps_the_agent_child() {
+        use crate::adb::{Answer, FakeAdb, still_running};
+
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        let registry = AgentRegistry::new();
+        *registry.state.lock().unwrap() = Some(AgentProc {
+            child: Some(child),
+            forward: Forward::for_test(SOCKET, 4321),
+            adb: fake.adb().clone(),
+            ready: true,
+        });
+        let remaining = registry.clone();
+        drop(registry);
+        let shared_child_was_running = still_running(&pid);
+        drop(remaining);
+        let child_survived = still_running(&pid);
+        if child_survived {
+            let _ = Command::new("kill").arg(&pid).status();
+        }
+
+        assert!(
+            shared_child_was_running,
+            "a remaining registry owner must keep its child"
+        );
+        assert!(
+            !child_survived,
+            "the last registry owner left its agent child alive or unreaped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn failed_forward_removal_is_retried_after_the_agent_has_stopped() {
         use crate::adb::{Answer, FakeAdb, still_running};
 

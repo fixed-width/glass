@@ -157,6 +157,62 @@ mod tests {
     }
 
     #[test]
+    fn forward_list_ignores_blank_lines_and_adb_daemon_notices() {
+        let listing = "\n* daemon not running; starting now at tcp:5037\n\
+                       * daemon started successfully\n\n\
+                       device tcp:4321 localabstract:glass-agent\n";
+        let found = entries(listing, Some("device"), "localabstract:glass-agent").unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].port, 4321);
+    }
+
+    #[test]
+    fn cleanup_diagnostics_report_failures_and_skipped_steps_once() {
+        const PROBE: &str = "TEST_ANDROID_CLEANUP_DIAGNOSTIC";
+        if let Ok(case) = std::env::var(PROBE) {
+            let outcome: Result<()> = match case.as_str() {
+                "failure" => Err(GlassError::Backend("device offline".into())),
+                "skipped" => Err(GlassError::deadline_not_started("test cleanup")),
+                "success" => Ok(()),
+                _ => panic!("unknown diagnostic probe {case}"),
+            };
+            note_cleanup("restoring test state", &outcome);
+            return;
+        }
+
+        let diagnostic = |case: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "forward::tests::cleanup_diagnostics_report_failures_and_skipped_steps_once",
+                    "--nocapture",
+                ])
+                .env(PROBE, case)
+                .output()
+                .expect("run the diagnostic probe with stderr capture disabled");
+            assert!(output.status.success(), "{case}: {output:?}");
+            String::from_utf8(output.stderr).unwrap()
+        };
+
+        let failure = diagnostic("failure");
+        assert!(
+            failure.contains("glass: cleanup failed restoring test state:"),
+            "{failure}"
+        );
+        assert!(failure.contains("device offline"), "{failure}");
+        assert_eq!(failure.lines().count(), 1, "{failure}");
+
+        let skipped = diagnostic("skipped");
+        assert!(
+            skipped.contains("glass: teardown skipped restoring test state"),
+            "{skipped}"
+        );
+        assert_eq!(skipped.lines().count(), 1, "{skipped}");
+        assert!(diagnostic("success").is_empty());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn malformed_port_removes_only_the_new_rule_on_the_selected_device() {
         use crate::adb::{Answer, FakeAdb};
