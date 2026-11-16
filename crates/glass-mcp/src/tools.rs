@@ -841,10 +841,8 @@ fn a11y_truncation_steer(tree: &glass_core::AxTree) -> Option<String> {
     })
 }
 
-/// Every disclosure a snapshot owes the agent: the elements it does not show, the content the app
-/// withheld, the web content it could not enter, and what it turned out to describe. One function,
-/// not four call-site lists, so `a11y_snapshot` and the `return:"snapshot"` fold disclose
-/// identically.
+/// Outline disclosures shared by `a11y_snapshot` and the `return:"snapshot"` fold.
+/// Element lookup tools disclose subject mismatches in their structured results.
 ///
 /// Order: truncation, unreadable, unexposed, document, subject.
 fn a11y_steers(tree: &glass_core::AxTree) -> Vec<String> {

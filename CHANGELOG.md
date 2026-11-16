@@ -40,6 +40,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Element waits, scroll-to-element results and semantic searches now disclose when accessibility
+  describes another app, including results without an element and steps inside `glass_do`.
 - Standalone pointer and key tools warn when input may already have occurred and ask callers to
   inspect the app before retrying. Android agent input preserves delivery uncertainty after a lost
   reply without replaying the request.

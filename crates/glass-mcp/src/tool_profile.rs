@@ -42,7 +42,7 @@ pub(crate) const SHARED_INSTRUCTIONS: &str = "Glass drives external native GUI a
     case-insensitive substring query over name, description and non-secure value, with optional role and \
     ANDed states; within must resolve one scope in the same fresh tree. Selectors must resolve uniquely \
     within timeout_ms (default 10000, range 0..120000); max_nodes bounds each read (0 removes the node cap). \
-    IDs are immediate references to the latest snapshot; re-read after UI changes. Never guess IDs.\n\n\
+    Never guess IDs or reuse them after UI changes. Inspect untrusted subject before acting on subject_mismatch:true.\n\n\
     Semantic actions: click_element takes exactly one id or target. Mode auto prefers native and may fall \
     back to pointer; native requires a native action; pointer requires proven geometry checks. Native \
     actions can bypass visibility/occlusion and may focus a text editor instead of activating it. Pointer \

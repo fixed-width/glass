@@ -6,6 +6,7 @@ const FINAL_READ_HEADROOM: std::time::Duration = std::time::Duration::from_milli
 
 pub(super) struct A11yPollOutcome<O> {
     pub observation: O,
+    pub subject: Option<crate::Subject>,
     pub satisfied: bool,
     pub elapsed_ms: u64,
     pub timed_out_by: Option<crate::Whose>,
@@ -276,6 +277,7 @@ impl Glass {
         };
         let mut looked = false;
         let mut last_observation = None;
+        let mut last_subject = None;
         let final_read_scheduled = std::cell::Cell::new(false);
         let outcome = crate::poll::poll_until_with_pause(
             interval_ms,
@@ -353,6 +355,7 @@ impl Glass {
                 let observation = observe(&tree, window);
                 let is_satisfied = satisfied(&observation);
                 last_observation = Some(observation);
+                last_subject = tree.subject;
                 Ok(is_satisfied.then_some(()))
             },
         )?;
@@ -378,6 +381,7 @@ impl Glass {
         Ok(A11yPollOutcome {
             observation: last_observation
                 .expect("a successful or soft-timed-out poll observed a tree"),
+            subject: last_subject,
             satisfied: outcome.value.is_some(),
             elapsed_ms: started.elapsed().as_millis() as u64,
             timed_out_by: outcome.value.is_none().then_some(whose),

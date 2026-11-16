@@ -725,6 +725,16 @@ pub(crate) fn envelope_at(out: &ToolOutput, i: usize) -> serde_json::Value {
     serde_json::json!({ "ok": true, "tool": envelope.tool, "result": envelope.result })
 }
 
+pub(crate) fn observation_at(out: &ToolOutput, i: usize) -> serde_json::Value {
+    let OutContent::Text(block) = &out.0[i] else {
+        panic!("expected observation text at block {i}")
+    };
+    assert_eq!(block.trust, crate::output::TextTrust::UntrustedApplication);
+    assert_eq!(block.role, crate::output::TextRole::Observation);
+    let body = block.body.splitn(3, '\n').nth(2).unwrap();
+    serde_json::from_str(body.rsplit_once('\n').unwrap().0).unwrap()
+}
+
 /// Assert block 0 is the success envelope for `tool` — and that `tool` is a REGISTERED
 /// `#[tool]` name, so a co-typo shared between the tool impl's envelope literal and the
 /// test's expected string (both say `"glass_stopp"`) still fails loudly. Returns `result`.
