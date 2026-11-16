@@ -94,6 +94,7 @@ classify_suite() {  # label cmd...
         fi
     else
         failed+=("$label")
+        printf 'coverage: %s failed:\n%s\n' "$label" "$out" >&2
     fi
 }
 
@@ -119,7 +120,7 @@ run_nextest() { # label nextest-args...
         # Exit 4 ran nothing, so the summary below must not credit it with coverage.
         [ "$rc" -eq 4 ] && label="$label (ran no tests)"
         failed+=("$label")
-        tail -n 30 <<<"$out"
+        printf 'coverage: %s failed:\n%s\n' "$label" "$out" >&2
     fi
 }
 
