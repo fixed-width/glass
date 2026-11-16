@@ -127,6 +127,8 @@ pub struct WaitElementOutcome {
     pub matched: bool,
     /// The matched element (absent on timeout, and for a satisfied `disappears`).
     pub element: Option<ElementInfo>,
+    /// Subject mismatch from the last observed tree; `None` makes no claim of agreement.
+    pub subject: Option<crate::Subject>,
     /// Wall-clock milliseconds elapsed when the wait returned.
     pub elapsed_ms: u64,
     /// Which timeout ended the wait. `None` when the predicate was satisfied.
@@ -137,6 +139,12 @@ pub struct WaitElementOutcome {
 enum WaitElementObservation {
     Pending,
     Satisfied(Option<ElementInfo>),
+}
+
+struct ScrollElementObservation {
+    element: Option<ElementInfo>,
+    outline: String,
+    subject: Option<crate::Subject>,
 }
 
 /// Wheel notches per scroll step; chosen so a step realizes at most a few rows
@@ -293,6 +301,8 @@ pub struct ScrollToElementOutcome {
     /// The matched element (absent when `matched` is false). Its id is from the
     /// final snapshot, so it is usable with `click_element`.
     pub element: Option<ElementInfo>,
+    /// Subject mismatch from the last observed tree; `None` makes no claim of agreement.
+    pub subject: Option<crate::Subject>,
     pub elapsed_ms: u64,
     /// Total scroll steps issued across the sweep.
     pub steps: u32,
@@ -529,6 +539,7 @@ impl Glass {
         Ok(WaitElementOutcome {
             matched: poll.satisfied,
             element,
+            subject: poll.subject,
             elapsed_ms: poll.elapsed_ms,
             timed_out_by: poll.timed_out_by,
         })
@@ -607,12 +618,12 @@ impl Glass {
         } else {
             whose
         };
-        let Some((found0, mut prev_outline)) =
-            self.snapshot_match_outline(params, first_read_deadline)?
+        let Some(mut observation) = self.snapshot_match_outline(params, first_read_deadline)?
         else {
             return Ok(ScrollToElementOutcome {
                 matched: false,
                 element: None,
+                subject: None,
                 elapsed_ms: start.elapsed().as_millis() as u64,
                 steps: 0,
                 reversed: false,
@@ -624,7 +635,7 @@ impl Glass {
                 }),
             });
         };
-        let found0_bounds = found0.as_ref().and_then(|i| i.bounds);
+        let found0_bounds = observation.element.as_ref().and_then(|i| i.bounds);
 
         // Resolve the primary sweep direction: explicit, else inferred from the
         // target's off-screen bounds, else the default vertical sweep.
@@ -634,22 +645,24 @@ impl Glass {
                 .unwrap_or(ScrollDirection::Down)
         });
 
-        // Every return shares this tail (elapsed_ms/direction); only the matched flag,
-        // element, step count, and reversed flag vary.
-        let outcome = |matched, element, steps, reversed, timed_out_by| ScrollToElementOutcome {
-            matched,
-            element,
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            steps,
-            reversed,
-            direction: primary,
-            timed_out_by,
-        };
+        let outcome =
+            |matched, observation: ScrollElementObservation, steps, reversed, timed_out_by| {
+                ScrollToElementOutcome {
+                    matched,
+                    element: if matched { observation.element } else { None },
+                    subject: observation.subject,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    steps,
+                    reversed,
+                    direction: primary,
+                    timed_out_by,
+                }
+            };
 
-        if let Some(info) = found0
-            && self.scroll_match_ready(&info, &geo, first_read_deadline)?
+        if let Some(info) = observation.element.as_ref()
+            && self.scroll_match_ready(info, &geo, first_read_deadline)?
         {
-            return Ok(outcome(true, Some(info), 0, false, None));
+            return Ok(outcome(true, observation, 0, false, None));
         }
 
         let (ax, ay) = params
@@ -661,10 +674,10 @@ impl Glass {
             let reversed = i == 1;
             loop {
                 if action_deadline.has_passed() {
-                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                    return Ok(outcome(false, observation, steps, reversed, Some(whose)));
                 }
                 if steps >= SCROLL_TO_MAX_STEPS {
-                    return Ok(outcome(false, None, steps, reversed, None));
+                    return Ok(outcome(false, observation, steps, reversed, None));
                 }
                 let (dx, dy) = dir.delta(params.step);
                 let scroll = self.pointer_by(
@@ -687,31 +700,31 @@ impl Glass {
                 let settle = std::time::Duration::from_millis(SCROLL_TO_SETTLE_MS);
                 std::thread::sleep(action_deadline.remaining().unwrap_or(settle).min(settle));
                 if action_deadline.has_passed() {
-                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                    return Ok(outcome(false, observation, steps, reversed, Some(whose)));
                 }
-                let Some((found, outline)) = self
+                let Some(next) = self
                     .snapshot_match_outline(params, action_deadline)
                     .map_err(after_scroll_dispatch)?
                 else {
-                    return Ok(outcome(false, None, steps, reversed, Some(whose)));
+                    return Ok(outcome(false, observation, steps, reversed, Some(whose)));
                 };
-                if let Some(info) = found
+                let saturated = next.outline == observation.outline;
+                observation = next;
+                if let Some(info) = observation.element.as_ref()
                     && self
-                        .scroll_match_ready(&info, &geo, action_deadline)
+                        .scroll_match_ready(info, &geo, action_deadline)
                         .map_err(after_scroll_dispatch)?
                 {
-                    return Ok(outcome(true, Some(info), steps, reversed, None));
+                    return Ok(outcome(true, observation, steps, reversed, None));
                 }
                 // No change in the a11y tree ⇒ the container did not advance ⇒ this
                 // end is reached; sweep the opposite direction.
-                let saturated = outline == prev_outline;
-                prev_outline = outline;
                 if saturated {
                     break;
                 }
             }
         }
-        Ok(outcome(false, None, steps, true, None))
+        Ok(outcome(false, observation, steps, true, None))
     }
 
     fn scroll_match_ready(
@@ -752,7 +765,7 @@ impl Glass {
         &mut self,
         params: &ScrollToElementParams,
         deadline: Deadline,
-    ) -> Result<Option<(Option<ElementInfo>, String)>> {
+    ) -> Result<Option<ScrollElementObservation>> {
         let tree = match self.a11y_resnapshot(deadline) {
             Ok(tree) => tree,
             Err(error)
@@ -777,7 +790,11 @@ impl Glass {
             ElementMatch::Satisfied(node) => node.map(ElementInfo::from_node),
             ElementMatch::Pending => None,
         };
-        Ok(Some((found, tree.to_outline())))
+        Ok(Some(ScrollElementObservation {
+            element: found,
+            outline: tree.to_outline(),
+            subject: tree.subject,
+        }))
     }
 
     /// Block until a watched region diverges from / converges to a reference.
@@ -1722,6 +1739,45 @@ mod tests {
             "watching a specific window must not go through capture_frame"
         );
         assert!(!capture_window_log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wait_subject_comes_from_the_matching_read_without_an_extra_snapshot() {
+        for actual in [Some("dialog-app"), None] {
+            let mut before = fake_tree();
+            before.subject = Some(crate::Subject {
+                asked: "requested-app".into(),
+                actual: "previous-app".into(),
+            });
+            let mut matched = fake_tree();
+            matched.root.children[0].name = Some("Ready".into());
+            matched.subject = actual.map(|actual| crate::Subject {
+                asked: "requested-app".into(),
+                actual: actual.into(),
+            });
+            let expected = matched.subject.clone();
+            let (mut glass, reads) =
+                glass_with_a11y_counted(FakePlatform::new(100, 100), vec![before, matched], None);
+            glass.start(&spec()).unwrap();
+
+            let outcome = glass
+                .wait_for_element(&WaitElementParams {
+                    name: Some("Ready".into()),
+                    description: None,
+                    role: None,
+                    value: None,
+                    value_contains: None,
+                    condition: ElementCondition::Appears,
+                    interval_ms: 0,
+                    timeout_ms: 1000,
+                })
+                .unwrap();
+
+            assert!(outcome.matched);
+            assert_eq!(outcome.subject, expected);
+            assert_eq!(outcome.element.unwrap().name.as_deref(), Some("Ready"));
+            assert_eq!(reads.load(Ordering::Relaxed), 2);
+        }
     }
 
     #[test]
@@ -3066,6 +3122,45 @@ mod tests {
             assert!(!outcome.matched);
             assert_eq!(outcome.timed_out_by, Some(expected));
             assert!(scrolls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn scroll_subject_comes_from_the_matching_read_without_an_extra_snapshot() {
+        for actual in [Some("dialog-app"), None] {
+            let mut before = fake_tree();
+            before.subject = Some(crate::Subject {
+                asked: "requested-app".into(),
+                actual: "previous-app".into(),
+            });
+            let mut matched = fake_tree();
+            matched.root.children[0].name = Some("Ready".into());
+            matched.subject = actual.map(|actual| crate::Subject {
+                asked: "requested-app".into(),
+                actual: actual.into(),
+            });
+            let expected = matched.subject.clone();
+            let (mut glass, reads) =
+                glass_with_a11y_counted(FakePlatform::new(100, 100), vec![before, matched], None);
+            glass.start(&spec()).unwrap();
+
+            let outcome = glass
+                .scroll_to_element(&ScrollToElementParams {
+                    name: Some("Ready".into()),
+                    description: None,
+                    role: None,
+                    value_contains: None,
+                    direction: Some(ScrollDirection::Down),
+                    anchor: None,
+                    step: SCROLL_TO_DEFAULT_STEP,
+                    timeout_ms: 1000,
+                })
+                .unwrap();
+
+            assert!(outcome.matched);
+            assert_eq!(outcome.subject, expected);
+            assert_eq!(outcome.steps, 1);
+            assert_eq!(reads.load(Ordering::Relaxed), 2);
         }
     }
 

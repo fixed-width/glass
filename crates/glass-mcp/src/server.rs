@@ -1006,7 +1006,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Find ranked accessibility candidates from one fresh read when the target is approximate, duplicated, or not yet identified. Query matches name, description and non-secure value; `within` must match one semantic scope. max_results defaults to 10, capped at 20; timeout_ms optionally waits. Returns actionable IDs, compact context and explicit truncation in an untrusted match array. Total text is capped at 8 KiB."
+        description = "Find ranked accessibility candidates from one fresh read when the target is approximate, duplicated, or not yet identified. Query matches name, description and non-secure value; `within` must match one semantic scope. max_results defaults to 10, capped at 20; timeout_ms optionally waits. Returns actionable IDs, compact context and explicit truncation in an untrusted match array. subject_mismatch flags a different app, named by subject in that block. Total text is capped at 8 KiB."
     )]
     async fn glass_find_elements(
         &self,
@@ -1136,7 +1136,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Wait for semantic transition completion, not pixels/stability. Select by name, description and/or role; `value` is exact, value_contains is a substring. Supports appears/disappears and state conditions. Returns matched, elapsed_ms and the element; timeout is matched:false. Waits for initial tree publication, but errors if no tree appeared. Batched use fails the sequence on an unmatched predicate. For 2+ known steps, use glass_do."
+        description = "Wait for semantic transition completion, not pixels/stability. Select by name, description and/or role; `value` is exact, value_contains is a substring. Supports appears/disappears and state conditions. Returns matched, elapsed_ms and the element; timeout is matched:false. subject_mismatch flags a different app, named by subject in the untrusted block even without an element. Waits for initial tree publication, but errors if no tree appeared. Batched use fails the sequence on an unmatched predicate. For 2+ known steps, use glass_do."
     )]
     async fn glass_wait_for_element(
         &self,
@@ -1157,7 +1157,7 @@ impl GlassServer {
             destructive_hint = false,
             open_world_hint = false
         ),
-        description = "Scroll until a semantic element is actually on-screen; returns matched, elapsed_ms, element and scrolled details. Sweeps the chosen/inferred direction, then reverses. No match after both ends or timeout returns matched:false; no tree errors. Batched use fails the sequence on an unmatched predicate. For 2+ known steps, use glass_do."
+        description = "Scroll until a semantic element is actually on-screen; returns matched, elapsed_ms, element and scrolled details. subject_mismatch flags a different app, named by subject in the untrusted block even without an element. Sweeps the chosen/inferred direction, then reverses. No match after both ends or timeout returns matched:false; no tree errors. Batched use fails the sequence on an unmatched predicate. For 2+ known steps, use glass_do."
     )]
     async fn glass_scroll_to_element(
         &self,

@@ -138,6 +138,19 @@ Most input/action tools (`glass_click`, `glass_move`, `glass_drag`, `glass_scrol
 the envelope is itself the confirmation that the action ran. (`glass_type` can fold an optional
 observe into that result via `return` — see its entry.)
 
+### Accessibility subjects
+
+`glass_wait_for_element`, `glass_scroll_to_element` and `glass_find_elements` return a trusted
+`subject_mismatch` flag. When true, the backend reported that the observed tree describes a
+different app than requested. The untrusted JSON observation includes `subject: {asked, actual}`;
+returned IDs address `actual`. Inspect that subject before choosing a dependent action.
+
+The disclosure comes from the same read as the element or search result. It remains present when
+there is no element, including a satisfied `disappears` condition or an unmatched result. Wait and
+scroll steps inside `glass_do` retain the flag in the step's `result` and the subject in its referenced
+`content_blocks`. A false flag means no mismatch was reported; it does not verify agreement, since
+some readers cannot identify the subject.
+
 ### Bounded text output and artifacts
 
 Every tool response has one fixed ceiling of exactly **8,192 UTF-8 bytes**, summed across every MCP
@@ -485,9 +498,13 @@ tree.
 - `interval_ms` (integer, default 200) — poll interval (one a11y snapshot per tick).
 - `timeout_ms` (integer, default 10000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, elapsed_ms}`. On a match, the matched element (`{id, role, name, description,
-value, bounds, states}`) rides as an untrusted sibling text block, since its `name`/`description`/
-`value` are app-controlled; its `id` is usable with `glass_click_element`. No sibling on timeout.
+Returns `{matched, elapsed_ms, subject_mismatch}`. On a match, the matched element
+(`{id, role, name, description, value, bounds, states}`) rides as an untrusted sibling text block,
+since its `name`, `description` and `value` are app-controlled; its `id` is usable with
+`glass_click_element`. A satisfied `disappears` condition has no element. Optional
+`subject: {asked, actual}` shares that block and is returned
+without an element on disappearance or timeout when a [subject mismatch](#accessibility-subjects)
+was reported. Otherwise a result without an element has no sibling.
 
 ### `glass_wait_for_region`
 
@@ -843,9 +860,11 @@ A positive soft timeout performs fresh bounded accessibility reads until a match
 timeout expires, then returns trusted `matched`, `timed_out`, elapsed, scope, completeness,
 truncation, and omission counts. Secure values are never searched, ranked, returned, or copied into
 context. Application-derived match fields and context are contained in one nonce-delimited
-untrusted match block. Complete success and error text is limited to 8 KiB; lower-ranked context and
-fields may be shortened, then lower-ranked matches omitted, with the trusted counters reporting
-those omissions.
+untrusted match block. The result also includes `subject_mismatch`; on a mismatch the same untrusted
+block adds `subject: {asked, actual}`, even when `matches` is empty. See
+[Accessibility subjects](#accessibility-subjects). Complete success and error text is limited to
+8 KiB; lower-ranked context and fields may be shortened, then lower-ranked matches omitted, with
+the trusted counters reporting those omissions.
 
 ### `glass_a11y_snapshot`
 
@@ -1170,10 +1189,14 @@ no accessibility tree.
   larger covers distance faster but risks stepping past a row's/column's realized band.
 - `timeout_ms` (integer, default 20000) — returns `{matched:false}` on timeout.
 
-Returns `{matched, elapsed_ms, scrolled{steps, reversed, direction}}` — `direction` is the resolved
-(possibly inferred) sweep direction. On a match, the matched element (`{id, role, name, description,
-value, bounds, states}`) rides as an untrusted sibling text block, since its `name`/`description`/
-`value` are app-controlled; its `id` is usable with `glass_click_element`. No sibling on timeout.
+Returns `{matched, elapsed_ms, subject_mismatch, scrolled{steps, reversed, direction}}` —
+`direction` is the resolved (possibly inferred) sweep direction. On a match, the matched element
+(`{id, role, name, description, value, bounds, states}`) rides as an untrusted sibling text block,
+since its `name`, `description` and `value` are app-controlled; its `id` is usable with
+`glass_click_element`. Optional
+`subject: {asked, actual}` shares that block and is returned without an element on an unmatched
+result when a [subject mismatch](#accessibility-subjects) was reported. Otherwise an unmatched
+result has no sibling.
 
 ## Clipboard
 

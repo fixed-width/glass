@@ -11,6 +11,8 @@ pub struct FindElementsParams {
 #[derive(Clone, Debug)]
 pub struct FindElementsOutcome {
     pub result: SemanticQueryResult,
+    /// Subject mismatch from the last observed tree; `None` makes no claim of agreement.
+    pub subject: Option<crate::Subject>,
     pub matched: bool,
     pub timed_out: bool,
     pub elapsed_ms: u64,
@@ -45,6 +47,7 @@ impl Glass {
         let matched = !poll.observation.matches.is_empty();
         Ok(FindElementsOutcome {
             result: poll.observation,
+            subject: poll.subject,
             matched,
             timed_out: params.timeout_ms > 0 && !matched && poll.timed_out_by.is_some(),
             elapsed_ms: poll.elapsed_ms,
@@ -69,6 +72,43 @@ mod tests {
             10,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn find_subject_comes_from_the_matching_read_without_an_extra_snapshot() {
+        for actual in [Some("dialog-app"), None] {
+            let mut before = fake_tree();
+            before.subject = Some(crate::Subject {
+                asked: "requested-app".into(),
+                actual: "previous-app".into(),
+            });
+            let mut matched = fake_tree();
+            matched.root.children[0].name = Some("Ready".into());
+            matched.subject = actual.map(|actual| crate::Subject {
+                asked: "requested-app".into(),
+                actual: actual.into(),
+            });
+            let expected = matched.subject.clone();
+            let (mut glass, reads) =
+                glass_with_a11y_counted(FakePlatform::new(100, 100), vec![before, matched], None);
+            glass.start(&spec()).unwrap();
+
+            let outcome = glass
+                .find_elements(&FindElementsParams {
+                    query: query("ready"),
+                    max_nodes: None,
+                    timeout_ms: 1000,
+                })
+                .unwrap();
+
+            assert!(outcome.matched);
+            assert_eq!(outcome.subject, expected);
+            assert_eq!(
+                outcome.result.matches[0].element.name.as_deref(),
+                Some("Ready")
+            );
+            assert_eq!(reads.load(Ordering::Relaxed), 2);
+        }
     }
 
     #[test]

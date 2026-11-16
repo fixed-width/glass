@@ -2765,7 +2765,7 @@ fn semantic_actions_delegate_and_retain_standalone_results() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        vec!["elapsed_ms", "matched"]
+        vec!["elapsed_ms", "matched", "subject_mismatch"]
     );
     assert_eq!(
         result["steps"][3]["result"]
@@ -2773,7 +2773,7 @@ fn semantic_actions_delegate_and_retain_standalone_results() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        vec!["elapsed_ms", "matched", "scrolled"]
+        vec!["elapsed_ms", "matched", "scrolled", "subject_mismatch"]
     );
     assert!(!result.to_string().contains("secret"));
 }
@@ -3083,6 +3083,78 @@ fn click_element_stale_target_stops_with_structured_detail() {
     assert_eq!(step["side_effects_may_have_occurred"], false);
     assert!(step.get("result").is_none());
     assert_eq!(error["outcome"]["steps"][1]["status"], "unexecuted");
+}
+
+#[test]
+fn batch_subject_disclosures_remain_with_their_completed_steps() {
+    let mut tree = fake_tree();
+    tree.subject = Some(glass_core::Subject {
+        asked: "requested-app".into(),
+        actual: "dialog-app".into(),
+    });
+    let subject = json!(tree.subject);
+    let mut glass = started_a11y_tree(FakePlatform::new(100, 100), tree);
+
+    let output = do_actions(
+        &mut glass,
+        &do_args(vec![
+            parsed_action(r#"{"action":"wait_for_element","name":"Save","timeout_ms":0}"#),
+            parsed_action(r#"{"action":"scroll_to_element","name":"Save","timeout_ms":0}"#),
+            parsed_action(r#"{"action":"wait_for_element","name":"missing","condition":"disappears","timeout_ms":0}"#),
+        ], 1000),
+    ).unwrap();
+
+    let result = assert_envelope(&output, "glass_do");
+    assert!(!result.to_string().contains("requested-app"));
+    assert!(!result.to_string().contains("dialog-app"));
+    for index in 0..3 {
+        let step = &result["steps"][index];
+        assert_eq!(step["result"]["subject_mismatch"], true);
+        assert_eq!(step["content_blocks"], json!([index + 1]));
+        assert_eq!(observation_at(&output, index + 1)["subject"], subject);
+    }
+    assert_eq!(observation_at(&output, 1)["id"], 1);
+    assert_eq!(observation_at(&output, 2)["id"], 1);
+    assert_eq!(observation_at(&output, 3), json!({"subject": subject}));
+}
+
+#[test]
+fn batch_subject_disclosures_survive_unmatched_predicate_failures() {
+    for action in [
+        r#"{"action":"wait_for_element","name":"missing","timeout_ms":0}"#,
+        r#"{"action":"scroll_to_element","name":"missing","timeout_ms":0}"#,
+    ] {
+        let mut tree = fake_tree();
+        tree.subject = Some(glass_core::Subject {
+            asked: "requested-app".into(),
+            actual: "dialog-app".into(),
+        });
+        let subject = json!(tree.subject);
+        let mut glass = started_a11y_tree(FakePlatform::new(100, 100), tree);
+
+        let output = do_actions(
+            &mut glass,
+            &do_args(
+                vec![
+                    parsed_action(action),
+                    parsed_action(r#"{"action":"key","chord":"Tab"}"#),
+                ],
+                1000,
+            ),
+        )
+        .unwrap_err();
+
+        let envelope: serde_json::Value =
+            serde_json::from_str(&output.render_text_blocks()[0]).unwrap();
+        assert_eq!(envelope["error"]["code"], "predicate_not_matched");
+        let step = &envelope["outcome"]["steps"][0];
+        assert_eq!(step["result"]["subject_mismatch"], true);
+        assert_eq!(step["content_blocks"], json!([1]));
+        assert!(!envelope.to_string().contains("requested-app"));
+        assert!(!envelope.to_string().contains("dialog-app"));
+        assert_eq!(observation_at(&output, 1), json!({"subject": subject}));
+        assert_eq!(envelope["outcome"]["steps"][1]["status"], "unexecuted");
+    }
 }
 
 #[test]
