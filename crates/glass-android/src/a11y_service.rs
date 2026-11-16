@@ -1411,23 +1411,14 @@ fn wait_for_ready(
     }
 }
 
-/// One node's identity, captured at actuation so a state read back after the click can be
-/// confirmed to be that same control. An `AxNodeId` is a positional pre-order index re-derived
-/// per snapshot, so an id alone can land on a different node in the next tree.
-#[derive(Debug)]
-struct Actuated {
-    id: AxNodeId,
-    role: AxRole,
-    name: Option<String>,
-}
-
 /// What an `invoke` must do, decided from one tree before any device I/O.
 #[derive(Debug)]
 struct InvokePlan {
     /// The element the caller named.
     target: AxNodeId,
     /// The node the click is sent to — the target, or the control the climb resolved to.
-    actuated: Actuated,
+    /// Its fingerprint includes the window-relative bounds at actuation.
+    actuated: AxTarget,
     /// `Some(want)` when the actuated control must be read back reporting `checked == want`.
     want_checked: Option<bool>,
 }
@@ -1583,10 +1574,12 @@ fn invoke_plan_with(
     };
     Ok(InvokePlan {
         target: target.id,
-        actuated: Actuated {
+        actuated: AxTarget {
             id: chosen.id,
             role: chosen.role,
             name: chosen.name.clone(),
+            bounds: chosen.bounds,
+            value: None,
         },
         want_checked: (chosen.states.checkable && want != chosen.states.checked).then_some(want),
     })
@@ -1603,14 +1596,15 @@ enum CheckState {
 
 /// Read the actuated control's `checked` out of a tree taken after the click.
 ///
-/// The id alone cannot accept a state change: it is positional, so a node the click added above
-/// the control shifts every later id, and `checked` reads `false` on any node with no checked
-/// state — between them, an inert label sliding into the id reads as a flip. Role and name are
-/// what stand in its place, so a same-named sibling that inherits the id is accepted as the
-/// control; `fingerprinted` compares bounds and value too, for the same job before the click.
-fn check_state(after: &AxTree, act: &Actuated) -> CheckState {
+/// Positional ids can be inherited by another node; role, name and bounds guard the read-back.
+/// Allow 8px of movement after the click, matching the pre-action drift guard's tolerance.
+fn check_state(after: &AxTree, act: &AxTarget) -> CheckState {
     match after.find(act.id) {
-        Some(n) if n.states.checkable && n.role == act.role && n.name == act.name => {
+        Some(n)
+            if n.states.checkable
+                && act.matches(n.role, n.name.as_deref())
+                && act.bounds_consistent(n.bounds, 8) =>
+        {
             CheckState::Reached(n.states.checked)
         }
         _ => CheckState::Gone,
@@ -1765,7 +1759,7 @@ fn focus_error(target: u32, failure: CallFailure) -> GlassError {
 }
 
 /// The error for a control whose click was accepted but whose state never reached `want`.
-fn check_timeout(target: u32, act: &Actuated, want: bool, seen: CheckState) -> GlassError {
+fn check_timeout(target: u32, act: &AxTarget, want: bool, seen: CheckState) -> GlassError {
     let id = act.id.0;
     let detail = match seen {
         CheckState::Reached(state) => format!(
@@ -3143,11 +3137,18 @@ mod tests {
         assert!(m.contains("re-snapshot"), "{m}");
     }
 
-    fn actuated(id: u32, role: AxRole, name: &str) -> Actuated {
-        Actuated {
+    fn actuated(id: u32, role: AxRole, name: &str) -> AxTarget {
+        AxTarget {
             id: AxNodeId(id),
             role,
             name: Some(name.into()),
+            bounds: Some(AxRect {
+                x: 40,
+                y: 100, // Window-relative: the fixture's screen y is 200 and win().y is 100.
+                width: 200,
+                height: 100,
+            }),
+            value: None,
         }
     }
 
@@ -3234,13 +3235,8 @@ mod tests {
         assert_eq!(check_state(&after, &act), CheckState::Gone);
     }
 
-    /// The known weakness, pinned rather than fixed: the fingerprint is `checkable` + role +
-    /// name, so a same-named sibling that inherits the id is accepted as the control that was
-    /// clicked, and its state is reported as the flip. `Actuated` records no rect, so nothing
-    /// here can tell the two apart. Strengthening this is glass#319's job — when it lands, this
-    /// test is the expectation it must consciously change.
     #[test]
-    fn a_same_named_sibling_that_inherited_the_id_is_accepted_as_the_control() {
+    fn a_same_named_sibling_that_inherited_the_id_is_not_accepted_as_the_control() {
         // `plan.actuated` is recorded from this tree, where id 1 really is the control clicked.
         let mut clicked = checkable_json("android.widget.CheckBox", "Agree", false);
         clicked["bounds"] = json!({"x": 40, "y": 400, "w": 200, "h": 100});
@@ -3253,8 +3249,39 @@ mod tests {
         let after = after_tree(vec![impostor, clicked]);
         assert_eq!(
             check_state(&after, &plan.actuated),
-            CheckState::Reached(true),
-            "a same-named sibling is indistinguishable to a role+name fingerprint"
+            CheckState::Gone,
+            "a same-named sibling at different bounds cannot confirm the click"
+        );
+    }
+
+    #[test]
+    fn a_control_that_moved_within_tolerance_still_confirms_the_flip() {
+        let clicked = checkable_json("android.widget.CheckBox", "Agree", false);
+        let before = after_tree(vec![clicked.clone()]);
+        let plan = invoke_plan_for_tree(&before, &target_for(&before, AxNodeId(1))).unwrap();
+        let mut moved = clicked;
+        moved["checked"] = json!(true);
+        moved["bounds"]["x"] = json!(48);
+        moved["bounds"]["y"] = json!(192);
+
+        assert_eq!(
+            check_state(&after_tree(vec![moved]), &plan.actuated),
+            CheckState::Reached(true)
+        );
+    }
+
+    #[test]
+    fn a_control_that_moved_beyond_tolerance_does_not_confirm_the_flip() {
+        let clicked = checkable_json("android.widget.CheckBox", "Agree", false);
+        let before = after_tree(vec![clicked.clone()]);
+        let plan = invoke_plan_for_tree(&before, &target_for(&before, AxNodeId(1))).unwrap();
+        let mut moved = clicked;
+        moved["checked"] = json!(true);
+        moved["bounds"]["y"] = json!(209);
+
+        assert_eq!(
+            check_state(&after_tree(vec![moved]), &plan.actuated),
+            CheckState::Gone
         );
     }
 
@@ -5873,6 +5900,58 @@ mod tests {
                 .expect("clicks"),
             None,
             "the target actuated itself, so nothing was substituted"
+        );
+    }
+
+    #[test]
+    fn a_same_named_sibling_cannot_confirm_an_invoked_toggle() {
+        let mut before = one_checkable("android.widget.CheckBox", false);
+        before["children"][0]["bounds"]["y"] = json!(400);
+        let mut after = before.clone();
+        after["children"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, checkable_json("android.widget.CheckBox", "Agree", true));
+        let target = target_for(&built(&before), AxNodeId(1));
+        let (port, ops) = fake_service(vec![before, after], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+
+        let error = a
+            .invoke(&ctx(), &target)
+            .expect_err("the sibling's checked state cannot confirm the click");
+
+        assert!(matches!(error, GlassError::AxActionFailed(1, _)), "{error}");
+        assert!(
+            error.to_string().contains("could not be confirmed"),
+            "{error}"
+        );
+        assert!(!error.invoke_fallback_eligible(), "{error}");
+        assert_eq!(
+            ops_of(&ops),
+            vec![
+                "conn1:tree".to_string(),
+                "conn1:click ref=1".to_string(),
+                "conn1:tree".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_toggle_is_confirmed_near_its_actuated_bounds_after_pre_action_movement() {
+        let stale = one_checkable("android.widget.CheckBox", false);
+        let target = target_for(&built(&stale), AxNodeId(1));
+        let mut before = stale;
+        before["children"][0]["bounds"]["y"] = json!(400);
+        let mut after = before.clone();
+        after["children"][0]["checked"] = json!(true);
+        after["children"][0]["bounds"]["y"] = json!(408);
+        let (port, _) = fake_service(vec![before, after], OnAction::Ok);
+        let mut a = reader(port, std::time::Duration::ZERO);
+
+        assert_eq!(
+            a.invoke(&ctx(), &target)
+                .expect("confirmation uses the actuated bounds rather than the stale snapshot"),
+            None
         );
     }
 
