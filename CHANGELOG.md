@@ -40,6 +40,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Android accessibility click confirmation checks the actuated control's bounds, tolerating
+  small movements while rejecting a same-named sibling that inherits its element ID elsewhere.
 - Element waits, scroll-to-element results and semantic searches now disclose when accessibility
   describes another app, including results without an element and steps inside `glass_do`.
 - Standalone pointer and key tools warn when input may already have occurred and ask callers to
