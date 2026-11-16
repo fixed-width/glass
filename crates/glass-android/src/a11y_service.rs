@@ -16,6 +16,7 @@ use glass_core::{GlassError, Result, write_took_no_effect};
 
 use crate::axmap::{LabelInputs, class_to_role, demote_web_hosts, labels};
 use crate::conn::{CallFailure, Conn};
+use crate::forward::{Forward, note_cleanup};
 
 const REQUIRED_NODE_SCHEMA: i64 = 2;
 const INCOMPATIBLE_NODE_SCHEMA: &str = "incompatible Android accessibility node schema";
@@ -1127,9 +1128,11 @@ pub(crate) struct Active {
     /// The client the service was enabled through, kept rather than resolved again at teardown:
     /// `Adb::from_env` reads the environment as it is *then*, which need not be what set this up.
     adb: Adb,
-    port: u16,
-    prior_enabled: String,
-    prior_a11y_enabled: String,
+    forward: Forward,
+    // A completed setting restoration leaves only the other cleanup work pending.
+    prior_enabled: Option<String>,
+    prior_a11y_enabled: Option<String>,
+    ready: bool,
 }
 
 // Unix-gated with its only consumer, the `FakeAdb`-backed teardown test — that fake is a
@@ -1140,9 +1143,10 @@ impl Active {
     pub(crate) fn for_test(adb: Adb, port: u16) -> Self {
         Self {
             adb,
-            port,
-            prior_enabled: String::new(),
-            prior_a11y_enabled: "0".to_string(),
+            forward: Forward::for_test(SOCKET, port),
+            prior_enabled: Some(String::new()),
+            prior_a11y_enabled: Some("0".to_string()),
+            ready: true,
         }
     }
 }
@@ -1161,54 +1165,80 @@ impl A11yServiceRegistry {
 
     /// Install + enable the service on `adb`'s device, forward a port, and connect. Returns a
     /// `ServiceClient` only once the service has served a window. The apk path is resolved from
-    /// env by the caller.
+    /// env by the caller. Reuses a ready service on the same device, retaining the original
+    /// accessibility settings until shutdown; switching devices first restores the old one.
     pub fn ensure(&self, adb: &Adb, apk: &str) -> Result<ServiceClient> {
-        install_service(adb, apk)?;
-        let get = |k: &str| {
-            adb.run(["shell", "settings", "get", "secure", k])
-                .unwrap_or_default()
-        };
-        let prior = get("enabled_accessibility_services");
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| GlassError::Backend("a11y service registry lock poisoned".into()))?;
+        if let Some(active) = guard.as_ref()
+            && active.ready
+            && active.adb.serial() == adb.serial()
+            && active.adb.bin() == adb.bin()
+            && let Some(prior) = active.prior_enabled.as_deref()
+            && let Some(port) = active.forward.port()
+        {
+            let want = with_service(prior);
+            let result = ready_with_rebind(port, READY_ATTEMPT, READY_ATTEMPTS, &|step| {
+                escalate(adb, apk, &want, step, READY_ATTEMPTS)
+            });
+            if result.is_err() {
+                let _ = restore_a11y(&mut guard, Deadline::UNBOUNDED);
+            }
+            return result;
+        }
+        restore_a11y(&mut guard, Deadline::UNBOUNDED)?;
+
+        let prior = adb.run([
+            "shell",
+            "settings",
+            "get",
+            "secure",
+            "enabled_accessibility_services",
+        ])?;
         let prior = prior.trim();
         let prior = if prior == "null" { "" } else { prior };
         // Save the global flag too, so teardown restores the device's prior a11y state exactly.
-        let prior_a11y = get("accessibility_enabled");
+        let prior_a11y = adb.run([
+            "shell",
+            "settings",
+            "get",
+            "secure",
+            "accessibility_enabled",
+        ])?;
         let prior_a11y = prior_a11y.trim();
         let prior_a11y = if prior_a11y == "null" || prior_a11y.is_empty() {
             "0"
         } else {
             prior_a11y
         };
-        let want = if prior.is_empty() {
-            SERVICE_COMPONENT.to_string()
-        } else if prior.split(':').any(|s| s == SERVICE_COMPONENT) {
-            prior.to_string()
-        } else {
-            format!("{prior}:{SERVICE_COMPONENT}")
-        };
-        put_enabled_services(adb, &want)?;
-        put_secure(adb, "accessibility_enabled", "1")?;
-        let out = adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")])?;
-        let port = crate::agent::parse_forward_port(&out)
-            .ok_or_else(|| GlassError::Backend(format!("adb forward gave no port: {out:?}")))?;
-        // From here, a failure must roll back the settings + forward, else a failed `ensure` leaks
-        // an enabled service and a forward slot.
-        let client = ready_or_restore(
-            port,
-            READY_ATTEMPT,
-            READY_ATTEMPTS,
-            &|step| escalate(adb, apk, &want, step, READY_ATTEMPTS),
-            // Unbounded: this is the rollback for a failed `ensure` during `glass_start`, not
-            // teardown, so each call keeps its own budget.
-            &|| restore_a11y(adb, prior, prior_a11y, port, Deadline::UNBOUNDED),
-        )?;
-        *self.state.lock().unwrap() = Some(Active {
+        let want = with_service(prior);
+        let forward = Forward::prepare(adb, SOCKET)?;
+        // Install can replace an existing APK and change its enabled state too.
+        let active = guard.insert(Active {
             adb: adb.clone(),
-            port,
-            prior_enabled: prior.to_string(),
-            prior_a11y_enabled: prior_a11y.to_string(),
+            forward,
+            prior_enabled: Some(prior.to_string()),
+            prior_a11y_enabled: Some(prior_a11y.to_string()),
+            ready: false,
         });
-        Ok(client)
+        let result = (|| {
+            install_service(adb, apk)?;
+            put_enabled_services(adb, &want)?;
+            put_secure(adb, "accessibility_enabled", "1")?;
+            let port = active.forward.open(adb)?;
+            let client = ready_with_rebind(port, READY_ATTEMPT, READY_ATTEMPTS, &|step| {
+                escalate(adb, apk, &want, step, READY_ATTEMPTS)
+            })?;
+            active.ready = true;
+            Ok(client)
+        })();
+        if result.is_err() {
+            // Setup has no caller deadline; individual adb calls retain their own budgets.
+            let _ = restore_a11y(&mut guard, Deadline::UNBOUNDED);
+        }
+        result
     }
 
     /// Plant an active service, for a test that needs a registry with something to restore.
@@ -1220,19 +1250,14 @@ impl A11yServiceRegistry {
     /// Restore the device's prior accessibility state and remove the forward by `deadline`, which
     /// the rest of teardown shares (glass#422).
     ///
-    /// Best-effort and idempotent. No process to kill: disabling unbinds the service.
+    /// Best-effort and idempotent. Failed work is reported and retained for another attempt.
+    /// No process to kill: disabling unbinds the service.
     pub fn shutdown(&self, deadline: Deadline) {
-        if let Ok(mut g) = self.state.lock()
-            && let Some(a) = g.take()
-        {
-            restore_a11y(
-                &a.adb,
-                &a.prior_enabled,
-                &a.prior_a11y_enabled,
-                a.port,
-                deadline,
-            );
-        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = restore_a11y(&mut guard, deadline);
     }
 }
 
@@ -1289,6 +1314,16 @@ fn without_service(list: &str) -> String {
         .join(":")
 }
 
+fn with_service(prior: &str) -> String {
+    if prior.is_empty() {
+        SERVICE_COMPONENT.to_string()
+    } else if prior.split(':').any(|service| service == SERVICE_COMPONENT) {
+        prior.to_string()
+    } else {
+        format!("{prior}:{SERVICE_COMPONENT}")
+    }
+}
+
 /// Make the platform tear this service's accessibility binding down and build a fresh one, by
 /// disabling and re-enabling it. The process is left alone: a restart is what glass#324 recovers
 /// from, not a remedy for it.
@@ -1300,20 +1335,37 @@ fn force_rebind(adb: &Adb, enabled: &str) -> Result<()> {
 }
 
 /// Restore `enabled_accessibility_services` + `accessibility_enabled` to their prior values and
-/// remove the forwarded port. Shared by `shutdown` and the failed-`ensure` rollback. Best-effort.
-fn restore_a11y(
-    adb: &Adb,
-    prior_enabled: &str,
-    prior_a11y_enabled: &str,
-    port: u16,
-    deadline: Deadline,
-) {
-    let services = put_enabled_services_until(adb, prior_enabled, deadline);
-    glass_core::note_if_skipped("restoring enabled_accessibility_services", &services);
-    let enabled = put_secure_until(adb, "accessibility_enabled", prior_a11y_enabled, deadline);
-    glass_core::note_if_skipped("restoring accessibility_enabled", &enabled);
-    let forward = adb.run_until(["forward", "--remove", &format!("tcp:{port}")], deadline);
-    glass_core::note_if_skipped("removing the a11y service's adb forward", &forward);
+/// remove the forwarded port. Forget completed restorations so retries leave user changes alone.
+fn restore_a11y(state: &mut Option<Active>, deadline: Deadline) -> Result<()> {
+    let Some(active) = state.as_mut() else {
+        return Ok(());
+    };
+    active.ready = false;
+    let services = if let Some(prior) = active.prior_enabled.as_deref() {
+        let result = put_enabled_services_until(&active.adb, prior, deadline);
+        note_cleanup("restoring enabled_accessibility_services", &result);
+        if result.is_ok() {
+            active.prior_enabled = None;
+        }
+        result
+    } else {
+        Ok(())
+    };
+    let enabled = if let Some(prior) = active.prior_a11y_enabled.as_deref() {
+        let result = put_secure_until(&active.adb, "accessibility_enabled", prior, deadline);
+        note_cleanup("restoring accessibility_enabled", &result);
+        if result.is_ok() {
+            active.prior_a11y_enabled = None;
+        }
+        result.map(|_| ())
+    } else {
+        Ok(())
+    };
+    let forward = active.forward.remove(&active.adb, deadline);
+    note_cleanup("removing the a11y service's adb forward", &forward);
+    services.and(enabled).and(forward)?;
+    *state = None;
+    Ok(())
 }
 
 /// How long ONE readiness attempt polls for a served window. On a cold-booted device readiness
@@ -1329,21 +1381,16 @@ const READY_ATTEMPTS: u32 = 3;
 /// Wait for readiness on `port`, and when an attempt is refused for its whole budget, force the
 /// service's binding to be rebuilt and try again — `rebind(step)` for the `step`th recovery,
 /// escalating with the number. `attempts` counts the first, so it makes `attempts - 1` rebinds.
-///
-/// `restore` runs on exactly one path, giving up — here rather than at the caller so retrying
-/// cannot grow a second way out that forgets it.
-fn ready_or_restore(
+fn ready_with_rebind(
     port: u16,
     attempt: std::time::Duration,
     attempts: u32,
     rebind: &dyn Fn(u32) -> Result<()>,
-    restore: &dyn Fn(),
 ) -> Result<ServiceClient> {
     let started = std::time::Instant::now();
     let mut refusal = match wait_for_ready(port, attempt) {
         Ok(client) => return Ok(client),
         Err(error) if error.contains(INCOMPATIBLE_NODE_SCHEMA) => {
-            restore();
             return Err(GlassError::AccessibilityUnavailable(error));
         }
         Err(e) => e,
@@ -1351,7 +1398,6 @@ fn ready_or_restore(
     let mut rebinds = 0u32;
     for step in 1..attempts {
         if let Err(e) = rebind(step) {
-            restore();
             return Err(GlassError::Backend(format!(
                 "could not force the on-device a11y service on :{port} to rebind after {step} \
                  readiness attempts, {}ms total: {e} — last attempt: {refusal}",
@@ -1362,13 +1408,11 @@ fn ready_or_restore(
         match wait_for_ready(port, attempt) {
             Ok(client) => return Ok(client),
             Err(error) if error.contains(INCOMPATIBLE_NODE_SCHEMA) => {
-                restore();
                 return Err(GlassError::AccessibilityUnavailable(error));
             }
             Err(e) => refusal = e,
         }
     }
-    restore();
     Err(GlassError::AccessibilityUnavailable(format!(
         "the on-device a11y service on :{port} never served a window: {} readiness attempts of \
          {attempt:?}, {rebinds} forced rebinds between them, {}ms total — last attempt: {refusal}",
@@ -1379,7 +1423,7 @@ fn ready_or_restore(
 
 /// One readiness attempt against the binding currently on `port`: connect, then poll `tree`
 /// until one is served. Both gates share the one budget. The error is a message, not a
-/// `GlassError`: [`ready_or_restore`] classifies the sequence, and a variant here would nest a
+/// `GlassError`: [`ready_with_rebind`] classifies the sequence, and a variant here would nest a
 /// second "accessibility unavailable:" inside the first.
 fn wait_for_ready(
     port: u16,
@@ -1828,27 +1872,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_one_readiness_restores_immediately_without_rebinding() {
+    fn schema_one_readiness_stops_immediately_without_rebinding() {
         let (port, seen) = fake_agent(r#"{"hello":{"proto":1}}"#, vec![]);
         let rebinds = AtomicUsize::new(0);
-        let restores = AtomicUsize::new(0);
-        let error = ready_or_restore(
-            port,
-            std::time::Duration::from_secs(6),
-            3,
-            &|_| {
-                rebinds.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            },
-            &|| {
-                restores.fetch_add(1, Ordering::Relaxed);
-            },
-        )
+        let error = ready_with_rebind(port, std::time::Duration::from_secs(6), 3, &|_| {
+            rebinds.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        })
         .err()
         .expect("schema one is permanently incompatible");
         assert!(error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA));
         assert_eq!(rebinds.load(Ordering::Relaxed), 0);
-        assert_eq!(restores.load(Ordering::Relaxed), 1);
         assert!(seen.lock().unwrap().is_empty(), "no tree request");
     }
 
@@ -1892,20 +1926,10 @@ mod tests {
             }
         });
         let rebinds = AtomicUsize::new(0);
-        let restores = AtomicUsize::new(0);
-
-        let error = match ready_or_restore(
-            port,
-            std::time::Duration::from_millis(20),
-            3,
-            &|_| {
-                rebinds.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            },
-            &|| {
-                restores.fetch_add(1, Ordering::Relaxed);
-            },
-        ) {
+        let error = match ready_with_rebind(port, std::time::Duration::from_millis(20), 3, &|_| {
+            rebinds.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }) {
             Ok(_) => panic!("a later schema downgrade is permanent, not another readiness refusal"),
             Err(error) => error,
         };
@@ -1913,7 +1937,6 @@ mod tests {
         server.join().expect("server");
         assert!(error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA));
         assert_eq!(rebinds.load(Ordering::Relaxed), 1);
-        assert_eq!(restores.load(Ordering::Relaxed), 1);
         let requests = requests.lock().unwrap();
         assert!(!requests.is_empty());
         assert!(requests.iter().all(|request| request == "conn1:tree"));
@@ -2066,12 +2089,7 @@ mod tests {
 
         let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
         let reg = A11yServiceRegistry::new();
-        *reg.state.lock().unwrap() = Some(Active {
-            adb: fake.adb().clone(),
-            port: 1234,
-            prior_enabled: String::new(),
-            prior_a11y_enabled: "0".to_string(),
-        });
+        *reg.state.lock().unwrap() = Some(Active::for_test(fake.adb().clone(), 1234));
 
         let started = Instant::now();
         reg.shutdown(Deadline::at(Instant::now() + Duration::from_millis(300)));
@@ -4592,6 +4610,469 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_failed_service_list_write_restores_the_original_settings() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*settings get secure enabled_accessibility_services",
+                vec![Answer::says("com.other/.Reader")],
+            ),
+            (
+                "*settings get secure accessibility_enabled",
+                vec![Answer::says("1")],
+            ),
+            (
+                "*settings put secure enabled_accessibility_services *",
+                vec![Answer::fails("write failed"), Answer::Silent],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+
+        assert!(error.to_string().contains("write failed"), "{error}");
+        assert_eq!(enabled_list_written(&fake), "com.other/.Reader");
+        assert!(fake.called("settings put secure accessibility_enabled 1"));
+        assert!(!fake.called("forward tcp:0"));
+        assert!(registry.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_global_flag_write_restores_the_original_settings() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[
+            ("*settings get secure *", Answer::says("null")),
+            (
+                "*settings put secure accessibility_enabled 1",
+                Answer::fails("write failed"),
+            ),
+            ("*", Answer::Silent),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+
+        assert!(error.to_string().contains("write failed"), "{error}");
+        assert!(fake.called("settings delete secure enabled_accessibility_services"));
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+        assert!(!fake.called("forward tcp:0"));
+        assert!(registry.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_forward_restores_the_original_settings() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::new(&[
+            ("*settings get secure *", Answer::says("null")),
+            ("*forward tcp:0 *", Answer::fails("forward failed")),
+            ("*", Answer::Silent),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+
+        assert!(error.to_string().contains("forward failed"), "{error}");
+        assert!(fake.called("settings delete secure enabled_accessibility_services"));
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+        assert!(registry.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreported_port_restores_settings_and_removes_the_new_forward() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            ("*settings get secure *", vec![Answer::says("null")]),
+            (
+                "*forward --list",
+                vec![
+                    Answer::Silent,
+                    Answer::says("device tcp:4321 localabstract:glass-a11y\n"),
+                ],
+            ),
+            ("*forward tcp:0 *", vec![Answer::says("not a port")]),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+
+        assert!(error.to_string().contains("no port"), "{error}");
+        assert!(fake.called("settings delete secure enabled_accessibility_services"));
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+        assert!(fake.called("forward --remove tcp:4321"));
+        assert!(registry.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_prior_settings_prevent_any_device_changes() {
+        use crate::adb::{Answer, FakeAdb};
+
+        for key in ["enabled_accessibility_services", "accessibility_enabled"] {
+            let failing = format!("*settings get secure {key}");
+            let fake = FakeAdb::new(&[
+                (&failing, Answer::fails("read failed")),
+                ("*", Answer::Silent),
+            ]);
+            let registry = A11yServiceRegistry::new();
+            let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+
+            assert!(error.to_string().contains("read failed"), "{key}: {error}");
+            assert!(
+                fake.calls()
+                    .iter()
+                    .all(|call| call.contains("settings get secure")),
+                "{key}: {:?}",
+                fake.calls()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_setup_retains_cleanup_for_shutdown_to_retry() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            ("*settings get secure *", vec![Answer::says("null")]),
+            (
+                "*settings put secure accessibility_enabled 1",
+                vec![Answer::fails("setup failed")],
+            ),
+            (
+                "*settings delete secure enabled_accessibility_services",
+                vec![Answer::fails("restore failed"), Answer::Silent],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+        assert!(error.to_string().contains("setup failed"), "{error}");
+        assert!(registry.state.lock().unwrap().is_some());
+
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("settings delete"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shutdown_retries_settings_without_recreating_a_removed_forward() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*settings delete secure enabled_accessibility_services",
+                vec![Answer::fails("offline"), Answer::Silent],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        registry.set_active_for_test(Active::for_test(fake.adb().clone(), 4321));
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert!(registry.state.lock().unwrap().is_some());
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("forward --remove"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("settings put secure accessibility_enabled 0"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_retry_does_not_replay_restored_settings_after_the_user_changes_them() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*forward --remove *",
+                vec![Answer::fails("offline"), Answer::Silent],
+            ),
+            (
+                "*forward --list",
+                vec![Answer::says("device tcp:4321 localabstract:glass-a11y\n")],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        registry.set_active_for_test(Active::for_test(fake.adb().clone(), 4321));
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert!(registry.state.lock().unwrap().is_some());
+
+        fake.adb()
+            .run([
+                "shell",
+                "settings",
+                "put",
+                "secure",
+                "enabled_accessibility_services",
+                "com.other/.Reader",
+            ])
+            .unwrap();
+        fake.adb()
+            .run([
+                "shell",
+                "settings",
+                "put",
+                "secure",
+                "accessibility_enabled",
+                "1",
+            ])
+            .unwrap();
+        let before_retry = fake.calls().len();
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert_eq!(
+            &fake.calls()[before_retry..],
+            &["forward --remove tcp:4321"]
+        );
+        assert_eq!(enabled_list_written(&fake), "com.other/.Reader");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_retry_new_setup_preserves_user_settings_after_pending_forward_cleanup() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let (port, _) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*forward --remove tcp:4321",
+                vec![Answer::fails("offline"), Answer::Silent],
+            ),
+            (
+                "*forward --list",
+                vec![Answer::says("device tcp:4321 localabstract:glass-a11y\n")],
+            ),
+            (
+                "*settings get secure enabled_accessibility_services",
+                vec![Answer::says("com.other/.Reader")],
+            ),
+            (
+                "*settings get secure accessibility_enabled",
+                vec![Answer::says("1")],
+            ),
+            ("*forward tcp:0 *", vec![Answer::says(format!("{port}\n"))]),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        registry.set_active_for_test(Active::for_test(fake.adb().clone(), 4321));
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert!(registry.state.lock().unwrap().is_some());
+        let before_retry = fake.calls().len();
+
+        drop(registry.ensure(fake.adb(), "/tmp/probe.apk").unwrap());
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        let calls = fake.calls();
+        assert_eq!(calls[before_retry], "forward --remove tcp:4321");
+        assert!(
+            !calls[before_retry..]
+                .iter()
+                .any(|call| call.contains("settings delete")
+                    || call.contains("accessibility_enabled 0")),
+            "{calls:?}"
+        );
+        assert_eq!(enabled_list_written(&fake), "com.other/.Reader");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_retry_missing_forward_does_not_block_a_new_service_session() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let (port, _) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = FakeAdb::new(&[
+            (
+                "*forward --remove tcp:4321",
+                Answer::fails("listener 'tcp:4321' not found"),
+            ),
+            ("*settings get secure *", Answer::says("null")),
+            ("*forward tcp:0 *", Answer::says(format!("{port}\n"))),
+            ("*", Answer::Silent),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        registry.set_active_for_test(Active::for_test(fake.adb().clone(), 4321));
+        registry.shutdown(Deadline::UNBOUNDED);
+        drop(registry.ensure(fake.adb(), "/tmp/probe.apk").unwrap());
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert!(fake.called(&format!("forward --remove tcp:{port}")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_retry_failed_flag_restore_does_not_repeat_the_completed_services_restore() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*settings put secure accessibility_enabled 0",
+                vec![Answer::fails("offline"), Answer::Silent],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = A11yServiceRegistry::new();
+        registry.set_active_for_test(Active::for_test(fake.adb().clone(), 4321));
+        registry.shutdown(Deadline::UNBOUNDED);
+        let before_retry = fake.calls().len();
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert_eq!(
+            &fake.calls()[before_retry..],
+            &["shell settings put secure accessibility_enabled 0"]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repeated_sessions_reuse_one_forward_and_restore_the_original_settings() {
+        let (port, _) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = a_device_ready_to_enable("null", "0", port);
+        let registry = A11yServiceRegistry::new();
+        drop(registry.ensure(fake.adb(), "/tmp/probe.apk").unwrap());
+        drop(registry.ensure(fake.adb(), "/tmp/probe.apk").unwrap());
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        let calls = fake.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("install -r"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("forward tcp:0"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("settings get secure"))
+                .count(),
+            2,
+            "{calls:?}"
+        );
+        assert!(fake.called("settings delete secure enabled_accessibility_services"));
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+        assert!(fake.called(&format!("forward --remove tcp:{port}")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn switching_devices_restores_the_old_device_before_setting_up_the_new_one() {
+        let (port1, _) = fake_service(vec![compose_like()], OnAction::Ok);
+        let (port2, _) = fake_service(vec![compose_like()], OnAction::Ok);
+        let first = a_device_ready_to_enable("com.other/.Reader", "1", port1);
+        let second = a_device_ready_to_enable("null", "0", port2);
+        let registry = A11yServiceRegistry::new();
+        drop(
+            registry
+                .ensure(&first.adb().with_serial("first"), "/tmp/probe.apk")
+                .unwrap(),
+        );
+        drop(
+            registry
+                .ensure(&second.adb().with_serial("second"), "/tmp/probe.apk")
+                .unwrap(),
+        );
+
+        assert_eq!(enabled_list_written(&first), "com.other/.Reader");
+        assert!(first.called(&format!("-s first forward --remove tcp:{port1}")));
+        assert!(!second.called("forward --remove"));
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert!(second.called(&format!("-s second forward --remove tcp:{port2}")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn readiness_failure_restores_settings_and_forward_exactly_once() {
+        let (port, _) = fake_agent(r#"{"hello":{"proto":1}}"#, vec![]);
+        let fake = a_device_ready_to_enable("null", "0", port);
+        let registry = A11yServiceRegistry::new();
+        let error = registry.ensure(fake.adb(), "/tmp/probe.apk").err().unwrap();
+        assert!(
+            error.to_string().contains(INCOMPATIBLE_NODE_SCHEMA),
+            "{error}"
+        );
+        let after = fake.calls();
+        assert_eq!(
+            after
+                .iter()
+                .filter(|call| call.contains("settings delete"))
+                .count(),
+            1
+        );
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+        assert!(fake.called(&format!("forward --remove tcp:{port}")));
+
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert_eq!(fake.calls(), after);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn poisoned_service_state_is_still_restored_on_shutdown() {
+        let (port, _) = fake_service(vec![compose_like()], OnAction::Ok);
+        let fake = a_device_ready_to_enable("null", "0", port);
+        let registry = A11yServiceRegistry::new();
+        drop(registry.ensure(fake.adb(), "/tmp/probe.apk").unwrap());
+        let poisoned = registry.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.state.lock().unwrap();
+                panic!("poison the registry");
+            })
+            .join()
+            .is_err()
+        );
+
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(fake.called("settings delete secure enabled_accessibility_services"));
+        assert!(fake.called("settings put secure accessibility_enabled 0"));
+        assert!(fake.called(&format!("forward --remove tcp:{port}")));
+        let after = fake.calls();
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert_eq!(fake.calls(), after);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_rebind_reinstalls_only_as_a_last_resort() {
         // The reinstall is what SIGKILLs the service and starts the binding race, so trying it
         // first restarts the thing being waited on.
@@ -4817,30 +5298,16 @@ mod tests {
         static SERVING: AtomicBool = AtomicBool::new(false);
         let (port, ops) = refusing_service(&SERVING);
         let steps = Mutex::new(Vec::new());
-        let restores = AtomicUsize::new(0);
-        let client = ready_or_restore(
-            port,
-            std::time::Duration::from_millis(100),
-            3,
-            &|step| {
-                steps.lock().unwrap().push(step);
-                SERVING.store(true, Ordering::Relaxed);
-                Ok(())
-            },
-            &|| {
-                restores.fetch_add(1, Ordering::Relaxed);
-            },
-        )
+        let client = ready_with_rebind(port, std::time::Duration::from_millis(100), 3, &|step| {
+            steps.lock().unwrap().push(step);
+            SERVING.store(true, Ordering::Relaxed);
+            Ok(())
+        })
         .expect("the attempt after the rebind serves");
         assert_eq!(
             *steps.lock().unwrap(),
             vec![1],
             "one rebind, and no second one once readiness came back"
-        );
-        assert_eq!(
-            restores.load(Ordering::Relaxed),
-            0,
-            "readiness succeeded — rolling the device back would tear down what it just got"
         );
         let ops = ops_of(&ops);
         assert_eq!(
@@ -4868,16 +5335,10 @@ mod tests {
         let (port, ops) = refusing_service(&NEVER);
         let steps = Mutex::new(Vec::new());
         let started = std::time::Instant::now();
-        let Err(e) = ready_or_restore(
-            port,
-            attempt,
-            3,
-            &|step| {
-                steps.lock().unwrap().push(step);
-                Ok(())
-            },
-            &|| {},
-        ) else {
+        let Err(e) = ready_with_rebind(port, attempt, 3, &|step| {
+            steps.lock().unwrap().push(step);
+            Ok(())
+        }) else {
             panic!("a device that never serves a window is not ready");
         };
         let waited = started.elapsed();
@@ -4906,72 +5367,22 @@ mod tests {
     }
 
     #[test]
-    fn readiness_that_gives_up_restores_the_device_exactly_once() {
-        // The rollback is what keeps a failed `ensure` from leaving the service enabled and the
-        // port forwarded. Retrying is where that goes wrong: once per attempt tears down the
-        // settings the next attempt needs, and none at all leaks both.
-        static NEVER: AtomicBool = AtomicBool::new(false);
-        let (port, _ops) = refusing_service(&NEVER);
-        let steps = Mutex::new(Vec::new());
-        let restores = AtomicUsize::new(0);
-        let Err(_) = ready_or_restore(
-            port,
-            std::time::Duration::from_millis(100),
-            3,
-            &|step| {
-                steps.lock().unwrap().push(step);
-                assert_eq!(
-                    restores.load(Ordering::Relaxed),
-                    0,
-                    "a rebind after the restore would re-enable the service it just tore down"
-                );
-                Ok(())
-            },
-            &|| {
-                restores.fetch_add(1, Ordering::Relaxed);
-            },
-        ) else {
-            panic!("a device that never serves a window is not ready");
-        };
-        assert_eq!(*steps.lock().unwrap(), vec![1, 2], "every retry ran");
-        assert_eq!(
-            restores.load(Ordering::Relaxed),
-            1,
-            "the device is restored once, after the last attempt — not once per attempt"
-        );
-    }
-
-    #[test]
-    fn a_rebind_that_fails_restores_the_device_and_stops_retrying() {
+    fn a_rebind_that_fails_stops_retrying() {
         // The other give-up path: adb itself failed. Its early return is the easiest place to
         // leak an enabled service and a forwarded port.
         static NEVER: AtomicBool = AtomicBool::new(false);
         let (port, _ops) = refusing_service(&NEVER);
         let steps = Mutex::new(Vec::new());
-        let restores = AtomicUsize::new(0);
-        let Err(e) = ready_or_restore(
-            port,
-            std::time::Duration::from_millis(100),
-            3,
-            &|step| {
-                steps.lock().unwrap().push(step);
-                Err(GlassError::Backend("device offline".into()))
-            },
-            &|| {
-                restores.fetch_add(1, Ordering::Relaxed);
-            },
-        ) else {
+        let Err(e) = ready_with_rebind(port, std::time::Duration::from_millis(100), 3, &|step| {
+            steps.lock().unwrap().push(step);
+            Err(GlassError::Backend("device offline".into()))
+        }) else {
             panic!("a rebind that cannot reach the device is not readiness");
         };
         assert_eq!(
             *steps.lock().unwrap(),
             vec![1],
             "a rebind adb could not deliver is not worth repeating"
-        );
-        assert_eq!(
-            restores.load(Ordering::Relaxed),
-            1,
-            "the device must still be restored when the recovery step is what failed"
         );
         let msg = e.to_string();
         assert!(msg.contains("device offline"), "{msg}");

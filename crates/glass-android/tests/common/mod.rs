@@ -27,10 +27,6 @@ impl Drop for StopAgent<'_> {
 
 /// Restores the device's accessibility settings — `enabled_accessibility_services`,
 /// `accessibility_enabled` and the `adb forward` — when it drops.
-///
-/// Covers a `shutdown` a panic would skip, not one with nothing to undo: `ensure` enables the
-/// service before it records anything in `state`, so a failure in that window leaves the
-/// companion on and this a no-op (glass#425).
 pub struct RestoreServiceState<'a>(pub &'a A11yServiceRegistry);
 
 impl Drop for RestoreServiceState<'_> {
