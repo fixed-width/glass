@@ -34,7 +34,7 @@ jobs:
     # The Cargo workspace is at the repo root.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Test mutation gate wrapper
+      - name: Test script wrappers
         run: python3 -m unittest discover -s scripts/tests
       - name: Test interaction benchmark
         run: python3 -m unittest discover -s tools/interaction-bench/tests
