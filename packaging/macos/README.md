@@ -36,18 +36,15 @@ Recording / Accessibility and install the run integration, connecting a client).
 
 ## Grant permissions + install the run integration
 
-```bash
-target/macos-app/GlassMcp.app/Contents/MacOS/glass-mcp setup
-```
+For shared-desktop development, follow
+[Build from source](../../docs/how-to/build-from-source.md#grant-the-permissions-and-install-the-launchagent)
+to load the signed app through a LaunchAgent and grant it privacy access. A bare Terminal/SSH
+invocation can attribute permission requests to its launcher instead.
 
-`glass-mcp setup` is the guided first-run: it requests Screen Recording +
-Accessibility (opening the exact System Settings pane and polling for you),
-then either installs this LaunchAgent (`--launchagent`, or answering yes when
-asked) or leaves nothing installed for an attended/stdio client (`--no-launchagent`),
-and confirms the result via `doctor`. See
-[docs/how-to/build-from-source.md](../../docs/how-to/build-from-source.md) for the full flow,
-including the flags (`--non-interactive`, `--addr`) and the Screen-Recording
-relaunch nuance.
+The supported `setup` command also selects integration (`--launchagent` or `--no-launchagent`)
+and can enrol an existing standard account with `--account ACCOUNT`. Separate-account setup
+requires the installed, signed and hardened bundle; see
+[macOS setup](../../docs/how-to/setup-macos.md#apps-off-your-desktop-preview).
 
 ## Load / unload the LaunchAgent by hand
 

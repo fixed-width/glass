@@ -9,7 +9,8 @@ the same HTTP MCP endpoint. Off-desktop details are in the [preview guide](windo
 
 ## System requirements
 
-Windows 10 or 11, x86-64. Nothing else to install to *run* the binary: `glass-mcp.exe` statically
+Windows 10 version 1903 (build 18362) or later, or Windows 11; x86-64.
+Nothing else to install to *run* the binary: `glass-mcp.exe` statically
 links the Visual C++ runtime, so **no Visual C++ Redistributable is needed** (the Universal CRT is a
 built-in Windows component). Full requirements are in [reference/platforms.md](../reference/platforms.md).
 
@@ -56,11 +57,10 @@ If you want to hack on Glass or are on an architecture with no published asset,
 
 Subsequent upgrades can use `glass-mcp update` instead of repeating these steps by hand.
 
-> **First run — SmartScreen.** The prebuilt `glass-mcp.exe` is Authenticode-signed (publisher: **Fixed
-> Width LLC**). Windows may still show Microsoft Defender SmartScreen's "Windows protected your PC" on
-> first download until the certificate builds reputation; if it does, click **More info → Run anyway**.
-> This is a publisher-trust prompt, not a permission request — Glass needs no permission grants on Windows
-> ([why](../explanation/windows-permissions.md)).
+> **First run — SmartScreen.** Release CI signs `glass-mcp.exe` when signing credentials are configured;
+> an unsigned build can also be published. Inspect the downloaded executable's signature and publisher
+> before accepting a distribution prompt. SmartScreen is separate from Glass runtime access;
+> see [the Windows access model](../explanation/windows-permissions.md).
 
 ## Verify
 
@@ -106,7 +106,7 @@ launched process exiting.
 
 ## Desktop interaction
 
-Native input uses the interactive desktop and can move your pointer or change focus. Read the active
+In **On your desktop** mode, native input can move your pointer or change focus. Read the active
 session's `glass_capabilities` report with `scope: "session"` for input support and desktop
 interference. A virtual display driver provides a monitor, not an isolated pointer or keyboard.
 The existing launch-context requirements continue to apply; there is no new input-mode setting.

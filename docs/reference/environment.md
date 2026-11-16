@@ -3,13 +3,14 @@
 
 # Environment variables
 
-Every `GLASS_*` variable Glass reads, grouped by concern. Each variable has a sensible default, so a
+Operator-facing `GLASS_*` variables, grouped by concern. Test-only and internal child-process
+variables are outside this configuration surface. Each variable has a default, so a
 default install needs none of them; set one only to override a default. `glass-mcp env` prints this
 same list with each variable's current value (see [reference/cli.md](cli.md)); the token
 (`GLASS_TOKEN`) is reported only as `set`/`(unset)`, never printed.
 
-Most variables also have an equivalent per-call argument on `glass_start` (`backend`, `sandbox`) —
-the argument wins when both are present.
+For backend and containment selection, `glass_start.backend` and `glass_start.sandbox` override
+their environment defaults, subject to `GLASS_SANDBOX_FLOOR`.
 
 ## Backend & display
 
@@ -34,7 +35,7 @@ standard `ANDROID_SDK_ROOT` / `ANDROID_HOME` (see the Android group below).
 | `GLASS_SANDBOX_FLOOR` | Operator-enforced minimum containment level; raises an omitted request, refuses an explicit one below it | `off` (no floor) | all |
 | `GLASS_ARTIFACT_DIR` | Absolute artifact cache-root override; relative paths are rejected | Linux: `$XDG_CACHE_HOME/glass/artifacts`, falling back to `~/.cache/glass/artifacts`; macOS: `~/Library/Caches/glass/artifacts`; Windows: `%LOCALAPPDATA%\glass\artifacts` | all |
 | `GLASS_BWRAP` | bubblewrap binary | `bwrap` (on `PATH`) | Linux |
-| `GLASS_WINDOWS_DESKTOP_STATE_DIR` | Private local directory for Windows desktop configuration and ownership records; changing its path does not grant isolation authority | Local application data under `fixedwidth/glass` | Windows |
+| `GLASS_WINDOWS_DESKTOP_STATE_DIR` | Private local directory for Windows desktop configuration and ownership records; changing its path does not grant isolation authority | `%LOCALAPPDATA%\fixedwidth\glass\windows-desktop` | Windows |
 | `GLASS_WIN_SANDBOX_PROVIDER` | Windows containment provider: `auto`, `sandboxie`, or `none` | `auto` | Windows |
 | `GLASS_SANDBOXIE_DIR` | Sandboxie install directory | `%ProgramFiles%\Sandboxie` | Windows |
 | `GLASS_CLIP_SHIM_DLL` | Private-clipboard shim DLL (`glass_clip_shim_windows.dll`) injected into a Sandboxie-boxed app | next to `glass-mcp`, else Layer-2 clipboard isolation is unavailable | Windows |
@@ -75,7 +76,7 @@ receive none of these defaults.
 
 | Variable | Purpose | Default | Scope |
 |---|---|---|---|
-| `GLASS_SH` | Shell used to run `glass_start`'s `build` command | `sh` (on `PATH`) | all |
+| `GLASS_SH` | Shell used for Linux desktop `glass_start.build` | `sh` (on `PATH`) | Linux desktop |
 | `GLASS_TYPE_DWELL_MS` | Per-key dwell for synthetic typing, to stay ahead of the OS input-pipeline race; raise on a slow/loaded host, lower for speed | `60` | Windows |
 
 ## Linux accessibility
@@ -88,7 +89,7 @@ receive none of these defaults.
 `GLASS_DBUS_DAEMON` is used only when a launch has a11y enabled — the default; see
 [reference/tools.md](tools.md): Glass spawns a private D-Bus session bus and AT-SPI bus per launch
 rather than touching your desktop's shared accessibility bus. `GLASS_ATSPI_LAUNCHER` is read on that
-path too, and by `glass doctor` and `glass_capabilities`, which report on the launcher it names.
+path too, and by `glass-mcp doctor` and `glass_capabilities`, which report on the launcher it names.
 
 ## Android
 

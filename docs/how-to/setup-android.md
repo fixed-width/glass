@@ -45,7 +45,8 @@ export ANDROID_SDK_ROOT=~/android-sdk                       # Windows: %LOCALAPP
 ## Create an AVD
 
 If you don't have an emulator image yet, install a system image and create one (named `glass` here,
-which `GLASS_AVD=glass` then selects):
+which `GLASS_AVD=glass` then selects). These commands use an x86-64 host image; on Apple Silicon,
+choose an `arm64-v8a` image in the SDK Manager instead:
 
 ```bash
 sdkmanager "system-images;android-34;google_apis;x86_64"
@@ -60,8 +61,10 @@ avdmanager create avd -n glass -k "system-images;android-34;google_apis;x86_64" 
 
 Like Android Studio, Glass prefers to attach: if an emulator is already online it uses it
 (`GLASS_ANDROID_SERIAL` picks one when several are running). If none is running, Glass boots a
-**headless** AVD itself and stops it on shutdown — choose it with `GLASS_AVD` (needed only when you
+**headless** AVD itself and stops it on server shutdown — choose it with `GLASS_AVD` (needed only when you
 have more than one AVD). Force attach-only with `GLASS_ANDROID_LIFECYCLE=attach`.
+
+`glass_stop` force-stops the app and retains the emulator for another launch through that server.
 
 The `emulator` binary resolves from `GLASS_EMULATOR` / `ANDROID_SDK_ROOT` / `ANDROID_HOME`; pass extra
 boot flags via `GLASS_EMULATOR_ARGS`; keep a Glass-booted emulator alive past shutdown with
@@ -148,7 +151,8 @@ Then [connect your agent](connect-an-agent.md).
 
 ## Running the device suites
 
-The Android tests are `#[ignore]`d — they need a real device. Two scripts run them the same way CI does:
+Contributors can run the Android tests against an emulator. They are `#[ignore]`d in the ordinary
+workspace test run. Two scripts run them the same way CI does:
 
 ```bash
 # Against an already-booted emulator. Needs the jar + APKs from the sections above.

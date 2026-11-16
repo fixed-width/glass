@@ -71,7 +71,8 @@ fresh snapshot before the pixel path: on an Android WebView the first snapshot a
 childless and the next held the whole page (read 2026-08-24). On iOS there is no such element to
 disclose — a `WKWebView` page contributed nothing to the tree through `idb`, neither the view nor
 its content (read on the iOS 26.5 Simulator, 2026-08-24), so a web page there is a pixel job:
-`glass_screenshot`, then `glass_click` at x,y. See [Web content](../explanation/web-content.md)
+`glass_screenshot`, then a coordinate `click` action through `glass_do` (or standalone `glass_click`
+in full). See [Web content](../explanation/web-content.md)
 for the per-platform readings.
 
 <!-- BEGIN GENERATED: role-support -->

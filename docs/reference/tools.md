@@ -10,6 +10,12 @@ For the concepts behind these tools — the build→see→interact→debug loop 
 return text — see [explanation/the-loop.md](../explanation/the-loop.md). For which tools each OS
 supports, see [reference/platforms.md](platforms.md).
 
+Jump to [profiles](#tool-profiles), [result format](#result-envelope),
+[launch/stop](#session-lifecycle), [screenshots and diffs](#capture--visual-comparison),
+[waits](#settling--waiting), [input](#input), [batches](#glass_do), [windows](#windows),
+[accessibility](#accessibility-semantic-addressing), [selector actions](#selector-action-contract),
+[clipboard](#clipboard), [logs and diagnostics](#logs--diagnostics), or [video](#workflow-evidence).
+
 ## Tool profiles
 
 The default **full** profile exposes all 33 tools below. For new agent configurations, use
@@ -86,8 +92,8 @@ Ordinary trace recording remains separate. See [Record a workflow video](../how-
 
 ## Conventions
 
-- **Coordinates are window-relative.** `(0,0)` is the active window's top-left; glass maps to global
-  coordinates internally.
+- **Input and capture coordinates are window-relative.** `(0,0)` is the active window's top-left;
+  Glass maps them internally. `glass_window` with `op:"move"` instead accepts a screen position.
 - **Text vs image results.** Capture tools return a lossless WebP image. The observe tools
   (`glass_diff`, the `glass_wait_for_*` family, `glass_wait_stable` with `include_image:false`)
   return **text only**, so routine checks between screenshots cost no vision tokens.
@@ -102,7 +108,8 @@ Ordinary trace recording remains separate. See [Record a workflow video](../how-
 
 ## Result envelope
 
-Every tool returns, on success, one leading text content block in a fixed shape:
+A successful logical result uses this text envelope (image ordering is described below).
+The [bounded-output policy](#bounded-text-output-and-artifacts) can move it into a manifest resource:
 
 `{ "ok": true, "tool": "<tool name>", "result": { ... } }`
 
@@ -214,12 +221,13 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   relative (`package/.Activity`) and fully qualified (`package/com.example.Activity`) components.
   The APK is optional and is installed with `adb install -r -t`, replacing an existing installation.
   Invalid lengths or malformed components fail with the expected form. `glass_stop` force-stops the
-  component package; it leaves the installed APK and emulator intact.
+  component package and leaves the APK installed and emulator running. On server shutdown, Glass
+  stops emulators it booted unless `GLASS_EMULATOR_KEEP` is set; attached emulators are retained.
   `run[1..]` are the app's own arguments, passed to the launched process; `android` launches an
   activity rather than a command line, so it has nowhere to put them and returns an error naming
   what it could not use rather than ignoring it.
-- `build` (string) — shell command run in `cwd` before launching.
-- `cwd` (string) — working directory for `build` and `run`.
+- `build` (string) — shell command run in `cwd` before launching, outside app containment.
+- `cwd` (string) — working directory for `build` and `run`; defaults to the server's directory.
 - `read_only_inputs` (array of absolute paths, default empty) — Linux X11/Wayland only, with
   containment enabled. Expose exactly these existing files or directories read-only, including
   files outside the workspace. File inputs do not expose sibling files. Paths are canonicalized;
@@ -240,7 +248,7 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   tools work against this app. On by default (the accessibility path is the cheap, low-token way to
   drive a UI); pass `false` to skip the bus for canvas/pixel-only apps, since it spawns extra
   processes. Other backends read accessibility ambiently and ignore this flag.
-- `timeout_ms` (integer) — launch timeout.
+- `timeout_ms` (integer, default 10000) — window-publication timeout; does not bound the build.
 
 Returns the located window's geometry: `{x, y, width, height}`.
 Linux also returns `display: {width, height}` and `filesystem` with the workspace, ephemeral roots,
@@ -256,16 +264,21 @@ while launch logs describe this session's setup.
 
 ### `glass_stop`
 
-Stop the running app and end the session. No parameters. Returns `{}`.
+Stop the running app and end the application session. No parameters. Returns `{}` when video
+recording is disabled. With `--record-dir`, returns `{recording: ...}` containing the final
+recording status, including any retained interrupted clip.
+
+Mobile devices remain available between app runs. On server shutdown, Glass stops devices it
+booted unless the corresponding keep variable is set; attached devices are retained.
 
 The app is asked to close before anything terminates it, so it runs its own shutdown path and
 saves whatever it saves on quit. This matters for the *next* run: an app that records whether it
 exited cleanly — a Chromium-based browser, say — otherwise opens with a crash-recovery prompt
 instead of its normal first screen, so a driven app's first screen changes from run to run.
 
-An app that ignores the request, or blocks on a "save changes?" prompt, is terminated anyway after
-a short grace, so `glass_stop` always completes. That case is reported on stderr rather than in the
-result, along with what to do about it where anything can be — the result stays `{}` either way.
+An app that ignores the request, or blocks on a "save changes?" prompt, is forcibly terminated after
+a bounded grace period. Normal forced cleanup is reported on stderr and still returns `{}`.
+Unconfirmed cleanup or a backend failure returns an error; inspect it before replacing the session.
 
 On Windows, a title/class hint can adopt a window owned by a process outside the launched process
 set, such as an Explorer folder served by the existing shell. Glass discloses this at launch:
@@ -320,7 +333,8 @@ completion, or stability.
   see [image size controls](#image-size-controls). Omit both for native pixels.
 
 Returns `{width, height}` — the returned image dimensions — plus native `x, y` (the region's origin)
-when `region` was given. Supplying a size bound also adds `image` metadata. Accessibility annotations
+when `region` was given. A size bound or backend capture geometry also adds `image` metadata.
+Accessibility annotations
 add `count` and an untrusted legend for elements intersecting the captured region. Boxes follow
 toolkit geometry; inspect action results before relying on a marked target.
 On Linux, `capture` reports `complete`, `window_complete`, the full screen-relative `window`
@@ -344,7 +358,7 @@ A 3840×2160 image bounded to width 1280 returns 1280×720. A 1001×667 image bo
 returns 500×333. The nearest-neighbor preview is encoded as lossless WebP; resizing discards native
 detail even though the encoding preserves the returned pixels.
 
-When a bound is supplied and an image is returned, the result includes:
+When a bound is supplied or the frame carries capture geometry, an image result includes:
 
 ```json
 {"image":{"source":{"x":120,"y":80,"width":2400,"height":1600},
@@ -366,8 +380,9 @@ Baselines, comparisons, masks, pixel counts, bboxes and stability detection use 
 A resized preview can hide a change that an exact diff detects. Diff bboxes keep their existing
 region-relative coordinates; the new image source origin is always window-relative.
 Bounds do not enable images: suppressed images, unchanged diffs and unmatched region waits produce
-no image metadata. Text-only settle retains native dimensions. Omitted bounds preserve existing
-bytes and result fields. Controls are per call; marks remain native, and no file-output mode,
+no image metadata. Text-only settle retains native dimensions. Without bounds, images retain native
+pixels; Linux capture geometry can still add `capture` and `image` metadata. Controls are per call;
+marks remain native, and no file-output mode,
 format/quality setting or automatic size limit is added. Compressed bytes and model token cost vary
 with content. See [capture a smaller image](../how-to/capture-a-smaller-image.md) for examples.
 
@@ -540,7 +555,11 @@ no sibling on timeout. Resume reading from the returned `cursor`.
 
 ## Input
 
-Every tool in this section returns an empty `result:{}` on success. `ok:true` confirms only that
+Standalone input tools require the full profile. In lean, pass the same arguments in a
+`glass_do` action, adding `"action":"click"`, `"action":"type"`, or the corresponding kind.
+The `glass_do` entry below describes batch results.
+
+Basic coordinate and keyboard tools return an empty `result:{}` on success. `ok:true` confirms only that
 Glass dispatched the action without an input error; it does not prove runtime state. Verify the
 expected outcome with `glass_wait_for_element` (`name`, `description` and/or `role`, plus
 `value` for exact text or `value_contains` for a substring), `glass_wait_for_region`, or
@@ -683,8 +702,9 @@ the event — Glass reports the binary and its build info if yours does not. Oth
 Prefer `glass_do` whenever at least two upcoming actions or verification waits are already known.
 Give each known unique target directly to its action. Use `glass_find_elements` when the selector
 still has several plausible candidates, and use `glass_a11y_snapshot` only when the task genuinely
-needs broad tree inspection. Use standalone tools only when the next step depends on newly observed
-state, and inspect the structured outcomes before recovery.
+needs broad tree inspection. In the full profile, standalone tools can handle steps chosen after
+observing new state. In lean, use a new `glass_do` call for that step. Inspect the structured outcomes
+before recovery.
 
 The call runs a bounded, fixed sequence, then optionally observes. The sequence is a static list: it
 cannot use variables, references to earlier results, interpolation, branching, loops, retries, or
@@ -722,7 +742,7 @@ Its action steps retain `index`, `action`, and `status:"completed"` alongside `r
 `content_blocks`. Earlier versions also used this detailed action shape for success without
 `then`; clients reading both versions can use the ordered step results in either format.
 
-Failed execution remains an MCP error with `is_error:true`. Its `outcome` retains `status`,
+Failed execution remains an MCP tool error with wire field `isError:true`. Its `outcome` retains `status`,
 `executed`, and each step's `index`, `action`, and `status`. `executed` counts only successfully
 completed actions. The failed step records `attempted`, `side_effects_may_have_occurred`,
 optional `result?` evidence produced before the failure, `error.{code,summary,category?}`, and
@@ -776,7 +796,8 @@ Returns the now-active window's geometry: `{x, y, width, height}`.
 Focus, resize, or move the active window, or read its geometry.
 
 - `op` (string, **required**) — `"focus"`, `"resize"`, `"move"`, or `"geometry"`.
-- `x`, `y` (integer) — target position for `"move"`.
+- `x`, `y` (integer) — screen position for `"move"`; this window-management operation is the
+  exception to window-relative input/capture coordinates.
 - `width`, `height` (integer) — target size for `"resize"`.
 
 Resize/move are non-goals on Android and iOS (apps are full-screen); those backends serve `"focus"`
@@ -967,9 +988,9 @@ and rendered as `#<id> <Role> desc="<description>"`, the same spelling the snaps
 the legend never shows a description where a matchable `name` would be.
 
 No parameters. Returns `{count}` — the number of marked elements; the image and the legend text
-follow as siblings (the legend untrusted-wrapped), per the image ordering above. Same ids as
-`glass_a11y_snapshot`. The box is only as precise as the toolkit's a11y geometry (can drift
-~10–20px), but the `#id` and the click are exact.
+follow as siblings (the legend untrusted-wrapped), per the image ordering above. IDs refer to the
+fresh tree used for the image. Boxes depend on toolkit geometry; semantic action validation and
+the active backend's actionability limits still apply.
 
 ## Selector action contract
 
@@ -1285,8 +1306,9 @@ coordinate-click entry.
 - **unknown**: the backend has no attestation; callers must not assume isolation.
 
 Owned Xvfb, headless Wayland, Android emulator and iOS Simulator sessions already provide isolated
-input with the normal tools. Explicitly attached X11 displays and current native macOS/Windows input
-report possible desktop interference. A virtual monitor does not change this. Session support uses
+input with the normal tools. Explicitly attached X11 displays and shared-desktop macOS/Windows input
+report possible desktop interference. The macOS separate-account and Windows child-desktop previews
+report the connected environment's actual route. A virtual monitor alone does not isolate input. Session support uses
 the connected mobile input driver, so unavailable companions and typing limitations remain visible.
 No input mode or extra desktop-control permission is required; existing OS grants still apply.
 These facts describe input dispatch, not startup activation, clipboard/file/network isolation or

@@ -63,7 +63,8 @@ SHA-256 digest. Read the URI with MCP `resources/read` to receive a binary blob.
 is untrusted application evidence. Remote clients must use the URI rather than opening the
 server-local path on the client machine.
 
-Desktop and Android retain H.264 in MP4; iOS retains H.264 in a QuickTime movie. Desktop capture attempts run at most 15 times per second; native mobile frame rates may
+Desktop and Android retain H.264 in MP4; iOS retains H.264 in a QuickTime movie. Desktop capture
+attempts run at most 15 times per second; native mobile frame rates may
 vary; use the trace and app-side verification for timing and correctness. The URI lasts for the
 server process. Movies and JSON metadata under the configured directory survive server exit.
 
@@ -129,7 +130,8 @@ outstanding clip as interrupted evidence before device teardown, then persist it
 cleanup. Shutdown hooks also run before persistence, so stalled video storage cannot delay cleanup.
 Process shutdown has a short
 shared cleanup deadline; a stalled recorder or disconnected device may leave no retained movie.
-Recording failure never repeats input or prevents application cleanup.
+Recording failure never repeats input or prevents application cleanup. With video enabled,
+`glass_stop` returns `recording` status so the final retained/discarded outcome can be inspected.
 If the Android device becomes unreachable, its recorder may continue until the native duration
 limit because Glass cannot deliver the stop signal over a disconnected transport.
 

@@ -39,16 +39,16 @@ the resident, worker, private state and per-user tasks. Most apps run at medium 
 the default works with no special handling.
 
 **SmartScreen and Defender (distribution, not runtime).** These gate *installing* a downloaded binary,
-not *what a running binary may do*. The release `glass-mcp.exe` is Authenticode-signed (publisher: Fixed
-Width LLC), which establishes the publisher; Microsoft Defender SmartScreen may still show "Windows
-protected your PC" on first download until the certificate builds reputation — a publisher-trust prompt,
-not an access grant, cleared with **More info → Run anyway**. See the install steps in
+not the session/integrity relationship used by Glass. Release CI applies Authenticode signing when
+its signing credentials are configured, and can publish unsigned builds otherwise. A signature
+identifies the publisher; SmartScreen can still prompt for a signed download. These distribution
+checks are separate from runtime capture/input access. See the install steps in
 [how-to/setup-windows.md](../how-to/setup-windows.md).
 
 ## Why there's no grant to click
 
 macOS TCC records each grant in a per-app consent database keyed to the app's code-signing identity, so
-the grant must be requested, is snapshotted at launch, and is re-checked on every rebuild. Windows has
+the grant must be requested and a long-lived process can retain a stale view after it changes. Windows has
 no such per-app capability database for capture, input, or UI Automation. Access is decided by *where
 the process runs* — its session and its integrity level — not by a stored per-app decision. Two
 consequences follow: rebuilding or moving `glass-mcp.exe` never re-prompts (there is no grant to lose),

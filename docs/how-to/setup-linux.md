@@ -42,8 +42,9 @@ Subsequent upgrades can use `glass-mcp update` instead of repeating these steps 
 
 ## Prerequisites
 
-Glass needs a display dependency for your backend and a containment runtime, both covered below.
-Nothing else — the released binary is self-contained.
+Glass needs a display dependency, a containment runtime and (for ordinary launches) the private
+accessibility-bus tools. The glibc release also needs glibc ≥ 2.39 and the C++ runtime
+(`libstdc++6` on Debian/Ubuntu); the static musl release has no shared-library requirement.
 
 ## X11 (the default)
 
@@ -54,7 +55,7 @@ sudo apt-get install -y xvfb
 # Fedora: sudo dnf install xorg-x11-server-Xvfb   ·   Arch: sudo pacman -S xorg-server-xvfb
 ```
 
-Glass spawns its own private display, so `Xvfb` is all you need. The X11 backend takes its display
+Glass spawns its own private display, so no window manager or graphical login is needed. The X11 backend takes its display
 from `GLASS_DISPLAY` (never the ambient `$DISPLAY`):
 
 - **unset (default)** — Glass spawns a private headless `Xvfb` on a free display, logs the number to
@@ -63,8 +64,8 @@ from `GLASS_DISPLAY` (never the ambient `$DISPLAY`):
 - **`:42`** — attach to a display you manage (see below).
 - **`:0`** — deliberately drive your real desktop. Only happens when you ask for it explicitly.
 
-To watch the default headless display live, point a VNC viewer at the logged number:
-`x11vnc -display :N` plus any VNC viewer (or `Xephyr` for a window).
+To watch a headless display, run a loopback-only VNC server against its logged display number:
+`x11vnc -localhost -display :N`, then connect a VNC viewer locally or through an SSH tunnel.
 
 ### Optional: a persistent display you control
 
@@ -112,6 +113,21 @@ sudo apt-get install -y libegl1 libgl1-mesa-dri   # Debian/Ubuntu
 
 Override the headless output size with `GLASS_WAYLAND_SCREEN` (default `1280x800`, format `WxH`). sway
 also launches an Xwayland server, so X11-only apps run under this backend too.
+
+Install Xwayland if your sway package does not include it. The host desktop does not need to use
+Wayland; Glass starts its own compositor.
+
+## Accessibility runtime
+
+Normal Linux launches start a private D-Bus and AT-SPI bus for semantic controls. On Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y dbus-bin at-spi2-core
+```
+
+These tools are separate from the accessibility services on your own desktop. Glass discovers
+`at-spi-bus-launcher` in standard installation locations; it need not be on `PATH`. For a canvas
+app with no accessibility tree, `glass_start` can explicitly set `a11y:false` to skip the private bus.
 
 ## Containment runtime
 

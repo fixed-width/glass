@@ -5,7 +5,7 @@ drives it *more reliably* with a little guidance — and without that guidance a
 several turns rediscovering the loop by trial and error. The habits that matter:
 
 - **Verify with cheap text before spending a screenshot** — save a baseline, act, then check
-  `glass_diff` or a `glass_wait_for_*` call (all text-only) before decoding a new image.
+  `glass_diff`, a `glass_do` element wait, or `glass_logs` with `wait` before decoding a new image.
 - **Use accessibility before pixels** — use a selector action when one intended target is unique;
   use `glass_find_elements` when several candidates need inspection; use `glass_a11y_snapshot` only
   for broad structural diagnosis. Fall back to pixels when the app publishes no usable semantic tree.
@@ -20,9 +20,10 @@ OpenCode, …):
 npx skills add fixed-width/skills -s glass-drive
 ```
 
-Install it once for your agent and it arrives already knowing the driving loop, instead of learning it
-on your time. It stays optional — Glass needs neither the skill nor any app cooperation to run — but
-it is the single highest-leverage thing you can add when pointing an agent at Glass.
+Install it for your agent to make these habits available in later tasks. The skill stays optional;
+Glass needs no app cooperation to run. New configurations use the lean profile, where actions go
+through `glass_do`; see [tool profiles](../reference/tools.md#tool-profiles) when adapting older
+examples that use standalone tools.
 
 For the reasoning behind the cheap-verify loop the skill encodes, see
 [the build → see → interact → debug loop](../explanation/the-loop.md); for the tools it reaches for,

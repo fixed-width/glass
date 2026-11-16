@@ -38,9 +38,12 @@ Containment has a different implementation per OS:
   user namespaces enabled.
 - **Windows** — [Sandboxie](https://sandboxie-plus.com) (Classic, the free default, or Plus).
 - **Android** — the emulator VM itself; there is no separate containment step.
-- **iOS** — the Simulator itself is the isolation boundary; like Android, there is no separate
-  containment step (and no sandbox crate).
+- **iOS** — the Simulator's per-app data container is the app boundary; there is no separate
+  Glass containment step. The Simulator runs on the Mac rather than in an Android-style VM.
 - **macOS** — the OS's built-in **Seatbelt** sandbox (`sandbox_init`); nothing to install.
+
+On Android and iOS, the `sandbox` argument does not install an additional filesystem or network
+policy. In particular, `strict` does not add Glass-managed network denial on mobile backends.
 
 ## Linux file inputs
 
@@ -64,16 +67,17 @@ filesystem model is deliberately *not* an allowlist of system directories. Inste
 filesystem is readable** (read-only), with one carve-out: your **home directory** (`/Users`) is
 denied, so `~/.ssh` and the rest of your secrets stay hidden. The working directory and the launched
 program's own directory are re-allowed for reads even when they live inside your home, so a project
-checked out under `~/` still works. **Writes** are confined to the working directory plus the usual
-scratch/cache roots (`/private/var/folders`, `/private/tmp`, `/tmp`, `/dev`) — nothing under your home
-is ever write-allowed. `mach-register` is allowed so a sandboxed app can still serve its accessibility
+checked out under `~/` still works. **Writes** are confined to a safely scoped working directory,
+which can be a project under your home, plus scratch/cache roots (`/private/var/folders`,
+`/private/tmp`, `/tmp`, `/dev`). A home root or its ancestor is not re-exposed as a writable workspace.
+`mach-register` is allowed so a sandboxed app can still serve its accessibility
 tree; an app that can't register with the window server would return an empty AX tree.
 
 ## Clipboard isolation
 
-Under `default`/`strict`, the clipboard tools act on a clipboard **isolated from your real one** — the
-app copies and pastes normally, but against a private store Glass owns, so driving an app never
-clobbers what you have on your own clipboard.
+Private Linux displays and mobile devices have their own clipboard. Contained Windows and macOS
+apps use a private bridge when supported; a missing bridge returns an unsupported error.
+Attaching an X11 display uses that display's clipboard, so attaching your desktop can affect it.
 
 How that isolation is achieved varies. On the private Xvfb/sway Linux backends the app simply has its
 own display clipboard. On a contained Windows app, Glass backs the boxed app's clipboard with its own
@@ -86,9 +90,9 @@ injection is never mistaken for a working bridge.
 
 An app that runs under the **hardened runtime** (App Store or notarized apps) can't be injected — the
 OS strips `DYLD_INSERT_LIBRARIES` — so the profile denies it the real pasteboard service and the
-clipboard tools return `Unsupported`. That is fail-closed at the profile level, not a silent fall-back
-to the shared system clipboard. Only shared-desktop modes (`GLASS_DISPLAY=:0`, or the Windows/macOS
-backend at `sandbox:off`) touch your real clipboard.
+clipboard tools return `Unsupported`. That is fail-closed at the profile level. On a shared Windows
+or macOS desktop, `sandbox:off` uses the system clipboard. Desktop selection and clipboard
+containment are separate choices.
 
 ## Artifact boundary
 

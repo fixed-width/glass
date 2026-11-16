@@ -9,7 +9,7 @@ Glass is running.
 - If your client launches the binary directly (the Linux default or Windows shared-desktop
   compatibility), use **stdio**.
 - If Glass runs as a **resident desktop app** (the macOS menu-bar app or Windows system-tray
-  tray app), or the agent and app run on different machines, use **HTTP**.
+  app), or the agent and app run on different machines, use **HTTP**.
 
 For the [Windows separate-desktop preview](windows-separate-desktop.md), open Glass with
 `glass-mcp desktop open`, choose **Off your desktop…** in Application setup, then **Start Environment…**,
@@ -36,7 +36,7 @@ claude mcp add glass --scope user -- /absolute/path/to/glass-mcp --tool-profile 
 For Windows shared-desktop operation, point at the `.exe`:
 
 ```powershell
-claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --tool-profile lean
+claude mcp add glass --scope user -- "$env:USERPROFILE\bin\glass-mcp.exe" --desktop shared --tool-profile lean
 ```
 
 **Generic MCP client (JSON config):**

@@ -4,11 +4,11 @@ This is glass's strongest isolation story on Windows: run **glass-mcp itself ins
 VM** alongside the app it drives, and reach it from your host's AI agent over glass's
 existing `serve --http` network transport.
 
-It contrasts with the in-OS option (`sandbox=default` / `sandbox=strict`), which uses
-**Sandboxie Classic** to give the app real filesystem/registry/network containment but
-leaves it **rendering on your desktop**. This **VM tier** goes further — it moves the
-whole stack (glass-mcp, the app, and its display) off your desktop into a separate VM,
-so nothing touches your interactive session.
+In-OS containment (`sandbox=default` / `sandbox=strict`) uses **Sandboxie Classic** to virtualise
+writes and, at strict, deny network access. Desktop choice is separate: Glass can use your visible
+desktop or its [child-desktop preview](../../docs/how-to/windows-separate-desktop.md), which shares
+your Windows account. This VM setup moves Glass, its app and its display into a separate operating
+system. The mapped folders below are explicit host-file access paths.
 
 ## Two flavors
 
@@ -32,7 +32,8 @@ Constraints:
 
 ### Managed VM (persistent)
 
-Any Windows edition, on Hyper-V / VMware / QEMU / a cloud instance. Install `glass-mcp`
+Use a virtualisation product supported by the host Windows edition (for example Hyper-V, VMware
+or QEMU), or a cloud VM. Install `glass-mcp`
 and the app inside the VM, then run:
 
 ```

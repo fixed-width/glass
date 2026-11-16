@@ -1,181 +1,153 @@
-# Your first drive: build, drive, and debug a real UI
+# Your first drive: build, capture, click and verify
 
-In this tutorial you'll watch an AI agent do something it can't normally do: **build a GUI app, look at
-it, act on it, and see the result change — with no human confirming anything.** You'll set glass up,
-point your agent at a small demo UI, and drive the whole **build → see → interact → debug** loop end to
-end. It takes about ten minutes.
+In this tutorial you will use an agent to build and launch a small X11 app, inspect its window,
+send input and verify that the app received it. Glass creates a private headless display, so the
+window and input stay off your desktop.
 
-We'll use the **Linux X11** backend because it needs no display setup — glass spawns its own private
-headless screen, so nothing lands on your desktop and every step is repeatable. The target is
-`glass-fixture-egui`, a small [egui](https://github.com/emilk/egui) app that ships with glass: a window
-with a **Text** field, a **Value** slider, and an **Apply** button. Unlike a static page it *responds*,
-so you'll see the screen actually change when the agent acts — and watch glass report exactly what
-changed.
+The app is `glass-testapp`, included in this repository. It draws four coloured quadrants and logs
+received events. It needs no GUI toolkit or GPU. This lesson uses pixels and logs; you can try
+semantic controls afterwards.
 
 ## Before you start
 
-Install the prerequisites (Debian/Ubuntu shown; other distros are in
-[how-to/setup-linux.md](../how-to/setup-linux.md)):
+Use a Linux host, a clone of this repository, Rust installed through rustup, and an MCP client that
+can display images. Run the shell commands below from the repository root.
+
+On Debian or Ubuntu, install the build and runtime prerequisites:
 
 ```bash
-sudo apt-get install -y xvfb bubblewrap libgl1-mesa-dri libegl1   # display · sandbox · software GL
-# and Rust, via https://rustup.rs
+sudo apt-get install -y build-essential cmake xvfb bubblewrap dbus-bin at-spi2-core
 ```
 
-The egui app renders with OpenGL, so the headless display needs a software GL driver
-(`libgl1-mesa-dri` / `libegl1`); the plain X11 fixtures don't, but this one does.
+Rustup installs the toolchain pinned in `rust-toolchain.toml`. The first build can take several
+minutes. Run the commands on your development machine, where bubblewrap can create unprivileged
+user namespaces.
 
-## Step 1 — Build glass
-
-From a clone of the glass repo, build the server:
+## 1. Build Glass and check the host
 
 ```bash
-cargo build --release -p glass-mcp
+cargo build --locked -p glass-mcp
+./target/debug/glass-mcp doctor
 ```
 
-This produces `target/release/glass-mcp`. The first build pulls the pinned stable Rust toolchain
-automatically, so it may take a few minutes; later builds are fast. You don't build the demo app
-yourself — in Step 3 your agent builds it *through* glass, which is the whole point.
+Resolve any failed X11 or containment checks before continuing; `doctor` prints a remedy beside
+each failure. The [Linux setup guide](../how-to/setup-linux.md) covers host restrictions.
 
-Confirm the environment is ready:
+## 2. Connect your agent
 
-```bash
-./target/release/glass-mcp doctor
+Add this server to your MCP client's configuration, replacing `/absolute/path/glass` with your
+checkout's absolute path:
+
+```json
+{
+  "mcpServers": {
+    "glass": {
+      "command": "/absolute/path/glass/target/debug/glass-mcp",
+      "args": ["--tool-profile", "lean"]
+    }
+  }
+}
 ```
 
-You'll see a list of `✓` checks ending in **OK** — the X11 backend, `Xvfb`, and bubblewrap are all in
-place.
+Reload the client's MCP connection. Ask your agent to list the Glass tools; you should see
+`glass_start`, `glass_screenshot`, `glass_do` and `glass_logs`.
+[Connect your agent](../how-to/connect-an-agent.md) gives client-specific configuration steps.
 
-## Step 2 — Point your agent at glass
+The examples below name an MCP tool followed by its JSON arguments. Ask your agent to make these
+calls; they are not shell commands. Only selected result fields are shown. Actual replies include
+an `ok`/`tool`/`result` envelope and mark app-derived content as untrusted data.
 
-Register the server with your MCP client (full details in
-[how-to/connect-an-agent.md](../how-to/connect-an-agent.md)). For Claude Code:
+## 3. Build and launch the test app
 
-```bash
-claude mcp add glass --scope user -- "$PWD/target/release/glass-mcp"
-```
-
-Restart your agent so it picks up the new tools. From here on, **you talk to your agent in plain
-language** and it calls the glass tools. We'll show each tool call and the result it returns, so you can
-follow along.
-
-## Step 3 — Build and launch the app (build →)
-
-Run your agent from your glass checkout (so the relative paths resolve), and ask it: **"Use glass to
-build and launch the egui demo — build it with `cargo build --release --manifest-path
-crates/glass-fixture-egui/Cargo.toml` and run
-`crates/glass-fixture-egui/target/release/glass-fixture-egui` on the x11 backend."** It calls:
+Run your agent from this checkout. Ask it to use Glass to build and launch `glass-testapp`:
 
 ```jsonc
 glass_start {
-  "build": "cargo build --release --manifest-path crates/glass-fixture-egui/Cargo.toml",
-  "run": ["crates/glass-fixture-egui/target/release/glass-fixture-egui"],
-  "backend": "x11"
+  "build": "cargo build --locked -p glass-testapp",
+  "run": ["target/debug/glass-testapp"],
+  "backend": "x11",
+  "a11y": false
 }
-// → { "x": 0, "y": 0, "width": 400, "height": 300 }
 ```
 
-glass ran the build, spun up a private headless display, launched the freshly-built app inside the
-sandbox, and found its window. The `400×300` geometry confirms it compiled and came up. This is the
-**build** phase — your agent compiled the app itself, then drove it. (The first build pulls in egui's
-dependencies, so it can take a minute; the build always runs unsandboxed with your full toolchain, while
-only the launched app is contained.)
+Glass runs the build, starts a private Xvfb display and launches the app under default containment.
+The result reports `width:320` and `height:240`. The build runs on the host with your toolchain;
+containment applies to the launched app.
 
-## Step 4 — See it ( → see)
+The fixture has no accessibility tree, so this launch explicitly skips the private accessibility
+bus. Ordinary launches enable it by default.
 
-Ask: **"Take a screenshot and tell me what's in the window."**
+## 4. See the window and save a baseline
+
+Wait for the initial paint, then capture the window:
 
 ```jsonc
-glass_screenshot
-// → an image, plus { "width": 400, "height": 300 }
+glass_do { "actions": [{ "action": "settle", "timeout_ms": 2000 }] }
+glass_screenshot {}
 ```
 
-The image goes to your **agent**, not to you directly — and that's the point: the agent looks at the UI
-for itself, so it never has to ask *you* "does this look right?". It reports back a small form: a
-**Text:** field at the top, a **Value** slider, and an **Apply** button. (Image-rendering clients like
-Claude Code also show the returned screenshot in your chat, so you can see it too — but the agent is the
-one acting on it.)
+You should see a 320×240 image: red at the top left, green at the top right, blue at the bottom
+left and white at the bottom right. Check that the settle step reports `settled:true`.
 
-Save this frame as a baseline, so we can measure what changes next:
+Save this image for comparison:
 
 ```jsonc
-glass_baseline_save { "name": "before" }
-// → saved baseline 'before'
+glass_baseline_save { "name": "before-input" }
 ```
 
-## Step 5 — Interact ( → interact)
+## 5. Send input and verify its delivery
 
-Ask: **"Click the Text field and type 'hello glass' into it."** The agent batches the focus-then-type as
-one known sequence with `glass_do` — the `settle` lets the field take focus before the keys land:
+Click inside the red quadrant and press the letter `a`:
 
 ```jsonc
 glass_do {
   "actions": [
-    { "action": "click", "x": 150, "y": 30 },
-    { "action": "settle" },
-    { "action": "type", "text": "hello glass" }
+    { "action": "click", "x": 80, "y": 60 },
+    { "action": "key", "chord": "a" }
   ]
 }
-// → ok:true; result.steps contains three ordered results
 ```
 
-The **Text:** field now reads `hello glass`.
-
-## Step 6 — Debug: what changed, and did it really happen? ( → debug)
-
-First the cheap check — ask: **"Diff against the 'before' baseline."**
+`ok:true` means both steps completed. To check that the application actually received the click,
+wait for its log entry:
 
 ```jsonc
-glass_diff { "name": "before" }
-// → { "changed_pct": 0.6, "changed_pixels": 737,
-//     "bbox": { "x": 8, "y": 26, "width": 280, "height": 19 }, "total_pixels": 120000 }
+glass_logs {
+  "contains": "EVENT button=1 x=80 y=60",
+  "cursor": 0,
+  "wait": { "timeout_ms": 3000 }
+}
 ```
 
-This is what the whole loop is built for: glass tells the agent — **as text, for zero vision cost** —
-that about 0.6% of the window changed, inside a `bbox` that is exactly the Text field. The agent knows
-*what* moved and *where* without decoding a single image. (Your exact `changed_pct` and pixel count
-will vary by a hair — the blinking text cursor and anti-aliasing shift a few pixels — but the `bbox`
-pins the field.)
-
-Now the ground truth. The fixture logs every change it makes, so ask: **"Show me the glass logs
-containing `text=`."**
+The result reports `matched:true`, with the event in a separate untrusted text block. Read the key
+event too:
 
 ```jsonc
-glass_logs { "contains": "text=" }
-// → [fixture] text=hello glass
+glass_logs { "contains": "EVENT keysym=97", "cursor": 0 }
 ```
 
-**The app itself recorded the value it now holds — `hello glass`, the exact text we asked for.** The
-agent built the app, saw it, drove it, and confirmed the result against the app's own record, with
-nobody in the loop. The build → see → interact → debug cycle is closed.
+`97` is the X11 keysym for lowercase `a`. The fixture logs input without changing its drawing.
+The app's own output confirms delivery.
 
-## Step 7 — Stop
-
-Ask: **"Stop glass."**
+## 6. Compare the pixels
 
 ```jsonc
-glass_stop
-// → stopped
+glass_diff { "name": "before-input", "mode": "exact" }
 ```
 
-glass tears down the app and the private display it created.
+Expect `changed_pixels:0` and `bbox:null`: receiving input did not change the quadrants. This result
+uses text only. A pixel comparison answers whether the picture changed; the log answered whether
+this app received the input.
 
-## What you just did
+## 7. Stop the app
 
-You watched an agent build, launch, see, drive, and verify a real GUI app entirely on its own — and,
-crucially, watched glass report *exactly* what changed on screen as cheap text. That's the loop that
-lets an agent debug UI code without stopping to ask you "does this look right?". You did it against a
-demo app, but nothing above changes when you point glass at your own: swap in your app's `build` and
-`run` commands and ask away.
+```jsonc
+glass_stop {}
+```
 
-Three things to do next:
+Glass closes the app and tears down its private display. Your agent has built, seen, driven and
+verified an application through MCP.
 
-- **Give your agent this loop permanently.** Install the [glass-drive skill](../how-to/drive-glass-well.md)
-  so it arrives already knowing the cheap-verify habits you just saw.
-- **Address elements by name, not pixels.** This egui app exposes an accessibility tree, so try
-  `glass_a11y_snapshot` (the accessibility bus is on by default) — you'll get the **Text** field, the
-  **Value** slider, and the **Apply** button as addressable elements. Then `glass_set_value` the slider
-  or `glass_click_element` the button by `#id`, no coordinates needed. See the
-  [tool reference](../reference/tools.md).
-- **Drive your own app.** Give `glass_start` your project's `build` command and binary, and read
-  [explanation/the-loop.md](../explanation/the-loop.md) for the thinking behind the text-first workflow.
+To try a code-fixing exercise next, use the [GTK Tasks demo](../../examples/tasks-demo/README.md).
+For named controls in your own app, see [semantic targeting](../reference/tools.md#selector-action-contract)
+and the optional [glass-drive skill](../how-to/drive-glass-well.md).

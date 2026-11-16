@@ -7,10 +7,10 @@ is what a snapshot shows — the value you verify after tapping Greet.
 
 ## Build
 
-Requires the full Xcode and an iOS Simulator runtime (macOS only):
+Requires full Xcode and an iOS Simulator runtime on an Apple Silicon Mac. Run from the repository root:
 
 ```bash
-./build.sh   # → build/Greeter.app
+./examples/ios-greeter/build.sh   # → examples/ios-greeter/build/Greeter.app
 ```
 
 Then follow [Drive a native iOS app in the Simulator](../../docs/how-to/drive-an-ios-app.md).

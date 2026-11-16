@@ -89,6 +89,18 @@ previous private login's lifetime. A surviving process or a retained login sessi
 defer recovery. Glass preserves the journal and reports the incomplete cleanup rather than restoring
 access while earlier work may still be running.
 
+## Workspace access in the separate account
+
+The requested workspace is shared read/write for the run. Existing executable search paths and
+existing file/directory arguments receive read access; unrelated environment values are not treated
+as file-sharing requests. Temporary access is recorded before changes and restored after owned work
+has stopped. Generated files may belong to the development account; Glass preserves your edit
+access in the selected workspace, including files atomically moved in from temporary storage.
+File contents and modes are preserved. Unreadable files, explicit access denials, surviving work
+or an unavailable filesystem can defer cleanup; Glass reports that failure and keeps its recovery
+journal for retry. Account homes, keychains and credentials are not copied.
+Default Seatbelt containment and protected artifact/trace paths still apply.
+
 ## Administrator authorisation and manual control
 
 Privacy grants are separate from the root authorisation used for account creation, registration,

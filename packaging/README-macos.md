@@ -1,97 +1,65 @@
-# glass — macOS (universal)
+# Glass — macOS universal
 
-**glass** is an MCP server that lets an AI coding agent drive native GUI apps: it
-launches an app, screenshots what's on screen, clicks and types into it, reads its
-logs, and detects visual changes — so the agent can build and debug a GUI on its own
-instead of asking you "does this look right?".
+Glass is an MCP server for driving external native GUI apps. This archive contains the signed,
+notarised `GlassMcp.app` for macOS 14 or later, with arm64 and x86-64 binaries. Apple Silicon is
+verified; Intel Macs are not yet verified.
 
-This is the **macOS universal** build, signed and notarized. It carries both
-architectures, though only Apple Silicon is tested — Intel Macs aren't yet verified.
-See the project README for the full picture:
-<https://github.com/fixed-width/glass>.
-The full macOS guide is
-[docs/how-to/setup-macos.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-macos.md).
+Full instructions: [macOS setup](https://github.com/fixed-width/glass/blob/master/docs/how-to/setup-macos.md).
 
----
+## Install and choose where apps run
 
-## 1. System requirements
+Drag **GlassMcp.app** to **/Applications**, then open it. **Application setup…** offers:
 
-macOS 14 or later. Nothing else to install — capture, input, the accessibility tree and
-the Seatbelt sandbox that launched apps run under are all built into macOS.
+- **On your desktop**: Glass uses your visible Aqua login; input can change focus and move your pointer.
+- **Off your desktop…**: a preview using a separate standard macOS account with a real graphical login.
+  Follow the wizard for account creation or reuse, initial macOS login, privacy access and
+  **Start Environment…**. Desktop startup uses an already enabled Screen Sharing service and local
+  account credentials. Glass does not save the account password. Initial login and missing grants
+  require user action; startup after reboot is user-assisted.
 
-## 2. Install
+Both choices need **Accessibility** and **Screen Recording** access for the signed Glass app.
+Use **Open Settings…** beside a missing permission; approve it from your normal account. If Glass
+is absent, add `/Applications/GlassMcp.app` with **+** in that privacy pane.
 
-Drag **`GlassMcp.app`** to **`/Applications`**, then double-click it. macOS may first
-ask you to confirm an app downloaded from the internet — that is the quarantine prompt
-every download gets, not a permission request.
+In the shared-desktop permission checklist, choose **Re-check** to relaunch after granting access,
+or accept macOS's **Quit & Reopen**. During the separate-account wizard, keep the wizard open and
+choose **Later** if macOS offers to quit; its fresh worker checks detect grants without restarting
+setup. The same signed app reuses approvals across accounts and compatible updates.
 
-Unlike the Linux and Windows builds, this one is a **GUI app, not a command-line
-binary**: macOS grants screen and input access to an application's signed identity, so
-glass ships as one.
+## Connect and verify
 
-## 3. Grant the two permissions
+The menu-bar app serves MCP at `http://127.0.0.1:7300/` by default. Keep Glass running and register
+that URL with your agent. Copy the actual endpoint from the **glass ●** menu if it differs.
+Loopback needs no bearer token. See
+[Connect your agent](https://github.com/fixed-width/glass/blob/master/docs/how-to/connect-an-agent.md#over-http).
 
-On first launch a **permission checklist** appears, listing **Accessibility** and
-**Screen Recording**. Click **Request…** next to each, one at a time. macOS raises its
-own consent prompt — use the **Open System Settings** button on it to reach the pane and
-turn the permission on. The app asks on its own behalf, so it is already listed there
-with nothing to add by hand.
+For a first check, ask the agent to launch your development app, take a screenshot and stop it.
+Apps run under Seatbelt containment by default. Apple's system apps may require LaunchServices
+and an explicit `sandbox:"off"` request; a failed contained launch does not run them unconfined.
 
-**Granting Screen Recording needs the app to restart.** macOS offers **Quit & Reopen**;
-accept it, so the grant takes effect. That restart is expected, not a failure. If a
-grant doesn't show up, click **Re-check**.
-
-Once both are on, the checklist is replaced by a **`glass ●`** menu-bar item and glass
-starts serving. It also installs a LaunchAgent, so it **starts again at every login** —
-**Quit glass** or **Uninstall glass…** from that menu are how you stop it. The grants
-are one-time and survive restarts and updates. Why they behave this way is in
-[docs/explanation/macos-permissions.md](https://github.com/fixed-width/glass/blob/master/docs/explanation/macos-permissions.md).
-
-## 4. Connect your agent (MCP over HTTP)
-
-The macOS app serves over HTTP at **`http://127.0.0.1:7300/`** — it does not need to be
-spawned by the agent the way the Linux and Windows binaries do. Point your client at
-that URL; loopback needs no token. See
-[docs/how-to/connect-an-agent.md](https://github.com/fixed-width/glass/blob/master/docs/how-to/connect-an-agent.md#over-http).
-
-The **`glass ●`** menu also has **Copy endpoint**, **Restart** (after a fresh grant),
-**Quit glass**, and **Uninstall glass…**.
-
-## 5. Check it works
-
-Ask your agent something like:
-
-> "Use glass to launch `/System/Applications/Font Book.app` with `sandbox` set to `off`
-> and take a screenshot."
-
-You should get back an image of the app. **Apple's own apps need `sandbox: "off"`**:
-macOS requires them to be started through LaunchServices, which glass cannot then place
-under Seatbelt, so a contained launch of one fails rather than running it unconfined.
-Apps you are developing take the default and stay contained. The tools it now has include `glass_start`,
-`glass_screenshot`, `glass_click`, `glass_type`, `glass_wait_stable`, `glass_diff`,
-`glass_logs`, `glass_a11y_snapshot`, `glass_click_element`, and `glass_doctor`.
-
-glass captures the real desktop, so a sleeping or locked display has nothing to grab.
-On a Mac you aren't sitting at, hold it awake: `caffeinate -d -i -s &`.
-
-## 6. Optional: the `glass-mcp` CLI on your `$PATH`
-
-The binary lives inside the bundle and isn't needed for MCP, but it's useful from a
-terminal — `glass-mcp status` and `glass-mcp doctor`:
+The CLI lives inside the bundle:
 
 ```bash
-sudo ln -s /Applications/GlassMcp.app/Contents/MacOS/glass-mcp /usr/local/bin/glass-mcp
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp status
+/Applications/GlassMcp.app/Contents/MacOS/glass-mcp doctor
 ```
 
-## Uninstall
+The resident menu-bar server holds its own privacy grants; a command run from Terminal can have a
+different responsible process. Diagnose the running service through your agent's `glass_doctor` too.
 
-**Uninstall glass…** from the **`glass ●`** menu (or `glass-mcp uninstall`) stops glass
-starting at login and quits it. Neither touches the bundle — drag `GlassMcp.app` to the
-Trash to finish.
+## Stop, update or uninstall
 
----
+Use **Quit glass** to stop the resident app and owned work. It starts again at your next login or
+when you reopen Glass. `glass_stop` ends application work and retains an off-desktop environment.
+For recovery and desktop changes, open **glass → Application setup…**.
 
-## Problems?
+To update, download and install the newer `.dmg`; `glass-mcp update --check` can check versions,
+but macOS has no in-place binary update. Reconnect clients after replacing the app.
 
-`glass-mcp doctor` diagnoses most setup issues and prints a remedy for each failed
-check. Bug reports and questions: <https://github.com/fixed-width/glass/issues>.
+Choose **Uninstall glass…** or run the bundled binary's `uninstall` command before deleting the app.
+This removes Glass startup/worker integration after cleanup. It retains the development account,
+home, app data and privacy grants. Then move **GlassMcp.app** to the Trash. To keep Glass and return
+to shared-desktop operation, use `unenroll` instead.
+
+See [Manage the macOS environment](https://github.com/fixed-width/glass/blob/master/docs/how-to/manage-macos-environment.md)
+for exact recovery/removal steps and [GitHub issues](https://github.com/fixed-width/glass/issues) for help.

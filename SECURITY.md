@@ -21,8 +21,10 @@ The application glass launches is sandboxed by default, per OS:
   unconfined. The app also runs on a **private headless display**, so it never touches your
   real desktop.
 - **Windows** — [Sandboxie Classic](https://sandboxie-plus.com): filesystem, registry, and
-  network virtualization, also **fail-closed**. The app still **renders on the interactive
-  desktop** (display isolation is in progress); for full isolation, run Glass inside a VM
+  network virtualisation, also **fail-closed**. The app renders on the selected desktop. The opt-in
+  [child-desktop preview](docs/how-to/windows-separate-desktop.md) separates input and windows
+  using the same Windows account; Sandboxie virtualises writes but does not hide the account's
+  readable files. For an OS boundary, run Glass inside a VM
   and reach it over the network transport — see
   [`packaging/windows-sandbox/`](packaging/windows-sandbox).
 - **macOS** — Seatbelt (`sandbox_init`): filesystem + process containment at `default`, plus no
@@ -33,9 +35,15 @@ The application glass launches is sandboxed by default, per OS:
   while your real pasteboard stays untouched. An app that runs under Apple's **hardened runtime**
   (App Store or notarized apps) can't be redirected and falls back to
   `Unsupported` (fail-closed) rather than reaching the real pasteboard. The app
-  still **renders on the real desktop** (display isolation is not yet implemented on macOS).
+  renders in the selected Aqua login. The opt-in
+  [separate-account preview](docs/how-to/setup-macos.md#apps-off-your-desktop-preview) uses a
+  retained development login; unenrolled use drives your visible desktop.
   Known limits: the Mach-service allowlist is currently broad (hardening in progress), Electron
   apps may escape their own sandbox, and `sandbox_init` is deprecated-but-shipping.
+
+- **Android** — the emulator VM and Android's app boundary; no additional Glass containment step.
+- **iOS** — the Simulator's per-app container, on the Mac; no additional Glass containment step.
+  Mobile `strict` does not add Glass-managed network denial.
 
 Choose the level per launch with `glass_start`'s `sandbox` argument, or globally with
 `GLASS_SANDBOX` (`off` / `default` / `strict`). `glass_doctor` reports what's available.

@@ -22,7 +22,7 @@ Linux, under the private AT-SPI bus `glass_start` already spawns for every a11y-
 Firefox 153 published its page at baseline on both X11 and Wayland; Brave 151 did not, and it
 stayed that way under both candidate levers tried on it: the `GNOME_ACCESSIBILITY=1` /
 `ACCESSIBILITY_ENABLED=1` environment pair, and the `--force-renderer-accessibility`
-command-line flag — which Glass cannot inject into an arbitrary app it launches (read
+command-line flag — which Glass does not add automatically to an arbitrary app it launches (read
 2026-08-24). On Windows, macOS and Android the engines examined published at baseline against
 the readers Glass already runs, with no extra lever pulled to get there.
 
@@ -83,8 +83,8 @@ older case that isn't specific to web content at all:
   the page is still empty on that re-read does it steer to pixels.
 - **A withheld placeholder, plus a different notice.** Some apps publish a stand-in element for a
   web view whose accessibility is off entirely. Nothing behind a placeholder can ever be addressed
-  by id — a re-snapshot won't change that — so this notice goes straight to `glass_screenshot`, then
-  `glass_click` at x,y.
+  by id while it remains withheld — so this notice directs the agent to `glass_screenshot`, then
+  coordinate input through `glass_do` (or standalone `glass_click` in full).
 - **No accessibility elements at all** (`empty_guidance`) is the pre-existing case for any app that
   publishes no tree — canvas apps, toolkits that need a11y turned on. It is not web-specific, and a
   page can also fall into it if the surrounding app itself exposes nothing.
@@ -98,6 +98,7 @@ tree alone does not establish that result.
 
 Every claim below is what a specific engine build did on the date read, not a fact about the
 engine — a later version, or the same engine under a different embedder, can differ.
+For current results on your host, use [the interaction runner](../how-to/measure-interactions.md).
 
 | Platform | Engines read (2026-08-24) | What was read |
 |---|---|---|

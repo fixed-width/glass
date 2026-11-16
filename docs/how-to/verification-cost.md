@@ -1,91 +1,69 @@
 # Measure what the verification loop costs
 
-Glass verifies work on the CPU: an accessibility snapshot, a text-only diff (`changed_pct`
-+ bbox, no image unless you ask), and `wait_for_*`. The alternative — a screenshot after
-every step — puts an image into the agent's context each time. This page measures the
-difference on one fixed task so you can put a number on it for your own model.
+Measure the actual tool calls and observations for a fixed task, then apply your model's token
+accounting to those observations. A screenshot count or byte count alone is not a billable token
+count.
 
-## The task
+For current repeated measurements, use [Measure repeated application interactions](measure-interactions.md).
+It covers preflight, fresh attempts, exact outcome checks and portable result validation. For native
+forms and application transfers, use [Measure application boundaries](measure-application-boundaries.md).
 
-Against `glass-fixture-egui` (a 400×300 window with a **Text** field, a **Value** slider,
-and an **Apply** button), driven two ways to the same end state (the app logs
-`[fixture] apply`):
+## Define comparable runs
 
-- **Semantic (text-only):** `glass_a11y_snapshot` → `glass_click_element` (focus field) →
-  `glass_type` → `glass_set_value` (slider) → `glass_click_element` (Apply) →
-  `glass_wait_for_log`. No images.
-- **Screenshot-every-step:** `glass_screenshot` → click/type → `glass_screenshot` → drag →
-  `glass_screenshot` → click → `glass_screenshot`. See-act-see.
+Keep the application build, initial state, task, final assertion, host and tool profile fixed.
+Record the Glass revision, driver configuration, image bounds and repetitions with the results.
+Include discovery, action and verification calls in the comparison. Separate setup/build time from
+task time, and keep failed attempts in the outcome counts.
 
-## Run it
+To compare semantic and visual verification, use the same assertion in both runs. An acknowledged
+click and a changed image do not by themselves prove that a form saved the expected value.
+Measure both the value and the activation count where the fixture exposes them.
+
+## Read the measurements
+
+The [interaction runner](../../tools/interaction-bench/README.md) preserves requests, responses,
+artifacts and phase costs. Validate the result directory before interpreting its summary:
 
 ```bash
-./scripts/verification-cost.sh
-cat target/verification-cost.json
+python3 tools/interaction-bench/run.py validate /absolute/path/results
+python3 tools/interaction-bench/run.py summarize /absolute/path/results
 ```
 
-On-demand contributor tooling (needs Xvfb + an AT-SPI bus); it is `#[ignore]`d and not part
-of the per-PR test gate. The structural numbers (round-trips, image count, image dimensions)
-are stable across repeated runs; the approximate text-token counts can drift by a byte or two
-because `glass_wait_for_log`'s response embeds a wall-clock `elapsed_ms`.
+Compare request and response text bytes, tool calls, images and their decoded dimensions. If the
+run reads output artifacts, count those reads too. Full and lean inventories have different schema
+costs; inspect the one used by the run without starting an application:
 
-## What it records
-
-Round-trips, request/response **bytes**, an approximate text-token count
-(`text_bytes ÷ 4`), and for each screenshot its **width × height**. It does **not** convert
-images to tokens — Glass is model-agnostic, and a tokenizer is a dependency it declines to
-carry. You convert, below.
-
-## Results
-
-| Arm | Round-trips | Text tokens (approx) | Images | Image size |
-|-----|-------------|-----------------------|--------|------------|
-| Semantic (text-only) | 6 | 349 | 0 | — |
-| Screenshot-every-step | 8 | 301 | 4 | 400×300 |
-
-## Turning images into tokens (your model)
-
-Apply your model's published vision-token formula to each recorded image. Two common ones,
-for a 400×300 image:
-
-- **Anthropic (Claude):** `tokens ≈ (width × height) / 750` → (400×300)/750 = **160**
-  tokens/image → screenshot arm ≈ 160 × 4 = **640** image tokens, plus its 301 text tokens
-  ≈ **941** tokens total. (See Anthropic's vision docs for the current formula.)
-- **OpenAI (GPT-class, high detail):** `85 + 170 × tiles`. High detail first scales the
-  image so its **shortest side is 768px**, then counts 512-px tiles — so a 400×300
-  screenshot scales up to 1024×768 = 2×2 = **4 tiles** → 85 + 170×4 = **765** tokens/image →
-  765 × 4 = **3060** image tokens, plus 301 text tokens ≈ **3361** tokens total. (Newer
-  OpenAI models tokenize images with a patch-based scheme rather than tiles, so check your
-  model's current vision docs.)
-
-On this task the text-only arm (349 tokens) costs roughly **2.7×** less than the screenshot
-arm under Anthropic's formula (941 tokens), and roughly **9.6×** less under OpenAI's
-high-detail formula (3361 tokens). The gap is structural — images versus text — not an artifact of task length: a
-longer task adds a screenshot per verification point to the screenshot arm and only a few
-hundred more text bytes to the semantic arm.
-
-## Scaling to your window size
-
-400×300 is a small fixture window, kept small so the harness runs fast and deterministically
-under Xvfb. That smallness makes the ratios above conservative: image-token cost scales with
-pixel count, so a normal application window costs proportionally more per screenshot — while
-the semantic arm's text cost barely moves, since it's driven by the number of elements and
-log lines involved, not by how many pixels the window has.
-
-Recompute for your own window by taking its width × height and applying the same formula.
-For example, a 1280×800 app window under Claude's formula:
-
-```
-(1280 × 800) / 750 ≈ 1365 tokens/image
-× 4 screenshots      ≈ 5460 image tokens
-+ 301 text tokens     ≈ 5761 tokens for the screenshot arm
+```bash
+glass-mcp --tool-profile full tools --json
+glass-mcp --tool-profile lean tools --json
 ```
 
-against 349 for the semantic arm — roughly **16.5×** less, not 2.7×. The 400×300 fixture
-number is a floor, not a representative figure: we report primitives (round-trips, bytes,
-image dimensions) rather than a single canned ratio so you can plug in your own window size
-and model and get a number that actually applies to your app.
+`tools_json_bytes` and `instructions_bytes` measure UTF-8 context size. They exclude JSON-RPC
+framing and do not measure model tokens.
 
-> The approximate text-token count uses bytes ÷ 4; the image formulas are the published,
-> per-model ones. We report primitives (round-trips, bytes, image dimensions) so the number
-> survives a change of tokenizer.
+## Convert observations to model costs
+
+Use the tokenizer and image-accounting rules for the exact model and detail setting used by your
+agent. Image accounting can depend on resizing, tiles, patches or detail level; it need not scale
+linearly with source pixels. Base64 size and compressed WebP size are not image-token estimates.
+
+A text approximation such as `ceil(text_bytes / 4)` is useful for a rough comparison, but does not
+account for a particular tokenizer, cached context or protocol overhead. Keep the raw bytes and
+image dimensions so the estimate can be recomputed.
+
+To compare a smaller preview, set the same `max_width`/`max_height` in every measured observation.
+Those controls shrink returned images; diff and stability checks still use native pixels.
+See [Capture a smaller image](capture-a-smaller-image.md).
+
+## Legacy egui comparison
+
+`scripts/verification-cost.sh` runs the older, opt-in `glass-testapp` verification-cost tests.
+It needs Xvfb, a private AT-SPI bus and the workspace-excluded egui fixture. Its semantic arm uses
+six calls and no images; its screenshot arm uses eight calls and four images. The screenshot arm
+uses an unmetered accessibility snapshot to locate controls and an unmetered log check, so it is a
+scripted observation-cost comparison, not a vision agent benchmark.
+
+The legacy invariant test still asserts 400×300 images while the current fixture opens at 700×500.
+That assumption needs updating before the complete script can be used as a passing measurement
+gate. Historical text-token totals and cost ratios do not describe the current build. Use the
+interaction runner for new cohorts.

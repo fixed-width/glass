@@ -34,6 +34,10 @@ Within a major version, these are stable — Glass will not change them incompat
   accompanying `.sha256` files. An installer or script can depend on the download-URL pattern. See
   [Platform support](platforms.md#release-artifacts) for the exact names.
 
+Tool profiles are explicit inventory choices. The compatible default is full; choosing lean omits
+standalone tools as described in [Tool profiles](tools.md#tool-profiles). A tool omitted by the
+selected profile is distinct from an operation unsupported by the active backend.
+
 ## What is not covered
 
 These may change in any release, including a patch, and are not a breaking change:

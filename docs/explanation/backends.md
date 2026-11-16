@@ -3,16 +3,17 @@
 Glass presents the same tools on every platform, but *where* the app runs and *how* it is captured
 differ underneath. That variation is hidden behind a `Platform` seam in `glass-core`: the core stays
 platform-agnostic, and each backend maps the common operations — capture, input, window enumeration —
-to one OS's mechanisms. This is why the MCP tools behave identically across backends and only the
-setup differs.
+to one OS's mechanisms. Tool names and argument shapes are shared; supported operations,
+confirmation and isolation depend on the backend.
 
 ## The backend is chosen per launch
 
 The backend is selected **per `glass_start`**, via its `backend` argument. When omitted it falls back
 to `GLASS_BACKEND`, then to the host default (`windows` on a Windows host, `macos` on a macOS host,
 otherwise `x11`). Because
-the choice is per-call, an agent can drive an X11 app and a Wayland app in the same session with no
-server restart. The backend is built when the app is launched, so the server boots even on a host with
+the choice is per-call, an agent can stop an X11 app and launch a Wayland app through the same server.
+There is one active application session at a time. The backend is built when the app is launched,
+so the server boots even on a host with
 no display or compositor at all.
 
 ## The six backends
@@ -20,14 +21,16 @@ no display or compositor at all.
 - **X11 (Linux)** — spawns its own private headless `Xvfb`, or attaches to a display you name.
 - **Wayland (Linux)** — spawns a private headless `sway` (a wlroots compositor) per session. sway also
   launches an Xwayland server, so X11-only apps run under this backend too.
-- **Windows** — drives the app on the interactive desktop (Windows.Graphics.Capture, SendInput, UI
-  Automation), so it needs a logged-in session to render and capture.
+- **Windows** — uses Windows.Graphics.Capture, SendInput and UI Automation in a signed-in session.
+  The resident app can use your desktop or a retained local child desktop (preview).
 - **Android** — drives a native app in an AVD emulator over `adb`; host-OS-agnostic, since it just
   shells out to `adb`. The VM *is* the sandbox.
 - **iOS** — drives a native app on an iOS Simulator over `xcrun simctl`; macOS-host-only, since the
-  Simulator and `simctl` ship with Xcode. The Simulator *is* the sandbox. This backend captures, reads
+  Simulator and `simctl` ship with Xcode. The app uses the Simulator's per-app data container.
+  This backend captures, reads
   logs, and drives the clipboard; with `idb_companion` installed it also taps, types, swipes, scrolls,
-  and reads the accessibility tree. Multi-touch gestures are not supported yet.
+  and reads the accessibility tree. A compatible companion also supports a two-finger pinch;
+  other multi-touch gestures are unsupported.
 - **macOS** — drives the logged-in Aqua session (ScreenCaptureKit capture, CGEvent input, AXUIElement
   windows), gated by macOS's privacy permissions.
 
@@ -55,9 +58,11 @@ On **Android**, the emulator provides the same isolation for free: Glass can boo
 is entirely separate from your session. On **iOS**, the Simulator gives the same result: Glass boots it
 through `simctl` without opening the Simulator app, so the app it drives never appears on your desktop.
 
-On **Windows**, isolation is weaker. There is one interactive desktop, and even a virtual-display
-driver only adds a monitor to *that* desktop rather than walling the app off — for full isolation you
-run Glass inside a VM. On **macOS**, shared-desktop setup drives the current Aqua session. The
+On **Windows**, shared-desktop operation uses your interactive desktop. A virtual-display driver
+adds a monitor to that same desktop and leaves its input shared. The
+[separate-desktop preview](../how-to/windows-separate-desktop.md) gives input and windows a retained
+child session, using the same account and file permissions. A VM provides a separate operating
+system boundary. On **macOS**, shared-desktop setup drives the current Aqua session. The
 [account setup preview](../how-to/setup-macos.md#apps-off-your-desktop-preview) routes the same tools
 to a separate account’s retained Aqua login in the same OS.
 
@@ -66,7 +71,7 @@ to a separate account’s retained Aqua login in the same OS.
 The normal click, scroll and typing tools already leave your desktop alone when their input goes
 into an owned Linux display, Android emulator or iOS Simulator. The target can acquire focus and
 move its pointer inside that environment without changing your host pointer or foreground app.
-Unenrolled macOS and native Windows input use your interactive desktop and can interfere with it.
+Unenrolled macOS and shared-desktop Windows input use your interactive desktop and can interfere with it.
 macOS's existing Accessibility grant authorizes that control; it does not establish input isolation.
 
 `glass_capabilities` with `scope: "session"` reports ordinary click, scroll and text support alongside
@@ -82,8 +87,6 @@ app, copying through a shared clipboard and filesystem/network access have separ
 On X11, pointing Glass at your running desktop is a one-line opt-in (`GLASS_DISPLAY=:0`). The Wayland
 analog — driving your existing live compositor session — is a deliberate **non-goal**. Wayland has no
 equivalent ambient-display handle; reaching a live session means going through the XDG desktop portal,
-which raises an interactive consent dialog. That is fundamentally unsuited to the unattended,
-agent-driven use Glass is built for, so the Wayland backend always spawns its own headless sway
-instead. The upshot is a feature, not a limitation: because the app runs inside the compositor Glass
-spawns, the Wayland backend works on **any** Linux host — including GNOME and KDE desktops, where the
-host's own compositor is simply irrelevant.
+which can require interactive consent. Glass instead owns the headless compositor for its app
+work. The host desktop can use GNOME, KDE, another compositor or no graphical login; the backend
+still needs its own supported sway, Xwayland and rendering dependencies.

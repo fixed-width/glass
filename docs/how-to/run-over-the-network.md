@@ -1,12 +1,12 @@
 # Run Glass over the network
 
-stdio requires `glass-mcp` to run on the **same machine** as the agent. When the agent and the target
-app are on different machines, run `glass-mcp` as a network server on the app's machine (rmcp
-Streamable HTTP) and point your client at the URL.
+Run Glass on the machine with the target application or device. When the agent connects from
+another machine, serve Streamable HTTP and register the server URL in the MCP client.
 
 | Situation | Transport | How |
 |---|---|---|
-| Agent + app on the same machine | stdio | Register `glass-mcp`; the client spawns it. Zero config — see [connect-an-agent.md](connect-an-agent.md). |
+| Client launches a local server | stdio | Register the binary; the client spawns it. |
+| Local macOS menu-bar or Windows tray app | HTTP | Register the resident app's endpoint and keep it running. |
 | Agent and app on different machines | network (HTTP) | Run `glass-mcp serve --http --addr …` on the app's machine; point the client at the URL with a bearer token. |
 
 The network transport is behind the default-on `network` cargo feature; a `--no-default-features`
@@ -19,7 +19,7 @@ Generate a token, then serve with it:
 ```bash
 mkdir -p ~/.glass
 glass-mcp gen-token --out ~/.glass/token                  # cross-platform CSPRNG token
-glass-mcp serve --http --addr 0.0.0.0:7300 --token-file ~/.glass/token
+glass-mcp serve --http --tool-profile lean --addr 0.0.0.0:7300 --token-file ~/.glass/token
 ```
 
 The client supplies the token as an `Authorization: Bearer <token>` header (check your client's docs

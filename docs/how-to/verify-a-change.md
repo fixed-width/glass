@@ -5,19 +5,36 @@ on. Every command here is run from the repo root.
 
 ## The gates, on any host
 
-These three are what CI fails a PR on, and they are the same everywhere:
+With the [build prerequisites](build-from-source.md) installed, run formatting and lint checks:
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+On Linux and Windows, run:
+
+```bash
 cargo test --workspace --locked
 ```
+
+On macOS, match CI's library-test gate:
+
+```bash
+cargo build --workspace --all-targets --locked
+./scripts/test-macos.sh
+cargo test --workspace --lib --locked
+```
+
+Several macOS integration targets use `harness = false` and require a granted GUI context.
+A plain macOS `cargo test --workspace` attempts to run those targets; `--lib` keeps this gate to
+unit tests. Build/clippy still cover all targets.
 
 `--workspace` resolves on Linux, macOS and Windows alike: the platform crates gate themselves, so
 the ones that do not apply to your host compile to nothing rather than failing.
 
-They need nothing installed. Anything wanting a display, a compositor or a device is
-`#[ignore]`d and does not run here — see [below](#integration-suites-linux).
+These gates need the compiler/toolchain dependencies, but no live display or mobile device.
+Ordinary display/device tests are ignored; native integration suites need the additional setup below.
 
 ## The gap this guide exists for
 
@@ -30,11 +47,14 @@ The fix is to name the target.
 ## Cover the Windows code from Linux
 
 Desktop recording builds bundled C++ sources, including during metadata checks. Install a
-MinGW C++ cross toolchain and configure Cargo's target `CC`/`CXX` before these checks. Native
+MinGW C++ cross toolchain (Debian/Ubuntu: `g++-mingw-w64-x86-64`) and configure the target tools. Native
 Windows builds use the installed Visual C++ toolchain.
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
+export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
+export CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++
+export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
 
 cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets --locked -- -D warnings
 ```
@@ -43,7 +63,7 @@ That needs no Windows machine: `cargo check` and `cargo clippy` emit Rust metada
 a final executable, while native dependencies still need their target compiler and archiver.
 
 To actually *run* the Windows-target tests you need a cross-linker and wine (Debian/Ubuntu:
-`sudo apt install gcc-mingw-w64 wine`):
+`sudo apt install g++-mingw-w64-x86-64 wine`):
 
 ```bash
 CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine \
@@ -60,8 +80,8 @@ Three things to know before trusting the result:
   executable suffix are compiled in per target rather than emulated, so a path-semantics bug fails
   here for the same reason it fails on Windows. Anything touching a real OS service is a different
   matter.
-- **Use a fresh `CARGO_TARGET_DIR`.** A second run against a warm one is a cache hit that prints a
-  clean result without compiling anything.
+- **A cache hit is valid for unchanged inputs.** Cargo recompiles changed inputs. Use a separate
+  `CARGO_TARGET_DIR` when isolating a cross-target experiment; deleting the cache is not a verification requirement.
 
 ## Cover the macOS code from Linux
 
@@ -81,80 +101,19 @@ The private-session bridge is Objective-C and compiles only on a Mac. Cross-host
 still check its Rust declarations and callers, but do not compile or validate the native bridge.
 Use a native macOS build and tests for changes to `private_session.m` or its ABI.
 
-- **`--lib` is what makes it work, and it is not the same reason the macOS CI job uses `--lib`.**
-  Here it is because `--lib` does not build dev-dependencies: `--all-targets` pulls `criterion`,
-  which depends unconditionally on `alloca`, whose build script compiles C — and cross-compiling
-  that runs the *host* `cc` with `-arch` and `-mmacosx-version-min`, which Linux `gcc` rejects.
-  Building it would need a darwin cross-toolchain such as osxcross.
-- To include tests and benches for one crate, scope with `-p`:
-  `cargo clippy --target x86_64-apple-darwin -p glass-macos --all-targets -- -D warnings` works,
-  because `glass-macos` does not dev-depend on `criterion`.
-- **You cannot link or run.** That needs the macOS SDK and a Mac. For anything past type-checking,
-  push and let the macOS CI job run it, or run it on a Mac.
-
-The read-only macOS input diagnostics use a nondefault build feature. To compile their binary and
-tests from Linux:
+`--lib` avoids pulling every test/benchmark dependency into the cross-check. `--all-targets`
+can additionally compile C dependencies such as `alloca`; these also need a correctly configured
+Darwin toolchain. To cover tests and benches for one crate, scope the check:
 
 ```bash
-cargo clippy --target x86_64-apple-darwin -p glass-macos --all-targets \
-  --features native-diagnostics --locked -- -D warnings
+cargo clippy --target x86_64-apple-darwin -p glass-macos --all-targets --locked -- -D warnings
 ```
 
-On a Mac with a logged-in WindowServer, run:
+Cross-checking is not a native link or runtime test. Run on a Mac, or use macOS CI, for that evidence.
 
-```bash
-cargo run -p glass-macos --features native-diagnostics \
-  --bin glass-macos-window-input-readiness --locked
-```
-
-The diagnostic reads its own kernel process identity, constructs unposted click/scroll events,
-checks event field and local-coordinate round trips, and reads existing permission grants without
-requesting them. It posts no input, captures no screen content and activates no app. These checks establish event round trips and live process facts, not actual input delivery or
-headless/display isolation. The feature adds no MCP parameter or input route; ordinary builds and
-session capability reports retain their existing behavior. Missing private
-symbols or incomplete identity/ABI readings return an error.
-
-The same feature provides an owned-target inspector and an opt-in lifecycle test. On a Mac with
-an existing Accessibility grant, build the nonactivating fixture and run the test:
-
-```bash
-swiftc crates/glass-macos/fixture/window_target.swift -o /tmp/glass-window-target-fixture
-swiftc -D DEVELOPMENT_REBUILD crates/glass-macos/fixture/window_target.swift \
-  -o /tmp/glass-window-target-rebuilt
-cargo test -p glass-macos --features native-diagnostics \
-  --test window_target --locked --no-run
-# Use the executable path printed by Cargo above.
-GLASS_WINDOW_TARGET_FIXTURE_BIN=/tmp/glass-window-target-fixture \
-  /path/to/window_target-test-binary --ignored /tmp/glass-window-target-rebuilt
-```
-
-When the grant belongs to a signed app bundle, build with `--no-run` and run the resulting test
-binary through that bundle's established signing and GUI-session procedure. The test requires
-the grant; it never requests one. It launches fresh direct children with existing containment,
-without the clipboard shim, and reads exact AX/WindowServer ownership and point geometry.
-Child standard input/output is discarded. Post-read failures retain AX dispatch evidence even
-though no input event was posted. The test covers geometry refresh, closure, replacement, competing windows,
-child exit and cleanup. It reads no control values and posts no input. Successful observations report `window_identity_revalidated: true` for fresh checks of the original
-process/window/connection/PSN tuple and retained AX reference. The live process image identity comes
-from the kernel. No application, compiler or OS-build allowlist is involved. There is no executable
-file hash/format/size requirement, and replacement or deletion of a file on disk does not invalidate
-an unchanged running process. Caller cwd/environment and development loader settings are preserved.
-
-The inspector is a diagnostic for an already built direct child with one reported window. Build and
-window-hint requests are outside this helper's scope; the normal application launcher retains its
-existing build/window-selection behavior. A failed observation invalidates the inspector, except
-while waiting for its first window. Observed closure/replacement or unavailable ownership facts
-refuse. Unobserved window-ID reuse in the same process/connection and changes between checks remain
-possible. Point geometry and the AX subtree are observations, not a complete pixel mapping or a
-supported input route. No operator input is needed and no physical interference verdict follows.
-
-The two Swift commands compile ordinary sample apps locally. The `DEVELOPMENT_REBUILD` variant
-changes the UI and reports its launch arguments, cwd and a caller environment value through an AX
-identifier for test assertions. Supply that second binary after `--ignored`. The test checks
-custom arguments/cwd/env and relative launch paths,
-executable replacement/deletion and cwd rename during a live process, and relaunch after replacing
-its binary with the changed build. Expected app behavior stays in tests; no binary/source identity
-is embedded in the inspector. Neither these tests nor the diagnostic provide headless macOS support.
+For the opt-in event and owned-window inspection tools, see
+[Run the macOS native diagnostics](run-macos-diagnostics.md). These are read-only diagnostics,
+not evidence of delivered input or desktop isolation.
 
 ## Integration suites (Linux)
 
@@ -204,8 +163,8 @@ The X11 and Wayland **backend crates** also keep their display-backed unit tests
 the command above covers the end-to-end suite but not them:
 
 ```bash
-cargo test -p glass-x11 -- --include-ignored       # 73 tests; needs xvfb + at-spi2-core
-cargo test -p glass-wayland -- --include-ignored   # 61 tests; needs sway >= 1.12, Mesa, Xwayland
+cargo test -p glass-x11 -- --include-ignored       # needs Xvfb + AT-SPI prerequisites
+cargo test -p glass-wayland -- --include-ignored   # needs sway >= 1.12, Mesa, Xwayland
 ```
 
 ## What only CI or a real host can do
@@ -226,7 +185,8 @@ the test's profile, and set `GLASS_CLIP_SHIM_DLL` in the scheduled process to th
 
 ## The scripts
 
-Fourteen run locally. One drives another machine.
+Choose the script for the area changed. Some scripts skip when prerequisites are absent; inspect
+the output and test counts before treating an exit status of zero as coverage.
 
 | script | what it does |
 |---|---|
@@ -236,12 +196,16 @@ Fourteen run locally. One drives another machine.
 | `test-macos.sh` | glass-macos suite; exits 0 off macOS, so it is safe to call anywhere |
 | `test-macos-a11y.sh` | compile/link gate for the macOS a11y integration test |
 | `test-macos-mcp.sh` | headless stdio MCP smoke — server boots and lists its tools |
+| `test-macos-packaging.sh` | signed bundle/disk-image permission checks on macOS |
+| `test-macos-account.sh` | account API lifecycle checks; disposable GitHub-hosted macOS runners only |
+| `test-android.sh` | attached emulator suites; `--build-only` compiles without a device |
+| `test-android-lifecycle.sh` | managed emulator boot/teardown; begin without a running emulator |
 | **`test-windows.sh`** | **drives a REMOTE Windows box over SSH**; skips cleanly when none is configured |
 | `sandbox-xvfb.sh` | manage the sandbox X display glass-mcp drives |
 | `bench.sh` | run the benchmarks, or flamegraph one |
 | `coverage.sh` | coverage via cargo-llvm-cov + cargo-nextest |
 | `mutants.sh` | mutation-test glass-core (CI does this; see the table above) |
-| `build-bundle.sh` | build the distribution bundle |
+| `build-bundle.sh` / `build-musl.sh` | local Linux bundles / the static Linux release binary |
 | `verification-cost.sh` | measure what the verification loop costs |
 | `x11-geometry-settle-measurement.sh` | one-off X11 launch-geometry measurement |
 | `wayland-geometry-settle-measurement.sh` | the Wayland counterpart |

@@ -21,7 +21,8 @@ exactly what a developer needs to debug.
 
 Point an agent at a GUI app and it runs the whole cycle itself:
 
-- **build** — Glass launches the app, optionally running a build command first, inside a sandbox.
+- **build** — Glass optionally runs a build command on the host, then launches the app under
+  the selected containment policy.
 - **see** — it captures the window (or a sub-region) as a lossless image.
 - **interact** — it clicks, types, drags, scrolls, or drives the accessibility tree.
 - **debug** — it reads the app's stdout/stderr, saves a baseline, and diffs later frames against it
@@ -33,8 +34,8 @@ the [tool reference](../reference/tools.md).
 
 ## Why the observe tools return text
 
-Looking at a screenshot costs an agent vision tokens, and that cost scales with the pixel area of the
-image. A naive loop — screenshot, act, screenshot, compare — pays that cost on every check, most of
+Looking at a screenshot consumes model context; its cost depends on the model and image dimensions.
+A screenshot, act, screenshot, compare loop pays that cost on every check, many of
 which only need to answer a yes/no question: *did anything change yet?*
 
 Glass is built so those checks are cheap. The comparison and waiting tools — `glass_diff`, the
@@ -46,7 +47,9 @@ region is a large, recurring saving over a full-window capture.
 
 The same instinct drives the wait-for-condition tools: instead of polling with screenshots until a
 button enables or a log line appears, an agent issues one blocking text call that returns when the
-condition is met (or times out softly). Fewer round-trips, no wasted vision.
+condition is met or times out. Standalone predicates time out softly; an unmatched element wait in
+`glass_do` fails that sequence. The lean profile exposes actions and element waits through
+`glass_do`, and log waits through `glass_logs.wait`, while retaining the same text-first approach.
 
 ## No silent fallbacks
 

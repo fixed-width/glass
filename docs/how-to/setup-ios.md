@@ -35,13 +35,15 @@ multi-GB image):
 xcodebuild -downloadPlatform iOS
 ```
 
-You also need at least one iPhone simulator device. Xcode creates a few by default; if none
-exist, create one:
+You also need an available iPhone or iPad Simulator. Inspect installed devices and device types:
 
 ```bash
 xcrun simctl list devices available   # see what's already there
-xcrun simctl create "iPhone glass" "iPhone 17"
+xcrun simctl list devicetypes
 ```
+
+If no device exists, create one using a type listed by your installed Xcode, for example
+`xcrun simctl create "iPhone glass" "iPhone 17"` when that type is available.
 
 ## Attach-or-boot
 
@@ -100,10 +102,9 @@ With `idb_companion` on `PATH`, these tools work against the Simulator:
   two-finger pinch. Rotation, two-finger pan and three-or-more-finger gestures are refused by name:
   idb's only multi-contact primitive is a pinch, so there is nothing to map them onto.
 
-  A pinch also needs an `idb_companion` that implements idb's `HIDPinch` event. As of 2026-08,
-  Homebrew ships idb-companion 1.1.8 (built August 2022), which does not; prebuilt newer companions
-  are published on idb's GitHub releases. If yours does not implement it, Glass names the binary and
-  quotes its `--version` output rather than failing opaquely.
+  A pinch also needs an `idb_companion` that implements idb's `HIDPinch` event. Older companions,
+  including 1.1.8, lack it. If yours does not implement it, Glass names the binary and quotes its
+  `--version` output. Select a compatible build through `GLASS_IDB_COMPANION`.
 
 If `idb_companion` isn't installed, the input and accessibility tools return an unsupported error,
 while capture, logs, and clipboard keep working.

@@ -20,10 +20,10 @@ removes the cover, allowing the test to verify that the underlying target become
 
 ## Build
 
-Requires the full Xcode and an iOS Simulator runtime (macOS only):
+Requires full Xcode and an iOS Simulator runtime on an Apple Silicon Mac. Run from the repository root:
 
 ```bash
-./build.sh   # → build/GlassFixture.app
+./examples/ios-fixture/build.sh   # → examples/ios-fixture/build/GlassFixture.app
 ```
 
 ## Run the on-box tests against it

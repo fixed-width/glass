@@ -1,7 +1,7 @@
 # Measure repeated application interactions
 
 Use the interaction benchmark to check a Glass build against deterministic web tasks and measure
-the cost of completing them through its actual MCP interface. You need Python 3.10+, Linux, Xvfb,
+the cost of completing them through its actual MCP interface. You need Python 3.9+, Linux, Xvfb,
 `dbus-daemon`, the AT-SPI prerequisites from [verify a change](verify-a-change.md), and an installed
 browser that publishes accessibility controls. The runner uses owned displays and profiles.
 

@@ -160,7 +160,7 @@ records are not all secret files.
 | `~/Library/LaunchAgents/tech.fixedwidth.glass.plist` and `~/Library/Logs/GlassMcp/` | Optional normal-user HTTP startup integration and server logs. |
 
 The current layout is per normal user; older previews used registration files directly under
-`/Library/Application Support/Glass`. See the existing [manual unenrollment procedure](../how-to/setup-macos.md#unenroll-by-hand)
+`/Library/Application Support/Glass`. See the existing [manual unenrollment procedure](../how-to/remove-macos-enrollment-manually.md)
 for both layouts. Deleting recovery records is not equivalent to restoring permissions.
 
 ## Privilege boundaries and verification limits
