@@ -16,7 +16,7 @@
 # sandbox level explicitly in the AppSpec.
 #
 # NOTE: the software_render tests (gtk4_app_renders_under_default_sandbox,
-# gtk4_gl_renderer_stays_black_under_sandbox) require 'python3-gi' + 'gir1.2-gtk-4.0'
+# gtk4_renderer_override_selects_gl_under_sandbox) require 'python3-gi' + 'gir1.2-gtk-4.0'
 # (they drive a real GTK4 app) and fail loudly if absent — install them, or run a subset
 # with a filter (e.g. ./scripts/test-x11.sh network_screenshot_over_http) to skip them.
 # Use `./scripts/test-x11.sh artifact` for the protected artifact-path launch cases.

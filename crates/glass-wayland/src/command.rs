@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -110,10 +110,30 @@ pub fn sway_config_with_inputs(
             wrap_argv(&prog, &args, &opts)?
         }
     };
-    Ok(render_sway_config(&argv))
+    let library_path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "LD_LIBRARY_PATH")
+        .map(|(_, value)| OsString::from(value))
+        .or_else(|| std::env::var_os("LD_LIBRARY_PATH"));
+    Ok(render_sway_config(&argv, library_path.as_deref()))
 }
 
-fn render_sway_config(argv: &[OsString]) -> Vec<u8> {
+fn render_sway_config(argv: &[OsString], library_path: Option<&OsStr>) -> Vec<u8> {
+    // A portable sway wrapper adds private libraries that must not replace the app's host GLib.
+    let mut prefix = vec![OsString::from("/usr/bin/env")];
+    if let Some(path) = library_path {
+        let mut assignment = OsString::from("LD_LIBRARY_PATH=");
+        assignment.push(path);
+        prefix.extend([OsString::from("--"), assignment]);
+    } else {
+        prefix.extend([
+            OsString::from("-u"),
+            OsString::from("LD_LIBRARY_PATH"),
+            OsString::from("--"),
+        ]);
+    }
     let (out_w, out_h) = output_resolution();
     let mut config = format!(
         "output HEADLESS-1 resolution {out_w}x{out_h}\n\
@@ -122,7 +142,7 @@ fn render_sway_config(argv: &[OsString]) -> Vec<u8> {
          exec "
     )
     .into_bytes();
-    for (index, argument) in argv.iter().enumerate() {
+    for (index, argument) in prefix.iter().chain(argv).enumerate() {
         if index > 0 {
             config.push(b' ');
         }
@@ -322,8 +342,53 @@ mod tests {
             OsString::from("--"),
             OsString::from("app"),
         ];
-        let config = render_sway_config(&argv);
+        let config = render_sway_config(&argv, None);
         assert!(contains_bytes(&config, home.as_bytes()));
+    }
+
+    #[test]
+    fn sway_exec_does_not_inherit_compositor_loader_path() {
+        let argv = [
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from("printf '%s' \"${LD_LIBRARY_PATH-unset}\""),
+        ];
+        let config = render_sway_config(&argv, None);
+        let command = config
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"exec "))
+            .unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(OsString::from_vec(command.to_vec()))
+            .env("LD_LIBRARY_PATH", "/private/compositor-libraries")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"unset");
+    }
+
+    #[test]
+    fn sway_exec_preserves_the_requested_loader_path() {
+        let original = OsStr::new("/sdk/one ' library:/sdk/two");
+        let mut spec = spec(&["/bin/sh", "-c", "printf '%s' \"$LD_LIBRARY_PATH\""]);
+        spec.env = vec![
+            ("LD_LIBRARY_PATH".into(), "/discarded".into()),
+            ("LD_LIBRARY_PATH".into(), original.to_str().unwrap().into()),
+        ];
+        let config = sway_config(&spec, Path::new("/run/test"), None, None, &[]).unwrap();
+        let command = config
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"exec "))
+            .unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(OsString::from_vec(command.to_vec()))
+            .env("LD_LIBRARY_PATH", "/private/compositor-libraries")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, original.as_bytes());
     }
 
     fn test_sway_config(
@@ -523,10 +588,7 @@ mod tests {
         );
         assert!(cfg.contains("default_border none"), "{cfg}");
         assert!(cfg.contains("floating enable"), "{cfg}");
-        assert!(
-            cfg.contains("exec 'glass-testapp' '--windows' '2'"),
-            "{cfg}"
-        );
+        assert!(cfg.contains("'glass-testapp' '--windows' '2'"), "{cfg}");
     }
 
     #[test]
@@ -535,7 +597,7 @@ mod tests {
         let mut s = spec(&["glass-testapp", "--windows", "2"]);
         s.sandbox = SandboxLevel::Default;
         let cfg = test_sway_config(&s, std::path::Path::new("/run/glass-rt"), None);
-        assert!(cfg.contains("exec 'bwrap'"), "{cfg}");
+        assert!(cfg.contains("'bwrap'"), "{cfg}");
         assert!(
             cfg.contains("'--bind-try' '/run/glass-rt' '/run/glass-rt'"),
             "{cfg}"
@@ -564,7 +626,7 @@ mod tests {
     #[test]
     fn sway_config_exec_unwrapped_when_off() {
         let cfg = test_sway_config(&spec(&["app"]), std::path::Path::new("/run/glass-rt"), None);
-        assert!(cfg.contains("exec 'app'"), "{cfg}");
+        assert!(cfg.contains("'app'"), "{cfg}");
         assert!(!cfg.contains("bwrap"), "{cfg}");
     }
 

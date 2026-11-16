@@ -40,6 +40,14 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Linux accessibility reads accept newer AT-SPI roles, including GTK switches, while preserving
+  their existing `CheckBox` selectors and checked-state handling.
+- Native Wayland apps retain their requested library paths instead of inheriting the portable
+  sway bundle's private libraries, avoiding GTK startup failures on newer hosts.
+- Popup-option clicks use the target's centre within the popup instead of its top-left corner.
+- Scrolling to a virtualized element continues when hit testing shows that its realized node is
+  still clipped or covered, rather than returning an item that cannot yet receive the click.
+
 - Windows private environments stream large worker responses, including workflow movies, without stalling the pipe, and preserve completed replies after an operation spends its deadline.
 
 - Stopping recorded macOS apps off your desktop allows more time for exit confirmation and

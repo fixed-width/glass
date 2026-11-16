@@ -52,8 +52,7 @@ jobs:
 
   x11:
     name: X11 integration (Xvfb)
-    # GTK/AT-SPI assertions use the Noble baseline; ubuntu-latest now selects Ubuntu 26.04.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install pinned toolchain
@@ -77,7 +76,7 @@ jobs:
 
   a11y:
     name: AT-SPI integration (a11y)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Its own job rather than a step on the X11 one: the suite takes ~2 minutes, which is the
     # length of that job again, and every integration job runs in parallel. The three
     # `wayland_a11y_*` tests need a sway this job does not fetch, so they run on the Wayland job
@@ -105,7 +104,7 @@ jobs:
 
   wayland:
     name: Wayland integration (sway)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Runs the #[ignore]d Wayland suite (scripts/test-wayland.sh) against a prebuilt
     # portable sway >=1.12 bundle from the sway-build repo's bundle-latest release
     # (cage was retired; Ubuntu only ships sway 1.9). The bundle is extracted into the
@@ -233,8 +232,7 @@ jobs:
 
   coverage:
     name: coverage (report-only)
-    # This job runs the same GTK integration suites as the gating jobs.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Non-gating: a coverage report, never a merge blocker. The number undercounts
     # by design (see scripts/coverage.sh): glass-windows Win32 FFI is
     # cfg(windows) so it isn't measured here; the Wayland suite needs a sway this job does not

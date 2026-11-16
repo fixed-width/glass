@@ -3,16 +3,13 @@
 `glass_a11y_snapshot` normalizes every platform's accessibility vocabulary into one set of
 roles. This page states which roles each backend can produce.
 
-**A platform switch is a `ToggleButton` — except on Linux.** The platforms disagree about what a
-switch *is*: AppKit calls it a button, UIKit and SwiftUI call it a checkbox, and AT-SPI and UIA have
-no switch role at all. Where the platform marks one — the `AXSwitch` subrole on macOS and iOS, the widget class on
-Android — Glass normalizes it to `ToggleButton`, and those three were read back from a real switch
-to confirm it. Windows maps a toggle-capable button to `ToggleButton`, which is what a WinUI
-`ToggleSwitch` is expected to report, but no switch has been probed there.
+**A platform switch is a `ToggleButton` on macOS, iOS and Android.** Glass recognises the
+`AXSwitch` subrole on Apple platforms and the Android widget class. Windows maps a toggle-capable
+button to `ToggleButton`; a WinUI `ToggleSwitch` has not been probed there.
 
-Linux is the exception: a GTK4 switch is published over AT-SPI as a **check box**, indistinguishable
-from a real checkbox, so it arrives as `CheckBox` and there is no signal to normalize on. Match a
-switch on Linux by name, or accept either role.
+On Linux, GTK 4.14 publishes a switch as an AT-SPI check box. Newer GTK publishes
+[`ATSPI_ROLE_SWITCH` (`130`)](https://gnome.pages.gitlab.gnome.org/at-spi2-core/libatspi/enum.Role.html).
+Glass normalises both to `CheckBox`, preserving existing selectors and checked-state reads.
 
 Each node also carries the backend's own token — the AT-SPI role, the UIA control type, the AX
 role string, the Android widget class, the iOS role string. When Glass has no mapping for a
