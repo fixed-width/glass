@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use crate::adb::Adb;
 use crate::conn::{CallFailure, Conn};
+use crate::forward::{Forward, note_cleanup};
 
 /// One absolute-display point in a pointer path (the agent's gesture element).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,14 +218,6 @@ pub fn agent_enabled(get: &dyn Fn(&str) -> Option<String>) -> bool {
     !off && agent_jar(get).is_some()
 }
 
-/// Parse the local port `adb forward tcp:0 …` prints on stdout.
-///
-/// The first line that reads as a port is it: the blank lines and the `* daemon …` noise adb
-/// emits on a cold start read as no port at all, so neither needs a rule of its own.
-pub(crate) fn parse_forward_port(out: &str) -> Option<u16> {
-    out.lines().map(str::trim).find_map(|l| l.parse().ok())
-}
-
 /// A fake agent on a loopback socket: sends `hello`, then answers each request line with the
 /// matching `responses[i]`, the request's own id spliced in. Returns the port and the requests it
 /// read.
@@ -317,15 +310,24 @@ pub struct AgentRegistry {
 /// Do not resolve a client at teardown instead: `Adb::from_env` reads the environment as it is
 /// *then*, which need not be what launched the agent.
 struct AgentProc {
-    child: Child,
-    port: u16,
+    child: Option<Child>,
+    forward: Forward,
     adb: Adb,
+    ready: bool,
+}
+
+impl AgentProc {
+    fn stop_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Drop for AgentProc {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop_child();
     }
 }
 
@@ -349,24 +351,22 @@ impl AgentRegistry {
 
         // Cache hit: same serial (or both unset) — reuse the existing port.
         if let Some(p) = guard.as_ref()
+            && p.ready
             && p.adb.serial() == adb.serial()
+            && p.adb.bin() == adb.bin()
+            && let Some(port) = p.forward.port()
         {
-            return Ok(p.port);
+            return Ok(port);
         }
-        // Serial changed (or first-ever call with a stale entry): tear down the stale agent.
-        // Taking it out of the guard drops it, which kills + reaps the child via Drop.
-        if let Some(stale) = guard.take() {
-            let _ = stale
-                .adb
-                .run(["forward", "--remove", &format!("tcp:{}", stale.port)]);
-            // stale drops here → Drop kills + reaps the child
-        }
+        // Restore a different device or finish a previous failed cleanup before replacing it.
+        stop_agent(&mut guard, Deadline::UNBOUNDED)?;
 
         let jar = agent_jar(get)
             .ok_or_else(|| GlassError::Backend("GLASS_ANDROID_AGENT_JAR not set".into()))?;
 
         // Push the jar (idempotent).
         adb.run(["push", &jar, REMOTE_JAR])?;
+        let forward = Forward::prepare(adb, SOCKET)?;
 
         // Launch the server detached. The child is the host-side `adb shell`; killing it on
         // shutdown closes the connection and the device process exits (SIGHUP).
@@ -382,64 +382,54 @@ impl AgentRegistry {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| GlassError::Backend(format!("launch agent: {e}")))?;
 
-        // From here on, any failure must kill + reap the child (Child::drop does NOT kill),
-        // so a failed ensure never leaks the host adb process / device app_process / rule.
-        let out = match adb.run(["forward", "tcp:0", &format!("localabstract:{SOCKET}")]) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e);
-            }
-        };
-        let port = match parse_forward_port(&out) {
-            Some(p) => p,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(GlassError::Backend(format!(
-                    "adb forward gave no port: {out:?}"
-                )));
-            }
-        };
-        // Give the server a moment to bind + connect-check it.
-        if let Err(e) = wait_for_agent(port).and_then(|c| c.ping()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = adb.run(["forward", "--remove", &format!("tcp:{port}")]);
-            return Err(e);
-        }
-
-        *guard = Some(AgentProc {
-            child,
-            port,
+        let active = guard.insert(AgentProc {
+            child: Some(child),
+            forward,
             adb: adb.clone(),
+            ready: false,
         });
-        Ok(port)
+        let result = (|| {
+            let port = active.forward.open(adb)?;
+            wait_for_agent(port)?.ping()?;
+            active.ready = true;
+            Ok(port)
+        })();
+        if result.is_err() {
+            let _ = stop_agent(&mut guard, Deadline::UNBOUNDED);
+        }
+        result
     }
 
     /// Kill the device agent (via the host child) and remove the forward by `deadline`, which the
     /// rest of teardown shares (glass#422). Best-effort.
     ///
-    /// Only the forward removal is under the deadline — dropping `p` then kills and reaps the
+    /// Only the forward removal is under the deadline — stopping the child kills and reaps the
     /// agent with an unbounded `wait()`, the gap `AndroidPlatform::stop_app_until` names for
     /// logcat.
     pub fn shutdown(&self, deadline: Deadline) {
-        if let Ok(mut guard) = self.state.lock()
-            && let Some(p) = guard.take()
-        {
-            let removed = p.adb.run_until(
-                ["forward", "--remove", &format!("tcp:{}", p.port)],
-                deadline,
-            );
-            glass_core::note_if_skipped("removing the agent's adb forward", &removed);
-            // p drops here → Drop kills + reaps the child
-        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = stop_agent(&mut guard, deadline);
     }
+}
+
+fn stop_agent(state: &mut Option<AgentProc>, deadline: Deadline) -> Result<()> {
+    let Some(active) = state.as_mut() else {
+        return Ok(());
+    };
+    active.ready = false;
+    active.stop_child();
+    let removed = active.forward.remove(&active.adb, deadline);
+    note_cleanup("removing the agent's adb forward", &removed);
+    removed?;
+    *state = None;
+    Ok(())
 }
 
 /// How long the agent gets to bind its socket and start answering. It takes ~1s in practice.
@@ -484,12 +474,15 @@ mod tests {
         let fake = FakeAdb::new(&[("*", Answer::Lingers)]);
         let reg = AgentRegistry::new();
         *reg.state.lock().unwrap() = Some(AgentProc {
-            child: std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("a child to stand in for the agent"),
-            port: 1234,
+            child: Some(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("a child to stand in for the agent"),
+            ),
+            forward: Forward::for_test(SOCKET, 1234),
             adb: fake.adb().clone(),
+            ready: true,
         });
 
         let started = Instant::now();
@@ -524,18 +517,6 @@ mod tests {
         assert!(!agent_enabled(&off));
         let no_jar = |_: &str| None;
         assert!(!agent_enabled(&no_jar)); // no jar → disabled
-    }
-
-    #[test]
-    fn parses_forward_port() {
-        assert_eq!(super::parse_forward_port("41234\n"), Some(41234));
-        assert_eq!(super::parse_forward_port(""), None);
-        assert_eq!(
-            super::parse_forward_port(
-                "* daemon not running; starting now\n* daemon started successfully\n41234\n"
-            ),
-            Some(41234)
-        );
     }
 
     const HELLO: &str = r#"{"hello":{"proto":1}}"#;
@@ -1516,6 +1497,174 @@ mod tests {
         let child = fake.wait_read("r1_0.pid", Duration::from_secs(5));
         assert!(!child.is_empty(), "the launch should have happened");
         assert!(!still_running(&child), "the failed launch leaked its child");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn poisoned_agent_state_still_stops_the_child_and_removes_its_forward() {
+        use crate::adb::{Answer, FakeAdb, still_running};
+
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        let registry = AgentRegistry::new();
+        *registry.state.lock().unwrap() = Some(AgentProc {
+            child: Some(child),
+            forward: Forward::for_test(SOCKET, 4321),
+            adb: fake.adb().clone(),
+            ready: true,
+        });
+        let poisoned = registry.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.state.lock().unwrap();
+                panic!("poison the registry");
+            })
+            .join()
+            .is_err()
+        );
+
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(!still_running(&pid));
+        assert!(fake.called("forward --remove tcp:4321"));
+        let after = fake.calls();
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert_eq!(fake.calls(), after);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dropping_the_last_registry_owner_kills_and_reaps_the_agent_child() {
+        use crate::adb::{Answer, FakeAdb, still_running};
+
+        let fake = FakeAdb::new(&[("*", Answer::Silent)]);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        let registry = AgentRegistry::new();
+        *registry.state.lock().unwrap() = Some(AgentProc {
+            child: Some(child),
+            forward: Forward::for_test(SOCKET, 4321),
+            adb: fake.adb().clone(),
+            ready: true,
+        });
+        let remaining = registry.clone();
+        drop(registry);
+        let shared_child_was_running = still_running(&pid);
+        drop(remaining);
+        let child_survived = still_running(&pid);
+        if child_survived {
+            let _ = Command::new("kill").arg(&pid).status();
+        }
+
+        assert!(
+            shared_child_was_running,
+            "a remaining registry owner must keep its child"
+        );
+        assert!(
+            !child_survived,
+            "the last registry owner left its agent child alive or unreaped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_forward_removal_is_retried_after_the_agent_has_stopped() {
+        use crate::adb::{Answer, FakeAdb, still_running};
+
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*forward --remove *",
+                vec![Answer::fails("offline"), Answer::Silent],
+            ),
+            (
+                "*forward --list",
+                vec![Answer::says("device tcp:4321 localabstract:glass-agent\n")],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        let registry = AgentRegistry::new();
+        *registry.state.lock().unwrap() = Some(AgentProc {
+            child: Some(child),
+            forward: Forward::for_test(SOCKET, 4321),
+            adb: fake.adb().clone(),
+            ready: true,
+        });
+        registry.shutdown(Deadline::UNBOUNDED);
+        assert!(!still_running(&pid));
+        assert!(registry.state.lock().unwrap().is_some());
+
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert_eq!(
+            fake.calls()
+                .iter()
+                .filter(|call| call.contains("forward --remove"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_agent_setup_removes_an_unreported_forward() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*forward --list",
+                vec![
+                    Answer::Silent,
+                    Answer::says("device tcp:4321 localabstract:glass-agent\n"),
+                ],
+            ),
+            ("*forward tcp:0 *", vec![Answer::says("not a port")]),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let registry = AgentRegistry::new();
+        let error = registry
+            .ensure(fake.adb(), &|_| Some("/tmp/probe.jar".into()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no port"), "{error}");
+        assert!(fake.called("forward --remove tcp:4321"));
+        assert!(registry.state.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_forward_does_not_block_a_new_agent_session() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let (port, _) = fake_agent(HELLO, vec![OK]);
+        let fake = FakeAdb::new(&[
+            (
+                "*forward --remove tcp:4321",
+                Answer::fails("listener 'tcp:4321' not found"),
+            ),
+            ("*forward tcp:0 *", Answer::says(format!("{port}\n"))),
+            ("*", Answer::Silent),
+        ]);
+        let registry = AgentRegistry::new();
+        *registry.state.lock().unwrap() = Some(AgentProc {
+            child: None,
+            forward: Forward::for_test(SOCKET, 4321),
+            adb: fake.adb().clone(),
+            ready: false,
+        });
+        assert_eq!(
+            registry
+                .ensure(fake.adb(), &|_| Some("/tmp/probe.jar".into()))
+                .unwrap(),
+            port
+        );
+        registry.shutdown(Deadline::UNBOUNDED);
+
+        assert!(registry.state.lock().unwrap().is_none());
+        assert!(fake.called(&format!("forward --remove tcp:{port}")));
     }
 
     #[test]

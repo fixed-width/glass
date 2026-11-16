@@ -40,6 +40,10 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Android companion setup rolls back partial failures and preserves the original accessibility
+  settings across repeated sessions. Shutdown cleans up after a registry panic, reports cleanup
+  failures, and retries only unfinished work. Already-removed forwards no longer block setup,
+  and cleanup retries preserve accessibility settings already returned to the user.
 - Android accessibility click confirmation checks the actuated control's bounds, tolerating
   small movements while rejecting a same-named sibling that inherits its element ID elsewhere.
 - Element waits, scroll-to-element results and semantic searches now disclose when accessibility

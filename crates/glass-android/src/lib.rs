@@ -14,6 +14,7 @@ mod build;
 mod cmd;
 mod conn;
 pub mod doctor;
+mod forward;
 mod input;
 mod logs;
 mod parse;
