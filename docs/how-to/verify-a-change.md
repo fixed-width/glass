@@ -117,6 +117,10 @@ not evidence of delivered input or desktop isolation.
 
 ## Integration suites (Linux)
 
+The GUI integration jobs use Ubuntu 24.04 with GTK 4.14. Their role and rendering assertions depend
+on that toolkit baseline; the portable build/lint/unit job continues to use `ubuntu-latest`.
+Newer GTK stacks need separate runtime qualification before moving the integration jobs.
+
 `#[ignore]`d, so the ordinary `cargo test` never starts them. Each self-starts what it needs.
 On Debian/Ubuntu, install the full AT-SPI suite's fixtures with
 `sudo apt install at-spi2-core bubblewrap dbus-bin xvfb python3-gi python3-cairo python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gtk-4.0`.
