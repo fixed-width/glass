@@ -14,7 +14,7 @@ use x11rb::errors::ConnectError;
 use crate::xvfb::Xvfb;
 
 /// Probe the X11 backend's environment. `deep` additionally spawns and tears down a
-/// private Xvfb (when in self-spawn mode) to prove it actually starts.
+/// private Xvfb (when in self-spawn mode) to verify startup and shutdown.
 pub fn checks(deep: bool) -> Vec<Check> {
     checks_for(std::env::var("GLASS_DISPLAY").ok().as_deref(), deep)
 }
@@ -51,11 +51,18 @@ enum Mode<'a> {
         verdict: AttachVerdict,
     },
     /// No `GLASS_DISPLAY`: glass starts its own Xvfb, which must be present and — on a deep
-    /// check — provably startable.
+    /// check — provably startable and stoppable.
     SelfSpawn {
         xvfb: &'a Resolved,
-        deep: Option<Result<String, ProbeFailure>>,
+        deep: Option<Result<XvfbSpawn, ProbeFailure>>,
     },
+}
+
+/// Startup succeeded; shutdown has its own outcome.
+#[derive(Debug, PartialEq, Eq)]
+struct XvfbSpawn {
+    display: String,
+    stopped: Result<(), String>,
 }
 
 /// Pure: build the X11 checks from gathered facts.
@@ -141,12 +148,27 @@ fn xvfb_check(xvfb: &Resolved) -> Check {
 
 /// What a deep probe proved. Its remedy comes from [`ProbeFailure`], which withholds
 /// [`XVFB_START_HINT`] from the outcomes that never reached Xvfb.
-fn deep_spawn_check(spawn: &Result<String, ProbeFailure>) -> Check {
+fn deep_spawn_check(spawn: &Result<XvfbSpawn, ProbeFailure>) -> Check {
     match spawn {
-        Ok(display) => Check::new(
+        Ok(XvfbSpawn {
+            display,
+            stopped: Ok(()),
+        }) => Check::new(
             "Xvfb spawn (deep)",
             CheckStatus::Ok,
             format!("started and stopped {display}"),
+        ),
+        Ok(XvfbSpawn {
+            display,
+            stopped: Err(why),
+        }) => Check::new(
+            "Xvfb spawn (deep)",
+            CheckStatus::Warn,
+            format!("started {display}, but {why}"),
+        )
+        .with_remedy(
+            "inspect the reported process IDs and stop any surviving probe processes; \
+             re-run `glass doctor --deep` to check cleanup again",
         ),
         Err(failure) => Check::new(
             "Xvfb spawn (deep)",
@@ -307,7 +329,7 @@ fn refused_over_authority(reason: &[u8]) -> bool {
     reason.contains("authoriz") || reason.contains("cookie")
 }
 
-/// Margin over `Xvfb::start`'s own worst case, so the backstop effectively never fires and
+/// Margin over startup and shutdown, so the backstop effectively never fires and
 /// the probe thread always finishes and reaps its child.
 const PROBE_MARGIN: Duration = Duration::from_secs(2);
 
@@ -315,28 +337,35 @@ const PROBE_MARGIN: Duration = Duration::from_secs(2);
 /// includes one retry of a wedged server: a shorter budget reports Fail for the exact
 /// transient class the start path survives, with a wrong remedy.
 fn probe_budget() -> Duration {
-    crate::xvfb::start_deadline() + PROBE_MARGIN
+    crate::xvfb::start_deadline()
+        + glass_proc_linux::REAP_GRACE
+        + crate::xvfb::STOP_GRACE
+        + PROBE_MARGIN
 }
 
 /// Spawn a private Xvfb and tear it down, with a timeout so a wedged Xvfb can't hang
-/// doctor. Returns the display it came up on, or why there was none.
-fn probe_xvfb() -> Result<String, ProbeFailure> {
+/// doctor. Keeps startup and shutdown outcomes separate.
+fn probe_xvfb() -> Result<XvfbSpawn, ProbeFailure> {
     let screen = std::env::var("GLASS_XVFB_SCREEN").unwrap_or_else(|_| "1280x800x24".into());
+    probe_xvfb_with(move || Xvfb::start(&screen))
+}
+
+fn probe_xvfb_with(
+    start: impl FnOnce() -> glass_core::Result<Xvfb> + Send + 'static,
+) -> Result<XvfbSpawn, ProbeFailure> {
     let budget = probe_budget();
     let (tx, rx) = mpsc::channel();
-    // Fallible, unlike a bare `spawn`, which panics when the OS refuses a thread — in doctor that
-    // is an unwind where a check belongs. `Xvfb::start` spawns two more threads with bare `spawn`,
-    // and those unwind inside this one, arriving as `Vanished`.
+    // A refused worker is a check failure; a panic inside it arrives as `Vanished`.
     std::thread::Builder::new()
         .name("glass-doctor-xvfb".into())
         .spawn(move || {
-            // The Xvfb is dropped at the end of `map` (after we read its display),
-            // tearing the test display back down.
-            let _ = tx.send(
-                Xvfb::start(&screen)
-                    .map(|x| x.display.clone())
-                    .map_err(|e| e.to_string()),
-            );
+            let result = start()
+                .map(|x| XvfbSpawn {
+                    display: x.display.clone(),
+                    stopped: x.stop().map_err(|e| e.to_string()),
+                })
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
         })
         .map_err(|e| ProbeFailure::NotStarted(e.to_string()))?;
     await_probe(&rx, budget)
@@ -346,11 +375,11 @@ fn probe_xvfb() -> Result<String, ProbeFailure> {
 /// server. A sender that dropped unsent is a probe thread that unwound, and arrives immediately:
 /// called a timeout it claims a wait nobody did (glass#373).
 fn await_probe(
-    rx: &mpsc::Receiver<Result<String, String>>,
+    rx: &mpsc::Receiver<Result<XvfbSpawn, String>>,
     budget: Duration,
-) -> Result<String, ProbeFailure> {
+) -> Result<XvfbSpawn, ProbeFailure> {
     match rx.recv_timeout(budget) {
-        Ok(Ok(display)) => Ok(display),
+        Ok(Ok(spawn)) => Ok(spawn),
         Ok(Err(e)) => Err(ProbeFailure::Failed(e)),
         Err(e) => Err(ProbeFailure::from_recv(e, budget)),
     }
@@ -369,6 +398,13 @@ mod tests {
 
     fn found() -> Resolved {
         Resolved::Found(PathBuf::from("/usr/bin/Xvfb"))
+    }
+
+    fn stopped(display: &str) -> XvfbSpawn {
+        XvfbSpawn {
+            display: display.into(),
+            stopped: Ok(()),
+        }
     }
 
     #[test]
@@ -505,21 +541,29 @@ mod tests {
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
     fn the_deep_probe_starts_a_real_display_and_takes_it_back_down() {
-        let display = probe_xvfb().expect("the deep probe should start a display");
-        // Only the report is asserted. Whether the number still answers is not this test's
-        // to check: display numbers are a machine-wide namespace, and the next server to
-        // start — in this suite or outside it — takes the one the probe just released.
+        let server = Xvfb::start("640x480x24").expect("private display");
+        let pid = server.pid();
+        let spawn =
+            probe_xvfb_with(move || Ok(server)).expect("the deep probe should start a display");
         assert!(
-            display.starts_with(':'),
-            "must report the display it came up on, got {display:?}"
+            spawn.display.starts_with(':'),
+            "must report the display it came up on, got {spawn:?}"
+        );
+        assert_eq!(spawn.stopped, Ok(()));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the probe returned before reaping server pid {pid}"
         );
     }
 
     #[test]
     fn the_probe_budget_outlasts_the_start_it_wraps() {
         assert!(
-            probe_budget() > crate::xvfb::start_deadline(),
-            "probe budget {:?} must exceed the start deadline {:?}",
+            probe_budget()
+                > crate::xvfb::start_deadline()
+                    + glass_proc_linux::REAP_GRACE
+                    + crate::xvfb::STOP_GRACE,
+            "probe budget {:?} must cover startup {:?}, teardown, and confirmation",
             probe_budget(),
             crate::xvfb::start_deadline()
         );
@@ -708,7 +752,7 @@ mod tests {
         assert!(!no.remedy.contains("start that display"), "{no:?}");
     }
 
-    fn deep(spawn: Result<String, ProbeFailure>) -> Check {
+    fn deep(spawn: Result<XvfbSpawn, ProbeFailure>) -> Check {
         x11_checks(&Mode::SelfSpawn {
             xvfb: &found(),
             deep: Some(spawn),
@@ -722,10 +766,25 @@ mod tests {
     /// dropped or restyled, `glass doctor --deep` would report a spawn it never proved.
     #[test]
     fn a_deep_probe_that_worked_names_the_display_it_started() {
-        let check = deep(Ok(":42".into()));
+        let check = deep(Ok(stopped(":42")));
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.detail.contains(":42"), "{:?}", check.detail);
         assert!(check.remedy.is_none(), "nothing to fix: {check:?}");
+    }
+
+    #[test]
+    fn a_deep_probe_with_unconfirmed_shutdown_warns_and_names_the_survivor() {
+        let check = deep(Ok(XvfbSpawn {
+            display: ":42".into(),
+            stopped: Err("processes still running: [1234]".into()),
+        }));
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("started :42"), "{check:?}");
+        assert!(check.detail.contains("1234"), "{check:?}");
+        assert!(!check.detail.contains("and stopped"), "{check:?}");
+        let remedy = check.remedy.expect("cleanup advice");
+        assert!(remedy.contains("process IDs"), "{remedy}");
+        assert!(!remedy.contains(XVFB_START_HINT), "{remedy}");
     }
 
     #[test]
@@ -782,7 +841,7 @@ mod tests {
     /// the real receiver rather than the mapper, because the collapse was in the wiring.
     #[test]
     fn a_probe_thread_that_died_is_told_apart_from_one_still_running() {
-        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+        let (tx, rx) = mpsc::channel::<Result<XvfbSpawn, String>>();
         drop(tx);
         assert_eq!(
             await_probe(&rx, Duration::from_secs(24)),
@@ -791,7 +850,7 @@ mod tests {
         );
 
         // Held open and silent: the shape of an Xvfb that spawned and never reported.
-        let (_tx, rx) = mpsc::channel::<Result<String, String>>();
+        let (_tx, rx) = mpsc::channel::<Result<XvfbSpawn, String>>();
         let budget = Duration::from_millis(20);
         assert_eq!(
             await_probe(&rx, budget),
@@ -803,8 +862,17 @@ mod tests {
     #[test]
     fn the_wait_carries_the_probes_own_answer() {
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(":99".into())).expect("send");
-        assert_eq!(await_probe(&rx, Duration::from_secs(1)), Ok(":99".into()));
+        tx.send(Ok(stopped(":99"))).expect("send");
+        assert_eq!(await_probe(&rx, Duration::from_secs(1)), Ok(stopped(":99")));
+
+        let (tx, rx) = mpsc::channel();
+        let unconfirmed = XvfbSpawn {
+            display: ":99".into(),
+            stopped: Err("server pid 1234 was not reaped".into()),
+        };
+        tx.send(Ok(unconfirmed)).expect("send");
+        let spawn = await_probe(&rx, Duration::from_secs(1)).expect("startup succeeded");
+        assert_eq!(spawn.stopped, Err("server pid 1234 was not reaped".into()));
 
         let (tx, rx) = mpsc::channel();
         tx.send(Err("Xvfb exited during startup".into()))
