@@ -557,15 +557,13 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_budget_outlasts_the_start_it_wraps() {
+    fn the_probe_budget_preserves_its_margin_after_startup_and_shutdown() {
+        let lifecycle =
+            crate::xvfb::start_deadline() + glass_proc_linux::REAP_GRACE + crate::xvfb::STOP_GRACE;
         assert!(
-            probe_budget()
-                > crate::xvfb::start_deadline()
-                    + glass_proc_linux::REAP_GRACE
-                    + crate::xvfb::STOP_GRACE,
-            "probe budget {:?} must cover startup {:?}, teardown, and confirmation",
+            probe_budget().saturating_sub(lifecycle) >= PROBE_MARGIN,
+            "probe budget {:?} must leave {PROBE_MARGIN:?} after the {lifecycle:?} lifecycle",
             probe_budget(),
-            crate::xvfb::start_deadline()
         );
     }
 

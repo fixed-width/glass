@@ -81,26 +81,38 @@ impl Xvfb {
         let tree = glass_proc_linux::proc_tree_pids(pid);
         drop(self);
 
-        let mut reaped = Ok(false);
-        let mut left = Vec::new();
-        glass_proc_linux::await_condition(STOP_GRACE, || {
-            reaped = std::path::Path::new(&format!("/proc/{pid}"))
-                .try_exists()
-                .map(|exists| !exists);
-            left = glass_proc_linux::live_pids(&tree);
-            matches!(reaped, Ok(true)) && left.is_empty()
-        });
-        match reaped {
-            Ok(true) if left.is_empty() => Ok(()),
-            Ok(reaped) => Err(GlassError::Backend(format!(
-                "Xvfb shutdown was not confirmed: server pid {pid} reaped: {reaped}; \
-                 processes still running: {left:?}"
-            ))),
-            Err(e) => Err(GlassError::Backend(format!(
-                "could not verify Xvfb server pid {pid} was reaped: {e}; \
-                 processes still running: {left:?}"
-            ))),
-        }
+        confirm_shutdown(pid, || {
+            (
+                std::path::Path::new(&format!("/proc/{pid}"))
+                    .try_exists()
+                    .map(|exists| !exists),
+                glass_proc_linux::live_pids(&tree),
+            )
+        })
+    }
+}
+
+/// Wait for reaping and descendant exit, retaining the final observation for diagnostics.
+fn confirm_shutdown(
+    pid: u32,
+    mut observe: impl FnMut() -> (std::io::Result<bool>, Vec<u32>),
+) -> Result<()> {
+    let mut reaped = Ok(false);
+    let mut left = Vec::new();
+    glass_proc_linux::await_condition(STOP_GRACE, || {
+        (reaped, left) = observe();
+        matches!(reaped, Ok(true)) && left.is_empty()
+    });
+    match reaped {
+        Ok(true) if left.is_empty() => Ok(()),
+        Ok(reaped) => Err(GlassError::Backend(format!(
+            "Xvfb shutdown was not confirmed: server pid {pid} reaped: {reaped}; \
+             processes still running: {left:?}"
+        ))),
+        Err(e) => Err(GlassError::Backend(format!(
+            "could not verify Xvfb server pid {pid} was reaped: {e}; \
+             processes still running: {left:?}"
+        ))),
     }
 }
 
@@ -373,7 +385,9 @@ impl Drop for Xvfb {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadErr, Xvfb, ended_thread_payload, read_displayfd, start_binary};
+    use super::{
+        ReadErr, Xvfb, confirm_shutdown, ended_thread_payload, read_displayfd, start_binary,
+    };
     use glass_core::{GlassError, Result};
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -579,6 +593,28 @@ mod tests {
             !running(pid),
             "server pid {pid} must be reaped before success"
         );
+    }
+
+    #[test]
+    fn shutdown_confirmation_waits_for_a_descendant_after_the_server_is_reaped() {
+        let mut observations = [(Ok(true), vec![456]), (Ok(true), vec![])].into_iter();
+        confirm_shutdown(123, || {
+            observations
+                .next()
+                .expect("two observations confirm shutdown")
+        })
+        .expect("a descendant exiting within the grace must not be reported as a survivor");
+    }
+
+    #[test]
+    fn shutdown_confirmation_waits_for_reaping_after_descendants_exit() {
+        let mut observations = [(Ok(false), vec![]), (Ok(true), vec![])].into_iter();
+        confirm_shutdown(123, || {
+            observations
+                .next()
+                .expect("two observations confirm shutdown")
+        })
+        .expect("an empty descendant list does not confirm the server was reaped");
     }
 
     #[test]
