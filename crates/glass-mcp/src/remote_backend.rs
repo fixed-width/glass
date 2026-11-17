@@ -494,6 +494,8 @@ impl<C: Connection> RollingBuffer for RemoteBuffer<C> {
                         pending: None,
                     });
                 progress.state = RollingState::Failed;
+                progress.pending = None;
+                progress.pending_bytes = 0;
                 progress.reason = Some(match other {
                     Err(error) => error.to_string(),
                     _ => wrong_response().to_string(),
@@ -662,6 +664,7 @@ mod tests {
     struct NativeBuffer {
         events: Arc<Mutex<Vec<String>>>,
         pending: Option<RollingWindow>,
+        fail_save: bool,
     }
     impl RollingBuffer for NativeBuffer {
         fn progress(&self) -> RollingProgress {
@@ -693,6 +696,9 @@ mod tests {
         }
         fn save(&mut self, _: Deadline) -> Result<BufferedVideo> {
             self.events.lock().unwrap().push("buffer_save".into());
+            if std::mem::take(&mut self.fail_save) {
+                return Err(GlassError::Backend("injected packaging failure".into()));
+            }
             let window = self
                 .pending
                 .take()
@@ -730,6 +736,7 @@ mod tests {
         platform.buffer = Some(Box::new(NativeBuffer {
             events,
             pending: None,
+            fail_save: false,
         }));
         Local {
             dispatcher: Dispatcher::new(platform, Reader),
@@ -767,6 +774,84 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        backend.platform.stop_app().unwrap();
+    }
+
+    #[test]
+    fn private_buffer_preserves_the_selected_clip_after_an_export_error() {
+        let mut platform = FakePlatform::new(4, 4);
+        platform.buffer = Some(Box::new(NativeBuffer {
+            events: Arc::new(Mutex::new(Vec::new())),
+            pending: None,
+            fail_save: true,
+        }));
+        let mut backend = backend(Local {
+            dispatcher: Dispatcher::new(platform, Reader),
+            closes: Arc::new(AtomicUsize::new(0)),
+        })
+        .unwrap();
+        let mut buffer = backend
+            .platform
+            .start_rolling_buffer(buffer_options(), Deadline::from_millis(1000))
+            .unwrap();
+        let marked = buffer
+            .mark(&"b".repeat(32), 0, Deadline::from_millis(1000))
+            .unwrap();
+        let failure = buffer.save(Deadline::from_millis(1000)).err().unwrap();
+        assert!(failure.to_string().contains("injected packaging failure"));
+        assert_eq!(buffer.progress().pending.unwrap().id, marked.id);
+        let saved = buffer.save(Deadline::from_millis(1000)).unwrap();
+        assert_eq!(
+            (saved.window.id, saved.window.start_ms, saved.window.end_ms),
+            (marked.id, marked.start_ms, marked.end_ms)
+        );
+        assert!(buffer.progress().pending.is_none());
+        buffer.stop(false, Deadline::from_millis(1000)).unwrap();
+        backend.platform.stop_app().unwrap();
+    }
+
+    struct LostBufferProgress {
+        inner: Local,
+        failed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Connection for LostBufferProgress {
+        fn call(&mut self, operation: Operation, deadline: Deadline) -> Result<Response> {
+            if matches!(operation, Operation::BufferProgress(_))
+                && self.failed.load(Ordering::Acquire)
+            {
+                return Err(GlassError::Backend("worker connection lost".into()));
+            }
+            self.inner.call(operation, deadline)
+        }
+        fn close(&mut self, deadline: Deadline) -> Result<()> {
+            self.inner.close(deadline)
+        }
+    }
+
+    #[test]
+    fn private_buffer_connection_failure_does_not_report_cached_pending_evidence() {
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backend = backend(LostBufferProgress {
+            inner: buffered_local(Arc::new(Mutex::new(Vec::new()))),
+            failed: Arc::clone(&failed),
+        })
+        .unwrap();
+        let mut buffer = backend
+            .platform
+            .start_rolling_buffer(buffer_options(), Deadline::from_millis(1000))
+            .unwrap();
+        buffer
+            .mark(&"b".repeat(32), 0, Deadline::from_millis(1000))
+            .unwrap();
+        assert!(buffer.progress().pending.is_some());
+        failed.store(true, Ordering::Release);
+        let progress = buffer.progress();
+        assert_eq!(progress.state, RollingState::Failed);
+        assert!(progress.reason.unwrap().contains("worker connection lost"));
+        assert!(progress.pending.is_none());
+        assert_eq!(progress.pending_bytes, 0);
+        buffer.stop(false, Deadline::from_millis(1000)).unwrap();
         backend.platform.stop_app().unwrap();
     }
 

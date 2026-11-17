@@ -101,6 +101,13 @@ Save waits for the remaining tail, persists one immutable movie through the same
 and leaves buffering active. Subsequent marks create another group; their lookback may overlap
 an explicitly saved movie. Arbitrary tool errors do not automatically mark or save anything.
 
+If packaging or export delivery fails while the buffer remains usable, the selected clip stays
+pending. Retry `save` to export the same clip ID and time range; buffering continues within the
+existing limits. A mark whose reply is lost while the buffer remains usable leaves the previously
+acknowledged selection intact.
+Worker or connection loss is reported as a failure. Storage failures after export still report
+their error and do not retain a second copy for retry. Stop and explicit discard remain terminal.
+
 Status includes `buffer`, its actual retained duration and bytes, and any pending clip. History
 evicts complete keyframe groups, so boundaries follow available keyframes. Warm-up, byte pressure,
 capture failure, and a shortened tail are disclosed rather than claiming missing history. The

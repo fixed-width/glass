@@ -350,7 +350,7 @@ mod tests {
             history.push(sample).unwrap();
         }
         history.mark(&"b".repeat(32), 3000, 0).unwrap();
-        let (window, samples) = history.take(3001, false).unwrap();
+        let (window, samples) = history.snapshot(3001, false).unwrap();
         assert!(window.start_ms > 0 && window.start_ms <= 2000);
         let bytes = encoder
             .mux(&samples, window.end_ms, 8 * 1024 * 1024)

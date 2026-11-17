@@ -40,6 +40,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Rolling workflow video keeps marked evidence available after failed or timed-out exports,
+  and preserves the previous selection when a mark reply is lost. Status no longer presents
+  cached pending evidence after a worker connection fails.
 - Workflow recording preserves capture failures during final byte and duration accounting,
   and keeps the first limit reason when multiple limits are reached.
 - Linux application stops report surviving processes instead of success when cleanup cannot be
