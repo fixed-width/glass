@@ -34,6 +34,9 @@ pub(crate) fn start_deadline() -> Duration {
 /// something holding it, and then this is what the message costs instead of everything.
 const SAID_GRACE: Duration = Duration::from_millis(500);
 
+/// Time for observed descendants to exit after server shutdown before reporting survivors.
+pub(crate) const STOP_GRACE: Duration = Duration::from_millis(500);
+
 #[derive(Debug)]
 pub struct Xvfb {
     child: Child,
@@ -68,6 +71,48 @@ impl Xvfb {
     /// impossible to produce from the client side.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Stop the server and verify that it was reaped and its observed descendants exited.
+    /// Returns an error naming survivors or a failure to inspect the server's pid.
+    pub fn stop(self) -> Result<()> {
+        let pid = self.pid();
+        // Parent links disappear during teardown, so collect descendants before dropping it.
+        let tree = glass_proc_linux::proc_tree_pids(pid);
+        drop(self);
+
+        confirm_shutdown(pid, || {
+            (
+                std::path::Path::new(&format!("/proc/{pid}"))
+                    .try_exists()
+                    .map(|exists| !exists),
+                glass_proc_linux::live_pids(&tree),
+            )
+        })
+    }
+}
+
+/// Wait for reaping and descendant exit, retaining the final observation for diagnostics.
+fn confirm_shutdown(
+    pid: u32,
+    mut observe: impl FnMut() -> (std::io::Result<bool>, Vec<u32>),
+) -> Result<()> {
+    let mut reaped = Ok(false);
+    let mut left = Vec::new();
+    glass_proc_linux::await_condition(STOP_GRACE, || {
+        (reaped, left) = observe();
+        matches!(reaped, Ok(true)) && left.is_empty()
+    });
+    match reaped {
+        Ok(true) if left.is_empty() => Ok(()),
+        Ok(reaped) => Err(GlassError::Backend(format!(
+            "Xvfb shutdown was not confirmed: server pid {pid} reaped: {reaped}; \
+             processes still running: {left:?}"
+        ))),
+        Err(e) => Err(GlassError::Backend(format!(
+            "could not verify Xvfb server pid {pid} was reaped: {e}; \
+             processes still running: {left:?}"
+        ))),
     }
 }
 
@@ -340,7 +385,9 @@ impl Drop for Xvfb {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadErr, Xvfb, ended_thread_payload, read_displayfd, start_binary};
+    use super::{
+        ReadErr, Xvfb, confirm_shutdown, ended_thread_payload, read_displayfd, start_binary,
+    };
     use glass_core::{GlassError, Result};
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -534,6 +581,65 @@ mod tests {
         assert!(running(pid), "the fixture server should be up first");
         drop(server);
         assert!(!running(pid), "pid {pid} outlived the Xvfb that owned it");
+    }
+
+    #[test]
+    fn explicit_stop_confirms_a_term_ignoring_server_was_reaped() {
+        let script = fixture("stop-kill.sh", "trap '' TERM\necho 4321\nexec sleep 30\n");
+        let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
+        let pid = server.pid();
+        server.stop().expect("SIGKILL should stop the server");
+        assert!(
+            !running(pid),
+            "server pid {pid} must be reaped before success"
+        );
+    }
+
+    #[test]
+    fn shutdown_confirmation_waits_for_a_descendant_after_the_server_is_reaped() {
+        let mut observations = [(Ok(true), vec![456]), (Ok(true), vec![])].into_iter();
+        confirm_shutdown(123, || {
+            observations
+                .next()
+                .expect("two observations confirm shutdown")
+        })
+        .expect("a descendant exiting within the grace must not be reported as a survivor");
+    }
+
+    #[test]
+    fn shutdown_confirmation_waits_for_reaping_after_descendants_exit() {
+        let mut observations = [(Ok(false), vec![]), (Ok(true), vec![])].into_iter();
+        confirm_shutdown(123, || {
+            observations
+                .next()
+                .expect("two observations confirm shutdown")
+        })
+        .expect("an empty descendant list does not confirm the server was reaped");
+    }
+
+    #[test]
+    fn explicit_stop_reports_a_descendant_after_the_server_is_reaped() {
+        let script = fixture(
+            "stop-survivor.sh",
+            "sleep 30 &\necho $! > \"$0.survivor\"\necho 4321\nexec sleep 30\n",
+        );
+        let server = start_fixture(&script, Duration::from_secs(5)).expect("must start");
+        let pid = server.pid();
+        let survivor: u32 = std::fs::read_to_string(format!("{}.survivor", script.display()))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _reap = Survivor(survivor);
+
+        let err = server
+            .stop()
+            .expect_err("a surviving descendant prevents success")
+            .to_string();
+        assert!(!running(pid), "the server itself must have been reaped");
+        assert!(running(survivor), "the fixture must leave a descendant");
+        assert!(err.contains(&survivor.to_string()), "{err}");
+        assert!(err.contains("shutdown was not confirmed"), "{err}");
     }
 
     #[test]

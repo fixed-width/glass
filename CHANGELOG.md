@@ -40,6 +40,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- The X11 deep doctor check verifies that its private Xvfb was reaped and its observed
+  descendants exited before reporting “started and stopped”; unconfirmed cleanup warns with
+  process details.
 - Android companion setup rolls back partial failures and preserves the original accessibility
   settings across repeated sessions. Shutdown cleans up after a registry panic, reports cleanup
   failures, and retries only unfinished work. Already-removed forwards no longer block setup,
