@@ -426,9 +426,8 @@ struct ClipboardRead<'a> {
 }
 
 impl<'a> ClipboardRead<'a> {
-    fn new(fd: OwnedFd, owner: Option<&'a mut ClipboardOwner>) -> Result<Self> {
+    fn new(fd: OwnedFd, pending_read: Option<&'a PendingRead>) -> Result<Self> {
         let file = File::from(fd);
-        let pending_read = owner.map(|owner| &*owner.pending_read);
         if let Some(pending_read) = pending_read {
             // The compositor passes the write end of this same pipe to the selection owner.
             let pipe = PipeId::of(&file)
@@ -557,7 +556,7 @@ fn open_transfer<'a>(
     // Create a pipe: offer writes to write_end, we read from read_end.
     let (read_end, write_end) =
         make_pipe().map_err(|e| GlassError::Backend(format!("clipboard get: pipe: {e}")))?;
-    let transfer = ClipboardRead::new(read_end, owner)?;
+    let transfer = ClipboardRead::new(read_end, owner.map(|owner| &*owner.pending_read))?;
 
     offer.receive(mime, write_end.as_fd());
     drop(write_end); // close write end BEFORE roundtrip so the source can EOF us
@@ -1071,9 +1070,9 @@ fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, File,
-        Mutex, Ordering, PipeId, PoisonError, ReadStatus, ReadyState, RetireOnExit, get,
-        is_retryable, open_transfer, read_to_eof_bounded, record_read_failure, serve_loop,
+        Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, ClipboardRead,
+        Condvar, File, Mutex, Ordering, PipeId, PoisonError, ReadStatus, ReadyState, RetireOnExit,
+        get, is_retryable, open_transfer, read_to_eof_bounded, record_read_failure, serve_loop,
         signal_ready, write_all_bounded,
     };
     use crate::testw::{Launch, on_a_thread};
@@ -1549,6 +1548,20 @@ mod tests {
         assert!(status.failure.is_none());
     }
 
+    #[test]
+    fn a_timed_out_read_clears_its_registration() {
+        let (read_end, _write_end) = rustix::pipe::pipe().expect("pipe");
+        let pending_read = Mutex::new(None);
+        let transfer = ClipboardRead::new(read_end, Some(&pending_read)).expect("register read");
+        assert!(pending_read.lock().expect("read status").is_some());
+
+        assert!(matches!(
+            transfer.read(Instant::now()),
+            Err(GlassError::Timeout(_))
+        ));
+        assert!(pending_read.lock().expect("read status").is_none());
+    }
+
     /// A payload past the pipe buffer cannot be handed over in one `write`. An implementation
     /// that writes once and trusts the count truncates the paste, and the app pasting has no way
     /// to tell a short clipboard from a short write.
@@ -1592,6 +1605,18 @@ mod tests {
         );
         // read_end stays alive until here: a closed one would fail as EPIPE, not as a timeout.
         drop(read_end);
+    }
+
+    #[test]
+    fn a_bounded_write_preserves_nonblocking_mode() {
+        let (_read_end, write_end) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK).expect("nonblocking pipe");
+        let mut file = File::from(write_end);
+
+        write_all_bounded(&mut file, b"clip!", CLIP_WRITE_TIMEOUT).expect("write ok");
+
+        let flags = rustix::fs::fcntl_getfl(&file).expect("write end flags");
+        assert!(flags.contains(rustix::fs::OFlags::NONBLOCK));
     }
 
     /// The common real failure: the app took what it wanted and closed the transfer. Silence here
