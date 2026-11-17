@@ -13,7 +13,7 @@ use crate::a11y_service::{A11yServiceRegistry, ServiceA11y};
 use crate::adb::Adb;
 use crate::agent::{AgentClient, AgentRegistry};
 use crate::build::run_build;
-use crate::cmd::{force_stop_args, install_args, launch_args, parse_launch};
+use crate::cmd::{force_stop, install_args, launch_args, parse_launch};
 use crate::input::{AgentInjector, Injector, ShellInjector};
 use crate::logs::{LogSink, LogcatStream};
 use crate::parse::{
@@ -59,17 +59,18 @@ impl AndroidPlatform {
     /// The logcat reap comes first and is unbounded, measured at 0-1ms — a kill and reap of a
     /// direct child, which only uninterruptible sleep can hold up.
     fn stop_app_until(&mut self, deadline: Deadline) -> Result<()> {
-        if let Some(mut app) = self.app.take() {
-            if let Some(mut logcat) = app.logcat.take() {
-                logcat.stop();
-            }
-            let stopped = self.adb().run_until(
-                force_stop_args(&app.package).iter().map(String::as_str),
-                deadline,
-            );
-            glass_core::note_if_skipped("the app force-stop", &stopped);
+        let Some(mut app) = self.app.take() else {
+            return Ok(());
+        };
+        if let Some(mut logcat) = app.logcat.take() {
+            logcat.stop();
         }
-        Ok(())
+        force_stop(self.adb(), &app.package, deadline).map_err(|source| {
+            GlassError::AppStopIncompleteCaused {
+                operation: format!("force-stopping {}", app.package),
+                source: Box::new(source),
+            }
+        })
     }
 
     /// Attach to (or boot) an emulator, and connect the on-device agent if enabled.
@@ -330,7 +331,7 @@ fn finish_capture(
 /// Force-stop a launch that failed after `am start` had already put the app on the device, and
 /// hand its error back — `start_app` records `self.app` only on success, so nothing else reaps it.
 fn reap_failed_launch(adb: &Adb, package: &str, e: GlassError) -> GlassError {
-    let _ = adb.run(force_stop_args(package).iter().map(String::as_str));
+    let _ = force_stop(adb, package, Deadline::UNBOUNDED);
     e
 }
 
@@ -659,7 +660,9 @@ impl Drop for AndroidPlatform {
     /// `Glass::shutdown` and a session replacement all call it. The path they do not reach is a
     /// launch that failed on the way up, which is [`reap_failed_launch`]'s.
     fn drop(&mut self) {
-        let _ = self.stop_app();
+        if let Err(error) = self.stop_app() {
+            eprintln!("glass-android: {error}");
+        }
     }
 }
 
@@ -898,7 +901,12 @@ mod platform_tests {
 
     /// A device that answers everything a healthy launch asks of it.
     fn launchable() -> FakeAdb {
+        launchable_with_force_stop(Answer::says("\n__glass_force_stop_status=0\n"))
+    }
+
+    fn launchable_with_force_stop(force_stop: Answer) -> FakeAdb {
         FakeAdb::new(&[
+            ("shell am force-stop *", force_stop),
             (
                 "shell am start *",
                 Answer::says("Starting: Intent {...}\nStatus: ok\n"),
@@ -1006,11 +1014,7 @@ mod platform_tests {
         let fake = launchable();
         let mut platform = started(&fake);
 
-        platform
-            .stop_app()
-            // A failed force-stop is NOT surfaced — `stop_app` discards it — so this asserts
-            // only that the call was made and the session ended, not that the app died.
-            .expect("ending a session reports");
+        platform.stop_app().expect("adb confirms force-stop");
 
         assert!(
             fake.called("am force-stop com.example.app"),
@@ -1021,6 +1025,75 @@ mod platform_tests {
             platform.window(&WindowOp::Geometry),
             Err(GlassError::NoActiveSession)
         ));
+    }
+
+    #[test]
+    fn force_stop_reports_an_adb_failure_and_ends_the_session() {
+        let fake = launchable_with_force_stop(Answer::fails("adb: device offline\n"));
+        let mut platform = started(&fake);
+
+        let error = platform.stop_app().expect_err("adb could not stop the app");
+        assert!(error.session_ended(), "{error}");
+        assert_eq!(error.tool_said(), Some("adb: device offline"));
+        assert!(matches!(
+            platform.running(),
+            Err(GlassError::NoActiveSession)
+        ));
+    }
+
+    #[test]
+    fn force_stop_reports_a_remote_failure_when_legacy_adb_exits_zero() {
+        let fake = launchable_with_force_stop(Answer::says(
+            "Error: Activity manager is unavailable\r\n\r\n__glass_force_stop_status=1\r\n",
+        ));
+        let mut platform = started(&fake);
+
+        let error = platform.stop_app().expect_err("the remote command failed");
+        assert!(error.session_ended(), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("am force-stop exited with status 1"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Activity manager is unavailable"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn force_stop_requires_a_complete_remote_status_line() {
+        let fake = launchable_with_force_stop(Answer::says("\n__glass_force_stop_status=0"));
+        let mut platform = started(&fake);
+
+        let error = platform
+            .stop_app()
+            .expect_err("adb returned an incomplete response");
+        assert!(error.session_ended(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("did not report a complete exit status"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn force_stop_reports_an_exhausted_deadline_without_invoking_adb() {
+        let fake = launchable();
+        let mut platform = started(&fake);
+
+        let error = platform
+            .stop_app_by(Deadline::at(Instant::now()))
+            .expect_err("force-stop was skipped");
+        assert!(error.session_ended(), "{error}");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        drop(platform);
+        assert!(!fake.called("am force-stop"), "{:?}", fake.calls());
     }
 
     #[test]
@@ -1071,25 +1144,20 @@ mod platform_tests {
     #[test]
     #[cfg(unix)]
     fn a_force_stop_that_never_answers_gives_up_at_the_shared_deadline() {
-        // `launchable`'s rules, with a force-stop that never returns in front of them.
-        let fake = FakeAdb::new(&[
-            ("shell am force-stop *", Answer::Lingers),
-            (
-                "shell am start *",
-                Answer::says("Starting: Intent {...}\nStatus: ok\n"),
-            ),
-            ("shell dumpsys window windows", Answer::says(WINDOWS)),
-            ("shell pidof *", Answer::says("4321\n")),
-            ("exec-out screencap", Answer::says(frame_bytes(1080, 2400))),
-            ("*", Answer::Silent),
-        ]);
+        let fake = launchable_with_force_stop(Answer::Lingers);
         let mut platform = started(&fake);
 
         let started_at = Instant::now();
-        platform
+        let error = platform
             .stop_app_by(Deadline::at(Instant::now() + Duration::from_millis(300)))
-            .expect("teardown is best-effort and reports success either way");
+            .expect_err("force-stop did not answer");
         let waited = started_at.elapsed();
+        assert!(error.session_ended(), "{error}");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
 
         assert!(
             waited < Duration::from_secs(2),

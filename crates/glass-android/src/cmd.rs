@@ -1,4 +1,6 @@
-use glass_core::{GlassError, Result};
+use glass_core::{Deadline, GlassError, Result};
+
+use crate::adb::Adb;
 
 /// The launch target parsed from `AppSpec.run`.
 ///
@@ -112,11 +114,33 @@ pub fn launch_args(component: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn force_stop_args(package: &str) -> Vec<String> {
-    ["shell", "am", "force-stop", package]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+pub(crate) fn force_stop(adb: &Adb, package: &str, deadline: Deadline) -> Result<()> {
+    const STATUS_PREFIX: &str = "__glass_force_stop_status=";
+    // Legacy adb shell drops the remote status, so the shell emits it on stdout.
+    let command =
+        format!("am force-stop {package}; status=$?; echo; echo \"{STATUS_PREFIX}$status\"");
+    let (stdout, stderr) = adb.run_streams_until(["shell", &command], deadline)?;
+    let completed = stdout
+        .strip_suffix('\n')
+        .and_then(|text| text.rsplit_once('\n'))
+        .and_then(|(output, line)| {
+            let status = line.trim_end_matches('\r').strip_prefix(STATUS_PREFIX)?;
+            Some((output, status.parse::<u8>().ok()?))
+        });
+    let (output, failure) = match completed {
+        Some((_, 0)) => return Ok(()),
+        Some((output, status)) => (output, format!("exited with status {status}")),
+        None => (
+            stdout.as_str(),
+            "did not report a complete exit status".into(),
+        ),
+    };
+    let details = [failure.as_str(), output.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(GlassError::Backend(format!("am force-stop {details}")).after_dispatch())
 }
 
 #[cfg(test)]
@@ -163,7 +187,6 @@ mod tests {
             launch_args("p/.A"),
             ["shell", "am", "start", "-W", "-n", "p/.A"]
         );
-        assert_eq!(force_stop_args("p"), ["shell", "am", "force-stop", "p"]);
     }
 
     #[test]

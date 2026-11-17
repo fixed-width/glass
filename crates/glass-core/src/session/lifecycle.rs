@@ -496,6 +496,10 @@ mod tests {
     fn incomplete_cleanup_discards_the_ended_session_and_blocks_its_replacement() {
         for error in [
             GlassError::AppStopIncomplete("surviving host PIDs: [123]".into()),
+            GlassError::AppStopIncompleteCaused {
+                operation: "terminating app".into(),
+                source: Box::new(GlassError::Backend("could not stop 123".into())),
+            },
             GlassError::AppStopIncomplete("surviving host PIDs: [123]".into()).before_dispatch(),
             GlassError::AppStopIncomplete("surviving host PIDs: [123]".into()).after_dispatch(),
             GlassError::cleanup_failed(

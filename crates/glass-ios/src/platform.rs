@@ -278,17 +278,16 @@ pub(crate) fn bundle_id_from_run(run: &[String]) -> Result<(Option<String>, Stri
 impl IosPlatform {
     /// Terminate the app, under `deadline` when the caller has one to share.
     fn stop_app_until(&mut self, deadline: Deadline) -> Result<()> {
-        if let Some(app) = self.app.take() {
-            // Best-effort teardown: the app may already be gone (it crashed, or a prior
-            // launch's `--terminate-running-process` killed it), so a failing `terminate`
-            // is not an error — dropping the session is the goal, and it is idempotent.
-            let stopped = self
-                .target
-                .simctl()
-                .run_until(&["terminate", self.target.udid(), &app.bundle_id], deadline);
-            glass_core::note_if_skipped("terminating the app", &stopped);
-        }
-        Ok(())
+        let Some(app) = self.app.take() else {
+            return Ok(());
+        };
+        self.target
+            .simctl()
+            .terminate_until(self.target.udid(), &app.bundle_id, deadline)
+            .map_err(|source| GlassError::AppStopIncompleteCaused {
+                operation: format!("terminating {} on {}", app.bundle_id, self.target.udid()),
+                source: Box::new(source),
+            })
     }
 
     /// Resolve (attaching to or booting) a simulator per the `GLASS_IOS_*` env vars, then
@@ -639,12 +638,7 @@ impl Platform for IosPlatform {
         Ok(geometry)
     }
 
-    /// The launched app's pid, when `simctl launch` reported one this could parse.
-    ///
-    /// The iOS accessibility reader does not correlate by pid — idb describes the whole screen —
-    /// so nothing in this backend consumes it today. It is answered anyway because the trait asks
-    /// a question this backend now knows the answer to, and a caller comparing backends should
-    /// not find iOS uniquely silent.
+    /// The launched app's pid, when `simctl launch` reported one.
     fn app_pid(&self) -> Option<u32> {
         self.app.as_ref().and_then(|a| a.pid)
     }
@@ -813,7 +807,9 @@ impl Drop for IosPlatform {
     /// `Glass::shutdown` and a session replacement all call it. The path they do not reach is a
     /// launch that failed on the way up, which is [`reap_failed_launch`]'s.
     fn drop(&mut self) {
-        let _ = self.stop_app();
+        if let Err(error) = self.stop_app() {
+            eprintln!("glass-ios: {error}");
+        }
     }
 }
 
@@ -1567,12 +1563,115 @@ mod teardown_tests {
     fn stop_app_takes_the_session_so_the_drop_behind_it_repeats_nothing() {
         let fake = FakeSimctl::new();
         let mut p = platform(&fake, true);
-        // Best-effort by construction today; when that changes (glass#428) this line changes with
-        // it.
-        p.stop_app().expect("stop is best-effort and cannot fail");
+        p.stop_app().expect("simctl confirms termination");
         drop(p);
 
         assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn terminate_of_an_already_exited_app_is_successful() {
+        let fake = FakeSimctl::new();
+        // Captured from Xcode 16 in appium/appium#20826, with the test bundle ID.
+        let stderr = format!(
+            "An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n\
+             Simulator device failed to terminate {BUNDLE}.\n\
+             found nothing to terminate\n\
+             Underlying error (domain=NSPOSIXErrorDomain, code=3):\n\t\
+             The request to terminate \"{BUNDLE}\" failed. found nothing to terminate\n"
+        );
+        fake.fails_with("terminate", 3, &stderr);
+        let mut platform = platform(&fake, true);
+
+        platform.stop_app().expect("the app is already gone");
+        drop(platform);
+        assert_eq!(terminations(&fake).len(), 1, "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn ambiguous_frontboard_termination_is_unconfirmed_even_after_the_original_pid_exits() {
+        let fake = FakeSimctl::new();
+        // Older Xcode stderr captured in wix/Detox#3416.
+        fake.fails_with(
+            "terminate",
+            3,
+            "An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n\
+             Application termination failed.\n\
+             FBSSystemService reported failure without an error, possibly because the app is not currently running.\n",
+        );
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let mut exited = platform(&fake, true);
+        exited.app.as_mut().unwrap().pid = Some(pid);
+        let error = exited
+            .stop_app()
+            .expect_err("the bundle may have restarted under a different PID");
+        assert!(error.session_ended(), "{error}");
+        assert!(error.to_string().contains("FBSSystemService"), "{error}");
+    }
+
+    #[test]
+    fn terminate_does_not_accept_other_errors_with_the_same_exit_status() {
+        let fake = FakeSimctl::new();
+        fake.fails_with(
+            "terminate",
+            3,
+            "An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):\n\
+             CoreSimulator service disappeared\n",
+        );
+        let mut platform = platform(&fake, true);
+
+        let error = platform
+            .stop_app()
+            .expect_err("the simulator became unavailable");
+        assert!(error.session_ended(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("CoreSimulator service disappeared"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn terminate_reports_a_simctl_failure_and_ends_the_session() {
+        let fake = FakeSimctl::new();
+        fake.fails("terminate");
+        let mut platform = platform(&fake, true);
+
+        let error = platform
+            .stop_app()
+            .expect_err("simctl could not terminate the app");
+        assert!(error.session_ended(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("the fake xcrun was told to fail terminate"),
+            "{error}"
+        );
+        assert!(matches!(
+            platform.running(),
+            Err(GlassError::NoActiveSession)
+        ));
+    }
+
+    #[test]
+    fn terminate_reports_an_exhausted_deadline_without_invoking_simctl() {
+        let fake = FakeSimctl::new();
+        let mut platform = platform(&fake, true);
+
+        let error = platform
+            .stop_app_by(Deadline::at(std::time::Instant::now()))
+            .expect_err("terminate was skipped");
+        assert!(error.session_ended(), "{error}");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::NotStarted));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        drop(platform);
+        assert!(terminations(&fake).is_empty(), "{:?}", fake.calls());
     }
 
     /// The iOS half of the composition guarantee: a `terminate` that never answers must not spend
@@ -1584,11 +1683,18 @@ mod teardown_tests {
         let mut p = platform(&fake, true);
 
         let started = std::time::Instant::now();
-        p.stop_app_by(Deadline::at(
-            std::time::Instant::now() + std::time::Duration::from_millis(300),
-        ))
-        .expect("teardown is best-effort and reports success either way");
+        let error = p
+            .stop_app_by(Deadline::at(
+                std::time::Instant::now() + std::time::Duration::from_millis(300),
+            ))
+            .expect_err("terminate did not answer");
         let waited = started.elapsed();
+        assert!(error.session_ended(), "{error}");
+        assert_eq!(error.bound(), Some(glass_core::BoundKind::TimedOut));
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::MayHaveDispatched)
+        );
 
         assert!(
             waited < std::time::Duration::from_secs(2),

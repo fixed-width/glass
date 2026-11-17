@@ -294,6 +294,14 @@ pub enum GlassError {
     #[error("application session ended, but cleanup is incomplete: {0}")]
     AppStopIncomplete(String),
 
+    /// Incomplete application cleanup with a structured backend failure.
+    #[error("application session ended, but cleanup is incomplete: {operation}: {source}")]
+    AppStopIncompleteCaused {
+        operation: String,
+        #[source]
+        source: Box<GlassError>,
+    },
+
     /// A tool glass drove ran and exited non-zero, carrying what it wrote to stderr.
     ///
     /// `said` is that stderr, trimmed — empty when the tool failed without a word, which for
@@ -419,7 +427,8 @@ impl GlassError {
     pub fn cause(&self) -> &Self {
         match self {
             GlassError::BeforeDispatch(error) | GlassError::AfterDispatch(error) => error.cause(),
-            GlassError::AxWriteUnconfirmedCaused { source, .. } => source.cause(),
+            GlassError::AxWriteUnconfirmedCaused { source, .. }
+            | GlassError::AppStopIncompleteCaused { source, .. } => source.cause(),
             GlassError::WindowRestoreFailed { primary, .. } => primary.cause(),
             GlassError::InputCleanupFailed { primary, .. }
             | GlassError::CleanupFailed { primary, .. } => primary.cause(),
@@ -430,7 +439,7 @@ impl GlassError {
     /// Whether teardown consumed the application session even though cleanup failed.
     pub fn session_ended(&self) -> bool {
         match self {
-            Self::AppStopIncomplete(_) => true,
+            Self::AppStopIncomplete(_) | Self::AppStopIncompleteCaused { .. } => true,
             Self::BeforeDispatch(error) | Self::AfterDispatch(error) => error.session_ended(),
             Self::CleanupFailed {
                 primary, cleanup, ..
@@ -584,6 +593,7 @@ impl GlassError {
             GlassError::Bounded { kind, .. } => Some(*kind),
             GlassError::BeforeDispatch(error)
             | GlassError::AfterDispatch(error)
+            | GlassError::AppStopIncompleteCaused { source: error, .. }
             | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound(),
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.bound().or_else(|| restore.bound())
@@ -604,6 +614,7 @@ impl GlassError {
             GlassError::Bounded { whose, .. } => Some(*whose),
             GlassError::BeforeDispatch(error)
             | GlassError::AfterDispatch(error)
+            | GlassError::AppStopIncompleteCaused { source: error, .. }
             | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.bound_owner(),
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.bound_owner().or_else(|| restore.bound_owner())
@@ -632,6 +643,7 @@ impl GlassError {
             GlassError::AfterDispatch(_)
             | GlassError::AxWriteUnconfirmed(..)
             | GlassError::AxWriteUnconfirmedCaused { .. } => Some(BoundDispatch::MayHaveDispatched),
+            GlassError::AppStopIncompleteCaused { source, .. } => source.bound_dispatch(),
             GlassError::WindowRestoreFailed { primary, restore } => {
                 match (primary.bound_dispatch(), restore.bound_dispatch()) {
                     (Some(BoundDispatch::MayHaveDispatched), _)
@@ -672,6 +684,7 @@ impl GlassError {
             GlassError::ToolFailed { said, .. } => Some(said.trim()),
             GlassError::BeforeDispatch(error)
             | GlassError::AfterDispatch(error)
+            | GlassError::AppStopIncompleteCaused { source: error, .. }
             | GlassError::AxWriteUnconfirmedCaused { source: error, .. } => error.tool_said(),
             GlassError::WindowRestoreFailed { primary, restore } => {
                 primary.tool_said().or_else(|| restore.tool_said())
@@ -776,6 +789,28 @@ mod tests {
     #[test]
     fn ordinary_backend_errors_have_no_bound_dispatch() {
         assert_eq!(GlassError::Backend("down".into()).bound_dispatch(), None);
+    }
+
+    #[test]
+    fn incomplete_stop_preserves_whether_the_stop_command_dispatched() {
+        for (source, expected) in [
+            (
+                GlassError::deadline_not_started("terminate"),
+                Some(BoundDispatch::NotDispatched),
+            ),
+            (
+                GlassError::caller_deadline_elapsed("terminate"),
+                Some(BoundDispatch::MayHaveDispatched),
+            ),
+            (GlassError::Backend("device offline".into()), None),
+        ] {
+            let error = GlassError::AppStopIncompleteCaused {
+                operation: "terminating app".into(),
+                source: Box::new(source),
+            };
+
+            assert_eq!(error.bound_dispatch(), expected, "{error}");
+        }
     }
 
     #[test]

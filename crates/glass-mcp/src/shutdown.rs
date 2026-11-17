@@ -14,6 +14,11 @@ use tokio::sync::Mutex;
 /// without a line of its own.
 const LOCK_WAIT_WORTH_SAYING: Duration = Duration::from_millis(250);
 
+pub(crate) fn report_diagnostic(report: impl FnOnce() + Send + 'static) {
+    // A host may stop draining stderr during shutdown, so process exit must not join this writer.
+    let _ = std::thread::Builder::new().spawn(report);
+}
+
 /// Best-effort, time-bounded teardown of all sessions for process exit. The backend
 /// teardown blocks (it waits on the child), so it runs off the async reactor via
 /// `spawn_blocking`; after `budget` we stop waiting and let the OS reap whatever is
@@ -44,7 +49,11 @@ pub(crate) async fn run_shutdown_with_trace(
         let mut glass = sessions.blocking_lock();
         let waited = waiting.elapsed();
         if waited > LOCK_WAIT_WORTH_SAYING {
-            eprintln!("glass: a tool call held the session for {waited:?} before teardown started");
+            report_diagnostic(move || {
+                eprintln!(
+                    "glass: a tool call held the session for {waited:?} before teardown started"
+                );
+            });
         }
         glass.shutdown_report(Deadline::at(
             Instant::now() + budget - glass_core::TEARDOWN_REAP_HEADROOM,
@@ -52,15 +61,22 @@ pub(crate) async fn run_shutdown_with_trace(
     });
     let status = match tokio::time::timeout(budget, task).await {
         Ok(Ok(Ok(()))) => "completed",
-        Ok(Ok(Err(_))) => "target_stop_failed",
+        Ok(Ok(Err(error))) => {
+            report_diagnostic(move || {
+                eprintln!("glass: teardown could not stop the target: {error}")
+            });
+            "target_stop_failed"
+        }
         // A panic inside teardown: the steps behind it did not run, and the process is about to
         // exit past it.
         Ok(Err(e)) => {
-            eprintln!("glass: teardown panicked ({e}); exiting anyway");
+            report_diagnostic(move || eprintln!("glass: teardown panicked ({e}); exiting anyway"));
             "panicked"
         }
         Err(_) => {
-            eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway");
+            report_diagnostic(move || {
+                eprintln!("glass: shutdown exceeded {budget:?}; exiting anyway")
+            });
             "timed_out"
         }
     };
@@ -107,6 +123,23 @@ mod tests {
         PointerEvent, Region, Result, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
     };
     use tokio::sync::Mutex;
+
+    #[test]
+    fn shutdown_diagnostic_does_not_wait_for_its_writer() {
+        let (started, writer_started) = std::sync::mpsc::channel();
+        let (release, writer_release) = std::sync::mpsc::channel();
+        let timeout = Duration::from_secs(2);
+
+        report_diagnostic(move || {
+            started.send(()).unwrap();
+            let _ = writer_release.recv_timeout(timeout);
+        });
+
+        writer_started.recv_timeout(timeout).unwrap();
+        release
+            .send(())
+            .expect("the caller returned before the writer finished");
+    }
 
     /// A backend whose `stop_app` blocks far longer than any test budget, to prove
     /// `run_shutdown` is time-bounded and does not block on a wedged teardown.
