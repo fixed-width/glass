@@ -40,6 +40,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Wayland clipboard reads report a failed transfer from Glass instead of returning partial or
+  empty text as a successful read.
 - Rolling workflow video keeps marked evidence available after failed or timed-out exports,
   and preserves the previous selection when a mark reply is lost. Status no longer presents
   cached pending evidence after a worker connection fails.

@@ -2563,7 +2563,7 @@ impl Platform for WaylandPlatform {
             .ok_or(GlassError::NoActiveSession)?
             .socket_path
             .clone();
-        crate::clipboard::get(&socket)
+        crate::clipboard::get(&socket, self.clipboard_owner.as_mut())
     }
 
     fn set_clipboard(&mut self, text: &str) -> Result<()> {
