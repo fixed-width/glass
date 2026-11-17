@@ -233,7 +233,7 @@ struct InstrumentedAccessibility {
     tree: glass_core::AxTree,
     coverage: AxStateCoverage,
     invoke_result: Option<AxNodeId>,
-    set_error: Option<String>,
+    set_error: Option<GlassError>,
 }
 
 impl Accessibility for InstrumentedAccessibility {
@@ -283,10 +283,7 @@ impl Accessibility for InstrumentedAccessibility {
     ) -> glass_core::Result<()> {
         self.counters
             .record(SessionIoKind::Action, "a11y_set_value");
-        match &self.set_error {
-            Some(message) => Err(GlassError::Backend(message.clone())),
-            None => Ok(()),
-        }
+        self.set_error.take().map_or(Ok(()), Err)
     }
 
     fn invoke(
@@ -320,7 +317,7 @@ fn started_instrumented_glass_with_errors(
     coverage: AxStateCoverage,
     invoke_result: Option<AxNodeId>,
     key_error: Option<String>,
-    set_error: Option<String>,
+    set_error: Option<GlassError>,
     capture_error: Option<String>,
 ) -> (Glass, Arc<SessionIoCounters>, Arc<AtomicUsize>) {
     let counters = Arc::new(SessionIoCounters::default());
@@ -1702,7 +1699,7 @@ fn legacy_set_value_scrubs_payload_from_context_batch_standalone_and_artifacts()
             semantic_control_coverage(),
             None,
             None,
-            Some(format!("backend echoed {SENTINEL}")),
+            Some(GlassError::Backend(format!("backend echoed {SENTINEL}"))),
             None,
         )
         .0;
@@ -1743,6 +1740,88 @@ fn legacy_set_value_scrubs_payload_from_context_batch_standalone_and_artifacts()
             .iter()
             .all(|b| !b.contains(SENTINEL))
     );
+}
+
+#[test]
+fn set_value_exposes_only_known_mobile_recovery_guidance() {
+    const REQUESTED: &str = "SUBMITTED_WRITE_SENTINEL";
+    const OBSERVED: &str = "OBSERVED_WRITE_SENTINEL";
+    const CACHED: &str = "CACHED_WRITE_SENTINEL";
+    const UNKNOWN_WHY: &str = "UNRECOGNIZED_WRITE_REASON_SENTINEL";
+    for (why, expected_summary, expected_retry) in [
+        (
+            Some(glass_core::TAP_MAY_HAVE_MISSED),
+            "focus tap may have missed",
+            "reobserve",
+        ),
+        (
+            Some(glass_android::COMPOSE_SET_TEXT_NO_OP),
+            "GLASS_ANDROID_A11Y=off",
+            "reobserve",
+        ),
+        (
+            None,
+            "write went out but could not be confirmed",
+            "do_not_retry",
+        ),
+        (
+            Some(UNKNOWN_WHY),
+            "write went out but could not be confirmed",
+            "do_not_retry",
+        ),
+    ] {
+        for selector in [false, true] {
+            let make = || {
+                let error = match why {
+                    Some(why) => {
+                        GlassError::value_not_applied_because(1, REQUESTED, Some(OBSERVED), why)
+                    }
+                    None => GlassError::value_not_applied(1, REQUESTED, Some(OBSERVED)),
+                };
+                let mut glass = started_instrumented_glass_with_errors(
+                    semantic_control_tree(AxRole::TextField, "Account", Some(CACHED), false),
+                    semantic_control_coverage(),
+                    None,
+                    None,
+                    Some(error),
+                    None,
+                )
+                .0;
+                glass.a11y_snapshot(None).unwrap();
+                glass
+            };
+            let args: SetValueArgs = serde_json::from_value(if selector {
+                serde_json::json!({"target": {"query": "Account", "role": "TextField"}, "text": REQUESTED})
+            } else {
+                serde_json::json!({"id": 1, "text": REQUESTED})
+            }).unwrap();
+            let standalone = set_value(&mut make(), &args).unwrap_err();
+            let envelope = error_envelope(&standalone);
+            assert_eq!(envelope["result"]["dispatch"], "may_have_dispatched");
+            if selector {
+                assert_eq!(envelope["result"]["retry"], expected_retry);
+            }
+            let batch = do_actions(
+                &mut make(),
+                &DoArgs {
+                    actions: vec![Action::SetValue(args)],
+                    then: None,
+                    timeout_ms: None,
+                    encoded_argument_bytes: 0,
+                },
+            )
+            .unwrap_err();
+            for output in [standalone, batch] {
+                let envelope = error_envelope(&output);
+                let summary = envelope["error"]["summary"].as_str().unwrap();
+                assert!(summary.contains(expected_summary), "{summary}");
+                let blocks = output.render_text_blocks().join("\n");
+                for sentinel in [REQUESTED, OBSERVED, CACHED, UNKNOWN_WHY] {
+                    assert!(!blocks.contains(sentinel), "{blocks}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

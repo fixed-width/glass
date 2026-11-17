@@ -1,9 +1,9 @@
 use glass_core::{
     ActionMethod, ActionMode, ActionTarget, ActionabilityReport, AxNodeId, ClickTargetParams,
     ElementInfo, GlassError, MatchField, MatchTier, MutationReport, ResolutionReport,
-    SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS, ScopeResolution,
-    SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome, SemanticMatch,
-    SetValueTargetParams, TypeTargetParams, Whose,
+    RetryGuidance, SEMANTIC_ACTION_DEFAULT_TIMEOUT_MS, SEMANTIC_ACTION_MAX_TIMEOUT_MS,
+    ScopeResolution, SemanticActionError, SemanticActionFailureKind, SemanticActionOutcome,
+    SemanticMatch, SetValueTargetParams, TypeTargetParams, Whose,
 };
 use serde_json::{Value, json};
 
@@ -472,6 +472,41 @@ pub(crate) fn id_error(
     ContextualError::from_caller_bound(source, context)
 }
 
+pub(crate) fn set_value_error(
+    error: Box<SemanticActionError>,
+    semantic: bool,
+    context: ToolContext,
+) -> ContextualError {
+    let reason = match &error.source {
+        Some(GlassError::AxValueNotApplied { why, .. }) => why.as_deref(),
+        _ => None,
+    };
+    // Map exact backend reasons to fixed summaries at the MCP trust boundary.
+    let recovery = match reason {
+        Some(glass_core::TAP_MAY_HAVE_MISSED) => Some(
+            "the field's value stayed the same, so the focus tap may have missed. Re-snapshot and retry once if the field still needs the change",
+        ),
+        Some(glass_android::COMPOSE_SET_TEXT_NO_OP) => Some(
+            "the field's value stayed the same. Re-snapshot, then clear the Compose field before setting it, or use the uiautomator backend (GLASS_ANDROID_A11Y=off)",
+        ),
+        _ => None,
+    };
+    let mut contextual = if semantic {
+        semantic_error("glass_set_value", error)
+    } else {
+        id_error(error, context)
+    };
+    if let Some(summary) = recovery
+        && contextual.category == SafeErrorCategory::Other
+    {
+        contextual.safe_summary = summary;
+        if let Some(result) = contextual.result.as_mut() {
+            result["retry"] = json!(RetryGuidance::Reobserve.as_str());
+        }
+    }
+    contextual.scrub_message()
+}
+
 pub(crate) fn semantic_error(
     tool: &'static str,
     error: impl Into<Box<SemanticActionError>>,
@@ -492,7 +527,7 @@ pub(crate) fn semantic_error(
     } else {
         category.summary_for_dispatch(Some(bound_dispatch))
     };
-    let include_text = tool != "glass_type";
+    let include_text = !(tool == "glass_type" || (tool == "glass_set_value" && post_write));
     let mut siblings = Vec::new();
     if !error.candidates.is_empty() {
         siblings.push(OutContent::untrusted_observation(

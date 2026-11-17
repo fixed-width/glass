@@ -740,7 +740,7 @@ fn subject_of(asked: &str, actual: Option<&str>) -> Option<Subject> {
 ///
 /// `GLASS_ANDROID_A11Y=off`, not unsetting `GLASS_ANDROID_A11Y_APK`: the apk is also picked up from
 /// the data dirs and from beside the binary, so unsetting the path leaves this reader selected.
-const COMPOSE_SET_TEXT_NO_OP: &str = "a Compose field that already holds text cannot be replaced via ACTION_SET_TEXT — clear it \
+pub const COMPOSE_SET_TEXT_NO_OP: &str = "a Compose field that already holds text cannot be replaced via ACTION_SET_TEXT — clear it \
      first, or set GLASS_ANDROID_A11Y=off to use the uiautomator backend";
 
 /// How long [`ServiceA11y::set_value`] polls for a write to reach the tree, and the gap between
@@ -934,13 +934,8 @@ impl Accessibility for ServiceA11y {
         let explicit_acting_package = rt.explicit_acting_package();
         // Addressed by the node the guard approved, not by the id the caller named, so a guard
         // that ever relaxes into a search cannot dispatch to a node it never approved.
-        let device_ref = rt
-            .device_ref(
-                resolved_editable_target(&rt.tree, target)
-                    .map_err(before_mutation_dispatch)?
-                    .id,
-            )
-            .map_err(before_mutation_dispatch)?;
+        let node = resolved_editable_target(&rt.tree, target).map_err(before_mutation_dispatch)?;
+        let device_ref = rt.device_ref(node.id).map_err(before_mutation_dispatch)?;
         #[cfg(test)]
         std::thread::sleep(self.before_set_text_delay);
         #[cfg(test)]
@@ -949,18 +944,18 @@ impl Accessibility for ServiceA11y {
         }
         require_semantic_time(ctx.deadline, "Android accessibility set_text", false)
             .map_err(before_mutation_dispatch)?;
-        match self
+        let before = match self
             .client
-            .set_text(device_ref, text, rt.acting_on(&self.package), ctx.deadline)
+            .set_text(device_ref, text, &acting_package, ctx.deadline)
         {
-            Ok(()) => {}
+            Ok(()) => node.value.clone(),
             Err(CallFailure::NotSent(_)) => {
                 let fresh = self
                     .refreshed_action_tree(ctx, explicit_acting_package, "set_text")
                     .map_err(|failure| write_error(target.id.0, failure))?;
                 let fresh_target = relocated_target(&fresh.tree, target)?;
-                let fresh_ref =
-                    fresh.device_ref(resolved_editable_target(&fresh.tree, &fresh_target)?.id)?;
+                let fresh_node = resolved_editable_target(&fresh.tree, &fresh_target)?;
+                let fresh_ref = fresh.device_ref(fresh_node.id)?;
                 require_semantic_time(ctx.deadline, "Android accessibility set_text", false)?;
                 self.client
                     .set_text(
@@ -970,9 +965,10 @@ impl Accessibility for ServiceA11y {
                         ctx.deadline,
                     )
                     .map_err(|failure| write_error(target.id.0, failure))?;
+                fresh_node.value.clone()
             }
             Err(failure) => return Err(write_error(target.id.0, failure)),
-        }
+        };
         // Verify the value actually took. ACTION_SET_TEXT returns success but silently no-ops when
         // *replacing* existing text in a Compose field, so a bare Ok could lie (glass forbids silent
         // fallbacks). The set is async (Compose recompose → a11y update), so poll briefly for the
@@ -1031,10 +1027,9 @@ impl Accessibility for ServiceA11y {
                             .into(),
                     ));
                 };
-                // The clause explains a field that never moved; on one holding something else the
-                // write did reach it, and "clear it first" would name a field already empty.
+                // The Compose workaround applies to replacing existing text.
                 return Err(
-                    if write_took_no_effect(&observed, target.value.as_deref()) {
+                    if !observed.is_empty() && write_took_no_effect(&observed, before.as_deref()) {
                         GlassError::value_not_applied_because(
                             target.id.0,
                             text,
@@ -5827,25 +5822,44 @@ mod tests {
     }
 
     #[test]
-    fn a_field_holding_something_neither_value_gets_no_compose_explanation() {
-        // The clause tells the caller to clear a field that already holds text; a field holding
-        // something the write put there was not refused.
+    fn compose_retry_advice_uses_the_tree_that_supplied_the_write_ref() {
         let (port, _ops) = fake_service(
-            vec![editable_field("old"), editable_field("filtered")],
+            vec![editable_field("old"), editable_field("current")],
             OnAction::Ok,
         );
         let mut a = impatient_writer(port);
-        let t = built(&editable_field("old"));
-        let target = target_for(&t, AxNodeId(1));
+        let target = AxTarget {
+            value: None,
+            ..target_for(&built(&editable_field("old")), AxNodeId(1))
+        };
+        break_set_text_write_after_guard(&mut a);
 
-        let err = a
-            .set_value(&ctx(), &target, "new")
-            .expect_err("the field holds neither the request nor what it held");
+        let err = a.set_value(&ctx(), &target, "new").unwrap_err();
         assert!(
-            matches!(&err, GlassError::AxValueNotApplied { observed, why: None, .. }
-                if observed.as_deref() == Some("filtered")),
+            matches!(&err, GlassError::AxValueNotApplied { observed, why, .. }
+                if observed.as_deref() == Some("current")
+                    && why.as_deref() == Some(COMPOSE_SET_TEXT_NO_OP)),
             "{err}"
         );
+    }
+
+    #[test]
+    fn compose_workaround_requires_existing_text_to_survive_the_write() {
+        for (before, after) in [("old", "filtered"), ("", "")] {
+            let (port, _ops) = fake_service(
+                vec![editable_field(before), editable_field(after)],
+                OnAction::Ok,
+            );
+            let mut a = impatient_writer(port);
+            let target = target_for(&built(&editable_field(before)), AxNodeId(1));
+
+            let err = a.set_value(&ctx(), &target, "new").unwrap_err();
+            assert!(
+                matches!(&err, GlassError::AxValueNotApplied { observed, why: None, .. }
+                    if observed.as_deref() == Some(after)),
+                "{err}"
+            );
+        }
     }
 
     #[test]

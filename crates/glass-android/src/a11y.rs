@@ -523,7 +523,7 @@ const PRE_WRITE_BOUND: RetryBound = RetryBound {
     then_within: Duration::ZERO,
 };
 
-/// Read the tree and locate `target`'s tap point — the read every write makes before it can act.
+/// Read the tree and locate `target`'s tap point and current value before the write.
 ///
 /// Over a runner so the bound above is testable without a device — the rest of a write taps and
 /// types through `Adb` directly.
@@ -531,24 +531,27 @@ fn locate_for_write(
     run: &mut AdbRunner<'_>,
     ctx: &AxContext,
     target: &AxTarget,
-) -> Result<(i32, i32)> {
+) -> Result<((i32, i32), Option<String>)> {
     let mut tree = snapshot_with_runner(run, ctx, PRE_WRITE_BOUND)?;
     tree.assign_ids();
-    locate_editable_target(&tree, target, &ctx.window)
+    let (center, value) = locate_editable_target(&tree, target, &ctx.window)?;
+    Ok((center, value.map(str::to_owned)))
 }
 
 /// [`editable_target`], plus the window-relative tap point for editing it — the extra step the
 /// `uiautomator` reader needs, because it edits by tapping where the on-device service can act on
 /// the node directly. Errors `AxElementNotClickable` when the element has no on-screen center.
-fn locate_editable_target(
-    tree: &AxTree,
+fn locate_editable_target<'a>(
+    tree: &'a AxTree,
     target: &AxTarget,
     window: &WindowGeometry,
-) -> Result<(i32, i32)> {
-    editable_target(tree, target)?
+) -> Result<((i32, i32), Option<&'a str>)> {
+    let node = editable_target(tree, target)?;
+    let center = node
         .bounds
         .and_then(|b| b.clamped_center(window.width, window.height))
-        .ok_or(GlassError::AxElementNotClickable(target.id.0))
+        .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
+    Ok((center, node.value.as_deref()))
 }
 
 fn write_unconfirmed(target: u32, error: GlassError) -> GlassError {
@@ -643,7 +646,11 @@ impl Accessibility for AndroidA11y {
         let window = ctx.window.clone();
         let adb = self.ensure_adb_within(ctx.deadline)?;
         // Re-snapshot and number nodes to locate the target by its pre-order id.
-        let (cx, cy) = locate_for_write(&mut adb_runner(&adb), ctx, target)?;
+        let ((cx, cy), value) = locate_for_write(&mut adb_runner(&adb), ctx, target)?;
+        let write_target = AxTarget {
+            value,
+            ..target.clone()
+        };
         require_time(ctx.deadline, target.id.0, false, false)?;
         self.warmed = true;
         // Tap to focus, select-all, delete, type — reusing the P2 input builders.
@@ -730,7 +737,7 @@ impl Accessibility for AndroidA11y {
                 .snapshot_within(ctx, VERIFY_BOUND)
                 .map_err(|e| read_back_error(target, e))?;
             after.assign_ids();
-            match verify_typed_write(&after, target, text, TAP_MAY_HAVE_MISSED) {
+            match verify_typed_write(&after, &write_target, text, TAP_MAY_HAVE_MISSED) {
                 Ok(()) => return Ok(()),
                 // Only a not-applied verdict can change on a later read: drift and truncation are
                 // structural, and re-dumping for them costs seconds to reach the same answer.
@@ -2495,30 +2502,13 @@ exec "$real" "$@"
         }
     }
 
-    #[test]
     #[cfg(unix)]
-    fn a_session_retains_the_captured_value_guard_after_backspace_never_spawns() {
-        use super::AndroidA11y;
-        use crate::adb::{Answer, FakeAdb};
+    fn session_with_adb(adb: &crate::adb::Adb) -> glass_core::Glass {
         use glass_core::{Backend, BaselineStore, Glass, PlatformFactory, SandboxLevel};
 
-        let alice = Answer::says(one_field_holding("Alice"));
-        let fake = FakeAdb::scripted(vec![
-            (
-                "*shell cat*",
-                vec![
-                    alice.clone(),
-                    alice,
-                    Answer::says(one_field_holding("Zara")),
-                    Answer::says(one_field_holding("updated")),
-                ],
-            ),
-            ("*", vec![Answer::Silent]),
-        ]);
-        let (bin, delegate) = fail_next_adb_spawn_after(&fake, "input keycombination");
         let backend = Backend {
             platform: Box::new(SessionPlatform),
-            accessibility: Some(Box::new(AndroidA11y::for_adb(fake.adb().clone()))),
+            accessibility: Some(Box::new(super::AndroidA11y::for_adb(adb.clone()))),
         };
         let mut backend = Some(backend);
         let factory: PlatformFactory = Box::new(move |_| {
@@ -2548,6 +2538,29 @@ exec "$real" "$@"
                 a11y: true,
             })
             .expect("start the test session");
+        glass
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_retains_the_captured_value_guard_after_backspace_never_spawns() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let alice = Answer::says(one_field_holding("Alice"));
+        let fake = FakeAdb::scripted(vec![
+            (
+                "*shell cat*",
+                vec![
+                    alice.clone(),
+                    alice,
+                    Answer::says(one_field_holding("Zara")),
+                    Answer::says(one_field_holding("updated")),
+                ],
+            ),
+            ("*", vec![Answer::Silent]),
+        ]);
+        let (bin, delegate) = fail_next_adb_spawn_after(&fake, "input keycombination");
+        let mut glass = session_with_adb(fake.adb());
         glass.a11y_snapshot(None).expect("capture Alice");
 
         let first = glass
@@ -2572,6 +2585,37 @@ exec "$real" "$@"
             "the retry must stop before focusing the recycled row: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_set_value_retry_uses_the_live_baseline_for_tap_advice() {
+        use super::{TAP_MAY_HAVE_MISSED, VERIFY_ATTEMPTS};
+        use crate::adb::{Answer, FakeAdb};
+
+        for (observed, expect_tap_advice) in [("hello", true), ("", false)] {
+            // The snapshot, both pre-write guards and the first write's read-backs see "hello".
+            let mut dumps = vec![Answer::says(one_field_holding("hello")); VERIFY_ATTEMPTS + 3];
+            dumps.push(Answer::says(one_field_holding(observed)));
+            let fake = FakeAdb::scripted(vec![("*shell cat*", dumps)]);
+            let mut glass = session_with_adb(fake.adb());
+            glass.a11y_snapshot(None).expect("capture the field");
+
+            let first = glass.set_value(AxNodeId(1), "world").unwrap_err();
+            assert!(
+                matches!(&first, GlassError::AxValueNotApplied { why, .. }
+                    if why.as_deref() == Some(TAP_MAY_HAVE_MISSED)),
+                "{first}"
+            );
+
+            let retry = glass.set_value(AxNodeId(1), "world").unwrap_err();
+            assert!(
+                matches!(&retry, GlassError::AxValueNotApplied { observed: value, why, .. }
+                    if value.as_deref() == Some(observed)
+                        && why.as_deref() == expect_tap_advice.then_some(TAP_MAY_HAVE_MISSED)),
+                "retry with read-back {observed:?}: {retry}"
+            );
+        }
     }
 
     #[test]
@@ -2818,7 +2862,7 @@ exec "$real" "$@"
         // Center of [100,500] x [200,280].
         assert_eq!(
             locate_editable_target(&t, &target(0, Some("Search"), Some(BOUNDS)), &WIN).unwrap(),
-            (300, 240)
+            ((300, 240), None)
         );
     }
 

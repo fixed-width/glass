@@ -1145,13 +1145,7 @@ pub(crate) fn set_value_with(
     let semantic = matches!(&params.target, glass_core::ActionTarget::Semantic(_));
     let outcome = glass
         .set_value_target_by(&params, &a.text, context.deadline)
-        .map_err(|error| {
-            if semantic {
-                semantic_action::semantic_error("glass_set_value", error)
-            } else {
-                semantic_action::id_error(error, context).scrub_message()
-            }
-        })?;
+        .map_err(|error| semantic_action::set_value_error(error, semantic, context))?;
     let action_context = ToolContext {
         deadline: outcome.bound.deadline,
         owner: outcome.bound.owner,

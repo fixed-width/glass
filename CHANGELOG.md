@@ -40,6 +40,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Mobile `set_value` errors use the field's live value before each write. MCP callers get
+  missed-tap recovery guidance when an Android or iOS field stays unchanged, and the Compose
+  workaround when existing text survives an Android accessibility-service write.
 - Wayland clipboard reads report a failed transfer from Glass instead of returning partial or
   empty text as a successful read.
 - Rolling workflow video keeps marked evidence available after failed or timed-out exports,
