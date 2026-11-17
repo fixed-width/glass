@@ -42,12 +42,16 @@ impl Glass {
         self.recordings.buffer.as_ref().map(|buffer| {
             let mut summary = buffer.summary.clone();
             summary.progress = buffer.handle.progress();
-            summary.pending = buffer.pending.clone().map(|mut pending| {
-                if let Some(window) = &summary.progress.pending {
+            summary.pending = buffer.pending.clone().and_then(|mut pending| {
+                if let Some(window) = &summary.progress.pending
+                    && window.id == pending.id
+                {
                     pending.progress = progress(window, summary.progress.state);
                     pending.window = Some(window.clone());
+                    Some(pending)
+                } else {
+                    None
                 }
-                pending
             });
             summary
         })

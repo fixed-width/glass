@@ -75,7 +75,9 @@ pub struct BufferedVideo {
 /// Owns recent history. Dropping a handle cancels capture and discards unexported bytes.
 pub trait RollingBuffer: Send {
     fn progress(&self) -> RollingProgress;
+    /// A usable worker preserves the previously acknowledged mark after failed delivery.
     fn mark(&mut self, clip_id: &str, tail_ms: u64, deadline: Deadline) -> Result<RollingWindow>;
+    /// Failed exports keep the selected clip pending while the worker remains usable.
     fn save(&mut self, deadline: Deadline) -> Result<BufferedVideo>;
     fn stop(&mut self, keep: bool, deadline: Deadline) -> Result<Option<BufferedVideo>>;
 }

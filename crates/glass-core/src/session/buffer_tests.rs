@@ -434,6 +434,97 @@ struct BrokenBuffer {
     missing: bool,
 }
 
+struct ExportFault {
+    base: Buffer,
+    fail: bool,
+    terminal: bool,
+}
+
+impl RollingBuffer for ExportFault {
+    fn progress(&self) -> RollingProgress {
+        let mut progress = self.base.progress();
+        if self.terminal && !self.fail {
+            progress.state = RollingState::Failed;
+            progress.reason = Some("worker lost".into());
+        }
+        progress
+    }
+    fn mark(&mut self, id: &str, tail: u64, deadline: Deadline) -> Result<RollingWindow> {
+        self.base.mark(id, tail, deadline)
+    }
+    fn save(&mut self, deadline: Deadline) -> Result<BufferedVideo> {
+        if std::mem::take(&mut self.fail) {
+            if self.terminal {
+                self.base.pending = None;
+            }
+            return Err(error("export failed"));
+        }
+        self.base.save(deadline)
+    }
+    fn stop(&mut self, keep: bool, deadline: Deadline) -> Result<Option<BufferedVideo>> {
+        self.base.stop(keep, deadline)
+    }
+}
+
+#[test]
+fn a_failed_export_preserves_pending_metadata_and_retries_the_same_clip() {
+    let (mut glass, events, saved, _root) = setup();
+    glass.start_rolling_buffer(None).unwrap();
+    let marked = glass
+        .mark_rolling_buffer("incident", RecordingOutcome::Failure, None, Some(0))
+        .unwrap()
+        .unwrap();
+    glass.recordings.buffer.as_mut().unwrap().handle = Box::new(ExportFault {
+        base: Buffer {
+            events,
+            now: 1100,
+            pending: marked.window.clone(),
+        },
+        fail: true,
+        terminal: false,
+    });
+    assert!(glass.save_rolling_buffer(Deadline::UNBOUNDED).is_err());
+    let status = glass.recording_status();
+    assert_eq!(status.last.unwrap().progress.state, RecordingState::Failed);
+    assert_eq!(status.buffer.unwrap().pending.unwrap().id, marked.id);
+    let retained = glass.save_rolling_buffer(Deadline::UNBOUNDED).unwrap();
+    assert_eq!(retained.id, marked.id);
+    assert!(retained.kept && retained.artifact.is_some());
+    assert!(glass.recording_status().buffer.unwrap().pending.is_none());
+    assert_eq!(saved.lock().unwrap().len(), 1);
+    glass.stop().unwrap();
+}
+
+#[test]
+fn a_terminal_export_failure_does_not_report_a_phantom_pending_clip() {
+    let (mut glass, events, saved, _root) = setup();
+    glass.start_rolling_buffer(None).unwrap();
+    let marked = glass
+        .mark_rolling_buffer("incident", RecordingOutcome::Failure, None, Some(0))
+        .unwrap()
+        .unwrap();
+    glass.recordings.buffer.as_mut().unwrap().handle = Box::new(ExportFault {
+        base: Buffer {
+            events,
+            now: 1100,
+            pending: marked.window.clone(),
+        },
+        fail: true,
+        terminal: true,
+    });
+    assert!(glass.save_rolling_buffer(Deadline::UNBOUNDED).is_err());
+    let status = glass.recording_status();
+    let last = status.last.unwrap();
+    assert_eq!(last.id, marked.id);
+    assert_eq!(last.progress.state, RecordingState::Failed);
+    assert!(!last.kept);
+    let buffer = status.buffer.unwrap();
+    assert!(buffer.pending.is_none() && buffer.progress.pending.is_none());
+    assert!(glass.save_rolling_buffer(Deadline::UNBOUNDED).is_err());
+    assert!(saved.lock().unwrap().is_empty());
+    glass.stop().unwrap();
+}
+
 impl RollingBuffer for BrokenBuffer {
     fn progress(&self) -> RollingProgress {
         self.base.progress()

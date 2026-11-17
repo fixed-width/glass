@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 const MAX_SAMPLES: usize = 1024;
 
+#[derive(Clone)]
 struct Pending {
     window: RollingWindow,
     samples: Vec<Sample>,
@@ -11,6 +12,7 @@ struct Pending {
     full: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct History {
     options: RollingOptions,
     samples: VecDeque<Sample>,
@@ -201,21 +203,23 @@ impl History {
             .ok_or_else(|| error("marked clip unavailable"))
     }
 
-    pub(crate) fn fail(&mut self, reason: &str) {
+    pub(crate) fn fail(&mut self, now: u64, reason: &str) {
         if let Some(pending) = &mut self.pending {
-            let end = pending
-                .samples
-                .last()
-                .map_or(pending.window.start_ms + 1, |s| s.timestamp + 1);
-            pending.window.end_ms = pending.window.end_ms.min(end);
+            if now < pending.window.end_ms {
+                let end = pending
+                    .samples
+                    .last()
+                    .map_or(pending.window.start_ms + 1, |s| s.timestamp + 1);
+                pending.window.end_ms = pending.window.end_ms.min(end);
+            }
             pending.window.reason = Some(reason.into());
             pending.window.truncated = true;
             pending.full = true;
         }
     }
 
-    pub(crate) fn take(
-        &mut self,
+    pub(crate) fn snapshot(
+        &self,
         now: u64,
         stopping: bool,
     ) -> Result<(RollingWindow, Vec<Sample>)> {
@@ -227,7 +231,7 @@ impl History {
         }
         let mut pending = self
             .pending
-            .take()
+            .clone()
             .ok_or_else(|| error("marked clip unavailable"))?;
         if stopping && now < pending.window.end_ms {
             pending.window.end_ms = now.max(pending.window.start_ms + 1);
@@ -299,7 +303,7 @@ mod tests {
             h.push(sample(ms, ms % 1000 == 0)).unwrap();
         }
         assert!(h.mark(&id, 5000, 0).is_err());
-        let (window, samples) = h.take(5000, false).unwrap();
+        let (window, samples) = h.snapshot(5000, false).unwrap();
         assert_eq!(window.end_ms, 2000);
         assert!(samples[0].sync);
         assert!(samples.iter().all(|s| s.timestamp < 2000));
@@ -331,10 +335,26 @@ mod tests {
         assert!(pending.reason.is_some());
         assert!(h.mark(&id, 300, 0).is_err());
         assert_eq!(h.samples.front().unwrap().timestamp, 300);
-        let (window, samples) = h.take(400, false).unwrap();
+        let (window, samples) = h.snapshot(400, false).unwrap();
         assert_eq!(window.end_ms, 201);
         assert_eq!(samples.len(), 3);
         assert!(h.bytes() <= 350);
+    }
+
+    #[test]
+    fn a_later_capture_failure_does_not_shorten_an_already_complete_selection() {
+        let mut h = history();
+        h.push(sample(0, true)).unwrap();
+        h.push(sample(100, false)).unwrap();
+        h.mark(&"b".repeat(32), 150, 0).unwrap();
+        let (selected, _) = h.snapshot(150, false).unwrap();
+        h.fail(200, "display disconnected");
+        let (retry, _) = h.snapshot(200, false).unwrap();
+        assert_eq!(retry.id, selected.id);
+        assert_eq!(
+            (retry.start_ms, retry.end_ms),
+            (selected.start_ms, selected.end_ms)
+        );
     }
 
     #[test]
