@@ -14,7 +14,9 @@ use glass_core::{
 };
 use glass_exec_unix::{Resolved, resolve_path};
 use glass_pipe_unix::LineTap;
-use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, ProcessIdentitySet};
+use glass_proc_linux::{
+    APP_REAP_GRACE, Asked, CLOSE_GRACE, EXIT_CONFIRM_GRACE, ProcessIdentitySet,
+};
 use glass_sandbox_linux::{BwrapStatusPipe, BwrapStatusReader};
 use smithay_client_toolkit::delegate_dispatch2;
 use smithay_client_toolkit::delegate_registry;
@@ -46,7 +48,8 @@ use crate::swayipc::{Ipc, Window as SwayWindow};
 
 // Keep the close-request and signal ladder within the non-cancellable teardown budget.
 const _: () = assert!(
-    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() < TEARDOWN_BUDGET.as_millis(),
+    CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis() + EXIT_CONFIRM_GRACE.as_millis()
+        < TEARDOWN_BUDGET.as_millis(),
     "the close request + compositor reap must finish inside glass_core::TEARDOWN_BUDGET"
 );
 
@@ -244,7 +247,15 @@ impl WaylandPlatform {
     /// signalling that group alone reaches the compositor and nothing else. A display client
     /// usually dies anyway once its compositor goes away, but anything the app forked that is
     /// not a display client would be left running.
-    fn kill_session(&mut self) {
+    fn kill_session(&mut self) -> Result<()> {
+        self.kill_session_with(glass_proc_linux::reap_launch)
+    }
+
+    fn kill_session_with(
+        &mut self,
+        reap: impl FnOnce(&mut Child, &[u32], Duration) -> Vec<u32>,
+    ) -> Result<()> {
+        let mut result = Ok(());
         // Tear down the clipboard owner thread before the wayland socket disappears.
         drop(self.clipboard_owner.take());
         if let Some(mut s) = self.active.take() {
@@ -265,18 +276,24 @@ impl WaylandPlatform {
                     !glass_proc_linux::any_alive(&app)
                 }
             });
-            // Teardown reports what it asked, not what survived — doctor's deep probe is the
-            // caller that reads this (glass#380).
-            let _ = glass_proc_linux::reap_launch(
-                &mut s.child,
-                &tree,
-                glass_proc_linux::APP_REAP_GRACE,
+            let survivors = glass_proc_linux::confirm_exit(
+                &reap(&mut s.child, &tree, APP_REAP_GRACE),
+                EXIT_CONFIRM_GRACE,
             );
             // Reaped first, so each tap's final drain sees what sway wrote on its way out.
             s.taps.clear();
-            glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
+            if !survivors.is_empty() {
+                let runtime_dir = s._runtime_dir.keep();
+                result = Err(GlassError::AppStopIncomplete(format!(
+                    "launch processes are still running after SIGTERM and SIGKILL: {survivors:?}; \
+                     runtime directory retained at {}; remove it after those processes exit",
+                    runtime_dir.display()
+                )));
+            }
+            glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself, survivors));
         }
         self.dbus = None;
+        result
     }
 }
 
@@ -561,7 +578,9 @@ impl Drop for WaylandPlatform {
         // only then drops the private bus. glass-mcp runs it on a detached thread nothing joins,
         // so a process exiting right after the drop kills it partway and orphans sway and the
         // bus (glass#415) — a shorter grace would not help. Call `stop_app`.
-        self.kill_session();
+        if let Err(error) = self.kill_session() {
+            eprintln!("glass: {error}");
+        }
     }
 }
 
@@ -2534,8 +2553,7 @@ impl Platform for WaylandPlatform {
     /// Ignores the deadline — the close-then-reap ladder above is asserted against
     /// `TEARDOWN_BUDGET` instead.
     fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
-        self.kill_session();
-        Ok(())
+        self.kill_session()
     }
 
     fn get_clipboard(&mut self) -> Result<String> {
@@ -6668,9 +6686,51 @@ mod session_tests {
     #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
     fn stopping_ends_the_session() {
         let mut s = Launch::new().start();
+        let runtime_dir = s.platform().session_runtime_dir().unwrap().to_path_buf();
         s.platform().stop_app().expect("stop");
+        assert!(
+            !runtime_dir.exists(),
+            "a clean stop removes its runtime directory"
+        );
         let err = s.platform().list_windows().expect_err("no session");
         assert!(matches!(err, GlassError::NoActiveSession), "{err}");
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn incomplete_teardown_keeps_the_runtime_directory_after_the_backend_drops() {
+        let mut session = Launch::new().start();
+        let runtime_dir = session
+            .platform()
+            .session_runtime_dir()
+            .unwrap()
+            .to_path_buf();
+        let survivor = std::process::id();
+        let error = session
+            .platform()
+            .kill_session_with(|child, tree, grace| {
+                let mut left = glass_proc_linux::reap_launch(child, tree, grace);
+                // Model a descendant that remained alive after the real launch was reaped.
+                left.push(survivor);
+                left
+            })
+            .unwrap_err();
+        assert!(matches!(error, GlassError::AppStopIncomplete(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains(&survivor.to_string()), "{message}");
+        assert!(
+            message.contains(&runtime_dir.display().to_string()),
+            "{message}"
+        );
+        assert!(runtime_dir.join("sway.cfg").exists());
+        assert!(session.platform().active.is_none());
+        session.platform().stop_app().expect("idempotent stop");
+        drop(session);
+        assert!(
+            runtime_dir.exists(),
+            "Drop must not remove a survivor's directory"
+        );
+        std::fs::remove_dir_all(runtime_dir).unwrap();
     }
 
     /// Teardown *asks* before it signals. Both routes end with the app gone, so its own shutdown

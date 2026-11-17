@@ -240,6 +240,21 @@ fn stop_running_session_returns_empty_envelope() {
 }
 
 #[test]
+fn stop_reports_survivors_and_retained_runtime_directory_to_the_caller() {
+    let mut platform = FakePlatform::new(10, 10);
+    platform.stop_error = Some(glass_core::GlassError::AppStopIncomplete(
+        "launch processes are still running: [123]; runtime directory retained at /tmp/glass-wl.test"
+            .into(),
+    ));
+    let mut glass = glass_with(platform);
+    start(&mut glass, &start_args()).unwrap();
+    let error = stop(&mut glass).unwrap_err();
+    assert!(error.contains("123"), "{error}");
+    assert!(error.contains("/tmp/glass-wl.test"), "{error}");
+    assert_eq!(glass.active_backend(), None);
+}
+
+#[test]
 fn window_resize_requires_dimensions() {
     let mut g = glass_with(FakePlatform::new(10, 10));
     start(&mut g, &start_args()).unwrap();

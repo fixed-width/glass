@@ -24,7 +24,11 @@ impl Glass {
         self.failed_launch = None;
         self.failed_launch_logs = None;
         let result = self.start_on_inner(backend, spec, inputs);
-        if result.is_err() && self.failed_launch.is_none() && self.active.is_none() {
+        if result.is_err()
+            && self.failed_launch.is_none()
+            && self.active.is_none()
+            && !result.as_ref().err().is_some_and(GlassError::session_ended)
+        {
             self.failed_launch = Some(FailedLaunch {
                 backend: backend.to_owned(),
                 phase: "backend_setup",
@@ -58,7 +62,12 @@ impl Glass {
         } else {
             Ok(())
         };
-        if stopped.is_ok() {
+        if stopped.is_ok()
+            || stopped
+                .as_ref()
+                .err()
+                .is_some_and(GlassError::session_ended)
+        {
             self.active.take();
         }
         if let Some(recording) = recording {
@@ -481,6 +490,57 @@ mod tests {
             glass.logs(0, 10, None, None).unwrap().0[0].text,
             "original session"
         );
+    }
+
+    #[test]
+    fn incomplete_cleanup_discards_the_ended_session_and_blocks_its_replacement() {
+        for error in [
+            GlassError::AppStopIncomplete("surviving host PIDs: [123]".into()),
+            GlassError::cleanup_failed(
+                "stopping private recorder and app",
+                GlassError::Backend("recorder failed".into()),
+                GlassError::AppStopIncomplete("surviving host PIDs: [123]".into()),
+            ),
+        ] {
+            let constructed = Arc::new(AtomicUsize::new(0));
+            let seen = constructed.clone();
+            let mut stop_error = Some(error);
+            let mut glass = glass_with_factory(Box::new(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let platform = FakePlatform::new(10, 10);
+                let platform = match stop_error.take() {
+                    Some(error) => platform.with_stop_error(error),
+                    None => platform,
+                };
+                Ok(Backend::display_only(Box::new(platform)))
+            }));
+            glass.start(&spec()).unwrap();
+            let error = glass.start(&spec()).unwrap_err();
+            assert!(error.to_string().contains("123"), "{error}");
+            assert_eq!(constructed.load(Ordering::SeqCst), 1);
+            assert_eq!(glass.active_backend(), None);
+            assert!(glass.failed_launch().is_none());
+            assert!(matches!(glass.geometry(), Err(GlassError::NoActiveSession)));
+            assert!(matches!(glass.stop(), Err(GlassError::NoActiveSession)));
+            glass
+                .start(&spec())
+                .expect("a later explicit launch can proceed");
+            assert_eq!(constructed.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn incomplete_stop_is_a_failed_audit_outcome_and_ends_the_session() {
+        let mut glass = glass_with(FakePlatform::new(10, 10).with_stop_error(
+            GlassError::AppStopIncomplete("surviving host PIDs: [123]".into()),
+        ));
+        let audit = RecordingSink::default();
+        glass.set_audit_sink(Box::new(audit.clone()));
+        glass.start(&spec()).unwrap();
+        let error = glass.stop().unwrap_err();
+        assert!(error.to_string().contains("123"), "{error}");
+        assert_eq!(*audit.0.lock().unwrap(), ["launch:true", "stop:false"]);
+        assert_eq!(glass.active_backend(), None);
     }
 
     #[test]

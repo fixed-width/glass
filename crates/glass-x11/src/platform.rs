@@ -10,7 +10,9 @@ use glass_core::{
     TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
 };
 use glass_pipe_unix::LineTap;
-use glass_proc_linux::{APP_REAP_GRACE, Asked, CLOSE_GRACE, ProcessIdentitySet, proc_tree_pids};
+use glass_proc_linux::{
+    APP_REAP_GRACE, Asked, CLOSE_GRACE, EXIT_CONFIRM_GRACE, ProcessIdentitySet, proc_tree_pids,
+};
 use glass_sandbox_linux::{BwrapStatusPipe, BwrapStatusReader};
 use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
@@ -29,7 +31,10 @@ use x11rb::wrapper::ConnectionExt as _;
 // private Xvfb — still reaps at `REAP_GRACE` each, so a helper that ignores SIGTERM can take the
 // whole teardown past the budget; that is pre-existing and not what this assertion is about.
 const _: () = assert!(
-    ASK_BUDGET.as_millis() + CLOSE_GRACE.as_millis() + APP_REAP_GRACE.as_millis()
+    ASK_BUDGET.as_millis()
+        + CLOSE_GRACE.as_millis()
+        + APP_REAP_GRACE.as_millis()
+        + EXIT_CONFIRM_GRACE.as_millis()
         < TEARDOWN_BUDGET.as_millis(),
     "sending the close request, waiting it out and the signal ladder must all finish inside \
      glass_core::TEARDOWN_BUDGET"
@@ -378,10 +383,20 @@ fn dispatch_launch<T, C>(
     origin: Instant,
     context: &mut C,
     dispatch: impl FnOnce(&mut C, Instant) -> Result<T>,
-    cleanup: impl FnOnce(&mut C),
+    cleanup: impl FnOnce(&mut C) -> Result<()>,
 ) -> Result<T> {
     let deadline = origin + Duration::from_millis(timeout_ms.max(1));
-    dispatch(context, deadline).inspect_err(|_| cleanup(context))
+    match dispatch(context, deadline) {
+        Ok(value) => Ok(value),
+        Err(primary) => match cleanup(context) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(GlassError::cleanup_failed(
+                "stopping a failed X11 launch",
+                primary,
+                cleanup,
+            )),
+        },
+    }
 }
 
 /// What display the X11 backend should use, derived from `GLASS_DISPLAY`.
@@ -929,7 +944,15 @@ impl X11Platform {
         }
     }
 
-    fn kill_child(&mut self) {
+    fn kill_child(&mut self) -> Result<()> {
+        self.kill_child_with(glass_proc_linux::reap_launch)
+    }
+
+    fn kill_child_with(
+        &mut self,
+        reap: impl FnOnce(&mut Child, &[u32], Duration) -> Vec<u32>,
+    ) -> Result<()> {
+        let mut result = Ok(());
         if let Some(launched) = self.child.take() {
             let ownership_root = launched.ownership_root();
             let mut child = launched.into_child();
@@ -942,10 +965,16 @@ impl X11Platform {
             // The sweep runs either way: an app that closed itself can still have forked children
             // it never cleaned up, and on the graceful path the signals land on processes that
             // are already gone and cost nothing.
-            // Teardown reports what it asked, not what survived — doctor's deep probe is the
-            // caller that reads this (glass#380).
-            let _ = glass_proc_linux::reap_launch(&mut child, &tree, APP_REAP_GRACE);
-            glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself));
+            let survivors = glass_proc_linux::confirm_exit(
+                &reap(&mut child, &tree, APP_REAP_GRACE),
+                EXIT_CONFIRM_GRACE,
+            );
+            if !survivors.is_empty() {
+                result = Err(GlassError::AppStopIncomplete(format!(
+                    "launch processes are still running after SIGTERM and SIGKILL: {survivors:?}"
+                )));
+            }
+            glass_proc_linux::disclose_teardown(&asked.outcome(closed_itself, survivors));
         }
         self.window = None;
         // Reaped first, so each tap's final drain sees what the app wrote on its way out.
@@ -958,6 +987,7 @@ impl X11Platform {
         self.dbus = None;
         // Dropping the owner stops its thread and releases the CLIPBOARD selection.
         self.clipboard_owner = None;
+        result
     }
 
     /// Poll the window tree until a top-level window matches a pid in the process
@@ -1699,8 +1729,14 @@ impl Platform for X11Platform {
             }
             Err(e) => {
                 // Window never appeared (or geometry failed): don't orphan the child.
-                self.kill_child();
-                Err(e)
+                match self.kill_child() {
+                    Ok(()) => Err(e),
+                    Err(cleanup) => Err(GlassError::cleanup_failed(
+                        "stopping a failed X11 launch",
+                        e,
+                        cleanup,
+                    )),
+                }
             }
         }
     }
@@ -1708,8 +1744,7 @@ impl Platform for X11Platform {
     /// Ignores the deadline — the close-then-signal ladder above is asserted against
     /// `TEARDOWN_BUDGET` instead.
     fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
-        self.kill_child();
-        Ok(())
+        self.kill_child()
     }
 
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
@@ -2130,7 +2165,9 @@ impl Drop for X11Platform {
     /// `self.child.take()`, so this is idempotent with `stop_app`. Field order then
     /// drops `xvfb`, tearing down any private display we spawned.
     fn drop(&mut self) {
-        self.kill_child(); // takes the child, and drops the clipboard owner with it
+        if let Err(error) = self.kill_child() {
+            eprintln!("glass: {error}");
+        }
     }
 }
 
@@ -2396,12 +2433,33 @@ mod tests {
                 assert_eq!(deadline, origin + Duration::from_millis(1));
                 Err::<(), _>(GlassError::Timeout(0))
             },
-            |()| events.borrow_mut().push("cleanup"),
+            |()| {
+                events.borrow_mut().push("cleanup");
+                Ok(())
+            },
         )
         .expect_err("the controlled dispatch reports timeout");
 
         assert!(matches!(error, GlassError::Timeout(0)));
         assert_eq!(*events.borrow(), ["dispatch", "cleanup"]);
+    }
+
+    #[test]
+    fn failed_launch_preserves_both_the_launch_error_and_incomplete_cleanup() {
+        let error = dispatch_launch(
+            1000,
+            Instant::now(),
+            &mut (),
+            |(), _| Err::<(), _>(GlassError::AppNotStarted("spawn failed".into())),
+            |()| {
+                Err(GlassError::AppStopIncomplete(
+                    "surviving host PIDs: [123]".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error.cause(), GlassError::AppNotStarted(_)));
+        assert!(error.to_string().contains("123"), "{error}");
     }
 
     #[test]
@@ -4038,7 +4096,7 @@ mod display_tests {
         let refreshed = platform.app_pids();
 
         assert!(refreshed.iter().any(|pid| !initial.contains(pid)));
-        platform.kill_child();
+        platform.kill_child().expect("cleanup");
     }
 
     #[test]
@@ -5082,6 +5140,32 @@ mod display_tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "pid {pid} outlived the stop that was supposed to reap it"
         );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn incomplete_teardown_reports_survivors_and_clears_the_child_and_window() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        platform.child = Some(LaunchedChild::Direct(spawn_stand_in()));
+        platform.window = Some(x.window().create());
+        let survivor = std::process::id();
+        let error = platform
+            .kill_child_with(|child, tree, grace| {
+                let mut left = glass_proc_linux::reap_launch(child, tree, grace);
+                // Model a descendant that remained alive after the real launch was reaped.
+                left.push(survivor);
+                left
+            })
+            .unwrap_err();
+        assert!(matches!(error, GlassError::AppStopIncomplete(_)), "{error}");
+        assert!(error.to_string().contains(&survivor.to_string()), "{error}");
+        assert!(platform.child.is_none());
+        assert!(platform.window.is_none());
+        assert!(platform.taps.is_empty());
+        platform
+            .stop_app()
+            .expect("the consumed launch is not reaped again");
     }
 
     #[test]

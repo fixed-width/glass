@@ -40,6 +40,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Linux application stops report surviving processes instead of success when cleanup cannot be
+  confirmed. Wayland retains the runtime directory for those processes and reports its path.
 - The X11 deep doctor check verifies that its private Xvfb was reaped and its observed
   descendants exited before reporting “started and stopped”; unconfirmed cleanup warns with
   process details.

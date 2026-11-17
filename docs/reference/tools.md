@@ -292,6 +292,9 @@ instead of its normal first screen, so a driven app's first screen changes from 
 An app that ignores the request, or blocks on a "save changes?" prompt, is forcibly terminated after
 a bounded grace period. Normal forced cleanup is reported on stderr and still returns `{}`.
 Unconfirmed cleanup or a backend failure returns an error; inspect it before replacing the session.
+On Linux, a stop that leaves observed launch processes running reports their host PIDs. The
+application session ends even when this cleanup fails. Wayland keeps its runtime directory and
+reports the path; remove that directory only after the remaining processes have exited.
 
 On Windows, a title/class hint can adopt a window owned by a process outside the launched process
 set, such as an Explorer folder served by the existing shell. Glass discloses this at launch:
