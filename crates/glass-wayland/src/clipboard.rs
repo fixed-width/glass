@@ -1,13 +1,15 @@
 //! Wayland clipboard get/set via the `wlr-data-control` protocol.
 //!
 //! `get` reads the compositor's current selection via a temporary
-//! `ZwlrDataControlDeviceV1` on the session's existing connection.
+//! `ZwlrDataControlDeviceV1` on its own connection.
 //! `set` installs a `ZwlrDataControlSourceV1` on a dedicated serving thread
 //! that owns its own wayland connection to the same sway socket, mirroring
 //! the X11 owner-thread pattern.
 
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -230,6 +232,7 @@ struct ServeState {
     // `expect`, not the readiness lock's `PoisonError::into_inner`: this one is off the readiness
     // path and its two holders only clone the string or assign to it, so nothing under it panics.
     text: Arc<Mutex<String>>,
+    pending_read: Arc<PendingRead>,
     /// The owner's stop flag, so a `Send` arriving after the owner was dropped is not served.
     stop: Arc<AtomicBool>,
     /// Set to true when the source is `Cancelled`.
@@ -362,10 +365,10 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
                 // the mutex for up to CLIP_WRITE_TIMEOUT. Later pastes gain nothing — they are
                 // dispatched in series on this thread either way.
                 let text = state.text.lock().expect("clipboard text mutex").clone();
-                // Printed, not returned: a Dispatch callback has nowhere to return an error. Only
-                // stderr records it — the requesting app sees a transfer that ended, with no
-                // in-band way to tell a short paste from a short clipboard.
-                if let Err(e) = write_all_bounded(fd, text.as_bytes(), CLIP_WRITE_TIMEOUT) {
+                let mut file = File::from(fd);
+                if let Err(e) = write_all_bounded(&mut file, text.as_bytes(), CLIP_WRITE_TIMEOUT) {
+                    record_read_failure(&state.pending_read, &file, &e);
+                    drop(file);
                     eprintln!("glass-wayland: clipboard serve: paste transfer: {e}");
                 }
             }
@@ -381,28 +384,118 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for ServeState {
 // `get` — read the current Wayland clipboard selection
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq)]
+struct PipeId {
+    device: u64,
+    inode: u64,
+}
+
+impl PipeId {
+    fn of(file: &File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+struct ReadStatus {
+    pipe: PipeId,
+    failure: Option<String>,
+}
+
+type PendingRead = Mutex<Option<ReadStatus>>;
+
+fn record_read_failure(pending_read: &PendingRead, file: &File, error: &GlassError) {
+    // Publish while the write end is still open so the reader sees the error at EOF.
+    if let Ok(pipe) = PipeId::of(file)
+        && let Some(status) = pending_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        && status.pipe == pipe
+    {
+        status.failure = Some(error.to_string());
+    }
+}
+
+struct ClipboardRead<'a> {
+    file: File,
+    pending_read: Option<&'a PendingRead>,
+}
+
+impl<'a> ClipboardRead<'a> {
+    fn new(fd: OwnedFd, owner: Option<&'a mut ClipboardOwner>) -> Result<Self> {
+        let file = File::from(fd);
+        let pending_read = owner.map(|owner| &*owner.pending_read);
+        if let Some(pending_read) = pending_read {
+            // The compositor passes the write end of this same pipe to the selection owner.
+            let pipe = PipeId::of(&file)
+                .map_err(|e| GlassError::Backend(format!("clipboard get: identify pipe: {e}")))?;
+            *pending_read.lock().unwrap_or_else(PoisonError::into_inner) = Some(ReadStatus {
+                pipe,
+                failure: None,
+            });
+        }
+        Ok(Self { file, pending_read })
+    }
+
+    fn read(mut self, deadline: Instant) -> Result<String> {
+        let bytes = read_to_eof_bounded(
+            &mut self.file,
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        if let Some(pending_read) = self.pending_read
+            && let Some(error) = pending_read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+                .and_then(|status| status.failure.take())
+        {
+            return Err(GlassError::Backend(format!(
+                "clipboard get: paste transfer: {error}"
+            )));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+impl Drop for ClipboardRead<'_> {
+    fn drop(&mut self) {
+        // Clear the registration before dropping the fd and letting its inode be reused.
+        if let Some(pending_read) = self.pending_read {
+            *pending_read.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+}
+
 /// Read the current clipboard selection as text.
 /// Opens a fresh connection to `socket` to avoid conflicting with the session's
 /// event queue, does a roundtrip to collect the selection offer, then reads the
 /// pipe transfer.
-pub fn get(socket: &Path) -> Result<String> {
+pub fn get(socket: &Path, owner: Option<&mut ClipboardOwner>) -> Result<String> {
     // One deadline for connecting, the syncs and the read, so the session lock is held for what
     // the constant says rather than its sum over the steps.
     let deadline = Instant::now() + CLIP_READ_TIMEOUT;
-    let Some(read_end) = open_transfer(socket, deadline)? else {
+    let Some(transfer) = open_transfer(socket, deadline, owner, rustix::pipe::pipe)? else {
         return Ok(String::new());
     };
-    let buf = read_to_eof_bounded(read_end, deadline.saturating_duration_since(Instant::now()))?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    transfer.read(deadline)
 }
 
-/// Ask the selection owner for a text transfer and return the pipe's read end, or `None` when
+/// Ask the selection owner for a text transfer and return the reader, or `None` when
 /// there is nothing to read — no selection, or no text MIME on offer.
 ///
 /// Returning means the transfer has been requested and the compositor has routed the fd, not that
 /// the owner has dispatched the `Send` yet: [`get`] is this plus the bounded read, and a test that
 /// wants the owner stuck mid-write is this plus a wait for the first bytes.
-fn open_transfer(socket: &Path, deadline: Instant) -> Result<Option<OwnedFd>> {
+fn open_transfer<'a>(
+    socket: &Path,
+    deadline: Instant,
+    owner: Option<&'a mut ClipboardOwner>,
+    make_pipe: impl FnOnce() -> rustix::io::Result<(OwnedFd, OwnedFd)>,
+) -> Result<Option<ClipboardRead<'a>>> {
     let (conn, globals, mut queue): (_, _, EventQueue<ClipState>) =
         crate::platform::connect_bounded(
             socket,
@@ -462,8 +555,9 @@ fn open_transfer(socket: &Path, deadline: Instant) -> Result<Option<OwnedFd>> {
     };
 
     // Create a pipe: offer writes to write_end, we read from read_end.
-    let (read_end, write_end) = rustix::pipe::pipe()
-        .map_err(|e| GlassError::Backend(format!("clipboard get: pipe: {e}")))?;
+    let (read_end, write_end) =
+        make_pipe().map_err(|e| GlassError::Backend(format!("clipboard get: pipe: {e}")))?;
+    let transfer = ClipboardRead::new(read_end, owner)?;
 
     offer.receive(mime, write_end.as_fd());
     drop(write_end); // close write end BEFORE roundtrip so the source can EOF us
@@ -485,7 +579,7 @@ fn open_transfer(socket: &Path, deadline: Instant) -> Result<Option<OwnedFd>> {
     // cut the read short.
     offer.destroy();
 
-    Ok(Some(read_end))
+    Ok(Some(transfer))
 }
 
 /// Whether a failed read should be retried — a signal arrived and nothing was lost. Retrying
@@ -517,9 +611,8 @@ pub(crate) fn remaining_timespec(deadline: Instant) -> Option<rustix::event::Tim
 /// and, via the session-wide Glass lock, every other tool call. Poll the fd
 /// with the remaining deadline and read when ready; we are the pipe's sole
 /// reader, so a poll-ready read never blocks. Returns `Timeout` on expiry.
-fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
+fn read_to_eof_bounded(file: &mut File, timeout: Duration) -> Result<Vec<u8>> {
     let deadline = Instant::now() + timeout;
-    let mut file = std::fs::File::from(fd);
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -530,7 +623,7 @@ fn read_to_eof_bounded(fd: OwnedFd, timeout: Duration) -> Result<Vec<u8>> {
         // the read below.
         let ready = rustix::event::poll(
             &mut [rustix::event::PollFd::new(
-                &file,
+                file,
                 rustix::event::PollFlags::IN,
             )],
             Some(&ts),
@@ -573,7 +666,7 @@ fn is_write_retryable(e: &std::io::Error) -> bool {
 
 /// Write `buf` to `fd`, but give up after `timeout`. The mirror of [`read_to_eof_bounded`] on the
 /// serving side: the receiver is an arbitrary external app, and one that opens the transfer but
-/// never reads blocks this write as soon as `buf` passes the pipe buffer (64 KiB by default).
+/// never reads blocks this write as soon as `buf` exceeds the pipe's capacity.
 /// That block lands on the owner thread inside `dispatch_pending`, so its loop never reaches the
 /// stop check — and `ClipboardOwner::drop` joins a thread that can no longer return.
 ///
@@ -582,14 +675,13 @@ fn is_write_retryable(e: &std::io::Error) -> bool {
 /// would leave the same unbounded wait one syscall further down.
 // The messages below name only the failure: the one caller prints them behind its own
 // "clipboard serve: paste transfer" prefix.
-fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
+fn write_all_bounded(file: &mut File, buf: &[u8], timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    let flags = rustix::fs::fcntl_getfl(&fd)
+    let flags = rustix::fs::fcntl_getfl(&*file)
         .map_err(|e| GlassError::Backend(format!("fcntl_getfl: {e}")))?;
-    rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)
+    rustix::fs::fcntl_setfl(&*file, flags | rustix::fs::OFlags::NONBLOCK)
         .map_err(|e| GlassError::Backend(format!("fcntl_setfl: {e}")))?;
 
-    let mut file = std::fs::File::from(fd);
     let total = buf.len();
     let mut written = 0usize;
     while written < total {
@@ -599,7 +691,7 @@ fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
         // The PollFd borrows `file` only for this statement, freeing it before the write below.
         let ready = rustix::event::poll(
             &mut [rustix::event::PollFd::new(
-                &file,
+                file,
                 rustix::event::PollFlags::OUT,
             )],
             Some(&ts),
@@ -643,6 +735,7 @@ fn write_all_bounded(fd: OwnedFd, buf: &[u8], timeout: Duration) -> Result<()> {
 pub struct ClipboardOwner {
     // See [`ServeState::text`] for why this lock keeps `expect` where the readiness lock does not.
     text: Arc<Mutex<String>>,
+    pending_read: Arc<PendingRead>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -679,19 +772,27 @@ impl ClipboardOwner {
     /// returning. Returns `Err` if the setup fails or times out (2 s).
     pub fn spawn(socket: PathBuf, initial_text: String) -> Result<Self> {
         let text = Arc::new(Mutex::new(initial_text));
+        let pending_read = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         // Signalled by the thread once the selection is registered (or it fails).
         let ready: Arc<(Mutex<ReadyState>, Condvar)> =
             Arc::new((Mutex::new(ReadyState::Pending), Condvar::new()));
 
         let text_thread = Arc::clone(&text);
+        let pending_read_thread = Arc::clone(&pending_read);
         let stop_thread = Arc::clone(&stop);
         let ready_thread = Arc::clone(&ready);
 
         let handle = std::thread::Builder::new()
             .name("glass-wl-clip-owner".into())
             .spawn(move || {
-                if let Err(e) = serve_loop(socket, text_thread, stop_thread, ready_thread) {
+                if let Err(e) = serve_loop(
+                    socket,
+                    text_thread,
+                    pending_read_thread,
+                    stop_thread,
+                    ready_thread,
+                ) {
                     eprintln!("glass-wayland: clipboard owner thread error: {e}");
                 }
             })
@@ -749,6 +850,7 @@ impl ClipboardOwner {
 
         Ok(Self {
             text,
+            pending_read,
             stop,
             handle: Some(handle),
         })
@@ -802,6 +904,7 @@ impl Drop for RetireOnExit<'_> {
 fn serve_loop(
     socket: PathBuf,
     text: Arc<Mutex<String>>,
+    pending_read: Arc<PendingRead>,
     stop: Arc<AtomicBool>,
     ready: Arc<(Mutex<ReadyState>, Condvar)>,
 ) -> Result<()> {
@@ -836,6 +939,7 @@ fn serve_loop(
         output: OutputState::new(&globals, &qh),
         shm,
         text,
+        pending_read,
         stop: Arc::clone(&stop),
         cancelled: false,
     };
@@ -967,13 +1071,22 @@ fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, Mutex,
-        Ordering, PoisonError, ReadyState, RetireOnExit, get, is_retryable, open_transfer,
-        read_to_eof_bounded, serve_loop, signal_ready, write_all_bounded,
+        Arc, AtomicBool, CLIP_READ_TIMEOUT, CLIP_WRITE_TIMEOUT, ClipboardOwner, Condvar, File,
+        Mutex, Ordering, PipeId, PoisonError, ReadStatus, ReadyState, RetireOnExit, get,
+        is_retryable, open_transfer, read_to_eof_bounded, record_read_failure, serve_loop,
+        signal_ready, write_all_bounded,
     };
     use crate::testw::{Launch, on_a_thread};
     use glass_core::GlassError;
     use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::time::Instant;
+
+    fn pipe_with_capacity() -> ((OwnedFd, OwnedFd), usize) {
+        let (read_end, write_end) = rustix::pipe::pipe().expect("create pipe");
+        let capacity = rustix::pipe::fcntl_getpipe_size(&write_end).expect("read pipe capacity");
+        ((read_end, write_end), capacity)
+    }
 
     /// The serving thread is the clipboard — it holds the selection while it runs, and a pasting
     /// app reads from it over a pipe. Nothing under that is fakeable, so these use a real one.
@@ -982,9 +1095,9 @@ mod tests {
     fn an_owner_serves_its_text_and_reports_itself_alive() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        let owner = ClipboardOwner::spawn(socket.clone(), "served".into()).expect("spawn");
+        let mut owner = ClipboardOwner::spawn(socket.clone(), "served".into()).expect("spawn");
         assert!(owner.is_alive(), "a freshly spawned owner is serving");
-        assert_eq!(get(&socket).expect("get"), "served");
+        assert_eq!(get(&socket, Some(&mut owner)).expect("get"), "served");
     }
 
     /// Another client taking the selection stops this thread. Reporting itself alive afterwards
@@ -995,7 +1108,7 @@ mod tests {
     fn an_owner_that_lost_the_selection_stops_reporting_itself_alive() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        let first = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
+        let mut first = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
         let _second = ClipboardOwner::spawn(socket.clone(), "theirs".into()).expect("spawn");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while first.is_alive() && std::time::Instant::now() < deadline {
@@ -1005,7 +1118,7 @@ mod tests {
             !first.is_alive(),
             "an owner the compositor cancelled is not still serving"
         );
-        assert_eq!(get(&socket).expect("get"), "theirs");
+        assert_eq!(get(&socket, Some(&mut first)).expect("get"), "theirs");
     }
 
     /// Updating in place is what lets a second write reuse the thread. If `set_text` did nothing
@@ -1015,10 +1128,10 @@ mod tests {
     fn updating_an_owners_text_changes_what_a_paste_reads() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        let owner = ClipboardOwner::spawn(socket.clone(), "before".into()).expect("spawn");
-        assert_eq!(get(&socket).expect("get"), "before");
+        let mut owner = ClipboardOwner::spawn(socket.clone(), "before".into()).expect("spawn");
+        assert_eq!(get(&socket, Some(&mut owner)).expect("get"), "before");
         owner.set_text("after");
-        assert_eq!(get(&socket).expect("get"), "after");
+        assert_eq!(get(&socket, Some(&mut owner)).expect("get"), "after");
     }
 
     /// Dropping an owner has to *return*. `Drop` joins the serving thread, so a loop that stops
@@ -1044,19 +1157,20 @@ mod tests {
     fn an_owner_stays_droppable_while_a_paste_is_going_unread() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        // Four times the default 64 KiB pipe buffer: a payload that fits is handed over in one
-        // write that never blocks, so a smaller one would pass with no bound at all.
-        let owner = ClipboardOwner::spawn(socket.clone(), "x".repeat(256 * 1024)).expect("spawn");
+        let (pipe, capacity) = pipe_with_capacity();
+        let owner = ClipboardOwner::spawn(socket.clone(), "x".repeat(capacity + 1)).expect("spawn");
 
-        let transfer = open_transfer(&socket, std::time::Instant::now() + CLIP_READ_TIMEOUT)
-            .expect("open a transfer")
-            .expect("a live owner offers text to transfer");
+        let transfer = open_transfer(&socket, Instant::now() + CLIP_READ_TIMEOUT, None, || {
+            Ok(pipe)
+        })
+        .expect("open a transfer")
+        .expect("a live owner offers text to transfer");
         // Wait for the first bytes: they are what says the serving thread is past its stop check
         // and inside the write. Nothing is read off the pipe, so it stays full and the write
         // stays blocked.
         let ready = rustix::event::poll(
             &mut [rustix::event::PollFd::new(
-                &transfer,
+                &transfer.file,
                 rustix::event::PollFlags::IN,
             )],
             Some(&rustix::event::Timespec {
@@ -1099,10 +1213,10 @@ mod tests {
     fn dropping_an_owner_gives_up_the_selection() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        let owner = ClipboardOwner::spawn(socket.clone(), "transient".into()).expect("spawn");
-        assert_eq!(get(&socket).expect("get"), "transient");
+        let mut owner = ClipboardOwner::spawn(socket.clone(), "transient".into()).expect("spawn");
+        assert_eq!(get(&socket, Some(&mut owner)).expect("get"), "transient");
         drop(owner);
-        assert_eq!(get(&socket).expect("get"), "");
+        assert_eq!(get(&socket, None).expect("get"), "");
     }
 
     /// A detached setup thread that unwedges after `spawn` already gave up is in exactly this
@@ -1114,8 +1228,8 @@ mod tests {
     fn a_stopped_serve_loop_does_not_take_the_selection_from_a_live_owner() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        let live = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
-        assert_eq!(get(&socket).expect("get"), "mine");
+        let mut live = ClipboardOwner::spawn(socket.clone(), "mine".into()).expect("spawn");
+        assert_eq!(get(&socket, Some(&mut live)).expect("get"), "mine");
 
         let text = Arc::new(Mutex::new("stolen".to_string()));
         let stop = Arc::new(AtomicBool::new(true));
@@ -1128,7 +1242,7 @@ mod tests {
             Duration::from_secs(10),
             "a stalled compositor must fail this test, not hang the whole suite",
             move || {
-                serve_loop(socket_thread, text, stop, ready)
+                serve_loop(socket_thread, text, Arc::new(Mutex::new(None)), stop, ready)
                     .err()
                     .map(|e| e.to_string())
             },
@@ -1141,7 +1255,7 @@ mod tests {
             live.is_alive(),
             "the live owner must still be serving after a detached thread stands down"
         );
-        assert_eq!(get(&socket).expect("get"), "mine");
+        assert_eq!(get(&socket, Some(&mut live)).expect("get"), "mine");
     }
 
     /// A compositor that is gone cannot be served. Reporting success would leave the caller
@@ -1240,7 +1354,7 @@ mod tests {
         let outcome = on_a_thread(
             Duration::from_secs(20),
             "a paste must return when its own bound expires, not wait on the peer",
-            move || get(&socket).err().map(|e| e.to_string()),
+            move || get(&socket, None).err().map(|e| e.to_string()),
         );
         let elapsed = started.elapsed();
 
@@ -1316,7 +1430,7 @@ mod tests {
         // Writer end open but silent — a stuck/slow selection owner that opened
         // the transfer but never finishes writing. Must NOT hang forever.
         let (read_end, _write_end) = rustix::pipe::pipe().expect("pipe");
-        let r = read_to_eof_bounded(read_end, Duration::from_millis(200));
+        let r = read_to_eof_bounded(&mut File::from(read_end), Duration::from_millis(200));
         assert!(
             matches!(r, Err(GlassError::Timeout(_))),
             "expected Timeout, got {r:?}"
@@ -1330,7 +1444,8 @@ mod tests {
         let mut w = std::fs::File::from(write_end);
         w.write_all(b"clip!").expect("write");
         drop(w); // close the write end → EOF
-        let got = read_to_eof_bounded(read_end, CLIP_READ_TIMEOUT).expect("read ok");
+        let got =
+            read_to_eof_bounded(&mut File::from(read_end), CLIP_READ_TIMEOUT).expect("read ok");
         assert_eq!(got, b"clip!");
     }
 
@@ -1360,9 +1475,78 @@ mod tests {
     fn a_paste_larger_than_the_pipe_buffer_arrives_whole() {
         let s = Launch::new().start();
         let socket = s.wayland_socket();
-        let big = "x".repeat(128 * 1024);
-        let _owner = ClipboardOwner::spawn(socket.clone(), big.clone()).expect("spawn");
-        assert_eq!(get(&socket).expect("get"), big);
+        let (pipe, capacity) = pipe_with_capacity();
+        let big = "x".repeat(capacity + 1);
+        let mut owner = ClipboardOwner::spawn(socket.clone(), big.clone()).expect("spawn");
+        let deadline = Instant::now() + CLIP_READ_TIMEOUT;
+        let transfer = open_transfer(&socket, deadline, Some(&mut owner), || Ok(pipe))
+            .expect("request transfer")
+            .expect("selection offers text");
+        assert_eq!(transfer.read(deadline).expect("read"), big);
+    }
+
+    #[test]
+    #[ignore = "starts a real compositor or X server; needs sway, Mesa, Xwayland or Xvfb"]
+    fn an_owned_transfer_that_times_out_returns_an_error_at_eof() {
+        let s = Launch::new().start();
+        let socket = s.wayland_socket();
+        let (pipe, capacity) = pipe_with_capacity();
+        let text = "x".repeat(capacity + 1);
+        let mut owner = ClipboardOwner::spawn(socket.clone(), text.clone()).expect("spawn");
+        let transfer = open_transfer(
+            &socket,
+            Instant::now() + CLIP_READ_TIMEOUT,
+            Some(&mut owner),
+            || Ok(pipe),
+        )
+        .expect("request transfer")
+        .expect("selection offers text");
+
+        // Leave the pipe full until the writer closes it on timeout.
+        let mut poll = [rustix::event::PollFd::new(
+            &transfer.file,
+            rustix::event::PollFlags::empty(),
+        )];
+        let timeout = rustix::event::Timespec {
+            tv_sec: 10,
+            tv_nsec: 0,
+        };
+        rustix::event::poll(&mut poll, Some(&timeout)).expect("poll transfer");
+        assert!(poll[0].revents().contains(rustix::event::PollFlags::HUP));
+
+        match transfer.read(Instant::now() + CLIP_READ_TIMEOUT) {
+            Err(GlassError::Backend(message)) => {
+                assert!(message.contains("timed out"), "{message}")
+            }
+            Err(error) => panic!("unexpected read error: {error}"),
+            Ok(value) => panic!("read reported success with {} bytes", value.len()),
+        }
+        assert_eq!(
+            get(&socket, Some(&mut owner)).expect("read after failure"),
+            text
+        );
+    }
+
+    #[test]
+    fn a_failed_write_to_another_pipe_does_not_fail_the_pending_read() {
+        let (read_end, _write_end) = rustix::pipe::pipe().expect("read pipe");
+        let (_other_read, other_write) = rustix::pipe::pipe().expect("unrelated pipe");
+        let pending_read = Mutex::new(Some(ReadStatus {
+            pipe: PipeId::of(&File::from(read_end)).expect("identify read pipe"),
+            failure: None,
+        }));
+
+        record_read_failure(
+            &pending_read,
+            &File::from(other_write),
+            &GlassError::Timeout(1),
+        );
+
+        let status = pending_read
+            .into_inner()
+            .expect("lock")
+            .expect("read status");
+        assert!(status.failure.is_none());
     }
 
     /// A payload past the pipe buffer cannot be handed over in one `write`. An implementation
@@ -1371,9 +1555,8 @@ mod tests {
     #[test]
     fn a_bounded_write_delivers_a_payload_larger_than_the_pipe_buffer() {
         use std::io::Read as _;
-        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
-        // 256 KiB — four times the default 64 KiB pipe buffer.
-        let payload = vec![b'x'; 256 * 1024];
+        let ((read_end, write_end), capacity) = pipe_with_capacity();
+        let payload = vec![b'x'; capacity + 1];
         let reader = std::thread::spawn(move || {
             let mut got = Vec::new();
             std::fs::File::from(read_end)
@@ -1381,7 +1564,12 @@ mod tests {
                 .expect("read");
             got
         });
-        write_all_bounded(write_end, &payload, Duration::from_secs(10)).expect("write ok");
+        write_all_bounded(
+            &mut File::from(write_end),
+            &payload,
+            Duration::from_secs(10),
+        )
+        .expect("write ok");
         let got = reader.join().expect("reader thread");
         assert_eq!(got.len(), payload.len(), "every byte reaches the reader");
         assert!(got == payload, "the bytes that arrive are the bytes sent");
@@ -1391,9 +1579,13 @@ mod tests {
     /// the write blocks once the pipe fills, on the thread whose loop honours the stop flag.
     #[test]
     fn a_bounded_write_times_out_when_the_reader_never_reads() {
-        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
-        let payload = vec![b'x'; 256 * 1024];
-        let r = write_all_bounded(write_end, &payload, Duration::from_millis(200));
+        let ((read_end, write_end), capacity) = pipe_with_capacity();
+        let payload = vec![b'x'; capacity + 1];
+        let r = write_all_bounded(
+            &mut File::from(write_end),
+            &payload,
+            Duration::from_millis(200),
+        );
         assert!(
             matches!(r, Err(GlassError::Timeout(_))),
             "expected Timeout, got {r:?}"
@@ -1408,7 +1600,7 @@ mod tests {
     fn a_bounded_write_reports_a_receiver_that_closed_the_transfer() {
         let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
         drop(read_end);
-        let err = write_all_bounded(write_end, b"clip!", CLIP_WRITE_TIMEOUT)
+        let err = write_all_bounded(&mut File::from(write_end), b"clip!", CLIP_WRITE_TIMEOUT)
             .expect_err("a closed receiver is not a delivered paste");
         let msg = err.to_string();
         assert!(msg.contains("closed the transfer"), "{msg}");
