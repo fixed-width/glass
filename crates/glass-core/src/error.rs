@@ -289,6 +289,11 @@ pub enum GlassError {
     #[error("backend error: {0}")]
     Backend(String),
 
+    /// The backend ended its application session but could not confirm all cleanup.
+    /// Unlike a retryable stop failure, retaining this session cannot make it usable again.
+    #[error("application session ended, but cleanup is incomplete: {0}")]
+    AppStopIncomplete(String),
+
     /// A tool glass drove ran and exited non-zero, carrying what it wrote to stderr.
     ///
     /// `said` is that stderr, trimmed — empty when the tool failed without a word, which for
@@ -419,6 +424,18 @@ impl GlassError {
             GlassError::InputCleanupFailed { primary, .. }
             | GlassError::CleanupFailed { primary, .. } => primary.cause(),
             error => error,
+        }
+    }
+
+    /// Whether teardown consumed the application session even though cleanup failed.
+    pub fn session_ended(&self) -> bool {
+        match self {
+            Self::AppStopIncomplete(_) => true,
+            Self::BeforeDispatch(error) | Self::AfterDispatch(error) => error.session_ended(),
+            Self::CleanupFailed {
+                primary, cleanup, ..
+            } => primary.session_ended() || cleanup.session_ended(),
+            _ => false,
         }
     }
 

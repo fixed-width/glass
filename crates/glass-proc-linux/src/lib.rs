@@ -25,6 +25,9 @@ pub const CLOSE_GRACE: Duration = Duration::from_millis(1500);
 /// SIGTERM-to-SIGKILL grace after [`CLOSE_GRACE`] expires.
 pub const APP_REAP_GRACE: Duration = Duration::from_millis(1000);
 
+/// Bounded confirmation after SIGKILL, within the application teardown budget.
+pub const EXIT_CONFIRM_GRACE: Duration = Duration::from_millis(50);
+
 /// How a launched app exited.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closed {
@@ -34,6 +37,8 @@ pub enum Closed {
     SignalledUnasked { reason: Option<String> },
     /// Signaled after [`CLOSE_GRACE`] expired.
     SignalledAfterGrace,
+    /// Launch processes remained alive after the signal ladder and confirmation wait.
+    StillRunning { pids: Vec<u32> },
 }
 
 /// The number of windows asked to close and why others could not be asked.
@@ -93,8 +98,11 @@ impl Asked {
         self.await_close(grace, || matches!(child.try_wait(), Ok(Some(_))))
     }
 
-    /// Classify the teardown: `closed_itself` is whether the app left before the grace ran out.
-    pub fn outcome(self, closed_itself: bool) -> Closed {
+    /// Classify the teardown, giving confirmed survivors precedence over the close request.
+    pub fn outcome(self, closed_itself: bool, survivors: Vec<u32>) -> Closed {
+        if !survivors.is_empty() {
+            return Closed::StillRunning { pids: survivors };
+        }
         match (self.asked, closed_itself) {
             (0, _) => Closed::SignalledUnasked {
                 reason: self.reason,
@@ -126,6 +134,10 @@ pub fn teardown_notice(closed: &Closed) -> Option<String> {
              shutdown prompt, or an app that ignores close requests, will do this), so it was \
              signalled. Unsaved state was not flushed, and the app may report a crash on its \
              next launch."
+        )),
+        Closed::StillRunning { pids } => Some(format!(
+            "glass: launch processes are still running after SIGTERM and SIGKILL: {pids:?}; \
+             cleanup could not be confirmed."
         )),
     }
 }
@@ -180,6 +192,16 @@ fn alive(pid: u32) -> bool {
 /// Which of `pids` are live processes.
 pub fn live_pids(pids: &[u32]) -> Vec<u32> {
     pids.iter().copied().filter(|pid| alive(*pid)).collect()
+}
+
+/// Poll observed survivors until they exit or `grace` expires. Never sends another signal.
+pub fn confirm_exit(pids: &[u32], grace: Duration) -> Vec<u32> {
+    let mut left = pids.to_vec();
+    await_condition(grace, || {
+        left.retain(|pid| alive(*pid));
+        left.is_empty()
+    });
+    left
 }
 
 /// Whether any of `pids` is still a live process.
@@ -576,7 +598,7 @@ mod reap_tests {
     fn an_app_that_was_never_asked_is_reported_as_signalled_unasked() {
         let asked = Asked::counted(2, 0, |n| format!("{n} cannot be asked"));
         assert_eq!(
-            asked.clone().outcome(false),
+            asked.clone().outcome(false, Vec::new()),
             Closed::SignalledUnasked {
                 reason: Some("2 cannot be asked".into())
             }
@@ -584,7 +606,7 @@ mod reap_tests {
         // Even if the app happened to exit on its own, nothing asked it to — the caller has no
         // basis for reporting a graceful close.
         assert_eq!(
-            asked.outcome(true),
+            asked.outcome(true, Vec::new()),
             Closed::SignalledUnasked {
                 reason: Some("2 cannot be asked".into())
             }
@@ -594,23 +616,71 @@ mod reap_tests {
     #[test]
     fn an_asked_app_that_exits_is_reported_as_graceful() {
         let asked = Asked::counted(1, 1, |_| unreachable!("nothing was left unasked"));
-        assert_eq!(asked.outcome(true), Closed::Gracefully);
+        assert_eq!(asked.outcome(true, Vec::new()), Closed::Gracefully);
     }
 
     #[test]
     fn an_asked_app_that_stays_is_reported_as_signalled_after_the_grace() {
         let asked = Asked::counted(1, 1, |_| unreachable!("nothing was left unasked"));
-        assert_eq!(asked.outcome(false), Closed::SignalledAfterGrace);
+        assert_eq!(
+            asked.outcome(false, Vec::new()),
+            Closed::SignalledAfterGrace
+        );
+    }
+
+    #[test]
+    fn surviving_children_override_a_gracefully_closed_app() {
+        let asked = Asked::counted(1, 1, |_| unreachable!());
+        let closed = asked.outcome(true, vec![123, 456]);
+        assert_eq!(
+            closed,
+            Closed::StillRunning {
+                pids: vec![123, 456]
+            }
+        );
+        let notice = teardown_notice(&closed).expect("survivors must be reported");
+        assert!(notice.contains("123") && notice.contains("456"), "{notice}");
+        assert!(notice.contains("still running"), "{notice}");
+    }
+
+    #[test]
+    fn survivors_are_reported_even_without_a_window_to_close() {
+        let closed = Asked::none().outcome(false, vec![123]);
+        assert!(teardown_notice(&closed).is_some());
+        assert!(matches!(closed, Closed::StillRunning { .. }));
+    }
+
+    #[test]
+    fn exit_confirmation_waits_for_a_process_that_is_exiting() {
+        let mut child = Command::new("sleep").arg("0.05").spawn().unwrap();
+        let left = super::confirm_exit(&[child.id()], Duration::from_secs(5));
+        child.wait().unwrap();
+        assert!(
+            left.is_empty(),
+            "an exiting process is not a survivor: {left:?}"
+        );
+    }
+
+    #[test]
+    fn exit_confirmation_reports_a_live_process_without_signalling_it() {
+        let pid = std::process::id();
+        assert_eq!(super::confirm_exit(&[pid], Duration::ZERO), vec![pid]);
+        assert!(super::confirm_exit(&[], Duration::from_secs(5)).is_empty());
     }
 
     #[test]
     fn an_app_with_no_window_to_ask_says_nothing() {
         // Teardown also runs on the failed-launch path, where there is no window and nothing was
         // missed. That must stay silent, while a window glass could not ask must not.
-        assert_eq!(teardown_notice(&Asked::none().outcome(false)), None);
+        assert_eq!(
+            teardown_notice(&Asked::none().outcome(false, Vec::new())),
+            None
+        );
         assert!(
-            teardown_notice(&Asked::counted(1, 0, |n| format!("{n} unaskable")).outcome(false))
-                .is_some()
+            teardown_notice(
+                &Asked::counted(1, 0, |n| format!("{n} unaskable")).outcome(false, Vec::new())
+            )
+            .is_some()
         );
     }
 
@@ -619,8 +689,9 @@ mod reap_tests {
         // The failure mode this guards: glass's own machinery breaks (an unreachable display or
         // compositor), nothing is asked, the app is signalled — and the user is told nothing,
         // because it looks exactly like an app that had no window.
-        let notice = teardown_notice(&Asked::blocked("the compositor went away").outcome(false))
-            .expect("a blocked ask must be disclosed");
+        let notice =
+            teardown_notice(&Asked::blocked("the compositor went away").outcome(false, Vec::new()))
+                .expect("a blocked ask must be disclosed");
         assert!(
             notice.contains("the compositor went away"),
             "the reason must reach the user: {notice}"

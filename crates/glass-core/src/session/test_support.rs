@@ -124,6 +124,7 @@ pub(crate) struct FakePlatform {
     fail_start: bool,
     reported_display_size: Option<(u32, u32)>,
     fail_stop: bool,
+    stop_error: Option<GlassError>,
     lifecycle_log: Option<Arc<Mutex<Vec<&'static str>>>>,
     protected_paths_log: Option<Arc<Mutex<Vec<Vec<ProtectedHostPath>>>>>,
 }
@@ -177,6 +178,10 @@ impl FakePlatform {
     }
     pub(crate) fn failing_stop(mut self) -> Self {
         self.fail_stop = true;
+        self
+    }
+    pub(crate) fn with_stop_error(mut self, error: GlassError) -> Self {
+        self.stop_error = Some(error);
         self
     }
     pub(crate) fn with_lifecycle_log(mut self, log: Arc<Mutex<Vec<&'static str>>>) -> Self {
@@ -413,7 +418,9 @@ impl Platform for FakePlatform {
         if let Some(c) = &self.stop_count {
             *c.lock().unwrap() += 1;
         }
-        if self.fail_stop {
+        if let Some(error) = self.stop_error.take() {
+            Err(error)
+        } else if self.fail_stop {
             Err(GlassError::Backend("scripted stop failure".into()))
         } else {
             Ok(())

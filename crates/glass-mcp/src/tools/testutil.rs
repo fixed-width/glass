@@ -18,6 +18,7 @@ pub struct FakePlatform {
     pub buffer_supported: bool,
     pub recorder: Option<Box<dyn glass_core::Recording>>,
     pub stop_events: Option<Arc<Mutex<Vec<String>>>>,
+    pub stop_error: Option<GlassError>,
     pub input_route: Option<glass_core::InputRoute>,
     pub geometry: WindowGeometry,
     pub frames: VecDeque<Frame>,
@@ -173,7 +174,10 @@ impl Platform for FakePlatform {
         if let Some(events) = &self.stop_events {
             events.lock().unwrap().push("stop".into());
         }
-        Ok(())
+        match self.stop_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn capture_frame_by(&mut self, region: Option<&Region>, deadline: Deadline) -> Result<Frame> {
         if deadline.has_passed() {
