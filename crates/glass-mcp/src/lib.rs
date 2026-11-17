@@ -637,7 +637,9 @@ pub async fn run_stdio_with_recordings(
 
     let signal = async {
         shutdown::shutdown_signal().await;
-        eprintln!("glass: received shutdown signal; tearing down sessions");
+        shutdown::report_diagnostic(|| {
+            eprintln!("glass: received shutdown signal; tearing down sessions")
+        });
     };
     let transport_outcome = run_stdio_service_lifecycle(
         service,

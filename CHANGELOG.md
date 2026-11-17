@@ -40,6 +40,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Android and iOS Simulator stops report failed, timed-out, or skipped app termination in
+  `glass_stop` and the audit log. A stop also succeeds when the backend confirms the app has
+  already exited.
 - Mobile `set_value` errors use the field's live value before each write. MCP callers get
   missed-tap recovery guidance when an Android or iOS field stays unchanged, and the Compose
   workaround when existing text survives an Android accessibility-service write.

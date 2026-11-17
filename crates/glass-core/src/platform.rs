@@ -417,8 +417,8 @@ pub trait Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry>;
 
     /// Terminate the running app (idempotent), giving up by `deadline`.
-    /// Return [`GlassError::AppStopIncomplete`] if the application session ended but cleanup
-    /// remains unconfirmed, so a replacement launch cannot retain an unusable session.
+    /// Return [`GlassError::AppStopIncomplete`] or [`GlassError::AppStopIncompleteCaused`]
+    /// if the application session ended but cleanup remains unconfirmed.
     ///
     /// **Cap every wait of your own by it.** Teardown shares [`TEARDOWN_BUDGET`], so a step that
     /// overruns spends what the steps behind it needed, and they are skipped rather than slowed

@@ -121,8 +121,30 @@ impl Simctl {
     /// [`Simctl::run`] under a deadline the whole sequence shares. The deadline bounds the run; it
     /// does not reserve time for the calls behind, which is `Glass::shutdown`'s job (glass#427).
     pub fn run_until(&self, sub: &[&str], deadline: Deadline) -> Result<String> {
-        let out = self.output(sub, deadline)?;
+        let out = checked_output(sub, self.command_output(sub, deadline)?)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    pub(crate) fn terminate_until(
+        &self,
+        udid: &str,
+        bundle_id: &str,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let sub = ["terminate", udid, bundle_id];
+        let out = self.command_output(&sub, deadline)?;
+        // ESRCH by itself can mean FrontBoard could not determine whether the bundle is running.
+        if out.status.code() == Some(3) {
+            const ESRCH_HEADER: &str = "An error was encountered processing the command (domain=NSPOSIXErrorDomain, code=3):";
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let mut lines = stderr.trim().lines().map(str::trim);
+            if lines.next() == Some(ESRCH_HEADER)
+                && lines.any(|line| line == "found nothing to terminate")
+            {
+                return Ok(());
+            }
+        }
+        checked_output(&sub, out).map(|_| ())
     }
 
     /// Start `xcrun simctl <sub...>` and hand back the child unwaited, in a process group of its
@@ -143,20 +165,23 @@ impl Simctl {
         cmd.spawn()
     }
 
-    fn output(&self, sub: &[&str], deadline: Deadline) -> Result<Vec<u8>> {
+    fn command_output(&self, sub: &[&str], deadline: Deadline) -> Result<std::process::Output> {
         let op = SimctlOp::for_sub(sub);
         let mut cmd = Command::new(self.program());
         cmd.args(self.full_args(sub));
-        let out = run_bounded_until(&mut cmd, op.budget(), deadline, op.label())?;
-        if !out.status.success() {
-            return Err(GlassError::Backend(format!(
-                "simctl {:?} failed: {}",
-                sub,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(out.stdout)
+        run_bounded_until(&mut cmd, op.budget(), deadline, op.label())
     }
+}
+
+fn checked_output(sub: &[&str], out: std::process::Output) -> Result<Vec<u8>> {
+    if !out.status.success() {
+        return Err(GlassError::Backend(format!(
+            "simctl {:?} failed: {}",
+            sub,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
 }
 
 /// An `xcrun` that is a shell script rather than the real tool: it records every invocation and,
@@ -183,8 +208,8 @@ env | grep '^SIMCTL_CHILD_' >> \"$dir/environments\" || true
 # Recorded before sleeping, so a test can see the call while this one is still running.
 [ -f \"$dir/slow-$2\" ] && sleep \"$(cat \"$dir/slow-$2\")\"
 if [ -f \"$dir/fail-$2\" ]; then
-    printf 'the fake xcrun was told to fail %s\\n' \"$2\" >&2
-    exit 1
+    { IFS= read -r status; cat >&2; } < \"$dir/fail-$2\"
+    exit \"$status\"
 fi
 case \"$*\" in
     *screenshot*)
@@ -245,8 +270,19 @@ impl FakeSimctl {
     /// Make every `simctl <verb>` call exit non-zero, for a test that asks what the caller does
     /// when the Simulator refuses.
     pub(crate) fn fails(&self, verb: &str) {
-        std::fs::write(self.dir.path().join(format!("fail-{verb}")), "")
-            .expect("tell the fake to fail");
+        self.fails_with(
+            verb,
+            1,
+            &format!("the fake xcrun was told to fail {verb}\n"),
+        );
+    }
+
+    pub(crate) fn fails_with(&self, verb: &str, status: u8, stderr: &str) {
+        std::fs::write(
+            self.dir.path().join(format!("fail-{verb}")),
+            format!("{status}\n{stderr}"),
+        )
+        .expect("tell the fake to fail");
     }
 
     /// Make every `simctl <verb>` call take `seconds`, for a test about whether the caller waits.
