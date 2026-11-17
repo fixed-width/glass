@@ -123,6 +123,9 @@ The default clip limit is 30 seconds; choose between 1 and 60 seconds. Each clip
 allowance and at most 1024 retained clips per server process. Repeated server runs accumulate files
 until the operator removes them. A limit stops capture, not application work. Status reports the
 limit or recording failure; inspect it before another recording.
+Capture failures remain visible when final accounting reaches another limit. If multiple limits
+are reached, status keeps the first reported limit. Finalization or storage failures still report
+their error.
 
 Stop recording before stopping the application for the best chance of retaining the complete
 outcome. `glass_stop`, application replacement, and server shutdown attempt to finalize an

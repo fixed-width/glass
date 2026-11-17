@@ -35,8 +35,11 @@ impl RecordingControl {
         }
         self.0.stop.store(true, Ordering::Release);
     }
+    /// Record the first limit without replacing a failure or finalized state.
     pub fn limit(&self, reason: &str) {
-        if let Ok(mut progress) = self.0.progress.lock() {
+        if let Ok(mut progress) = self.0.progress.lock()
+            && progress.state == RecordingState::Recording
+        {
             progress.state = RecordingState::Limited;
             progress.reason = Some(reason.to_owned());
         }
@@ -76,20 +79,14 @@ impl RecordingControl {
     pub fn observe_bytes(&self, bytes: u64) {
         if let Ok(mut progress) = self.0.progress.lock() {
             progress.bytes = bytes;
-            if bytes >= self.0.options.max_bytes.saturating_sub(256 * 1024) {
-                progress.state = RecordingState::Limited;
-                progress.reason = Some("byte_limit".into());
-                self.0.stop.store(true, Ordering::Release);
-            }
+        }
+        if bytes >= self.0.options.max_bytes.saturating_sub(256 * 1024) {
+            self.limit("byte_limit");
         }
     }
     pub fn should_stop(&self) -> bool {
         if self.elapsed_ms() >= self.0.options.max_duration_ms {
-            if let Ok(mut progress) = self.0.progress.lock() {
-                progress.state = RecordingState::Limited;
-                progress.reason = Some("duration_limit".into());
-            }
-            self.0.stop.store(true, Ordering::Release);
+            self.limit("duration_limit");
         }
         self.cancelled() || self.0.stop.load(Ordering::Acquire)
     }
@@ -178,11 +175,7 @@ pub fn start_recording_worker(
                 ));
             }
             if let Err(error) = &completed {
-                if let Ok(mut state) = background.0.progress.lock() {
-                    state.state = RecordingState::Failed;
-                    state.reason = Some(error.to_string());
-                    state.elapsed_ms = background.elapsed_ms();
-                }
+                background.fail(&error.to_string());
                 if let Ok(mut sender) = background.0.ready.lock()
                     && let Some(sender) = sender.take()
                 {
@@ -316,6 +309,118 @@ mod tests {
             limited.progress().reason.as_deref(),
             Some("native duration limit")
         );
+    }
+
+    #[test]
+    fn capture_failure_survives_final_byte_accounting() {
+        let mut worker =
+            start_recording_worker(options(), Deadline::from_millis(1000), |control| {
+                control.ready();
+                control.fail("display disconnected");
+                control.observe_bytes(control.options().max_bytes);
+                Ok(RecordedVideo {
+                    format: crate::RecordingFormat::Mp4,
+                    progress: control.mark_finalized(),
+                    data: vec![1],
+                })
+            })
+            .unwrap();
+
+        let video = worker.finish(true, Deadline::from_millis(1000)).unwrap();
+        assert_eq!(video.progress.state, RecordingState::Failed);
+        assert_eq!(
+            video.progress.reason.as_deref(),
+            Some("display disconnected")
+        );
+        assert_eq!(video.progress.bytes, options().max_bytes);
+        assert_eq!(video.data, vec![1]);
+        assert_eq!(worker.progress().state, RecordingState::Failed);
+    }
+
+    #[test]
+    fn capture_failure_survives_explicit_limits_and_duration_polling() {
+        let control = control();
+        control.ready();
+        control.fail("display disconnected");
+        control.limit("native duration limit");
+        assert_eq!(control.progress().state, RecordingState::Failed);
+        assert_eq!(
+            control.progress().reason.as_deref(),
+            Some("display disconnected")
+        );
+
+        *control.0.started.lock().unwrap() = Some(Instant::now() - Duration::from_millis(1000));
+        assert!(control.should_stop());
+        let progress = control.mark_finalized();
+        assert_eq!(progress.state, RecordingState::Failed);
+        assert_eq!(progress.reason.as_deref(), Some("display disconnected"));
+        assert!(progress.elapsed_ms >= 1000);
+    }
+
+    #[test]
+    fn capture_failure_overrides_an_existing_limit() {
+        let control = control();
+        control.limit("byte_limit");
+        control.fail("display disconnected");
+
+        assert!(control.should_stop());
+        let progress = control.mark_finalized();
+        assert_eq!(progress.state, RecordingState::Failed);
+        assert_eq!(progress.reason.as_deref(), Some("display disconnected"));
+    }
+
+    #[test]
+    fn byte_limit_reason_survives_duration_polling_and_later_limits() {
+        let control = control();
+        control.ready();
+        let threshold = control.options().max_bytes - 256 * 1024;
+        control.observe_bytes(threshold);
+        *control.0.started.lock().unwrap() = Some(Instant::now() - Duration::from_millis(1000));
+        assert!(control.should_stop());
+        assert_eq!(control.progress().reason.as_deref(), Some("byte_limit"));
+        control.limit("native duration limit");
+
+        let progress = control.mark_finalized();
+        assert_eq!(progress.state, RecordingState::Limited);
+        assert_eq!(progress.reason.as_deref(), Some("byte_limit"));
+        assert_eq!(progress.bytes, threshold);
+    }
+
+    #[test]
+    fn duration_limit_reason_survives_final_byte_accounting() {
+        let control = control();
+        control.ready();
+        *control.0.started.lock().unwrap() = Some(Instant::now() - Duration::from_millis(1000));
+        assert!(control.should_stop());
+        control.observe_bytes(control.options().max_bytes);
+
+        let progress = control.mark_finalized();
+        assert_eq!(progress.state, RecordingState::Limited);
+        assert_eq!(progress.reason.as_deref(), Some("duration_limit"));
+        assert_eq!(progress.bytes, control.options().max_bytes);
+        assert!(progress.elapsed_ms >= 1000);
+    }
+
+    #[test]
+    fn finalization_errors_remain_authoritative_after_capture_failure() {
+        let mut worker =
+            start_recording_worker(options(), Deadline::from_millis(1000), |control| {
+                control.ready();
+                control.fail("display disconnected");
+                Err(GlassError::Backend("movie finalization failed".into()))
+            })
+            .unwrap();
+
+        let error = worker
+            .finish(true, Deadline::from_millis(1000))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&error, GlassError::Backend(reason) if reason == "movie finalization failed")
+        );
+        let progress = worker.progress();
+        assert_eq!(progress.state, RecordingState::Failed);
+        assert_eq!(progress.reason.as_deref(), Some(error.to_string().as_str()));
     }
 
     #[test]

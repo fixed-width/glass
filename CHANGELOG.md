@@ -40,6 +40,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Workflow recording preserves capture failures during final byte and duration accounting,
+  and keeps the first limit reason when multiple limits are reached.
 - Linux application stops report surviving processes instead of success when cleanup cannot be
   confirmed. Wayland retains the runtime directory for those processes and reports its path.
 - The X11 deep doctor check verifies that its private Xvfb was reaped and its observed
