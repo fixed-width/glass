@@ -792,6 +792,28 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_stop_preserves_whether_the_stop_command_dispatched() {
+        for (source, expected) in [
+            (
+                GlassError::deadline_not_started("terminate"),
+                Some(BoundDispatch::NotDispatched),
+            ),
+            (
+                GlassError::caller_deadline_elapsed("terminate"),
+                Some(BoundDispatch::MayHaveDispatched),
+            ),
+            (GlassError::Backend("device offline".into()), None),
+        ] {
+            let error = GlassError::AppStopIncompleteCaused {
+                operation: "terminating app".into(),
+                source: Box::new(source),
+            };
+
+            assert_eq!(error.bound_dispatch(), expected, "{error}");
+        }
+    }
+
+    #[test]
     fn input_cleanup_failure_preserves_both_sources_and_metadata() {
         let error = GlassError::InputCleanupFailed {
             operation: "releasing held input".into(),
