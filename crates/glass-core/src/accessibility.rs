@@ -1000,6 +1000,9 @@ pub struct AxTarget {
     /// identical and only this differs. The desktop backends carry it without reading it; see
     /// [`Self::value_consistent`].
     ///
+    /// A failed write that may have changed the field clears this fingerprint. Use a fresh
+    /// pre-write reading to diagnose the result of a retry.
+    ///
     /// After a successful write the session cache patches this to the text that was requested —
     /// an exact fact only on a typed-write backend (Android/iOS, verified by
     /// `typed_text_landed`/`typed_clear_landed`). An atomic-write backend (Windows/macOS) may

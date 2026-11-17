@@ -26,7 +26,7 @@ mod target;
 mod window_occlusion;
 
 pub use a11y::AndroidA11y;
-pub use a11y_service::{A11yServiceRegistry, ServiceA11y, a11y_apk};
+pub use a11y_service::{A11yServiceRegistry, COMPOSE_SET_TEXT_NO_OP, ServiceA11y, a11y_apk};
 pub use agent::{AgentClient, AgentRegistry};
 pub use avd::{DEFAULT_BOOT_TIMEOUT_MS, EmulatorRegistry};
 pub use platform::AndroidPlatform;

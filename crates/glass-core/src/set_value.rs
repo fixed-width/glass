@@ -79,8 +79,7 @@ pub fn write_took_no_effect(observed: &str, before: Option<&str>) -> bool {
 /// `"worl"` after `"world"` was typed has not received the write, even though it differs from what
 /// was there before.
 ///
-/// `read_back` is `None` when the element reports no value, which for a text field means it is
-/// empty — the `uiautomator` and `idb` mappers both drop an empty value — so it compares as `""`.
+/// `read_back` is `None` when the element reports no value, which compares as `""` for a text field.
 ///
 /// The cost of the strictness: a field that reformats what it is given (a phone number becoming
 /// `"(123) 456-7890"`) reports the write as not applied even though it landed. That is the safer
@@ -165,6 +164,9 @@ pub fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
 /// nameless target is refused however it was reached, its own id included: [`AxTarget::matches`]
 /// compares `None` to `None`, so `AtId` there accepts whatever nameless editable renumbering slid
 /// onto the id.
+///
+/// Pass the value from the live pre-write guard in `target.value`. An absent value in that
+/// reading is treated as an empty field.
 ///
 /// `why` closes the message when the field took nothing from the write. It is the caller's because
 /// only the caller knows how its write reaches the element — [`TAP_MAY_HAVE_MISSED`] for the two
@@ -252,13 +254,8 @@ pub fn verify_typed_write(
     if landed {
         return Ok(());
     }
-    // The mobile mappers drop an empty value, so an empty field arrives as `None` — which the
-    // verdict reserves for a reading nobody took.
+    // Mobile mappers can represent an observed empty field as `None`.
     let observed = node.value.as_deref().unwrap_or("");
-    // The one site that reads an absent `AxTarget::value` as empty rather than unknown, which is
-    // what it means for a mapper that drops empty values. Do not copy this into a backend whose
-    // `None` means the pre-write read failed: `write_took_no_effect` refuses that one, and the
-    // coercion defeats the refusal.
     let before = target.value.as_deref().unwrap_or("");
     // Only where the field never moved: on a value the element transformed — an iOS field
     // autocapitalizing a typed lowercase letter (glass#363) — the tap landed, so "write again"

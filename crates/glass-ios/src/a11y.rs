@@ -196,8 +196,7 @@ fn describe_at_scale(
     Ok(tree)
 }
 
-/// Locate `target` in a tree described for the write and return its window-relative pixel bounds —
-/// the guard every write runs before it dispatches.
+/// Verify `target` in a tree described for the write and return its bounds and current value.
 ///
 /// Re-resolved by identity via [`AxTarget::relocate`], not by pre-order id alone: on the Simulator
 /// a soft keyboard raised by an earlier write inserts nodes ahead of the field, renumbering it
@@ -212,7 +211,7 @@ fn describe_at_scale(
 /// Refusals are pre-dispatch: [`AxTarget::drift_error`] for a node the tree cannot place or that no
 /// longer looks like what was addressed, `AxElementNotEditable` / `AxElementNotClickable` for one
 /// that is the element but cannot be written or tapped.
-fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
+fn verify<'a>(tree: &'a AxTree, target: &AxTarget) -> Result<(AxRect, Option<&'a str>)> {
     let node = match target.relocate(tree) {
         Located::AtId(node) | Located::Moved(node) => node,
         Located::Ambiguous(_) | Located::Gone | Located::Unproven => {
@@ -227,8 +226,10 @@ fn verify(tree: &AxTree, target: &AxTarget) -> Result<AxRect> {
     if !node.states.editable {
         return Err(GlassError::AxElementNotEditable(target.id.0));
     }
-    node.bounds
-        .ok_or(GlassError::AxElementNotClickable(target.id.0))
+    let bounds = node
+        .bounds
+        .ok_or(GlassError::AxElementNotClickable(target.id.0))?;
+    Ok((bounds, node.value.as_deref()))
 }
 
 // The simulator acknowledges the tap before the keyboard is ready to consume keys.
@@ -284,7 +285,7 @@ fn prepare_after_focus(
 }
 
 fn target_after_focus(before: &AxTree, after: &AxTree, target: &AxTarget) -> Result<AxTarget> {
-    if let Ok(bounds) = verify(after, target) {
+    if let Ok((bounds, _)) = verify(after, target) {
         return Ok(AxTarget {
             bounds: Some(bounds),
             ..target.clone()
@@ -482,7 +483,7 @@ impl Accessibility for IosA11y {
         let before_dispatch = SemanticPhase::SetValue { dispatched: false };
         before_dispatch.require(ctx.deadline)?;
         let (tree, scale) = self.describe(ctx, before_dispatch)?;
-        let bounds = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
+        let (bounds, before) = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
         let tap_target = AxTarget {
             bounds: Some(bounds),
             ..target.clone()
@@ -503,7 +504,7 @@ impl Accessibility for IosA11y {
             modifiers: vec![],
         };
         let client = self.client.as_ref();
-        let write_target = dispatch_write(
+        let mut write_target = dispatch_write(
             &mut |events| client.hid_by(events, ctx.deadline),
             &mut || prepare_after_focus(client, ctx, scale, &tree, &tap_target),
             &injector,
@@ -512,6 +513,7 @@ impl Accessibility for IosA11y {
             text,
             ctx.deadline,
         )?;
+        write_target.value = before.map(str::to_owned);
 
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
@@ -1198,6 +1200,29 @@ mod tests {
             outcome.action.confirmation,
             glass_core::ConfirmationStatus::ValueConfirmed
         );
+    }
+
+    #[test]
+    fn set_value_retry_keeps_tap_advice_when_the_field_stays_unchanged() {
+        let reader_hid = Arc::new(Mutex::new(Vec::new()));
+        let reads_per_write = 3 + VERIFY_ATTEMPTS;
+        let replies = successful_tree_replies(&field_json("old"), 1 + 2 * reads_per_write);
+        let mut glass = scripted_glass(replies, Vec::new(), reader_hid, HidPlatform::default());
+        glass.start(&test_spec()).unwrap();
+        let tree = glass.a11y_snapshot(None).unwrap();
+        let field = tree
+            .find_first(|node| node.name.as_deref() == Some("inputField"))
+            .unwrap();
+
+        for _ in 0..2 {
+            let err = glass.set_value(field.id, "new").unwrap_err();
+            assert!(
+                matches!(&err, GlassError::AxValueNotApplied { observed, why, .. }
+                    if observed.as_deref() == Some("old")
+                        && why.as_deref() == Some(TAP_MAY_HAVE_MISSED)),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -2141,7 +2166,7 @@ mod tests {
             bounds: Some(r),
             value: None,
         };
-        assert_eq!(verify(&tree, &target).unwrap(), r);
+        assert_eq!(verify(&tree, &target).unwrap(), (r, None));
     }
 
     #[test]
@@ -2182,7 +2207,7 @@ mod tests {
             matches!(matching_target().relocate(&tree), Located::Moved(_)),
             "the fixture must reach Moved"
         );
-        assert_eq!(verify(&tree, &matching_target()).unwrap(), FIELD);
+        assert_eq!(verify(&tree, &matching_target()).unwrap(), (FIELD, None));
     }
 
     #[test]
@@ -2197,7 +2222,7 @@ mod tests {
             matches!(shifted_target().relocate(&tree), Located::Moved(_)),
             "the fixture must reach Moved"
         );
-        assert_eq!(verify(&tree, &shifted_target()).unwrap(), shifted);
+        assert_eq!(verify(&tree, &shifted_target()).unwrap(), (shifted, None));
     }
 
     #[test]
