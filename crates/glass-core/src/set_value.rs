@@ -917,6 +917,42 @@ mod tests {
         }
 
         #[test]
+        fn a_still_missing_field_is_unconfirmed_after_one_retry() {
+            let target = matching_target();
+            let mut verifier = TypedWriteVerifier::new(&target, "world", TAP_MAY_HAVE_MISSED);
+            let missing = tree_with(vec![leaf(AxRole::Label, "Loading", FIELD)]);
+
+            assert!(matches!(
+                verifier.read(&missing),
+                Ok(TypedWriteStatus::Retry(GlassError::AxWriteUnconfirmed(
+                    1,
+                    _
+                )))
+            ));
+            assert!(matches!(
+                verifier.read(&missing),
+                Err(GlassError::AxWriteUnconfirmed(1, _))
+            ));
+        }
+
+        #[test]
+        fn a_truncated_tree_without_the_field_ends_verification() {
+            let target = matching_target();
+            let mut verifier = TypedWriteVerifier::new(&target, "world", TAP_MAY_HAVE_MISSED);
+            let mut truncated = tree_with(vec![leaf(AxRole::Label, "Loading", FIELD)]);
+            truncated.truncated = Some(Truncation {
+                limit: TruncationLimit::Nodes,
+                limit_value: 2,
+                nodes_walked: 2,
+            });
+
+            assert!(
+                matches!(verifier.read(&truncated), Err(GlassError::AxWriteUnconfirmed(1, reason))
+                if reason.contains("truncated at 2 nodes"))
+            );
+        }
+
+        #[test]
         fn a_reappearing_field_must_be_unique_even_at_the_old_id() {
             let target = matching_target();
             let mut verifier = TypedWriteVerifier::new(&target, "world", TAP_MAY_HAVE_MISSED);
