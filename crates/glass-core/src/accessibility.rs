@@ -1018,7 +1018,7 @@ pub enum Located<'a> {
     /// Still at its own id. The common case, and the only one that needs no second, full-tree
     /// search.
     AtId(&'a AxNode),
-    /// One node elsewhere carries its role and name, in a tree complete enough for that to mean
+    /// One node carries its role and name, in a tree complete enough for that to mean
     /// it is the only one, and it overlaps where the target was.
     Moved(&'a AxNode),
     /// Several do, so the id no longer picks one out. Carries them for the error to name.
@@ -1084,6 +1084,11 @@ impl AxTarget {
         {
             return Located::AtId(node);
         }
+        self.relocate_by_identity(tree)
+    }
+
+    /// Search for a unique, overlapping match when the prior positional ID cannot be trusted.
+    pub(crate) fn relocate_by_identity<'a>(&self, tree: &'a AxTree) -> Located<'a> {
         let mut candidates = Vec::new();
         collect_matches(&tree.root, self, &mut candidates);
         match candidates.len() {
