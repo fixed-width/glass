@@ -142,9 +142,26 @@ fn reject_input_mode<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Optio
     ))
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum AccessibilityReader {
+    Ax,
+    Axbridge,
+}
+
+impl AccessibilityReader {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ax => "ax",
+            Self::Axbridge => "axbridge",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StartArgs {
-    /// Linux X11/Wayland: existing absolute files or directories to expose read-only in containment. Returned paths are canonical. Protected Glass paths remain denied.
+    /// Linux X11/Wayland only. Absolute paths to expose read-only in containment. Returns canonical paths and refuses protected paths.
     #[serde(default)]
     pub read_only_inputs: Vec<String>,
     // Reject cached requests for the unmerged mode without tightening the existing start schema.
@@ -158,7 +175,7 @@ pub struct StartArgs {
     pub(crate) _rejected_input_mode: Option<()>,
     /// Optional shell command to run (in `cwd`) before launching.
     pub build: Option<String>,
-    /// Desktop: [executable, args...]. iOS: [.app-or-bundle-id, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].
+    /// Desktop: [executable, args...]. iOS: [.app or bundle ID, args...]. Android: [apk?, package/.Activity] in either order, e.g. ["/absolute/path/app.apk", "com.example.app/.MainActivity"].
     pub run: Vec<String>,
     /// x11/wayland (Linux), windows (Windows), macos (macOS), android (any host), ios (macOS). Default: GLASS_BACKEND, else host default (x11 on Linux).
     pub backend: Option<String>,
@@ -166,16 +183,19 @@ pub struct StartArgs {
     pub sandbox: Option<String>,
     /// Working directory for build and app; defaults to the server directory.
     pub cwd: Option<String>,
-    /// Extra {KEY: VALUE} environment for build and app. Android applies it only to the host build, not the app.
+    /// Extra environment for build and app. Android applies it only to the host build.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     /// X11 and Windows: find a window by title/class, including process handoffs.
     pub window_hint: Option<WindowHintArgs>,
     /// Window-publication timeout in ms (default 10000); does not bound build.
     pub timeout_ms: Option<u64>,
-    /// Enable the private accessibility bus (default true). False skips it for canvas-only apps. Linux only; other backends read accessibility ambiently.
+    /// Linux only. Enable the private accessibility bus (default true).
     #[serde(default)]
     pub a11y: Option<bool>,
+    /// iOS only. axbridge reads WKWebView content and leaves automation mode enabled. Omit for the server default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility_reader: Option<AccessibilityReader>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]

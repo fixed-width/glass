@@ -472,6 +472,7 @@ fn deadline_glass(behavior: DeadlineBehavior, frames: Vec<Frame>) -> DeadlineFix
         &StartArgs {
             read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
+            accessibility_reader: None,
             build: None,
             run: vec!["app".into()],
             backend: None,
@@ -553,6 +554,7 @@ fn deadline_a11y_glass_with_tree_behavior(
         &StartArgs {
             read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
+            accessibility_reader: None,
             build: None,
             run: vec!["app".into()],
             backend: None,
@@ -2050,6 +2052,7 @@ fn started(platform: FakePlatform) -> Glass {
     let a = StartArgs {
         read_only_inputs: Vec::new(),
         _rejected_input_mode: None,
+        accessibility_reader: None,
         build: None,
         run: vec!["app".into()],
         backend: None,
@@ -2076,6 +2079,7 @@ fn started_a11y_session(mut g: Glass) -> Glass {
     let a = StartArgs {
         read_only_inputs: Vec::new(),
         _rejected_input_mode: None,
+        accessibility_reader: None,
         build: None,
         run: vec!["app".into()],
         backend: None,

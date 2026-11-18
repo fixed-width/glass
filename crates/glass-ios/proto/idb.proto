@@ -255,9 +255,15 @@ message AccessibilityInfoRequest {
   enum Format {
     LEGACY = 0;
     NESTED = 1;
+    COMPLETE = 2;
+  }
+  enum Backend {
+    BACKEND_UNSPECIFIED = 0;
+    AXBRIDGE = 2;
   }
   Point point = 2;
   Format format = 3;
+  Backend backend = 8;
 }
 
 message AccessibilityInfoResponse {

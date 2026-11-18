@@ -32,8 +32,9 @@ const LEAN_TOOLS: &[&str] = &[
     "glass_window",
 ];
 
-pub(crate) const SHARED_INSTRUCTIONS: &str = "Glass drives external native GUI apps. One active session: \
-    glass_start launches and captures logs; glass_stop ends it. Check glass_capabilities for runtime support.\n\n\
+pub(crate) const SHARED_INSTRUCTIONS: &str = "Use glass_start and glass_stop to manage the active GUI session. \
+    Check glass_capabilities for runtime \
+    support and WebView reader setup.\n\n\
     Prefer glass_do whenever at least two upcoming actions or verification waits are already known. \
     Example: write a known field, click Apply, then wait for the expected state, each with its own selector. \
     Batch known work; observe before choosing dependent steps.\n\n\

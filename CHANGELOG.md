@@ -21,6 +21,9 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Launch an iOS Simulator session with `accessibility_reader: "axbridge"` in `glass_start` to read
+  WKWebView contents. `glass_capabilities` shows agents the option and reports the session reader.
+
 - Desktop workflow video can keep bounded recent history in memory. Explicit incident marks include preceding history and a result tail, merge when overlapping, and save through the existing protected recording store while buffering continues. Unmarked history is discarded.
 
 - Workflow recording now supports desktop backends, including private Wayland/Xvfb and Windows child displays, app-filtered macOS capture, and shared-desktop window capture. Movies use bounded software H.264 encoding and keep the existing workflow retention controls.

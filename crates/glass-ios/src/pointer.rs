@@ -22,6 +22,7 @@ impl Metadata {
                 .filter(|pid| *pid != 0),
             identifier: node
                 .get("AXUniqueId")
+                .or_else(|| node.get("identifier"))
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
                 .map(str::to_owned),

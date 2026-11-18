@@ -263,8 +263,12 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   drive a UI); pass `false` to skip the bus for canvas/pixel-only apps, since it spawns extra
   processes. Other backends read accessibility ambiently and ignore this flag.
 - `timeout_ms` (integer, default 10000) — window-publication timeout; does not bound the build.
+- `accessibility_reader` — iOS Simulator only. Pass `"axbridge"` for WKWebView accessibility
+  reads or `"ax"` for the host reader. Omit for the server default. Guest reads enable automation
+  mode for the simulator and leave it enabled. [iOS setup](../how-to/setup-ios.md#read-wkwebview-content)
 
 Returns the located window's geometry: `{x, y, width, height}`.
+iOS includes `accessibility_reader` when the session has an accessibility connection.
 Linux also returns `display: {width, height}` and `filesystem` with the workspace, ephemeral roots,
 launch read-only roots and explicit inputs. Host HOME and `/tmp` are hidden except for these binds.
 If a chooser reports an existing host file as missing, relaunch with that path in `read_only_inputs`.
@@ -967,7 +971,7 @@ reconstruct text and verify the protocol. `glass_a11y_snapshot` keeps its existi
 The trusted `result` contains `version: 1`, `kind: "full" | "diff" | "unchanged"`, fresh opaque
 `revision`, opaque `context_id`, `outline_format: "compact-v1"`, `body_sha256`, UTF-8 `body_bytes`,
 LF `line_count`, `cacheable`, and `completeness`. Completeness repeats current `count`, nullable
-`truncated: {limit: "nodes" | "depth" | "siblings", limit_value, nodes_walked}`, `unreadable`,
+`truncated: {limit: "nodes" | "depth" | "siblings" | "provider", limit_value, nodes_walked}`, `unreadable`,
 `unexposed`, and `subject_mismatch`. Current recovery guidance accompanies every packet.
 
 One untrusted JSON observation block carries the application text. A full packet contains
@@ -1337,6 +1341,8 @@ values as the backend report. `text` also describes ordinary keyboard dispatch t
 Tool lists are filtered for the full/lean profile; `glass_do` supports the stated operation subset.
 Semantic accessibility support remains a separate capability, rather than being implied by a
 coordinate-click entry.
+An iOS session with an accessibility connection also returns `accessibility_reader`, which identifies
+the reader selected at launch.
 
 `desktop_interference` is `none`, `possible` or `unknown`, independently of operation support:
 

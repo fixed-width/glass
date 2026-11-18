@@ -15,12 +15,15 @@ use tokio::runtime::Runtime;
 use tonic::transport::{Channel, Endpoint, Uri};
 
 use super::proto;
+use crate::{AXBRIDGE_SETUP, AccessibilityBackend};
 use proto::companion_service_client::CompanionServiceClient;
 
 /// Budget for establishing the connection (dial + HTTP/2 handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for a single RPC. 30s mirrors glass-android's socket timeout.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const GUEST_READ_RETRY_DELAY: Duration = Duration::from_millis(750);
+const GUEST_READ_RETRIES: usize = 3;
 
 /// Result of a snapshot RPC together with proof of whether the gRPC method was invoked.
 pub(crate) enum SnapshotRpc<T> {
@@ -144,8 +147,53 @@ pub struct IdbClient {
     /// user replaces the binary as the error advises, that reports a fresh build as evidence
     /// the old one is in the way.
     build_info: Option<String>,
+    accessibility_backend: AccessibilityBackend,
     #[cfg(test)]
     snapshot_rpc_boundary: Option<Box<dyn IdbSnapshotRpcBoundary>>,
+}
+
+fn accessibility_request(
+    reader: AccessibilityBackend,
+    point: Option<proto::Point>,
+) -> proto::AccessibilityInfoRequest {
+    use proto::accessibility_info_request::{Backend, Format};
+    let (backend, format) = match reader {
+        AccessibilityBackend::Host => (Backend::Unspecified, Format::Nested),
+        AccessibilityBackend::AxBridge => (Backend::Axbridge, Format::Complete),
+    };
+    proto::AccessibilityInfoRequest {
+        point,
+        format: format as i32,
+        backend: backend as i32,
+    }
+}
+
+fn verify_guest_reader(json: &str) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Provenance<'a> {
+        backend: &'a str,
+    }
+
+    let backend = serde_json::from_str::<Provenance<'_>>(json).ok();
+    if backend.is_some_and(|reply| {
+        matches!(
+            reply.backend,
+            "axbridge-exclusive" | "axbridge-persistent" | "axbridge-oneshot"
+        )
+    }) {
+        return Ok(());
+    }
+    Err(GlassError::AccessibilityUnavailable(format!(
+        "idb_companion did not confirm the requested axbridge reader. {AXBRIDGE_SETUP}"
+    )))
+}
+
+fn guest_app_not_ready(error: &tonic::Status) -> bool {
+    let message = error.message();
+    error.code() == tonic::Code::Internal
+        && (message.contains("window-server frontmost returned no application object")
+            || (message.starts_with("The application with pid ")
+                && message.contains("did not respond to an accessibility request")))
 }
 
 /// Budget for one `hid` stream. A `HidSwipe`/`HidDelay`/`HidPinch` plays out over
@@ -216,6 +264,35 @@ fn rpc_timeout_error(op: &str, timeout: Duration, whose: Whose) -> GlassError {
             GlassError::Backend(format!("{op} timed out after {}s", timeout.as_secs()))
         }
     }
+}
+
+fn map_accessibility_outcome(
+    reader: AccessibilityBackend,
+    op: &str,
+    timeout: Duration,
+    whose: Whose,
+    ends: Instant,
+    outcome: std::result::Result<
+        std::result::Result<tonic::Response<proto::AccessibilityInfoResponse>, tonic::Status>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Result<String> {
+    if reader == AccessibilityBackend::AxBridge
+        && Instant::now() < ends
+        && let Ok(Err(status)) = &outcome
+        && guest_app_not_ready(status)
+    {
+        return Err(GlassError::AccessibilityNotReady(
+            status.message().to_owned(),
+        ));
+    }
+    let json = map_rpc_outcome(op, timeout, whose, ends, outcome)?
+        .into_inner()
+        .json;
+    if reader == AccessibilityBackend::AxBridge {
+        verify_guest_reader(&json)?;
+    }
+    Ok(json)
 }
 
 fn rpc_bound(
@@ -354,9 +431,18 @@ impl IdbClient {
             client: CompanionServiceClient::new(channel),
             bin: bin.to_path_buf(),
             build_info: build_info.map(str::to_owned),
+            accessibility_backend: AccessibilityBackend::Host,
             #[cfg(test)]
             snapshot_rpc_boundary: None,
         })
+    }
+
+    pub(crate) fn set_accessibility_backend(&mut self, reader: AccessibilityBackend) {
+        self.accessibility_backend = reader;
+    }
+
+    pub(crate) fn uses_guest_reader(&self) -> bool {
+        self.accessibility_backend == AccessibilityBackend::AxBridge
     }
 
     /// A client whose channel is never dialed (lazy), for `IosPlatform` unit tests that
@@ -379,6 +465,7 @@ impl IdbClient {
             client: CompanionServiceClient::new(channel),
             bin: PathBuf::from("/nonexistent/idb_companion"),
             build_info: None,
+            accessibility_backend: AccessibilityBackend::Host,
             snapshot_rpc_boundary: None,
         }
     }
@@ -417,16 +504,31 @@ impl IdbClient {
                 None => boundary.describe_all(),
             };
         }
-        let req = proto::AccessibilityInfoRequest {
-            point,
-            format: proto::accessibility_info_request::Format::Nested as i32,
-        };
-        let outcome = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(ends),
-            client.accessibility_info(req),
+        let req = accessibility_request(self.accessibility_backend, point);
+        let rpc_end = tokio::time::Instant::from_std(ends);
+        let mut outcome = tokio::time::timeout_at(rpc_end, client.accessibility_info(req)).await;
+        if self.uses_guest_reader() {
+            for _ in 0..GUEST_READ_RETRIES {
+                if !matches!(&outcome, Ok(Err(error)) if guest_app_not_ready(error))
+                    || ends.saturating_duration_since(Instant::now()) <= GUEST_READ_RETRY_DELAY
+                {
+                    break;
+                }
+                tokio::time::sleep(GUEST_READ_RETRY_DELAY).await;
+                if Instant::now() >= ends {
+                    break;
+                }
+                outcome = tokio::time::timeout_at(rpc_end, client.accessibility_info(req)).await;
+            }
+        }
+        map_accessibility_outcome(
+            self.accessibility_backend,
+            op,
+            timeout,
+            whose,
+            ends,
+            outcome,
         )
-        .await;
-        map_rpc_outcome(op, timeout, whose, ends, outcome).map(|resp| resp.into_inner().json)
     }
 
     async fn call_describe(
@@ -598,6 +700,66 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn guest_accessibility_requires_the_complete_guest_response() {
+        use proto::accessibility_info_request::{Backend, Format};
+
+        let host = accessibility_request(AccessibilityBackend::Host, None);
+        assert_eq!(host.backend(), Backend::Unspecified);
+        assert_eq!(host.format(), Format::Nested);
+
+        let point = proto::Point { x: 156.0, y: 146.0 };
+        let guest = accessibility_request(AccessibilityBackend::AxBridge, Some(point));
+        assert_eq!(guest.backend(), Backend::Axbridge);
+        assert_eq!(guest.format(), Format::Complete);
+        assert_eq!(guest.point, Some(point));
+
+        assert!(verify_guest_reader(r#"{"backend":"axbridge-exclusive"}"#).is_ok());
+        for downgraded in [r#"{"backend":"ax"}"#, r#"[{"role":"AXApplication"}]"#] {
+            let error = verify_guest_reader(downgraded).expect_err("host response");
+            assert!(error.to_string().contains("SimulatorFrameworkBridge"));
+        }
+    }
+
+    #[test]
+    fn guest_retry_only_covers_foreground_app_readiness() {
+        assert!(guest_app_not_ready(&tonic::Status::internal(
+            "window-server frontmost returned no application object"
+        )));
+        assert!(guest_app_not_ready(&tonic::Status::internal(
+            "The application with pid 42 did not respond to an accessibility request before it timed out."
+        )));
+        assert!(!guest_app_not_ready(&tonic::Status::internal(
+            "The SimulatorFrameworkBridge guest binary was not found"
+        )));
+    }
+
+    #[test]
+    fn exhausted_guest_retries_leave_waits_a_pollable_error() {
+        let timeout = Duration::from_secs(1);
+        let op = "idb accessibility_info";
+        let startup =
+            || tonic::Status::internal("window-server frontmost returned no application object");
+        let outcome = |reader, ends, status| {
+            map_accessibility_outcome(reader, op, timeout, Whose::Caller, ends, Ok(Err(status)))
+        };
+        let ends = Instant::now() + timeout;
+        assert!(matches!(
+            outcome(AccessibilityBackend::AxBridge, ends, startup()),
+            Err(GlassError::AccessibilityNotReady(_))
+        ));
+        assert!(matches!(
+            outcome(AccessibilityBackend::Host, ends, startup()),
+            Err(GlassError::Backend(_))
+        ));
+        assert_eq!(
+            outcome(AccessibilityBackend::AxBridge, Instant::now(), startup())
+                .unwrap_err()
+                .bound_owner(),
+            Some(Whose::Caller)
+        );
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotRpcEvent {

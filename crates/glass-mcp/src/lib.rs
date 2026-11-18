@@ -117,7 +117,7 @@ pub fn make_platform(
         // and the doctor warns. A genuine connect failure while the companion IS present is
         // still propagated here rather than degraded to observe-only.
         let accessibility: Option<Box<dyn glass_core::Accessibility + Send>> = platform
-            .accessibility()?
+            .session_accessibility()?
             .map(|a| Box::new(a) as Box<dyn glass_core::Accessibility + Send>);
         return Ok(Backend {
             platform: Box::new(platform),

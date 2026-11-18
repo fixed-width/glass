@@ -893,6 +893,38 @@ fn web_fixture_button_and_field_respond() {
     let mut initial = snapshot_until(&mut a11y, &ctx, 20, |t| carries(t, WEB_BUTTON).is_some());
     initial.assign_ids();
     report("initial", &initial);
+    if std::env::var("GLASS_IOS_ACCESSIBILITY_BACKEND").as_deref() == Ok("axbridge") {
+        for tree in [
+            &initial,
+            &a11y.snapshot(&ctx).expect("repeat WebView snapshot"),
+        ] {
+            assert!(tree.is_complete());
+            let document = tree
+                .find_first(|node| node.role == AxRole::Document)
+                .expect("guest reader must expose the web document");
+            let button = find_named(document, "Save account").expect("page button");
+            assert_eq!(button.role, AxRole::Button);
+            assert!(
+                button.bounds.is_none(),
+                "remote WebKit bounds are not screen-relative"
+            );
+            assert!(
+                tree.find_first(|node| node.name.as_deref() == Some("a select")
+                    && node.value.as_deref() == Some("alpha"))
+                    .is_some()
+            );
+            assert!(
+                tree.find_first(|node| node.role == AxRole::TextField
+                    && node.name.as_deref() == Some("Account name"))
+                    .is_some()
+            );
+            assert!(
+                find_named(document, "frame button").is_some(),
+                "iframe contents"
+            );
+        }
+        return;
+    }
     println!(
         "web view element {WEB_VIEW_ID:?} present: {}",
         find_named(&initial.root, WEB_VIEW_ID).is_some()

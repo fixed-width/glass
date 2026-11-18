@@ -107,14 +107,4 @@ For current results on your host, use [the interaction runner](../how-to/measure
 | Windows (UIA) | Edge 151, Brave 151, Firefox 154 | Publish at baseline (0.4–3.3s). A web page's `Document` and a text editor's edit surface report the same UIA control type; they're told apart per element by the `FrameworkId` each reports (`Chrome`/`Gecko` vs. `Win32`). Clicks and `set_value` land. |
 | macOS (AX) | Safari 26.5 (WebKit) | Publishes `AXWebArea` in the very first snapshot — reading the tree is itself what materializes the lazily built web area. `AXPress` clicks land; `set_value` on a web input is refused honestly (`AxValueNotApplied`) — type into it instead. |
 | Android | System WebView (version not read), on an API 34 emulator | Read through both readers — `uiautomator` and the on-device companion (v0.6.0). The host view and the page root the engine publishes inside it both report `android.webkit.WebView`, so a host holding a page root is read as the `Group` around the page's `Document` rather than as a second one. The first snapshot right after launch can show a childless `Document`; the next one holds the page. |
-| iOS (idb) | WKWebView | No element at all — not the view, not the page, not an empty web area. See below. |
-
-## What stays open: iOS
-
-Every other platform's failure mode is a `Document` that arrived empty or as a placeholder — a
-node the agent can see and act on the disclosure for. On iOS, a `WKWebView`'s page contributes
-nothing to the tree `idb` hands back: no view, no content, no node to attach a notice to. The
-matrix records this as `unmarked` rather than `absent`, because the control is on screen and real —
-it just never surfaces through this reading path. Closing this gap needs a different signal than
-the childless-`Document` mechanism the other platforms use, since there is no element here for that
-mechanism to act on.
+| iOS (idb) | WKWebView, iOS 26.5 and 27.0 with idb v1.7.8 (2026-11-18) | Opt-in `axbridge` exposes the page under a `Document`, including buttons, text fields, and iframe contents. The default `ax` reader exposes the app and its native controls. Use coordinate input for web actions. See [iOS Simulator setup](../how-to/setup-ios.md#read-wkwebview-content). |

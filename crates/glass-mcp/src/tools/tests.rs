@@ -6,6 +6,7 @@ fn start_args() -> StartArgs {
     StartArgs {
         read_only_inputs: Vec::new(),
         _rejected_input_mode: None,
+        accessibility_reader: None,
         build: None,
         run: vec!["app".into()],
         backend: None,
@@ -16,6 +17,28 @@ fn start_args() -> StartArgs {
         timeout_ms: None,
         a11y: None,
     }
+}
+
+#[test]
+fn start_rejects_a_reader_on_an_unrelated_backend_before_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut glass = glass_core::Glass::new(
+        Box::new(|_| panic!("invalid request must not reach the factory")),
+        "test".into(),
+        glass_core::BaselineStore::new(directory.path()),
+        10,
+    );
+    let args: StartArgs = serde_json::from_value(json!({
+        "backend": "android", "run": ["example/.Activity"], "accessibility_reader": "axbridge"
+    }))
+    .unwrap();
+    let error = start(&mut glass, &args).unwrap_err();
+    assert!(
+        error
+            .render_text_blocks()
+            .join("\n")
+            .contains("requires the ios backend")
+    );
 }
 
 #[test]

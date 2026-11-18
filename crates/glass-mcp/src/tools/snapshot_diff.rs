@@ -209,6 +209,7 @@ impl Reservation {
                     glass_core::TruncationLimit::Nodes => "nodes",
                     glass_core::TruncationLimit::Depth => "depth",
                     glass_core::TruncationLimit::Siblings => "siblings",
+                    glass_core::TruncationLimit::Provider => "provider",
                 },
                 "limit_value": t.limit_value,
                 "nodes_walked": t.nodes_walked,

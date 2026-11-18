@@ -105,6 +105,12 @@ impl Backend {
 /// stays platform-agnostic.
 pub type PlatformFactory = Box<dyn FnMut(&str) -> Result<Backend> + Send>;
 
+#[derive(Default)]
+pub struct StartOptions<'a> {
+    pub read_only_inputs: &'a [std::path::PathBuf],
+    pub accessibility_reader: Option<&'a str>,
+}
+
 /// The session manager: builds the active app's backend on demand, owns its
 /// geometry/logs and the baseline store, and routes tool ops to the backend with
 /// validation and log pumping. One active session at a time (v1); the backend is
@@ -128,6 +134,11 @@ impl Glass {
     /// Backend of the current session, without querying the target.
     pub fn active_backend(&self) -> Option<&str> {
         self.active.as_ref().map(|session| session.backend.as_str())
+    }
+
+    /// Accessibility reader selected for the active session, without querying the target.
+    pub fn accessibility_reader(&self) -> Option<&str> {
+        self.active.as_ref()?.accessibility.as_deref()?.reader()
     }
     pub fn new(
         factory: PlatformFactory,

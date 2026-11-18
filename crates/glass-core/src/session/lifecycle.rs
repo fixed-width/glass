@@ -20,10 +20,27 @@ impl Glass {
         spec: &AppSpec,
         inputs: &[std::path::PathBuf],
     ) -> Result<WindowGeometry> {
+        self.start_on_with_options(
+            backend,
+            spec,
+            StartOptions {
+                read_only_inputs: inputs,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Start a session with backend-specific reader selection and read-only host inputs.
+    pub fn start_on_with_options(
+        &mut self,
+        backend: &str,
+        spec: &AppSpec,
+        options: StartOptions<'_>,
+    ) -> Result<WindowGeometry> {
         let t = std::time::Instant::now();
         self.failed_launch = None;
         self.failed_launch_logs = None;
-        let result = self.start_on_inner(backend, spec, inputs);
+        let result = self.start_on_inner(backend, spec, options);
         if result.is_err()
             && self.failed_launch.is_none()
             && self.active.is_none()
@@ -53,7 +70,7 @@ impl Glass {
         &mut self,
         backend: &str,
         spec: &AppSpec,
-        inputs: &[std::path::PathBuf],
+        options: StartOptions<'_>,
     ) -> Result<WindowGeometry> {
         let recording = self.finalize_recording_for_stop(Deadline::from_millis(15_000));
         self.observation_epoch.invalidate();
@@ -77,8 +94,16 @@ impl Glass {
         stopped?;
         let Backend {
             mut platform,
-            accessibility,
+            mut accessibility,
         } = (self.factory)(backend)?;
+        if let Some(accessibility) = accessibility.as_mut() {
+            accessibility.configure_reader(options.accessibility_reader)?;
+        } else if let Some(reader) = options.accessibility_reader {
+            return Err(GlassError::AccessibilityUnavailable(format!(
+                "{backend} has no accessibility connection for reader {reader:?}; check glass_capabilities"
+            )));
+        }
+        let inputs = options.read_only_inputs;
         let protection_mode =
             platform.configure_protected_host_paths(&self.protected_host_paths)?;
         if !inputs.is_empty() && spec.sandbox == SandboxLevel::Off {
@@ -842,6 +867,78 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec!["x11", "wayland"]);
         g.stop().unwrap();
         assert_eq!(g.active_backend(), None);
+    }
+
+    #[test]
+    fn start_reports_the_accessibility_reader_configured_for_the_session() {
+        #[derive(Default)]
+        struct SelectableReader(Option<String>);
+
+        impl Accessibility for SelectableReader {
+            fn configure_reader(&mut self, reader: Option<&str>) -> Result<()> {
+                self.0 = Some(reader.unwrap_or("standard").to_owned());
+                Ok(())
+            }
+
+            fn reader(&self) -> Option<&str> {
+                self.0.as_deref()
+            }
+
+            fn snapshot(&mut self, _ctx: &crate::AxContext) -> Result<crate::AxTree> {
+                Ok(fake_tree())
+            }
+        }
+
+        let factory: PlatformFactory = Box::new(|_| {
+            Ok(Backend {
+                platform: Box::new(FakePlatform::new(10, 10)),
+                accessibility: Some(Box::new(SelectableReader::default())),
+            })
+        });
+        let mut glass = glass_with_factory(factory);
+        assert_eq!(glass.accessibility_reader(), None);
+        glass
+            .start_on_with_options(
+                "test",
+                &spec(),
+                StartOptions {
+                    accessibility_reader: Some("detailed"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(glass.accessibility_reader(), Some("detailed"));
+
+        glass.start_on("test", &spec()).unwrap();
+        assert_eq!(glass.accessibility_reader(), Some("standard"));
+        glass.stop().unwrap();
+        assert_eq!(glass.accessibility_reader(), None);
+    }
+
+    #[test]
+    fn backend_without_reader_selection_refuses_an_explicit_accessibility_reader() {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let mut glass = glass_with_a11y(
+            FakePlatform::new(10, 10).with_lifecycle_log(lifecycle.clone()),
+            fake_tree(),
+        );
+        let outcome = glass.start_on_with_options(
+            "test",
+            &spec(),
+            StartOptions {
+                accessibility_reader: Some("unsupported"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(outcome, Err(GlassError::Unsupported(message)) if message.contains("unsupported"))
+        );
+        assert!(lifecycle.lock().unwrap().is_empty());
+        assert_eq!(glass.active_backend(), None);
+
+        let mut default = glass_with_a11y(FakePlatform::new(10, 10), fake_tree());
+        default.start(&spec()).unwrap();
+        assert_eq!(default.accessibility_reader(), None);
     }
 
     #[test]

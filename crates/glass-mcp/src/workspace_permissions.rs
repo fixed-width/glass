@@ -181,6 +181,7 @@ impl NativePrepare {
         self.prepare(&StartArgs {
             read_only_inputs: Vec::new(),
             _rejected_input_mode: None,
+            accessibility_reader: None,
             build: spec.build.clone(),
             run: spec.run.clone(),
             backend: Some("macos".into()),
