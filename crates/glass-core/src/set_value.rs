@@ -123,6 +123,51 @@ pub fn read_back_failed(target: &AxTarget, e: &GlassError) -> GlassError {
     GlassError::AxWriteUnconfirmed(target.id.0, format!("reading the element back failed: {e}"))
 }
 
+/// Verification of one dispatched tap-and-type write across successive snapshots.
+pub struct TypedWriteVerifier<'a> {
+    target: &'a AxTarget,
+    text: &'a str,
+    why: &'static str,
+    saw_missing: bool,
+}
+
+pub enum TypedWriteStatus {
+    Confirmed,
+    /// Take another read if the backend's budget permits, or report this verdict.
+    Retry(GlassError),
+}
+
+impl<'a> TypedWriteVerifier<'a> {
+    pub fn new(target: &'a AxTarget, text: &'a str, why: &'static str) -> Self {
+        Self {
+            target,
+            text,
+            why,
+            saw_missing: false,
+        }
+    }
+
+    pub fn read(&mut self, tree: &AxTree) -> Result<TypedWriteStatus> {
+        // After disappearance, another field can inherit the original preorder ID.
+        let location = if self.saw_missing {
+            self.target.relocate_by_identity(tree)
+        } else {
+            self.target.relocate(tree)
+        };
+        let missing = matches!(location, Located::Gone);
+        match verify_located_typed_write(tree, self.target, location, self.text, self.why) {
+            Ok(()) => Ok(TypedWriteStatus::Confirmed),
+            Err(error @ GlassError::AxValueNotApplied { .. }) => Ok(TypedWriteStatus::Retry(error)),
+            // A complete tree can temporarily omit the field during a transition.
+            Err(error) if missing && !self.saw_missing => {
+                self.saw_missing = true;
+                Ok(TypedWriteStatus::Retry(error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Judge a typed `set_value` from a tree read back after it. `Ok(())` only when the field holds
 /// exactly what was asked for, or — for a named field — reads back empty after a clear.
 ///
@@ -177,7 +222,17 @@ pub fn verify_typed_write(
     text: &str,
     why: &'static str,
 ) -> Result<()> {
-    let node = match target.relocate(after_tree) {
+    verify_located_typed_write(after_tree, target, target.relocate(after_tree), text, why)
+}
+
+fn verify_located_typed_write(
+    after_tree: &AxTree,
+    target: &AxTarget,
+    location: Located<'_>,
+    text: &str,
+    why: &'static str,
+) -> Result<()> {
+    let node = match location {
         Located::AtId(node) | Located::Moved(node) => node,
         Located::Ambiguous(candidates) => {
             return Err(GlassError::AxWriteUnconfirmed(
@@ -191,9 +246,7 @@ pub fn verify_typed_write(
         Located::Gone => {
             return Err(GlassError::AxWriteUnconfirmed(
                 target.id.0,
-                "nothing in the tree carries its role and name, so the screen it was on was \
-                 replaced"
-                    .into(),
+                "nothing in the read-back tree carries its role and name".into(),
             ));
         }
         Located::Unproven => {
@@ -837,7 +890,7 @@ mod tests {
         }
 
         #[test]
-        fn a_write_that_replaced_the_screen_says_it_was_typed_but_unconfirmed() {
+        fn an_absent_field_makes_a_dispatched_write_unconfirmed() {
             // glass#323: a teardown can land between the write and the read-back, which is where
             // four of the nine refusals observed there came from.
             let replaced = tree_with(vec![leaf(AxRole::Label, "No Results", FIELD)]);
@@ -856,7 +909,32 @@ mod tests {
             // template, not this arm's own clause) — assert the Gone arm's own sentence too, or a
             // change to just this arm's message would leave the suite green.
             assert!(err.to_string().contains("the write went out"), "{err}");
-            assert!(err.to_string().contains("replaced"), "{err}");
+            assert!(
+                err.to_string()
+                    .contains("nothing in the read-back tree carries its role and name"),
+                "{err}"
+            );
+        }
+
+        #[test]
+        fn a_reappearing_field_must_be_unique_even_at_the_old_id() {
+            let target = matching_target();
+            let mut verifier = TypedWriteVerifier::new(&target, "world", TAP_MAY_HAVE_MISSED);
+            let transition = tree_with(vec![leaf(AxRole::Label, "Loading", FIELD)]);
+            assert!(matches!(
+                verifier.read(&transition),
+                Ok(TypedWriteStatus::Retry(_))
+            ));
+
+            let mut impostor = leaf(AxRole::TextField, "Note", FIELD);
+            impostor.value = Some("world".into());
+            let mut original = leaf(AxRole::TextField, "Note", FIELD);
+            original.value = Some("old".into());
+            let after = tree_with(vec![impostor, original]);
+            assert!(
+                matches!(verifier.read(&after), Err(GlassError::AxWriteUnconfirmed(1, reason))
+                if reason.contains("2 elements now match"))
+            );
         }
 
         #[test]

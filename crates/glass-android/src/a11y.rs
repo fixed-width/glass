@@ -9,10 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxStateCoverage, AxTarget, AxTree, PointerHit,
 };
+use glass_core::set_value::{TypedWriteStatus, TypedWriteVerifier};
 use glass_core::{BoundDispatch, Deadline, Whose};
 use glass_core::{
     GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, WindowGeometry,
-    verify_typed_write,
 };
 
 use crate::adb::{Adb, AdbOp};
@@ -300,15 +300,8 @@ fn dump_until_ready(
     }
 }
 
-/// How many times to read the element back before reporting the write as not applied. A landed
-/// write confirms on the first read and pays for one; the retries exist for a field that commits a
-/// frame or two later — a Compose recompose, a debounced handler — which the on-device service
-/// reader polls two whole seconds for.
+/// Maximum read-backs for a write whose field is slow to update or temporarily absent.
 const VERIFY_ATTEMPTS: usize = 3;
-const _: () = assert!(
-    VERIFY_ATTEMPTS > 0,
-    "set_value reports the last read-back, so there must be one"
-);
 
 /// How long to let the toolkit commit typed text before reading it back. Generous relative to a
 /// keystroke and small next to the `uiautomator dump` that follows it.
@@ -601,8 +594,59 @@ fn command_error(
     }
 }
 
-fn verification_phase_owned_by_caller(owner: Whose) -> bool {
-    owner == Whose::Caller
+fn verify_write(
+    target: &AxTarget,
+    text: &str,
+    deadline: Deadline,
+    now: impl Fn() -> Instant,
+    sleep: impl Fn(Duration),
+    mut snapshot: impl FnMut() -> Result<AxTree>,
+) -> Result<()> {
+    let read_back_error = |source| {
+        GlassError::write_unconfirmed_because(
+            target.id.0,
+            "reading the element back failed",
+            source,
+        )
+    };
+    let (phase_ends, phase_owner) =
+        deadline.resolve(now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS));
+    let phase_expired = || {
+        if now() < phase_ends {
+            return Ok(false);
+        }
+        if phase_owner == Whose::Caller {
+            return Err(read_back_error(GlassError::caller_deadline_elapsed(
+                "Android accessibility set_value verification",
+            )));
+        }
+        Ok(true)
+    };
+    let mut verifier = TypedWriteVerifier::new(target, text, TAP_MAY_HAVE_MISSED);
+    let mut last = None;
+    for _ in 0..VERIFY_ATTEMPTS {
+        let settle = Duration::from_millis(VERIFY_SETTLE_MS)
+            .min(phase_ends.saturating_duration_since(now()));
+        sleep(settle);
+        if phase_expired()? {
+            break;
+        }
+        let mut after = snapshot().map_err(read_back_error)?;
+        after.assign_ids();
+        match verifier.read(&after).map_err(read_back_error)? {
+            TypedWriteStatus::Confirmed => return Ok(()),
+            TypedWriteStatus::Retry(error) => last = Some(error),
+        }
+        if phase_expired()? {
+            break;
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        GlassError::AxWriteUnconfirmed(
+            target.id.0,
+            "the verification phase ended before a snapshot could be read".into(),
+        )
+    }))
 }
 
 impl Accessibility for AndroidA11y {
@@ -634,14 +678,6 @@ impl Accessibility for AndroidA11y {
     }
 
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
-        fn read_back_error(target: &AxTarget, error: GlassError) -> GlassError {
-            GlassError::write_unconfirmed_because(
-                target.id.0,
-                "reading the element back failed",
-                error,
-            )
-        }
-
         require_time(ctx.deadline, target.id.0, false, false)?;
         let window = ctx.window.clone();
         let adb = self.ensure_adb_within(ctx.deadline)?;
@@ -706,66 +742,27 @@ impl Accessibility for AndroidA11y {
             }
         }
 
-        // Each read-back is a whole `uiautomator dump` — measured at ~2.3s on the dogfood AVD — so
-        // this reads once and retries only the one verdict a later read can overturn.
-        //
         // A failure of this read is NOT a failure of the write — the field has already been cleared
         // and typed into — so it says so, because a caller that retries blindly types twice. Each
         // read retries a not-ready device even on a warmed reader: the IME and any suggestion strip
         // are still animating, which is exactly when a dump comes back not-ready.
-        let (phase_ends, phase_owner) = ctx
-            .deadline
-            .resolve(Instant::now() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS));
-        let mut last = None;
-        for _ in 0..VERIFY_ATTEMPTS {
-            require_time(
-                ctx.deadline,
-                target.id.0,
-                external_dispatched,
-                value_dispatched,
-            )?;
-            let requested = Duration::from_millis(VERIFY_SETTLE_MS)
-                .min(phase_ends.saturating_duration_since(Instant::now()));
-            std::thread::sleep(ctx.deadline.remaining().unwrap_or(requested).min(requested));
-            require_time(
-                ctx.deadline,
-                target.id.0,
-                external_dispatched,
-                value_dispatched,
-            )?;
-            let mut after = self
-                .snapshot_within(ctx, VERIFY_BOUND)
-                .map_err(|e| read_back_error(target, e))?;
-            after.assign_ids();
-            match verify_typed_write(&after, &write_target, text, TAP_MAY_HAVE_MISSED) {
-                Ok(()) => return Ok(()),
-                // Only a not-applied verdict can change on a later read: drift and truncation are
-                // structural, and re-dumping for them costs seconds to reach the same answer.
-                Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
-                Err(e) => return Err(read_back_error(target, e)),
-            }
-            if Instant::now() >= phase_ends {
-                if verification_phase_owned_by_caller(phase_owner) {
-                    let error = GlassError::caller_deadline_elapsed(
-                        "Android accessibility set_value verification",
-                    );
-                    return Err(read_back_error(target, error));
-                }
-                break;
-            }
-        }
-        // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
-        // avoids an unwrap.
-        Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
+        verify_write(
+            &write_target,
+            text,
+            ctx.deadline,
+            Instant::now,
+            std::thread::sleep,
+            || self.snapshot_within(ctx, VERIFY_BOUND),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AndroidA11y, Attempt, COLD_BOUND, RetryBound, Warmth, bound_fired, command_error,
-        dump_once, dump_until_ready, editable_target, locate_editable_target, locate_for_write,
-        require_time, snapshot_bound, snapshot_with_runner, verification_phase_owned_by_caller,
+        AndroidA11y, Attempt, COLD_BOUND, RetryBound, VERIFY_PHASE_BUDGET_MS, Warmth, bound_fired,
+        command_error, dump_once, dump_until_ready, editable_target, locate_editable_target,
+        locate_for_write, require_time, snapshot_bound, snapshot_with_runner, verify_write,
     };
     use crate::adb::{AdbOp, a_failed_call, a_real_spawn_failure, a_real_timeout_hinted};
     use glass_core::Deadline;
@@ -866,9 +863,49 @@ mod tests {
     }
 
     #[test]
-    fn only_the_outer_caller_owns_verification_expiry() {
-        assert!(verification_phase_owned_by_caller(Whose::Caller));
-        assert!(!verification_phase_owned_by_caller(Whose::Callee));
+    fn settle_spending_the_verification_budget_keeps_the_last_verdict() {
+        let now = std::cell::Cell::new(Instant::now());
+        let phase_ends = now.get() + Duration::from_millis(VERIFY_PHASE_BUDGET_MS);
+        let mut reads = 0;
+        let error = verify_write(
+            &target(0, Some("Search"), Some(BOUNDS)),
+            "world",
+            Deadline::UNBOUNDED,
+            || now.get(),
+            |settle| now.set(now.get() + settle),
+            || {
+                reads += 1;
+                now.set(phase_ends - Duration::from_millis(100));
+                Ok(a_different_screen())
+            },
+        )
+        .expect_err("the second settle exhausts the phase");
+
+        assert_eq!(reads, 1);
+        assert!(matches!(error, GlassError::AxWriteUnconfirmed(0, reason)
+            if reason == "nothing in the read-back tree carries its role and name"));
+    }
+
+    #[test]
+    fn settle_spending_the_callers_deadline_reports_a_dispatched_timeout() {
+        let now = std::cell::Cell::new(Instant::now());
+        let error = verify_write(
+            &target(0, Some("Search"), Some(BOUNDS)),
+            "world",
+            Deadline::at(now.get() + Duration::from_millis(100)),
+            || now.get(),
+            |settle| now.set(now.get() + settle),
+            || panic!("an expired deadline prevents the dump"),
+        )
+        .expect_err("settle exhausts the caller's deadline");
+
+        assert_eq!(error.bound_owner(), Some(Whose::Caller), "{error}");
+        assert_eq!(error.bound(), Some(BoundKind::TimedOut), "{error}");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(BoundDispatch::MayHaveDispatched),
+            "{error}"
+        );
     }
 
     /// A spent-deadline error as `glass_core` really raises one. Nothing is spawned on that path,
@@ -2685,6 +2722,66 @@ exec "$real" "$@"
             "the field must be cleared first: {:?}",
             fake.calls()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_value_resamples_a_missing_field_within_the_read_limit() {
+        use crate::adb::{Answer, FakeAdb};
+
+        let old = Answer::says(one_field_holding("old"));
+        let missing = Answer::says(concat!(
+            r#"<?xml version='1.0'?><hierarchy rotation="0">"#,
+            r#"<node index="0" text="Loading" class="android.widget.TextView" "#,
+            r#"package="com.example.app" enabled="true" bounds="[100,200][500,300]" />"#,
+            "</hierarchy>"
+        ));
+        let written = Answer::says(one_field_holding("world"));
+
+        for (read_backs, expected_reads, confirmed) in [
+            (vec![missing.clone(), written.clone()], 2, true),
+            (
+                vec![missing.clone(), missing.clone(), written.clone()],
+                2,
+                false,
+            ),
+            (vec![old.clone(), old.clone(), missing, written], 3, false),
+        ] {
+            let fake = FakeAdb::scripted(vec![(
+                "*shell cat*",
+                std::iter::once(old.clone()).chain(read_backs).collect(),
+            )]);
+            let mut reader = AndroidA11y::for_adb(fake.adb().clone());
+            let result = reader.set_value(&write_context(), &field_target(None), "world");
+
+            if confirmed {
+                result.expect("the field reappeared with the requested text");
+            } else {
+                let error = result.expect_err("the write could not be confirmed");
+                assert!(
+                    matches!(&error, GlassError::AxWriteUnconfirmed(1, reason)
+                    if reason == "nothing in the read-back tree carries its role and name"),
+                    "{error}"
+                );
+            }
+            let calls = fake.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.contains("shell cat"))
+                    .count(),
+                1 + expected_reads,
+                "{calls:?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.contains("input text"))
+                    .count(),
+                1,
+                "{calls:?}"
+            );
+        }
     }
 
     #[test]

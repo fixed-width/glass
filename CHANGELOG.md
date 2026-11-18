@@ -40,6 +40,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- On iOS Simulator and Android without the accessibility service, `glass_set_value` rechecks a
+  temporarily missing field once within the existing read-back budget, so a transition can finish
+  before the write is reported as unconfirmed.
 - X11 discovery timeouts on private Xvfb report which candidate windows were rejected and why.
   The MCP schema and tools reference describe X11's exact, case-sensitive title hints.
 - Android and iOS Simulator stops report failed, timed-out, or skipped app termination in

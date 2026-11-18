@@ -6,11 +6,11 @@
 use glass_core::accessibility::{
     Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget, AxTree, Located, PointerHit,
 };
+use glass_core::set_value::{TypedWriteStatus, TypedWriteVerifier};
 use std::time::Duration;
 
 use glass_core::{
     Deadline, GlassError, KeyEvent, MouseButton, PointerEvent, Result, TAP_MAY_HAVE_MISSED, Whose,
-    verify_typed_write,
 };
 
 use crate::axmap;
@@ -380,9 +380,7 @@ fn contains_editable(node: &AxNode) -> bool {
 /// keystroke and small next to the `describe` that follows it.
 const VERIFY_SETTLE: Duration = Duration::from_millis(300);
 
-/// How many times to read the element back before reporting the write as not applied. A landed write
-/// confirms on the first attempt and pays for one describe; the retries cover a field that commits a
-/// frame or two later.
+/// Maximum read-backs for a write whose field is slow to update or temporarily absent.
 const VERIFY_ATTEMPTS: usize = 3;
 const _: () = assert!(
     VERIFY_ATTEMPTS > 0,
@@ -518,6 +516,7 @@ impl Accessibility for IosA11y {
         // A failure of this read is not a failure of the write — the field has already been cleared
         // and typed into — so it says so rather than letting a caller retry blindly and type twice.
         let after_dispatch = SemanticPhase::SetValue { dispatched: true };
+        let mut verifier = TypedWriteVerifier::new(&write_target, text, TAP_MAY_HAVE_MISSED);
         let mut last = None;
         for _ in 0..VERIFY_ATTEMPTS {
             after_dispatch
@@ -532,16 +531,11 @@ impl Accessibility for IosA11y {
                 .describe(ctx, after_dispatch)
                 .map_err(|e| post_write_error(target, e))?;
             match after_dispatch
-                .run(ctx.deadline, || {
-                    verify_typed_write(&after, &write_target, text, TAP_MAY_HAVE_MISSED)
-                })
-                .map_err(|e| post_write_error(target, e))
+                .run(ctx.deadline, || verifier.read(&after))
+                .map_err(|e| post_write_error(target, e))?
             {
-                Ok(()) => return Ok(()),
-                // Only a not-applied verdict can change on a later describe: drift and truncation
-                // are structural, so re-describing for them reaches the same answer more slowly.
-                Err(e @ GlassError::AxValueNotApplied { .. }) => last = Some(e),
-                Err(e) => return Err(e),
+                TypedWriteStatus::Confirmed => return Ok(()),
+                TypedWriteStatus::Retry(error) => last = Some(error),
             }
         }
         // The const assert on `VERIFY_ATTEMPTS` is what makes `last` always set; the fallback only
@@ -600,6 +594,7 @@ mod tests {
     use super::*;
     use crate::idb::client::{IdbSnapshotRpcBoundary, SnapshotRpc, SnapshotRpcGate};
     use glass_core::accessibility::{AxNode, AxNodeId, AxRect, AxRole, AxStates, AxTarget, AxTree};
+    use glass_core::verify_typed_write;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1199,6 +1194,38 @@ mod tests {
         assert_eq!(
             outcome.action.confirmation,
             glass_core::ConfirmationStatus::ValueConfirmed
+        );
+    }
+
+    #[test]
+    fn set_value_confirms_a_field_that_reappears_after_the_first_read_back() {
+        let reader_hid = Arc::new(Mutex::new(Vec::new()));
+        let mut replies = successful_tree_replies(&field_json("old"), 4);
+        replies.extend(successful_tree_replies(
+            r#"[{"role":"AXApplication","AXLabel":"Fixture","enabled":true,
+                "frame":{"x":0,"y":0,"width":200,"height":200},"children":[]}]"#,
+            1,
+        ));
+        replies.extend(successful_tree_replies(&field_json("updated"), 1));
+        let mut glass = scripted_glass(
+            replies,
+            Vec::new(),
+            Arc::clone(&reader_hid),
+            HidPlatform::default(),
+        );
+        glass.start(&test_spec()).unwrap();
+        let tree = glass.a11y_snapshot(None).unwrap();
+        let field = tree
+            .find_first(|node| node.name.as_deref() == Some("inputField"))
+            .unwrap();
+
+        glass
+            .set_value(field.id, "updated")
+            .expect("the field reappeared with the requested text");
+        assert_eq!(
+            reader_hid.lock().unwrap().len(),
+            2,
+            "one tap and one key batch"
         );
     }
 
