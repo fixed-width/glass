@@ -19,6 +19,17 @@ use crate::idb::proto;
 use crate::injector::IdbInjector;
 
 trait IosA11yClient: Send {
+    fn configure_reader(&mut self, reader: Option<&str>) -> Result<()> {
+        if reader.is_some() {
+            return Err(GlassError::AxUnsupported);
+        }
+        Ok(())
+    }
+
+    fn uses_guest_reader(&self) -> bool {
+        false
+    }
+
     fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions>;
     fn describe_all_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<String>;
     fn describe_point_rpc_by(&self, point: proto::Point, deadline: Deadline)
@@ -27,6 +38,17 @@ trait IosA11yClient: Send {
 }
 
 impl IosA11yClient for IdbClient {
+    fn configure_reader(&mut self, reader: Option<&str>) -> Result<()> {
+        use crate::AccessibilityBackend;
+        let reader = AccessibilityBackend::resolve(reader, AccessibilityBackend::from_env)?;
+        self.set_accessibility_backend(reader);
+        Ok(())
+    }
+
+    fn uses_guest_reader(&self) -> bool {
+        IdbClient::uses_guest_reader(self)
+    }
+
     fn describe_rpc_by(&self, deadline: Deadline) -> SnapshotRpc<proto::ScreenDimensions> {
         IdbClient::describe_rpc_by(self, deadline)
     }
@@ -467,6 +489,18 @@ fn post_write_error(target: &AxTarget, error: GlassError) -> GlassError {
 }
 
 impl Accessibility for IosA11y {
+    fn configure_reader(&mut self, reader: Option<&str>) -> Result<()> {
+        self.client.configure_reader(reader)
+    }
+
+    fn reader(&self) -> Option<&str> {
+        Some(if self.client.uses_guest_reader() {
+            "axbridge"
+        } else {
+            "ax"
+        })
+    }
+
     fn state_coverage(&self) -> glass_core::AxStateCoverage {
         crate::axmap::STATE_COVERAGE
     }
@@ -480,6 +514,11 @@ impl Accessibility for IosA11y {
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let before_dispatch = SemanticPhase::SetValue { dispatched: false };
         before_dispatch.require(ctx.deadline)?;
+        if self.client.uses_guest_reader() {
+            return Err(GlassError::Unsupported(
+                "iOS axbridge supports accessibility reads. Focus the field with a coordinate tap, +                 type, and confirm its value in a fresh snapshot".into(),
+            ));
+        }
         let (tree, scale) = self.describe(ctx, before_dispatch)?;
         let (bounds, before) = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
         let tap_target = AxTarget {

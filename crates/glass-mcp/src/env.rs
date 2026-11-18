@@ -309,6 +309,13 @@ pub(crate) const GLASS_ENV: &[EnvVarDoc] = &[
         secret: false,
     },
     EnvVarDoc {
+        name: "GLASS_IOS_ACCESSIBILITY_BACKEND",
+        scope: EnvScope::Ios,
+        purpose: "Default iOS Simulator accessibility reader. Override with glass_start accessibility_reader",
+        default: "ax",
+        secret: false,
+    },
+    EnvVarDoc {
         name: "GLASS_CLIP_SHIM_DYLIB",
         scope: EnvScope::Macos,
         purpose: "Override discovery of the injected clipboard-isolation shim (libglass_clip_shim_macos.dylib)",
@@ -632,6 +639,7 @@ mod tests {
             "GLASS_IOS_DEVICE",
             "GLASS_SIMULATOR_KEEP",
             "GLASS_IDB_COMPANION",
+            "GLASS_IOS_ACCESSIBILITY_BACKEND",
             "GLASS_CLIP_SHIM_DYLIB",
             "GLASS_TOKEN",
             "GLASS_AUDIT_LOG",

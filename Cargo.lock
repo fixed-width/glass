@@ -1478,6 +1478,7 @@ dependencies = [
  "prost",
  "protox",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

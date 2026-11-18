@@ -36,6 +36,8 @@ pub(crate) fn start_arguments(args: &crate::params::StartArgs) {
         window_hint: &'a Option<crate::params::WindowHintArgs>,
         timeout_ms: Option<u64>,
         a11y: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accessibility_reader: Option<crate::params::AccessibilityReader>,
     }
     arguments(&Args {
         build: &args.build,
@@ -47,6 +49,7 @@ pub(crate) fn start_arguments(args: &crate::params::StartArgs) {
         window_hint: &args.window_hint,
         timeout_ms: args.timeout_ms,
         a11y: args.a11y,
+        accessibility_reader: args.accessibility_reader,
     });
 }
 

@@ -1244,6 +1244,7 @@ mod tests {
             &StartArgs {
                 read_only_inputs: Vec::new(),
                 _rejected_input_mode: None,
+                accessibility_reader: None,
                 build: None,
                 run: vec!["app".into()],
                 backend: None,
@@ -1366,6 +1367,7 @@ mod tests {
             StartArgs {
                 read_only_inputs: Vec::new(),
                 _rejected_input_mode: None,
+                accessibility_reader: None,
                 build: None,
                 run: vec!["app".into()],
                 backend: None,

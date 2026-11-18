@@ -120,6 +120,7 @@ override that with an explicit path. Full setup is in [how-to/setup-android.md](
 | `GLASS_IOS_DEVICE` | Device name to boot when none is running, e.g. `iPhone 17` or `iPad Pro 13-inch` (ignored if `GLASS_IOS_UDID` is set) | the newest available iPhone simulator | iOS |
 | `GLASS_SIMULATOR_KEEP` | Leave a Glass-booted iOS Simulator running at shutdown instead of stopping it | stop it | iOS |
 | `GLASS_IDB_COMPANION` | Path to the `idb_companion` binary (input + accessibility for the Simulator backend) | the first runnable `idb_companion` on `PATH`, then Homebrew's standard prefixes | iOS |
+| `GLASS_IOS_ACCESSIBILITY_BACKEND` | Default accessibility reader. Override per session with `glass_start` and `accessibility_reader`. | `ax` | iOS |
 
 Attach-or-boot works the same way as the Android group above: Glass attaches to an already-booted
 Simulator, or boots the newest available iPhone simulator itself. `GLASS_IOS_DEVICE` names any

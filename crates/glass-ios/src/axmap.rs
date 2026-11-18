@@ -1,4 +1,4 @@
-//! Pure mapping from idb's `accessibility_info` (nested) JSON into glass's
+//! Pure mapping from idb's host and guest `accessibility_info` JSON into glass's
 //! [`AxTree`]. idb reports frames in logical points; we scale them to
 //! window-relative pixels (`px = pt * scale`) so accessibility bounds share the
 //! capture frame's coordinate space (the simulator's backing scale is ×3).
@@ -20,8 +20,8 @@
 //! key anywhere in the output), so [`AxStates::focused`] is always false from this
 //! backend — a known limitation.
 use glass_core::accessibility::{
-    AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTree, WalkBudget, WalkLimits,
-    normalize_description, normalize_name,
+    AxNode, AxNodeId, AxRect, AxRole, AxStateCoverage, AxStates, AxTree, Truncation,
+    TruncationLimit, WalkBudget, WalkLimits, normalize_description, normalize_name,
 };
 use glass_core::{GlassError, Result, WindowGeometry};
 use serde_json::Value;
@@ -69,7 +69,28 @@ pub const ROLE_TOKENS: &[(&str, AxRole)] = &[
     ("AXGroup", AxRole::Group),
     // A screen or section title.
     ("AXHeading", AxRole::Heading),
+    ("WKAccessibilityWebPageObject", AxRole::Document),
 ];
+
+fn guest_role(kind: &str, has_trait: impl Fn(&str) -> bool) -> AxRole {
+    match kind {
+        "WebAccessibilityObjectWrapper" if has_trait("TextEntry") && has_trait("TextArea") => {
+            AxRole::TextArea
+        }
+        "WebAccessibilityObjectWrapper" if has_trait("TextEntry") => AxRole::TextField,
+        "WebAccessibilityObjectWrapper" if has_trait("Header") => AxRole::Heading,
+        "WebAccessibilityObjectWrapper" | "WebView" | "AXRemoteElement" => AxRole::Group,
+        "Button" if has_trait("Toggle") && has_trait("WebContent") => AxRole::CheckBox,
+        "Button" => AxRole::Button,
+        "StaticText" => AxRole::Label,
+        "Image" => AxRole::Image,
+        "Link" => AxRole::Link,
+        "Application" => AxRole::Application,
+        "TabBar" => AxRole::TabList,
+        "TextField" | "SecureTextField" => AxRole::TextField,
+        _ => ax_role(kind),
+    }
+}
 
 /// Map an idb AX role string (e.g. `AXButton`) to a normalized [`AxRole`].
 /// Unrecognized roles become [`AxRole::Other`]; the caller preserves the native
@@ -103,8 +124,8 @@ pub fn ax_role_with_subrole(role: &str, subrole: Option<&str>) -> AxRole {
         .unwrap_or_else(|| ax_role(role))
 }
 
-/// Parse idb's nested accessibility JSON into an [`AxTree`]. Each element's
-/// logical-point frame is converted to a window-relative pixel [`AxRect`] via
+/// Parse idb's nested accessibility JSON into an [`AxTree`]. Screen-relative frames
+/// in logical points are converted to a window-relative pixel [`AxRect`] via
 /// `scale`, and the top-level elements are wrapped under a synthetic
 /// [`AxRole::Window`] root sized to `window`. Node ids are left `AxNodeId(0)`;
 /// the caller runs [`AxTree::assign_ids`].
@@ -137,20 +158,47 @@ pub(crate) fn build_tree_observing(
 ) -> Result<AxTree> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))?;
+    let guest = v.get("backend").is_some();
+    let frame_scale = if guest {
+        v.get("screen")
+            .filter(|screen| {
+                screen.get("coordinate_space").and_then(Value::as_str) == Some("screen")
+                    && [("width", window.width), ("height", window.height)]
+                        .into_iter()
+                        .all(|(key, pixels)| {
+                            screen
+                                .get(key)
+                                .and_then(Value::as_f64)
+                                .is_some_and(|points| (points * scale).round() == f64::from(pixels))
+                        })
+            })
+            .map(|_| scale)
+    } else {
+        Some(scale)
+    };
+    let (elements, provider_truncated) = if guest {
+        let elements = v.get("elements").filter(|value| value.is_array());
+        let truncated = v.get("truncated").and_then(Value::as_bool);
+        elements.zip(truncated).ok_or_else(|| {
+            GlassError::AccessibilityUnavailable("idb axbridge: invalid complete response".into())
+        })?
+    } else {
+        (&v, false)
+    };
     let mut budget = WalkBudget::with_limits(limits);
     // idb may return either a single root object or an array of top-level elements.
-    let children: Vec<AxNode> = match &v {
+    let children: Vec<AxNode> = match elements {
         Value::Array(a) => {
             let mut out = Vec::new();
             for (i, n) in a.iter().enumerate() {
                 if !budget.may_visit_sibling(i) {
                     break;
                 }
-                out.push(map_node(n, scale, 0, &mut budget, observe));
+                out.push(map_node(n, frame_scale, 0, &mut budget, observe, guest));
             }
             out
         }
-        obj @ Value::Object(_) => vec![map_node(obj, scale, 0, &mut budget, observe)],
+        obj @ Value::Object(_) => vec![map_node(obj, frame_scale, 0, &mut budget, observe, guest)],
         _ => {
             return Err(GlassError::AccessibilityUnavailable(
                 "idb a11y JSON: unexpected root".into(),
@@ -174,7 +222,15 @@ pub(crate) fn build_tree_observing(
         children,
     };
     let mut tree = AxTree::new(root);
-    tree.truncated = budget.truncation();
+    tree.truncated = if provider_truncated {
+        Some(Truncation {
+            limit: TruncationLimit::Provider,
+            limit_value: 0,
+            nodes_walked: budget.nodes_walked(),
+        })
+    } else {
+        budget.truncation()
+    };
     Ok(tree)
 }
 
@@ -195,10 +251,11 @@ fn checkable_checked(role: AxRole, ax_value: Option<&str>) -> (bool, bool) {
 
 fn map_node(
     n: &Value,
-    scale: f64,
+    frame_scale: Option<f64>,
     depth: usize,
     budget: &mut WalkBudget,
     observe: &mut impl FnMut(&Value),
+    guest: bool,
 ) -> AxNode {
     budget.visit();
     observe(n);
@@ -210,31 +267,36 @@ fn map_node(
             .filter(|v| !v.is_empty())
             .map(str::to_string)
     };
-    let ax_type = s("role").unwrap_or_default();
+    let (role_key, id_key, label_key, value_key) = if guest {
+        ("type", "identifier", "label", "value")
+    } else {
+        ("role", "AXUniqueId", "AXLabel", "AXValue")
+    };
+    let ax_type = s(role_key).unwrap_or_default();
+    let traits = n.get("traits").and_then(Value::as_array);
+    let has_trait = |name: &str| {
+        traits.is_some_and(|traits| traits.iter().any(|value| value.as_str() == Some(name)))
+    };
     // `subrole` is a real key in idb's node schema — present on every node, null where there is
     // none — so this is a plain field read, not an extra round-trip.
-    let role = ax_role_with_subrole(&ax_type, s("subrole").as_deref());
+    let role = if guest {
+        guest_role(&ax_type, has_trait)
+    } else {
+        ax_role_with_subrole(&ax_type, s("subrole").as_deref())
+    };
     let editable = matches!(role, AxRole::TextField | AxRole::TextArea);
-    let secure =
-        s("subrole").as_deref() == Some("AXSecureTextField") || ax_type == "AXSecureTextField";
-    let uid = s("AXUniqueId").and_then(|value| normalize_name(&value));
-    let label = s("AXLabel").and_then(|value| normalize_name(&value));
+    let secure = s("subrole").as_deref() == Some("AXSecureTextField")
+        || ax_type == "AXSecureTextField"
+        || (guest && (ax_type == "SecureTextField" || has_trait("SecureTextField")));
+    let uid = s(id_key).and_then(|value| normalize_name(&value));
+    let label = s(label_key).and_then(|value| normalize_name(&value));
     // Prefer the stable identifier for semantic addressing; fall back to the label.
     let name = uid.clone().or_else(|| label.clone());
-    // Editable → value is `AXValue`; non-editable with a uid → the uid already displaced the
-    // label out of `name`, so the label becomes `value` instead (e.g. a status line's
-    // READY→TAPPED lives in `AXLabel`, never `AXValue`). Editable-with-a-uid is the mirror
-    // case: the label has nowhere to go but `description` (`orphan_label`). One `match`, not
-    // two sequential `if`s, so the compiler sees the label-moving arms are disjoint and skips
-    // a clone.
-    let (value, orphan_label) = match (editable, uid.is_some()) {
-        (true, true) => (
-            n.get("AXValue").and_then(Value::as_str).map(str::to_string),
-            label,
-        ),
-        (true, false) => (
-            n.get("AXValue").and_then(Value::as_str).map(str::to_string),
-            None,
+    // The host reports static value changes in the label when an identifier supplies the name.
+    let (value, orphan_label) = match (guest || editable, uid.is_some()) {
+        (true, has_id) => (
+            n.get(value_key).and_then(Value::as_str).map(str::to_string),
+            label.filter(|_| has_id),
         ),
         (false, true) => (label, None),
         (false, false) => (None, None),
@@ -247,9 +309,10 @@ fn map_node(
         .or_else(|| orphan_label.and_then(|label| normalize_description(&label, name.as_deref())));
     // `checkable`/`checked` from the switch's AXValue (see `checkable_checked`). idb exposes no
     // per-element focus state, so `focused` stays false — a real limitation of this backend.
-    let (checkable, checked) = checkable_checked(role, s("AXValue").as_deref());
+    let (checkable, checked) = checkable_checked(role, s(value_key).as_deref());
     let states = AxStates {
-        enabled: n.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        enabled: n.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+            && !(guest && has_trait("NotEnabled")),
         visible: true,
         focused: false,
         editable,
@@ -258,7 +321,23 @@ fn map_node(
         checked,
         ..AxStates::default()
     };
-    let bounds = n.get("frame").and_then(|f| frame_to_rect(f, scale));
+    // Remote descendants can use document coordinates even when the display reports screen coordinates.
+    let frame_scale = if guest
+        && (matches!(
+            ax_type.as_str(),
+            "WKAccessibilityWebPageObject"
+                | "AXRemoteElement"
+                | "RemoteElement"
+                | "WebView"
+                | "WebAccessibilityObjectWrapper"
+        ) || has_trait("WebContent")
+            || n.get("is_remote").and_then(Value::as_bool) == Some(true))
+    {
+        None
+    } else {
+        frame_scale
+    };
+    let bounds = frame_scale.and_then(|scale| n.get("frame").and_then(|f| frame_to_rect(f, scale)));
     // Recursion is bounded by `budget` (depth, node count, siblings per level), so a
     // pathologically deep or wide accessibility tree cannot blow the stack or the token
     // budget. The child array is resolved before either bound is consulted: a childless
@@ -274,7 +353,7 @@ fn map_node(
                 if !budget.may_visit_sibling(i) {
                     break;
                 }
-                out.push(map_node(c, scale, depth + 1, budget, observe));
+                out.push(map_node(c, frame_scale, depth + 1, budget, observe, guest));
             }
             out
         }
@@ -398,12 +477,66 @@ mod tests {
         assert!(!contains_key(&fixture, "focusable"));
     }
 
-    /// Read on the iOS 26.5 Simulator (2026-08-24, companions 1.5.0b3 and 1.1.8): a WKWebView
-    /// page exposes no element through idb — not the page, not an empty web area, not the view
-    /// itself. `AXWebArea` came from the macOS token table and was never seen here.
     #[test]
-    fn no_token_stands_for_a_web_page_on_this_backend() {
-        assert_eq!(ax_role("AXWebArea"), AxRole::Other);
+    fn guest_reader_preserves_web_document_and_controls() {
+        let json = r#"{
+            "backend": "axbridge-exclusive",
+            "truncated": true,
+            "screen": {"coordinate_space": "screen", "width": 402, "height": 874},
+            "elements": [{"type": "WKAccessibilityWebPageObject", "children": [
+                {"type": "Button", "label": "Disabled semantic", "enabled": null,
+                 "traits": ["Button", "NotEnabled", "WebContent"]},
+                {"type": "WebAccessibilityObjectWrapper", "label": "Account name",
+                 "value": "abc", "traits": ["WebContent", "TextEntry"],
+                 "frame": {"x": 71, "y": 141, "width": 65, "height": 10}},
+                {"type": "Button", "label": "a select", "value": "alpha",
+                 "frame": {"x": 107, "y": 21575, "width": 54, "height": 21}},
+                {"type": "Button", "label": "frame button",
+                 "frame": {"x": 8, "y": 71, "width": 92, "height": 21}}
+            ]},
+            {"type": "TabBar", "label": "Tab Bar",
+             "frame": {"x": 0, "y": 791, "width": 402, "height": 83}},
+            {"type": "Button", "label": "a remote point hit", "traits": ["WebContent"],
+             "frame": {"x": 333, "y": 195, "width": 96, "height": 21}}]
+        }"#;
+        let tree = build_tree(
+            json,
+            3.0,
+            &WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 1206,
+                height: 2622,
+            },
+            WalkLimits::DEFAULT,
+        )
+        .expect("guest document");
+        let web = &tree.root.children[0];
+        assert_eq!(web.role, AxRole::Document);
+        assert_eq!(web.children[0].role, AxRole::Button);
+        assert!(!web.children[0].states.enabled);
+        let field = &web.children[1];
+        assert_eq!(field.role, AxRole::TextField);
+        assert_eq!(field.name.as_deref(), Some("Account name"));
+        assert_eq!(field.value.as_deref(), Some("abc"));
+        assert!(field.bounds.is_none());
+        let select = &web.children[2];
+        assert!(!select.states.editable);
+        assert_eq!(select.value.as_deref(), Some("alpha"));
+        assert!(web.children[3].bounds.is_none(), "iframe coordinates");
+        let tab_bar = &tree.root.children[1];
+        assert_eq!(
+            tab_bar.bounds.expect("screen-relative native bounds").y,
+            2373
+        );
+        assert!(
+            tree.root.children[2].bounds.is_none(),
+            "remote point coordinates"
+        );
+        assert_eq!(
+            tree.truncated.expect("idb truncated").limit,
+            TruncationLimit::Provider
+        );
     }
 
     #[test]
@@ -741,7 +874,7 @@ mod tests {
         for _ in 0..glass_core::MAX_NODES {
             budget.visit();
         }
-        let _ = map_node(&leaf, 1.0, 0, &mut budget, &mut |_| {});
+        let _ = map_node(&leaf, Some(1.0), 0, &mut budget, &mut |_| {}, false);
         assert!(budget.truncation().is_none());
     }
 

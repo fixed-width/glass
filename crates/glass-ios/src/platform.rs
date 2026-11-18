@@ -367,6 +367,15 @@ impl IosPlatform {
     /// The session holds the platform and the accessibility reader as separate boxed trait
     /// objects, so the reader owns its own client rather than borrowing this one.
     pub fn accessibility(&self) -> Result<Option<crate::a11y::IosA11y>> {
+        let mut accessibility = self.session_accessibility()?;
+        if let Some(reader) = accessibility.as_mut() {
+            glass_core::Accessibility::configure_reader(reader, None)?;
+        }
+        Ok(accessibility)
+    }
+
+    /// Connect a reader whose selection is configured when the session starts.
+    pub fn session_accessibility(&self) -> Result<Option<crate::a11y::IosA11y>> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(None);
         };

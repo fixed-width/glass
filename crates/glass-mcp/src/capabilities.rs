@@ -24,6 +24,9 @@ pub(crate) fn render_session_value(
         .map_err(|error| error.to_string())?;
     let mut value = serde_json::json!(report);
     value["scope"] = serde_json::json!("session");
+    if let Some(reader) = glass.accessibility_reader() {
+        value["accessibility_reader"] = serde_json::json!(reader);
+    }
     for (operation, tools) in [
         ("click", vec!["glass_click", "glass_do"]),
         ("scroll", vec!["glass_scroll", "glass_do"]),

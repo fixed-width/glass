@@ -457,6 +457,7 @@ pub enum TruncationLimit {
     Nodes,
     Depth,
     Siblings,
+    Provider,
 }
 
 impl TruncationLimit {
@@ -466,6 +467,7 @@ impl TruncationLimit {
             TruncationLimit::Nodes => "nodes",
             TruncationLimit::Depth => "levels deep",
             TruncationLimit::Siblings => "siblings per level",
+            TruncationLimit::Provider => "provider limit",
         }
     }
 }
@@ -478,6 +480,7 @@ pub struct Truncation {
     /// The actual limit value that fired — the runtime [`WalkLimits`] field in effect, not the
     /// compile-time default — so the notice reports the cap the caller was really subject to
     /// (e.g. a `max_nodes: 42` snapshot reads "truncated at 42 nodes", not "1500").
+    /// Zero when the provider did not identify which limit it reached.
     pub limit_value: usize,
     pub nodes_walked: usize,
 }
@@ -487,6 +490,13 @@ impl Truncation {
     /// missing and names the pixel fallback — the same shape as [`AxTree::empty_guidance`],
     /// because a truncated tree fails the agent the same way a treeless one does.
     pub fn notice(&self) -> String {
+        if self.limit == TruncationLimit::Provider {
+            return format!(
+                "… the accessibility provider truncated the tree ({} nodes walked). Some elements \
+                 are missing. Narrow the UI, or use glass_screenshot and coordinate input.",
+                self.nodes_walked,
+            );
+        }
         format!(
             "… tree truncated at {} {} ({} nodes walked). Some elements are NOT shown and \
              cannot be addressed by id. Narrow the UI, or drive by pixels: glass_screenshot, \
@@ -632,6 +642,7 @@ impl WalkBudget {
             TruncationLimit::Nodes => self.limits.nodes,
             TruncationLimit::Depth => self.limits.depth,
             TruncationLimit::Siblings => self.limits.siblings,
+            TruncationLimit::Provider => 0,
         };
         self.truncated.get_or_insert(Truncation {
             limit,
@@ -1222,6 +1233,21 @@ pub struct AxObservationScope {
 
 /// The OS accessibility seam, stored as a Send trait object by the session.
 pub trait Accessibility {
+    /// Select a reader before launch, or initialize the backend's default.
+    fn configure_reader(&mut self, reader: Option<&str>) -> Result<()> {
+        if let Some(reader) = reader {
+            return Err(GlassError::Unsupported(format!(
+                "accessibility reader {reader:?} is unavailable for this backend"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The configured reader, without querying the target.
+    fn reader(&self) -> Option<&str> {
+        None
+    }
+
     /// Snapshot the active window's accessibility subtree in window-relative coordinates; the
     /// caller assigns node ids with [`AxTree::assign_ids`].
     ///

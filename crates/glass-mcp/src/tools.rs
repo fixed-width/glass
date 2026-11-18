@@ -712,8 +712,21 @@ pub(crate) fn start(glass: &mut Glass, a: &StartArgs) -> BatchToolResult {
         .as_deref()
         .unwrap_or(glass.default_backend())
         .to_owned();
+    let accessibility_reader = a.accessibility_reader.map(|reader| reader.as_str());
+    if accessibility_reader.is_some() && backend != "ios" {
+        return Err(ToolOutput(vec![OutContent::trusted_error(
+            "accessibility_reader requires the ios backend",
+        )]));
+    }
     let geo = glass
-        .start_on_with_inputs(&backend, &spec, &inputs)
+        .start_on_with_options(
+            &backend,
+            &spec,
+            glass_core::session::StartOptions {
+                read_only_inputs: &inputs,
+                accessibility_reader,
+            },
+        )
         .map_err(|error| {
             let diagnostic = match error.cause() {
                 glass_core::GlassError::BuildFailed { stdout, stderr, .. } => {
@@ -745,6 +758,9 @@ pub(crate) fn start(glass: &mut Glass, a: &StartArgs) -> BatchToolResult {
             ToolOutput(output)
         })?;
     let mut result = geometry_value(&geo);
+    if let Some(reader) = glass.accessibility_reader() {
+        result["accessibility_reader"] = json!(reader);
+    }
     if let Some((width, height)) = glass.display_size() {
         result["display"] = json!({"width": width, "height": height});
     }

@@ -940,7 +940,7 @@ impl GlassServer {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Backend support, or scope session: click, scroll and text support with desktop_interference. Session requires a matching backend."
+        description = "Backend support and setup. Session scope reports input support, desktop_interference, and the selected accessibility reader when available."
     )]
     async fn glass_capabilities(
         &self,

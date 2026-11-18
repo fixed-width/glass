@@ -20,10 +20,27 @@ impl Glass {
         spec: &AppSpec,
         inputs: &[std::path::PathBuf],
     ) -> Result<WindowGeometry> {
+        self.start_on_with_options(
+            backend,
+            spec,
+            StartOptions {
+                read_only_inputs: inputs,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Start a session with backend-specific reader selection and read-only host inputs.
+    pub fn start_on_with_options(
+        &mut self,
+        backend: &str,
+        spec: &AppSpec,
+        options: StartOptions<'_>,
+    ) -> Result<WindowGeometry> {
         let t = std::time::Instant::now();
         self.failed_launch = None;
         self.failed_launch_logs = None;
-        let result = self.start_on_inner(backend, spec, inputs);
+        let result = self.start_on_inner(backend, spec, options);
         if result.is_err()
             && self.failed_launch.is_none()
             && self.active.is_none()
@@ -53,7 +70,7 @@ impl Glass {
         &mut self,
         backend: &str,
         spec: &AppSpec,
-        inputs: &[std::path::PathBuf],
+        options: StartOptions<'_>,
     ) -> Result<WindowGeometry> {
         let recording = self.finalize_recording_for_stop(Deadline::from_millis(15_000));
         self.observation_epoch.invalidate();
@@ -77,8 +94,16 @@ impl Glass {
         stopped?;
         let Backend {
             mut platform,
-            accessibility,
+            mut accessibility,
         } = (self.factory)(backend)?;
+        if let Some(accessibility) = accessibility.as_mut() {
+            accessibility.configure_reader(options.accessibility_reader)?;
+        } else if let Some(reader) = options.accessibility_reader {
+            return Err(GlassError::AccessibilityUnavailable(format!(
+                "{backend} has no accessibility connection for reader {reader:?}; check glass_capabilities"
+            )));
+        }
+        let inputs = options.read_only_inputs;
         let protection_mode =
             platform.configure_protected_host_paths(&self.protected_host_paths)?;
         if !inputs.is_empty() && spec.sandbox == SandboxLevel::Off {
