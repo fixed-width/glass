@@ -44,6 +44,8 @@ const _: () = assert!(
 /// straight to signalling. Sending it is a handful of X round trips — sub-millisecond on a
 /// healthy server — so this is a liveness bound, not a budget the ask is expected to use.
 const ASK_BUDGET: Duration = Duration::from_millis(400);
+const DISCOVERY_DIAGNOSTICS_BUDGET: Duration = Duration::from_millis(150);
+const DISCOVERY_CANDIDATE_LIMIT: usize = 4;
 
 const XT_MOTION: u8 = 6; // MotionNotify
 const XT_BTN_PRESS: u8 = 4; // ButtonPress
@@ -281,6 +283,46 @@ fn run_scroll_buttons_by(
 
 type LogSink = Arc<Mutex<Vec<(Stream, String)>>>;
 
+enum WindowRejection {
+    AttributesUnavailable,
+    NotViewable(MapState),
+    NoMatch {
+        pid: Option<u32>,
+        properties: Option<WindowHintProperties>,
+    },
+}
+
+struct WindowHintProperties {
+    title: Option<String>,
+    class: Option<(String, String)>,
+}
+
+#[derive(Default)]
+struct DiscoveryRejections {
+    candidates: Vec<(Window, WindowRejection)>,
+    total: usize,
+}
+
+impl DiscoveryRejections {
+    fn push(&mut self, win: Window, rejection: WindowRejection) {
+        self.total += 1;
+        if self.candidates.len() == DISCOVERY_CANDIDATE_LIMIT {
+            if !matches!(rejection, WindowRejection::NoMatch { .. }) {
+                return;
+            }
+            let Some(hidden) = self
+                .candidates
+                .iter()
+                .rposition(|(_, reason)| !matches!(reason, WindowRejection::NoMatch { .. }))
+            else {
+                return;
+            };
+            self.candidates.remove(hidden);
+        }
+        self.candidates.push((win, rejection));
+    }
+}
+
 /// The Linux/X11 backend. Connects to an X display, launches and locates the
 /// target app's top-level window, and drives it via X requests + XTEST.
 pub struct X11Platform {
@@ -295,6 +337,7 @@ pub struct X11Platform {
     a11y_setup_failed: bool,
     window: Option<Window>,
     discovery_hint: Option<WindowHint>,
+    discovery_diagnostics: Vec<String>,
     read_only_inputs: Vec<std::path::PathBuf>,
     logs: LogSink,
     /// The launched app's stdout/stderr readers, dropped in `kill_child`. The app's write ends
@@ -523,6 +566,7 @@ impl X11Platform {
             a11y_setup_failed: false,
             window: None,
             discovery_hint: None,
+            discovery_diagnostics: Vec::new(),
             read_only_inputs: Vec::new(),
             logs: Arc::new(Mutex::new(Vec::new())),
             taps: Vec::new(),
@@ -694,7 +738,10 @@ impl X11Platform {
             if !seen.insert(win) {
                 continue;
             }
-            if self.window_matches(win, identities, pid_atom, hint)? {
+            if self
+                .window_rejection(win, identities, pid_atom, hint)
+                .is_none()
+            {
                 out.push(win);
             }
         }
@@ -1002,6 +1049,7 @@ impl X11Platform {
         let root_pid = self.child.as_ref().map(LaunchedChild::ownership_root);
         let pid_atom = self.intern(b"_NET_WM_PID")?;
         let client_list_atom = self.intern(b"_NET_CLIENT_LIST")?;
+        let mut rejections = self.xvfb.is_some().then(DiscoveryRejections::default);
 
         loop {
             // Re-collect the pid set each iteration: a sandboxed launch's bwrap
@@ -1014,6 +1062,7 @@ impl X11Platform {
                 pid_atom,
                 client_list_atom,
                 spec.window_hint.as_ref(),
+                rejections.as_mut(),
             )? {
                 self.window = Some(win);
                 return Ok(win);
@@ -1031,6 +1080,12 @@ impl X11Platform {
                 ));
             }
             if Instant::now() >= deadline {
+                if let Some(rejections) = rejections {
+                    self.discovery_diagnostics = self.describe_discovery_timeout(
+                        rejections,
+                        !identities.matching_pids().is_empty(),
+                    );
+                }
                 return Err(GlassError::Timeout(spec.timeout_ms));
             }
             std::thread::sleep(Duration::from_millis(40));
@@ -1043,6 +1098,7 @@ impl X11Platform {
         pid_atom: Atom,
         client_list_atom: Atom,
         hint: Option<&WindowHint>,
+        mut rejections: Option<&mut DiscoveryRejections>,
     ) -> Result<Option<Window>> {
         let root_children = self
             .conn
@@ -1054,6 +1110,10 @@ impl X11Platform {
         // _NET_CLIENT_LIST (the WM's managed, possibly-reparented clients) first,
         // then root's direct children (no-WM / bare Xvfb fallback). Dedup so a
         // non-reparented window present in both is only checked once.
+        if let Some(rejections) = rejections.as_deref_mut() {
+            rejections.candidates.clear();
+            rejections.total = 0;
+        }
         let mut seen = std::collections::HashSet::new();
         for win in self
             .client_list_windows(client_list_atom)
@@ -1063,8 +1123,11 @@ impl X11Platform {
             if !seen.insert(win) {
                 continue;
             }
-            if self.window_matches(win, identities, pid_atom, hint)? {
+            let Some(rejection) = self.window_rejection(win, identities, pid_atom, hint) else {
                 return Ok(Some(win));
+            };
+            if let Some(rejections) = rejections.as_deref_mut() {
+                rejections.push(win, rejection);
             }
         }
         Ok(None)
@@ -1081,43 +1144,162 @@ impl X11Platform {
             .unwrap_or_default()
     }
 
-    fn window_matches(
+    fn window_rejection(
         &self,
         win: Window,
         identities: &ProcessIdentitySet,
         pid_atom: Atom,
         hint: Option<&WindowHint>,
-    ) -> Result<bool> {
-        let mapped = self
+    ) -> Option<WindowRejection> {
+        let Some(attributes) = self
             .conn
             .get_window_attributes(win)
             .ok()
             .and_then(|c| c.reply().ok())
-            .map(|a| a.map_state == MapState::VIEWABLE)
-            .unwrap_or(false);
-        if !mapped {
-            return Ok(false);
+        else {
+            return Some(WindowRejection::AttributesUnavailable);
+        };
+        if attributes.map_state != MapState::VIEWABLE {
+            return Some(WindowRejection::NotViewable(attributes.map_state));
         }
-        if !identities.matching_pids().is_empty()
-            && let Some(reply) = self
-                .conn
+        let pid = if identities.matching_pids().is_empty() {
+            None
+        } else {
+            self.conn
                 .get_property(false, win, pid_atom, AtomEnum::CARDINAL, 0, 1)
                 .ok()
                 .and_then(|c| c.reply().ok())
-            && let Some(win_pid) = reply.value32().and_then(|mut v| v.next())
-            && pid_matches(win_pid, identities)
-        {
-            return Ok(true);
+                .and_then(|reply| reply.value32()?.next())
+        };
+        if pid.is_some_and(|pid| pid_matches(pid, identities)) {
+            return None;
         }
-        if let Some(hint) = hint {
-            let name = self.window_name(win);
-            let class = self.window_class(win);
-            let class_ref = class.as_ref().map(|(i, c)| (i.as_str(), c.as_str()));
-            if hint_matches(name.as_deref(), class_ref, hint) {
-                return Ok(true);
+        let properties = if let Some(hint) = hint {
+            let properties = self.window_hint_properties(win);
+            let class = properties
+                .class
+                .as_ref()
+                .map(|(i, c)| (i.as_str(), c.as_str()));
+            if hint_matches(properties.title.as_deref(), class, hint) {
+                return None;
+            }
+            Some(properties)
+        } else {
+            None
+        };
+        Some(WindowRejection::NoMatch { pid, properties })
+    }
+
+    fn describe_discovery_timeout(
+        &self,
+        rejections: DiscoveryRejections,
+        has_launch_pids: bool,
+    ) -> Vec<String> {
+        if rejections.total == 0 {
+            return vec!["X11 discovery saw no candidate windows in its last scan.".into()];
+        }
+        let mut report = vec![format!(
+            "X11 discovery rejected {} candidates in its last scan (showing up to {}).",
+            rejections.total, DISCOVERY_CANDIDATE_LIMIT
+        )];
+        // Use a separate connection so blocked diagnostic reads cannot hold up launch cleanup.
+        let display = self.display.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::Builder::new().spawn(move || {
+            if let Ok(platform) = Self::connect(Some(&display)) {
+                let details: Vec<_> = rejections
+                    .candidates
+                    .into_iter()
+                    .map(|(win, reason)| platform.describe_rejection(win, reason, has_launch_pids))
+                    .collect();
+                let _ = tx.send(details);
+            }
+        });
+        match reader
+            .ok()
+            .and_then(|_| rx.recv_timeout(DISCOVERY_DIAGNOSTICS_BUDGET).ok())
+        {
+            Some(details) => report.extend(details),
+            None => report.push("X11 candidate details were unavailable before cleanup.".into()),
+        }
+        report
+    }
+
+    fn describe_rejection(
+        &self,
+        win: Window,
+        rejection: WindowRejection,
+        has_launch_pids: bool,
+    ) -> String {
+        let at_scan = match &rejection {
+            WindowRejection::NoMatch { properties, .. } => properties.as_ref(),
+            _ => None,
+        };
+        let after_scan;
+        let (properties, suffix) = match at_scan {
+            Some(properties) => (properties, ""),
+            None => {
+                after_scan = self.window_hint_properties(win);
+                (&after_scan, "_after_scan")
+            }
+        };
+        let title = describe_window_text(properties.title.as_deref());
+        let class = properties.class.as_ref().map(|(instance, class)| {
+            format!(
+                "({}, {})",
+                describe_window_text(Some(instance)),
+                describe_window_text(Some(class)),
+            )
+        });
+        let class = class.as_deref().unwrap_or("unavailable");
+        let geometry = self
+            .conn
+            .get_geometry(win)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        let geometry = geometry.map(|g| format!("{}x{} at ({}, {})", g.width, g.height, g.x, g.y));
+        let geometry = geometry.as_deref().unwrap_or("unavailable");
+        let parent = self
+            .conn
+            .query_tree(win)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        let parent = parent.map(|tree| format!("{:#x}", tree.parent));
+        let parent = parent.as_deref().unwrap_or("unavailable");
+        let mut line = format!(
+            "{win:#x} title{suffix}={title} class{suffix}={class} geometry={geometry} parent={parent}"
+        );
+        match rejection {
+            WindowRejection::AttributesUnavailable => {
+                line.push_str(" map_state=unavailable, window attributes could not be read");
+            }
+            WindowRejection::NotViewable(state) => {
+                line.push_str(&format!(" map_state={state:?}, window was not viewable"));
+            }
+            WindowRejection::NoMatch { pid, properties } => {
+                line.push_str(" map_state=VIEWABLE, ");
+                match pid {
+                    Some(pid) => line.push_str(&format!(
+                        "_NET_WM_PID={pid} did not match the launched process tree"
+                    )),
+                    None if has_launch_pids => line.push_str("no readable _NET_WM_PID"),
+                    None => line.push_str("no launch PIDs to compare"),
+                }
+                line.push_str(if properties.is_some() {
+                    ", window hint did not match (X11 uses exact, case-sensitive matching)"
+                } else {
+                    ", no window hint supplied"
+                });
             }
         }
-        Ok(false)
+        line
+    }
+
+    fn window_hint_properties(&self, win: Window) -> WindowHintProperties {
+        WindowHintProperties {
+            title: self.window_name(win),
+            class: self.window_class(win),
+        }
     }
 
     fn window_name(&self, win: Window) -> Option<String> {
@@ -1684,6 +1866,7 @@ impl Platform for X11Platform {
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         self.a11y_setup_failed = false;
         self.discovery_hint = spec.window_hint.clone();
+        self.discovery_diagnostics.clear();
         ensure_sandbox_available(spec.sandbox, glass_sandbox_linux::availability)?;
         glass_sandbox_linux::run_build(spec)?;
         // Opt-in private, isolated a11y bus (its own XDG_RUNTIME_DIR — never the host
@@ -1739,6 +1922,10 @@ impl Platform for X11Platform {
                 }
             }
         }
+    }
+
+    fn take_window_discovery_diagnostics(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.discovery_diagnostics)
     }
 
     /// Ignores the deadline — the close-then-signal ladder above is asserted against
@@ -2133,6 +2320,18 @@ impl Platform for X11Platform {
     fn a11y_bus_addr(&self) -> Option<String> {
         self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
     }
+}
+
+fn describe_window_text(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "unavailable".into();
+    };
+    let mut chars = value.chars();
+    let mut text: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        text.push('…');
+    }
+    format!("{text:?}")
 }
 
 /// Decide whether a window's fetched `WM_NAME` and `WM_CLASS` satisfy a hint.
@@ -3435,23 +3634,22 @@ mod display_tests {
         let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
         let win = x.window().owned_by(4242).create();
         assert!(
-            plat.window_matches(
+            plat.window_rejection(
                 win,
                 &ProcessIdentitySet::from_pairs([(4242, None)]),
                 pid_atom,
                 None
             )
-            .expect("match")
+            .is_none()
         );
         assert!(
-            !plat
-                .window_matches(
-                    win,
-                    &ProcessIdentitySet::from_pairs([(OTHER_PID, None)]),
-                    pid_atom,
-                    None
-                )
-                .expect("match"),
+            plat.window_rejection(
+                win,
+                &ProcessIdentitySet::from_pairs([(OTHER_PID, None)]),
+                pid_atom,
+                None
+            )
+            .is_some(),
             "another process's window is not the app's"
         );
     }
@@ -3466,14 +3664,13 @@ mod display_tests {
         let pid_atom = plat.intern(b"_NET_WM_PID").expect("intern");
         let hidden = x.window().owned_by(4242).unmapped().create();
         assert!(
-            !plat
-                .window_matches(
-                    hidden,
-                    &ProcessIdentitySet::from_pairs([(4242, None)]),
-                    pid_atom,
-                    None
-                )
-                .expect("match")
+            plat.window_rejection(
+                hidden,
+                &ProcessIdentitySet::from_pairs([(4242, None)]),
+                pid_atom,
+                None
+            )
+            .is_some()
         );
     }
 
@@ -3490,17 +3687,16 @@ mod display_tests {
             class: None,
         };
         assert!(
-            plat.window_matches(win, &ProcessIdentitySet::default(), pid_atom, Some(&hint))
-                .expect("match")
+            plat.window_rejection(win, &ProcessIdentitySet::default(), pid_atom, Some(&hint))
+                .is_none()
         );
         let wrong = WindowHint {
             title: Some("Spreadsheet".into()),
             class: None,
         };
         assert!(
-            !plat
-                .window_matches(win, &ProcessIdentitySet::default(), pid_atom, Some(&wrong))
-                .expect("match")
+            plat.window_rejection(win, &ProcessIdentitySet::default(), pid_atom, Some(&wrong))
+                .is_some()
         );
     }
 
@@ -5249,6 +5445,114 @@ mod display_tests {
 
     #[test]
     #[ignore = "starts a real X server; needs Xvfb"]
+    fn private_discovery_timeout_describes_rejected_windows() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let hidden = x.window().named("Hidden").unmapped().create();
+        for _ in 0..DISCOVERY_CANDIDATE_LIMIT {
+            x.window().unmapped().create();
+        }
+        let viewable = x.window().named("Miff").sized(880, 620).create();
+        let (server, _client) = x.into_server_and_client();
+        platform.xvfb = Some(server);
+
+        let mut spec = AppSpec {
+            build: None,
+            run: vec!["sleep".into(), "30".into()],
+            cwd: None,
+            env: vec![],
+            window_hint: Some(WindowHint {
+                title: Some("miff".into()),
+                class: None,
+            }),
+            timeout_ms: 250,
+            sandbox: SandboxLevel::Off,
+            a11y: false,
+        };
+        assert!(matches!(
+            platform.start_app(&spec),
+            Err(GlassError::Timeout(250))
+        ));
+        let report = platform.take_window_discovery_diagnostics();
+        assert_eq!(report.len(), DISCOVERY_CANDIDATE_LIMIT + 1, "{report:?}");
+        assert!(report[0].contains("rejected 6 candidates"), "{report:?}");
+        let miff = report[1..]
+            .iter()
+            .find(|line| line.starts_with(&format!("{viewable:#x} ")))
+            .expect("viewable window is included");
+        for expected in [
+            "title=\"Miff\"",
+            "class=unavailable",
+            "880x620",
+            "parent=0x",
+            "map_state=VIEWABLE",
+            "no readable _NET_WM_PID",
+            "window hint did not match",
+        ] {
+            assert!(miff.contains(expected), "{miff}");
+        }
+        assert!(
+            report
+                .iter()
+                .any(|line| line.starts_with(&format!("{hidden:#x} "))
+                    && line.contains("window was not viewable")),
+            "{report:?}"
+        );
+
+        spec.window_hint.as_mut().unwrap().title = Some("Miff".into());
+        let geometry = platform.start_app(&spec).expect("exact title matches");
+        assert_eq!((geometry.width, geometry.height), (880, 620));
+        assert!(platform.take_window_discovery_diagnostics().is_empty());
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn discovery_timeout_reports_the_title_and_class_that_were_compared() {
+        let x = TestX::start();
+        let platform = x.platform();
+        let win = x.window().named("Starting").classed("old", "Old").create();
+        let pid_atom = platform.intern(b"_NET_WM_PID").unwrap();
+        let list_atom = platform.intern(b"_NET_CLIENT_LIST").unwrap();
+        let hint = WindowHint {
+            title: Some("Ready".into()),
+            class: Some("New".into()),
+        };
+        let mut rejections = DiscoveryRejections::default();
+        let matched = platform
+            .scan_for_window(
+                &ProcessIdentitySet::default(),
+                pid_atom,
+                list_atom,
+                Some(&hint),
+                Some(&mut rejections),
+            )
+            .unwrap();
+        assert_eq!(matched, None);
+
+        for (property, value) in [
+            (AtomEnum::WM_NAME, &b"Ready"[..]),
+            (AtomEnum::WM_CLASS, &b"new\0New\0"[..]),
+        ] {
+            platform
+                .conn
+                .change_property8(PropMode::REPLACE, win, property, AtomEnum::STRING, value)
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        let report = platform.describe_discovery_timeout(rejections, false);
+        assert!(
+            report[1].contains("title=\"Starting\" class=(\"old\", \"Old\")"),
+            "{report:?}"
+        );
+        assert!(
+            report[1].contains("window hint did not match"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
     fn an_untypable_character_is_reported_at_its_own_index() {
         // The index is all the error may carry — naming the character would put typed
         // content into the unredacted audit log — so it has to advance per character.
@@ -5434,6 +5738,7 @@ mod display_tests {
                 &ProcessIdentitySet::from_pairs([(4242, None)]),
                 pid_atom,
                 list_atom,
+                None,
                 None
             )
             .expect("scan"),
@@ -5444,6 +5749,7 @@ mod display_tests {
                 &ProcessIdentitySet::from_pairs([(OTHER_PID, None)]),
                 pid_atom,
                 list_atom,
+                None,
                 None
             )
             .expect("scan"),

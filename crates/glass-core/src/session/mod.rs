@@ -255,6 +255,8 @@ pub struct FailedLaunch {
     pub window_hint: Option<crate::WindowHint>,
     pub timeout_ms: u64,
     pub exit_code: Option<i32>,
+    #[serde(skip)]
+    pub window_discovery: Vec<String>,
 }
 
 /// Build the ignore mask for a comparison over a `frame_w`×`frame_h` frame,

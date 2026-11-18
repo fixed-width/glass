@@ -23,6 +23,7 @@ pub struct FakePlatform {
     pub geometry: WindowGeometry,
     pub frames: VecDeque<Frame>,
     pub pending_logs: Vec<(Stream, String)>,
+    pub discovery_timeout: Option<Vec<String>>,
     pub pointer_events: Vec<PointerEvent>,
     pub key_events: Vec<KeyEvent>,
     pub input_error: Option<GlassError>,
@@ -166,8 +167,14 @@ impl Platform for FakePlatform {
     }
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry> {
         self.specs.lock().unwrap().push(spec.clone());
+        if self.discovery_timeout.is_some() {
+            return Err(GlassError::Timeout(spec.timeout_ms));
+        }
         self.started = true;
         Ok(self.geometry.clone())
+    }
+    fn take_window_discovery_diagnostics(&mut self) -> Vec<String> {
+        self.discovery_timeout.take().unwrap_or_default()
     }
     fn stop_app_by(&mut self, _deadline: glass_core::Deadline) -> Result<()> {
         self.started = false;
