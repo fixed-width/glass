@@ -5549,6 +5549,10 @@ mod display_tests {
             report[1].contains("window hint did not match"),
             "{report:?}"
         );
+        assert!(
+            report[1].contains("no launch PIDs to compare"),
+            "{report:?}"
+        );
     }
 
     #[test]

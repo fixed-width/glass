@@ -474,6 +474,7 @@ mod tests {
             assert_eq!(diagnostic.cwd, launch.cwd);
             assert_eq!(diagnostic.window_hint, launch.window_hint);
             assert_eq!(diagnostic.timeout_ms, launch.timeout_ms);
+            assert!(diagnostic.window_discovery.is_empty());
             assert!(glass.logs(0, 10, None, None).unwrap().0.is_empty());
         }
     }

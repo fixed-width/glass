@@ -419,7 +419,7 @@ pub trait Platform {
     /// Diagnostic observations from the window scan that timed out.
     /// These may include application-controlled text.
     fn take_window_discovery_diagnostics(&mut self) -> Vec<String> {
-        Vec::new()
+        vec![]
     }
 
     /// Terminate the running app (idempotent), giving up by `deadline`.
