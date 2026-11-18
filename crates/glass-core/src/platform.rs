@@ -416,6 +416,12 @@ pub trait Platform {
     /// return the window's geometry.
     fn start_app(&mut self, spec: &AppSpec) -> Result<WindowGeometry>;
 
+    /// Diagnostic observations from the window scan that timed out.
+    /// These may include application-controlled text.
+    fn take_window_discovery_diagnostics(&mut self) -> Vec<String> {
+        vec![]
+    }
+
     /// Terminate the running app (idempotent), giving up by `deadline`.
     /// Return [`GlassError::AppStopIncomplete`] or [`GlassError::AppStopIncompleteCaused`]
     /// if the application session ended but cleanup remains unconfirmed.

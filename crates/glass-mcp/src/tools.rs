@@ -728,16 +728,19 @@ pub(crate) fn start(glass: &mut Glass, a: &StartArgs) -> BatchToolResult {
                 error,
             ))];
             output.extend(diagnostic);
-            if glass.failed_launch().is_some() {
+            if let Some(launch) = glass.failed_launch() {
+                let mut diagnostic = json!({"failed_launch": launch});
+                if !launch.window_discovery.is_empty() {
+                    diagnostic["window_discovery"] = json!(launch.window_discovery);
+                }
                 let logs = glass.logs(0, 100, None, None).ok().map(|(lines, _)| {
                     lines
                         .into_iter()
                         .map(|line| json!({"stream": line.stream, "text": line.text}))
                         .collect::<Vec<_>>()
                 });
-                output.push(OutContent::untrusted_observation(
-                    &json!({"failed_launch": glass.failed_launch(), "logs": logs}).to_string(),
-                ));
+                diagnostic["logs"] = json!(logs);
+                output.push(OutContent::untrusted_observation(&diagnostic.to_string()));
             }
             ToolOutput(output)
         })?;

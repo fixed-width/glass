@@ -37,6 +37,7 @@ impl Glass {
                 window_hint: spec.window_hint.clone(),
                 timeout_ms: spec.timeout_ms,
                 exit_code: None,
+                window_discovery: Vec::new(),
             });
             self.failed_launch_logs = Some(LogBuffer::new(self.log_capacity.min(200)));
         }
@@ -89,6 +90,7 @@ impl Glass {
         let geometry = match platform.start_app(spec) {
             Ok(geometry) => geometry,
             Err(error) => {
+                let window_discovery = platform.take_window_discovery_diagnostics();
                 let _ = platform.stop_app();
                 let mut logs = LogBuffer::new(self.log_capacity.min(200));
                 for (stream, text) in platform.drain_logs() {
@@ -112,6 +114,7 @@ impl Glass {
                     window_hint: spec.window_hint.clone(),
                     timeout_ms: spec.timeout_ms,
                     exit_code,
+                    window_discovery,
                 });
                 self.failed_launch_logs = Some(logs);
                 return Err(error);
@@ -471,6 +474,7 @@ mod tests {
             assert_eq!(diagnostic.cwd, launch.cwd);
             assert_eq!(diagnostic.window_hint, launch.window_hint);
             assert_eq!(diagnostic.timeout_ms, launch.timeout_ms);
+            assert!(diagnostic.window_discovery.is_empty());
             assert!(glass.logs(0, 10, None, None).unwrap().0.is_empty());
         }
     }

@@ -270,6 +270,23 @@ pub(crate) fn diff_with(
 }
 
 pub fn logs(glass: &mut Glass, a: &LogsArgs) -> ToolResult {
+    if a.window_discovery == Some(true) {
+        if a.wait.is_some()
+            || a.cursor.is_some()
+            || a.max_lines.is_some()
+            || a.stream.is_some()
+            || a.contains.is_some()
+        {
+            return Err("request window_discovery on its own".into());
+        }
+        let launch = glass.failed_launch().ok_or("no failed launch to inspect")?;
+        let report = json!({ "window_discovery": launch.window_discovery });
+        return Ok(ToolOutput::result_with(
+            "glass_logs",
+            json!({ "failed_launch": launch }),
+            vec![OutContent::untrusted_observation(&report.to_string())],
+        ));
+    }
     if let Some(wait) = &a.wait {
         if a.max_lines.is_some() {
             return Err("max_lines is unavailable when waiting for a log match".into());
@@ -1054,6 +1071,7 @@ mod tests {
         let out = logs(
             &mut g,
             &LogsArgs {
+                window_discovery: None,
                 wait: None,
                 cursor: None,
                 max_lines: None,
@@ -1083,9 +1101,79 @@ mod tests {
     }
 
     #[test]
+    fn failed_launch_discovery_report_is_independent_of_log_pagination() {
+        use crate::output::{TargetAccess, ToolEffect};
+        use crate::output_policy::{OutputPolicy, ToolCallOutcome};
+
+        let long_line = "\\".repeat(3800);
+        let report = "candidate title did not match ".repeat(40);
+        let platform = FakePlatform {
+            discovery_timeout: Some(vec![report.clone()]),
+            ..FakePlatform::new(10, 10).with_logs(vec![
+                (Stream::Stdout, &long_line),
+                (Stream::Stderr, "last line"),
+            ])
+        };
+        let mut glass = glass_with(platform);
+        assert!(
+            start_tool(
+                &mut glass,
+                &serde_json::from_value(json!({"run": ["app"]})).unwrap()
+            )
+            .is_err()
+        );
+
+        let page = logs(
+            &mut glass,
+            &serde_json::from_value(json!({"max_lines": 1})).unwrap(),
+        )
+        .unwrap();
+        let page = OutputPolicy::unavailable()
+            .apply(ToolCallOutcome {
+                tool: "glass_logs",
+                effect: ToolEffect::ReadOnly,
+                is_error: false,
+                target_access: TargetAccess::NoActiveTarget,
+                output: page,
+            })
+            .output;
+        let cursor = assert_envelope(&page, "glass_logs")["cursor"].clone();
+        let OutContent::Text(line) = &page.0[1] else {
+            panic!("expected the paged line");
+        };
+        assert!(line.as_str().contains(&"\\".repeat(7600)));
+        assert!(!line.as_str().contains("window_discovery"));
+
+        let diagnostics = logs(
+            &mut glass,
+            &serde_json::from_value(json!({"window_discovery": true})).unwrap(),
+        )
+        .unwrap();
+        let result = assert_envelope(&diagnostics, "glass_logs");
+        assert_eq!(result["failed_launch"]["phase"], "window_discovery");
+        assert!(result.get("window_discovery").is_none());
+        let OutContent::Text(observation) = &diagnostics.0[1] else {
+            panic!("expected the report");
+        };
+        assert!(observation.as_str().starts_with(crate::untrusted::NOTE));
+        assert!(observation.as_str().contains(&report));
+        assert!(!observation.as_str().contains("\"lines\""));
+
+        let next = logs(
+            &mut glass,
+            &serde_json::from_value(json!({"cursor": cursor, "max_lines": 1})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&next.0[1], OutContent::Text(text) if text.as_str().contains("last line"))
+        );
+    }
+
+    #[test]
     fn logs_rejects_bad_stream() {
         let mut g = started_with(FakePlatform::new(10, 10));
         let a = LogsArgs {
+            window_discovery: None,
             wait: None,
             cursor: None,
             max_lines: None,

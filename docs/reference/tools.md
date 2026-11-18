@@ -254,9 +254,10 @@ Build, launch, and locate a native GUI app; returns its window geometry.
   the server default (`GLASS_BACKEND`, else `windows` on Windows, `macos` on macOS, else `x11`).
 - `sandbox` (string) — `"default"`, `"strict"`, or `"off"`. Omit for the server default
   (`GLASS_SANDBOX`, else `default`). See [explanation/containment.md](../explanation/containment.md).
-- `window_hint` (`{ title?, class? }`) — disambiguate which window is the app's when several appear,
-  or find a window the launched process hands off to an unrelated process (some packaged Windows
-  apps). `title` is a case-insensitive substring; `class` is an exact match.
+- `window_hint` (`{ title?, class? }`) — help X11 or Windows locate an app window by title or class,
+  including windows handed off to another process. X11 matches `title` exactly and case-sensitively
+  against `WM_NAME` and matches `class` exactly against either part of `WM_CLASS`. Windows matches a
+  case-insensitive title substring or an exact class.
 - `a11y` (boolean, default true) — **Linux only.** Spawn a private AT-SPI bus so the accessibility
   tools work against this app. On by default (the accessibility path is the cheap, low-token way to
   drive a UI); pass `false` to skip the bus for canvas/pixel-only apps, since it spawns extra
@@ -269,6 +270,9 @@ launch read-only roots and explicit inputs. Host HOME and `/tmp` are hidden exce
 If a chooser reports an existing host file as missing, relaunch with that path in `read_only_inputs`.
 Failed launches retain bounded stdout/stderr for `glass_logs`, together with the launch phase,
 command, working directory, window hint, timeout and exit code when available.
+When discovery times out on a private Xvfb, `glass_start` reports a bounded sample of rejected
+candidates and why they were rejected. Retrieve the same report with
+`glass_logs {"window_discovery": true}`.
 Linux keeps `AT_SPI_BUS_ADDRESS` pinned to the managed accessibility bus through nested D-Bus
 wrappers. A wrapper that replaces that variable routes the app elsewhere. A standard nested
 session bus can also activate installed desktop services; portal startup may require its own
@@ -1257,6 +1261,10 @@ drain the buffered pages and save the final cursor before performing the action.
 - `stream` (string) — `"stdout"`, `"stderr"`, or `"both"` (default).
 - `cursor` (integer) — resume from this cursor.
 - `max_lines` (integer, `u32`) — cap the number of lines returned.
+- `window_discovery` (boolean, default false) — return only the last failed launch's window
+  discovery report. Supply on its own. The result carries `failed_launch` metadata, with
+  `window_discovery` in an untrusted sibling block. The report is empty when the backend has no
+  candidate diagnostics.
 - `wait` (object) — wait for a non-empty `contains` substring. Optional `timeout_ms` defaults to
   10000 and `interval_ms` to 100. An empty object uses both defaults. While waiting, omitted `cursor`
   watches future lines only; `cursor:0` includes retained history. `max_lines` is rejected in wait

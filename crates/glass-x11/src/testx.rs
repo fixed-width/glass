@@ -63,6 +63,10 @@ impl TestX {
         X11Platform::connect(Some(self.display())).expect("the backend should connect")
     }
 
+    pub(crate) fn into_server_and_client(self) -> (Xvfb, RustConnection) {
+        (self.xvfb, self.conn)
+    }
+
     pub(crate) fn intern(&self, name: &[u8]) -> Atom {
         self.conn
             .intern_atom(false, name)

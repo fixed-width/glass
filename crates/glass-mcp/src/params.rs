@@ -129,9 +129,9 @@ pub enum ScreenshotAnnotations {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct WindowHintArgs {
-    /// Case-insensitive title substring; can locate a window handed off to an unrelated process.
+    /// X11: exact, case-sensitive WM_NAME. Windows: case-insensitive title substring.
     pub title: Option<String>,
-    /// Exact window-class match.
+    /// Exact class match on X11 and Windows. X11 also matches the WM_CLASS instance.
     pub class: Option<String>,
 }
 
@@ -169,7 +169,7 @@ pub struct StartArgs {
     /// Extra {KEY: VALUE} environment for build and app. Android applies it only to the host build, not the app.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    /// Select a window by title/class, including process handoffs. Omit for the first window owned by the process or a followable descendant.
+    /// X11 and Windows: find a window by title/class, including process handoffs.
     pub window_hint: Option<WindowHintArgs>,
     /// Window-publication timeout in ms (default 10000); does not bound build.
     pub timeout_ms: Option<u64>,
@@ -583,6 +583,8 @@ pub struct DiffArgs {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct LogsArgs {
+    /// Return only the last failed launch's window discovery report. Supply on its own.
+    pub window_discovery: Option<bool>,
     /// Wait for non-empty contains; omit cursor for future lines, use 0 for retained history. max_lines is unavailable while waiting.
     pub wait: Option<LogWaitArgs>,
     /// Resume from a prior returned cursor; omit for oldest buffered line.
