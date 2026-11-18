@@ -870,6 +870,78 @@ mod tests {
     }
 
     #[test]
+    fn start_reports_the_accessibility_reader_configured_for_the_session() {
+        #[derive(Default)]
+        struct SelectableReader(Option<String>);
+
+        impl Accessibility for SelectableReader {
+            fn configure_reader(&mut self, reader: Option<&str>) -> Result<()> {
+                self.0 = Some(reader.unwrap_or("standard").to_owned());
+                Ok(())
+            }
+
+            fn reader(&self) -> Option<&str> {
+                self.0.as_deref()
+            }
+
+            fn snapshot(&mut self, _ctx: &crate::AxContext) -> Result<crate::AxTree> {
+                Ok(fake_tree())
+            }
+        }
+
+        let factory: PlatformFactory = Box::new(|_| {
+            Ok(Backend {
+                platform: Box::new(FakePlatform::new(10, 10)),
+                accessibility: Some(Box::new(SelectableReader::default())),
+            })
+        });
+        let mut glass = glass_with_factory(factory);
+        assert_eq!(glass.accessibility_reader(), None);
+        glass
+            .start_on_with_options(
+                "test",
+                &spec(),
+                StartOptions {
+                    accessibility_reader: Some("detailed"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(glass.accessibility_reader(), Some("detailed"));
+
+        glass.start_on("test", &spec()).unwrap();
+        assert_eq!(glass.accessibility_reader(), Some("standard"));
+        glass.stop().unwrap();
+        assert_eq!(glass.accessibility_reader(), None);
+    }
+
+    #[test]
+    fn backend_without_reader_selection_refuses_an_explicit_accessibility_reader() {
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let mut glass = glass_with_a11y(
+            FakePlatform::new(10, 10).with_lifecycle_log(lifecycle.clone()),
+            fake_tree(),
+        );
+        let outcome = glass.start_on_with_options(
+            "test",
+            &spec(),
+            StartOptions {
+                accessibility_reader: Some("unsupported"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(outcome, Err(GlassError::Unsupported(message)) if message.contains("unsupported"))
+        );
+        assert!(lifecycle.lock().unwrap().is_empty());
+        assert_eq!(glass.active_backend(), None);
+
+        let mut default = glass_with_a11y(FakePlatform::new(10, 10), fake_tree());
+        default.start(&spec()).unwrap();
+        assert_eq!(default.accessibility_reader(), None);
+    }
+
+    #[test]
     fn backend_switch_reports_failed_cleanup_before_constructing_the_replacement() {
         let constructed = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&constructed);
