@@ -992,9 +992,14 @@ The server retains one volatile baseline, bounded to 1 MiB of outline and owned 
 provider, process, limits, coordinate interpretation or disclosure changes require full output.
 Keep `max_nodes` consistent across observations and semantic actions to preserve limit continuity;
 an action's default limits can otherwise force a fresh full response.
-Selecting even the same window breaks continuity. Unknown or ambiguous scope returns
-`cacheable: false`. macOS currently attests selected-window scope plus root-selection uniqueness
-and scale during the fresh AX read. Other backends return `context_unproven` without retention.
+Selecting even the same window breaks continuity. macOS attests the selected window, AX
+root-selection uniqueness, and scale during the fresh read. On an owned Xvfb display, X11 can
+attest the selected native window and the application-wide AT-SPI tree. Qualification requires
+a viewable window and exactly one application root registered by the launched process tree on the
+private bus, supplied by the process that owns the window. The reader checks the provider's
+top-level window bounds used to normalize the outline. Attached X11 displays, unverified X11
+providers and coordinate scopes, and all remaining backends return `context_unproven` with
+`cacheable: false`.
 Scope is an observed episode, with the ordinary snapshot's root guarantees; tokens do not identify
 a native object's lifetime. IDs remain immediate references from the latest read.
 

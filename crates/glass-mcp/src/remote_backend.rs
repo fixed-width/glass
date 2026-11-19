@@ -606,6 +606,7 @@ impl<C: Connection + 'static> Accessibility for RemoteAccessibility<C> {
             .map(|coordinate_basis| AxObservationScope {
                 provider: "macos-ax-v1",
                 coordinate_basis,
+                root_identity: None,
             })
     }
     fn state_coverage(&self) -> AxStateCoverage {

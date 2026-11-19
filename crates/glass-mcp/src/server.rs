@@ -2475,6 +2475,7 @@ mod tests {
                 Some(glass_core::AxObservationScope {
                     provider: "fake",
                     coordinate_basis: 1,
+                    root_identity: None,
                 })
             }
         }

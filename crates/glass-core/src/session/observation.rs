@@ -39,6 +39,10 @@ impl Default for ObservationEpoch {
 }
 
 impl ObservationEpoch {
+    pub(super) fn has_context(&self) -> bool {
+        self.0.read().is_ok_and(|state| state.context.is_some())
+    }
+
     pub fn generation(&self) -> ObservationGeneration {
         self.0
             .read()
@@ -105,6 +109,7 @@ pub struct ObservationContext {
     pub generation: ObservationGeneration,
     pub backend: String,
     pub window: WindowId,
+    pub window_instance: u64,
     pub pids: Vec<u32>,
     pub geometry: WindowGeometry,
     pub limits: WalkLimits,
@@ -126,13 +131,9 @@ impl Glass {
     pub fn a11y_observation(&mut self, max_nodes: Option<usize>) -> Result<AxObservation> {
         self.set_a11y_limits(max_nodes)?;
         let mut context = None;
-        let tree = self.snapshot_worker(Deadline::UNBOUNDED, false, Some(&mut context))?;
-        if tree.subject.is_some() {
-            context = None;
-        }
-        if context.is_none() {
-            self.observation_epoch.invalidate();
-        }
+        let tree = self
+            .snapshot_worker(Deadline::UNBOUNDED, false, Some(&mut context))
+            .inspect_err(|_| self.observation_epoch.invalidate())?;
         Ok(AxObservation { tree, context })
     }
 }
@@ -300,6 +301,23 @@ mod tests {
         assert_eq!(
             glass.active.as_ref().unwrap().last_ax.as_ref(),
             Some(&second.tree)
+        );
+    }
+
+    #[test]
+    fn failed_read_invalidates_the_episode_in_a_live_session() {
+        let mut glass = glass_with_a11y(platform().with_geometry_error_at(3), fake_tree());
+        glass.start(&spec()).unwrap();
+        let first = glass.a11y_observation(None).unwrap().context.unwrap();
+        assert!(glass.a11y_observation(None).is_err());
+        assert_ne!(
+            glass
+                .a11y_observation(None)
+                .unwrap()
+                .context
+                .unwrap()
+                .generation,
+            first.generation
         );
     }
 

@@ -274,6 +274,18 @@ pub enum WindowOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WindowId(pub u64);
 
+/// Native window facts the display backend can compare across an accessibility read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AxObservationWindow {
+    pub id: WindowId,
+    /// Backend discriminator for window replacement within a session.
+    pub instance: u64,
+    /// Verified native owner, when the reader must correlate its provider to that process.
+    pub owner_pid: Option<u32>,
+    /// Geometry sampled by the observation probe, when available.
+    pub geometry: Option<WindowGeometry>,
+}
+
 /// A top-level window belonging to the launched app.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowInfo {
@@ -582,6 +594,16 @@ pub trait Platform {
     /// Selected window attested for fresh reads within an observation episode.
     fn observation_window_id(&self) -> Option<WindowId> {
         None
+    }
+
+    /// Obtain the backend's available window evidence within the observation deadline.
+    fn observation_window_by(&mut self, _deadline: crate::Deadline) -> Option<AxObservationWindow> {
+        self.observation_window_id().map(|id| AxObservationWindow {
+            id,
+            instance: 0,
+            owner_pid: None,
+            geometry: None,
+        })
     }
 
     /// Whether another native window intercepts this active-window-relative point.

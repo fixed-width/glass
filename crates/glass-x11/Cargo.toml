@@ -25,7 +25,7 @@ glass-sandbox-linux.workspace = true
 glass-proc-linux.workspace = true
 glass-pipe-unix.workspace = true
 glass-dbus-linux.workspace = true
-x11rb.workspace = true
+x11rb = { workspace = true, features = ["res"] }
 rustix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

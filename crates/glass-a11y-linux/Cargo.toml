@@ -14,6 +14,7 @@ atspi.workspace = true
 atspi-common.workspace = true
 zbus.workspace = true
 tokio.workspace = true
+sha2 = "0.11"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 glass-proc-linux.workspace = true

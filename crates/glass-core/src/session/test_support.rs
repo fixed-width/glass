@@ -882,6 +882,7 @@ impl Accessibility for FakeAccessibility {
         Some(crate::AxObservationScope {
             provider: "fake",
             coordinate_basis: 1,
+            root_identity: None,
         })
     }
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
@@ -1252,6 +1253,7 @@ impl Accessibility for SeqAccessibility {
         Some(crate::AxObservationScope {
             provider: "fake",
             coordinate_basis: 1,
+            root_identity: None,
         })
     }
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {

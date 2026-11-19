@@ -194,14 +194,22 @@ impl Glass {
         }
         s.geometry = window.clone();
         let ctx = s.accessibility_context(window, deadline)?;
-        let selected = s.platform.observation_window_id();
+        let selected = if scope.is_some() || epoch.has_context() {
+            s.platform.observation_window_by(deadline)
+        } else {
+            None
+        };
         let mut pids = ctx.pids.clone();
         pids.sort_unstable();
         pids.dedup();
         let generation = epoch.generation();
         let acc = s.accessibility.as_mut().ok_or(GlassError::AxUnsupported)?;
-        let mut tree = match acc.snapshot(&ctx) {
-            Ok(tree) => tree,
+        let snapshot = match selected.as_ref() {
+            Some(window) => acc.snapshot_for_observation(&ctx, window),
+            None => acc.snapshot(&ctx).map(|tree| (tree, None)),
+        };
+        let (mut tree, reader_scope) = match snapshot {
+            Ok(snapshot) => snapshot,
             Err(error @ GlassError::AccessibilityNotReady(_)) => {
                 s.pump();
                 s.platform.accessibility_health()?;
@@ -209,7 +217,6 @@ impl Glass {
             }
             Err(error) => return Err(error),
         };
-        let reader_scope = acc.observation_scope();
         tree.assign_ids();
         if deadline.has_passed() {
             return Err(GlassError::caller_deadline_elapsed(
@@ -224,51 +231,48 @@ impl Glass {
             ));
         }
         s.last_ax = Some(cached);
-        if let Some(result) = scope {
+        let context = (|| {
             let (Some(window), Some(reader_scope)) = (selected, reader_scope) else {
-                return Ok(tree);
+                return None;
             };
-            let Ok(mut after_pids) = s.platform.app_pids_by(deadline) else {
-                return Ok(tree);
-            };
-            after_pids.sort_unstable();
-            after_pids.dedup();
-            let Ok(after_window) = s.platform.window_by(&WindowOp::Geometry, deadline) else {
-                return Ok(tree);
-            };
-            if Some(window) == s.platform.observation_window_id()
-                && !pids.is_empty()
-                && pids == after_pids
-                && ctx.window == after_window
-                && ctx.a11y_bus_addr == s.platform.a11y_bus_addr()
-                && epoch.generation() == generation
-            {
-                let mut context = ObservationContext {
-                    generation,
-                    backend: s.backend.clone(),
-                    window,
-                    pids,
-                    geometry: ctx.window,
-                    limits: ctx.limits,
-                    a11y_bus_addr: ctx.a11y_bus_addr,
-                    reader_scope,
-                };
-                context.generation = epoch.bind(context.clone());
-                *result = Some(context);
+            if pids.is_empty() || tree.subject.is_some() {
+                return None;
             }
-        } else if let (Some(window), Some(reader_scope)) = (selected, reader_scope)
-            && !pids.is_empty()
-        {
-            epoch.bind(ObservationContext {
+            if scope.is_some() || window.geometry.is_some() {
+                let mut after_pids = s.platform.app_pids_by(deadline).ok()?;
+                after_pids.sort_unstable();
+                after_pids.dedup();
+                let after = s.platform.observation_window_by(deadline)?;
+                let after_geometry = match after.geometry.as_ref() {
+                    Some(geometry) => geometry.clone(),
+                    None => s.platform.window_by(&WindowOp::Geometry, deadline).ok()?,
+                };
+                if window != after
+                    || pids != after_pids
+                    || ctx.window != after_geometry
+                    || ctx.a11y_bus_addr != s.platform.a11y_bus_addr()
+                    || epoch.generation() != generation
+                {
+                    return None;
+                }
+            }
+            Some(ObservationContext {
                 generation,
                 backend: s.backend.clone(),
-                window,
+                window: window.id,
+                window_instance: window.instance,
                 pids,
                 geometry: ctx.window,
                 limits: ctx.limits,
                 a11y_bus_addr: ctx.a11y_bus_addr,
                 reader_scope,
-            });
+            })
+        })();
+        if let Some(mut context) = context {
+            context.generation = epoch.bind(context.clone());
+            if let Some(result) = scope {
+                *result = Some(context);
+            }
         } else {
             epoch.invalidate();
         }

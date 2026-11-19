@@ -1229,6 +1229,8 @@ pub enum ChangeWait {
 pub struct AxObservationScope {
     pub provider: &'static str,
     pub coordinate_basis: u64,
+    /// Fingerprint of the observed root and any dynamic coordinate basis it supplies.
+    pub root_identity: Option<[u8; 32]>,
 }
 
 /// The OS accessibility seam, stored as a Send trait object by the session.
@@ -1258,6 +1260,16 @@ pub trait Accessibility {
     /// Use [`crate::GlassError::AccessibilityNotReady`] only when the app has not published a usable
     /// tree before the deadline.
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree>;
+
+    /// Take one snapshot and collect scope for the supplied native window, when supported.
+    fn snapshot_for_observation(
+        &mut self,
+        ctx: &AxContext,
+        _window: &crate::AxObservationWindow,
+    ) -> Result<(AxTree, Option<AxObservationScope>)> {
+        let tree = self.snapshot(ctx)?;
+        Ok((tree, self.observation_scope()))
+    }
 
     /// Return scope only for an unambiguous successful snapshot; clear it on failed reads.
     fn observation_scope(&self) -> Option<AxObservationScope> {
