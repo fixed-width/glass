@@ -41,6 +41,7 @@ service CompanionService {
   rpc accessibility_info(AccessibilityInfoRequest)
       returns (AccessibilityInfoResponse) {}
   rpc focus(FocusRequest) returns (FocusResponse) {}
+  rpc get_orientation(GetOrientationRequest) returns (GetOrientationResponse) {}
   rpc hid(stream HIDEvent) returns (HIDResponse) {}
   rpc open_url(OpenUrlRequest) returns (OpenUrlRequest) {}
   rpc set_location(SetLocationRequest) returns (SetLocationResponse) {}
@@ -245,6 +246,21 @@ message ScreenshotResponse {
 message FocusRequest {}
 
 message FocusResponse {}
+
+// Read-only Simulator orientation RPC from idb v1.7.8.
+message GetOrientationRequest {}
+message GetOrientationResponse {
+  enum Orientation {
+    UNKNOWN = 0;
+    PORTRAIT = 1;
+    PORTRAIT_UPSIDE_DOWN = 2;
+    LANDSCAPE_LEFT = 3;
+    LANDSCAPE_RIGHT = 4;
+    FACE_UP = 5;
+    FACE_DOWN = 6;
+  }
+  Orientation orientation = 1;
+}
 
 message Point {
   double x = 1;

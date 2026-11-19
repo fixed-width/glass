@@ -74,6 +74,7 @@ impl IosA11yClient for IdbClient {
 /// Simulator, over idb's `accessibility_info` and HID RPCs.
 pub struct IosA11y {
     client: Box<dyn IosA11yClient>,
+    device: Option<String>,
     /// The target's scale, fetched on first need and kept: a property of the device, so it
     /// does not change between snapshots.
     scale: Option<f64>,
@@ -160,8 +161,14 @@ impl IosA11y {
     pub(crate) fn new(client: IdbClient) -> Self {
         IosA11y {
             client: Box::new(client),
+            device: None,
             scale: None,
         }
+    }
+
+    pub(crate) fn with_device(mut self, device: &str) -> Self {
+        self.device = Some(device.to_owned());
+        self
     }
 
     /// The target's point→pixel scale, from the device rather than from the tree.
@@ -206,13 +213,36 @@ fn describe_at_scale(
     scale: f64,
     phase: SemanticPhase,
 ) -> Result<AxTree> {
+    read_at_scale(client, ctx, scale, phase, None).map(|(tree, _)| tree)
+}
+
+fn read_at_scale(
+    client: &dyn IosA11yClient,
+    ctx: &AxContext,
+    scale: f64,
+    phase: SemanticPhase,
+    owner: Option<u32>,
+) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
     phase.require(ctx.deadline)?;
     let (json, phase) =
         phase.finish_snapshot_rpc(ctx.deadline, client.describe_all_rpc_by(ctx.deadline))?;
     let tree = phase.run(ctx.deadline, || {
-        let mut tree = axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?;
+        let (mut tree, scope) = match owner {
+            Some(pid) => axmap::build_tree_with_scope(
+                &json,
+                scale,
+                &ctx.window,
+                ctx.limits,
+                pid,
+                client.uses_guest_reader(),
+            )?,
+            None => (
+                axmap::build_tree(&json, scale, &ctx.window, ctx.limits)?,
+                None,
+            ),
+        };
         tree.assign_ids();
-        Ok(tree)
+        Ok((tree, scope))
     })?;
     phase.require(ctx.deadline)?;
     Ok(tree)
@@ -511,6 +541,25 @@ impl Accessibility for IosA11y {
             .0)
     }
 
+    fn snapshot_for_observation(
+        &mut self,
+        ctx: &AxContext,
+        window: &glass_core::AxObservationWindow,
+    ) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
+        let phase = SemanticPhase::Snapshot { dispatched: false };
+        let (scale, phase) = self.scale(ctx.deadline, phase)?;
+        let owner = window.subject.as_ref().and_then(|subject| {
+            if self.device.as_deref() != Some(subject.device.as_str())
+                || window.geometry.as_ref() != Some(&ctx.window)
+                || subject.coordinate_basis != scale.to_bits()
+            {
+                return None;
+            }
+            window.owner_pid.filter(|pid| ctx.pids.contains(pid))
+        });
+        read_at_scale(self.client.as_ref(), ctx, scale, phase, owner)
+    }
+
     fn set_value(&mut self, ctx: &AxContext, target: &AxTarget, text: &str) -> Result<()> {
         let before_dispatch = SemanticPhase::SetValue { dispatched: false };
         before_dispatch.require(ctx.deadline)?;
@@ -803,6 +852,7 @@ mod tests {
         };
         let mut reader = IosA11y {
             client: Box::new(client),
+            device: None,
             scale: None,
         };
         assert_eq!(
@@ -849,6 +899,7 @@ mod tests {
         };
         let mut reader = IosA11y {
             client: Box::new(client),
+            device: None,
             scale: Some(2.0),
         };
         let error = reader
@@ -875,6 +926,7 @@ mod tests {
             };
             let mut reader = IosA11y {
                 client: Box::new(client),
+                device: None,
                 scale: Some(2.0),
             };
             let error = reader
@@ -916,6 +968,7 @@ mod tests {
             };
             let mut reader = IosA11y {
                 client: Box::new(client),
+                device: None,
                 scale: Some(2.0),
             };
             let error = reader
@@ -981,6 +1034,7 @@ mod tests {
     ) -> IosA11y {
         IosA11y {
             client: Box::new(ScriptedClient::new(scale, tree)),
+            device: None,
             scale: cached_scale,
         }
     }
@@ -1133,6 +1187,7 @@ mod tests {
         };
         let a11y = IosA11y {
             client: Box::new(client),
+            device: None,
             scale: Some(1.0),
         };
         let mut backend = Some(glass_core::Backend {

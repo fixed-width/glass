@@ -168,6 +168,15 @@ fn accessibility_request(
     }
 }
 
+pub(crate) fn guest_reader_name(backend: &str) -> Option<&'static str> {
+    match backend {
+        "axbridge-exclusive" => Some("axbridge-exclusive"),
+        "axbridge-persistent" => Some("axbridge-persistent"),
+        "axbridge-oneshot" => Some("axbridge-oneshot"),
+        _ => None,
+    }
+}
+
 fn verify_guest_reader(json: &str) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Provenance<'a> {
@@ -175,12 +184,10 @@ fn verify_guest_reader(json: &str) -> Result<()> {
     }
 
     let backend = serde_json::from_str::<Provenance<'_>>(json).ok();
-    if backend.is_some_and(|reply| {
-        matches!(
-            reply.backend,
-            "axbridge-exclusive" | "axbridge-persistent" | "axbridge-oneshot"
-        )
-    }) {
+    if backend
+        .and_then(|reply| guest_reader_name(reply.backend))
+        .is_some()
+    {
         return Ok(());
     }
     Err(GlassError::AccessibilityUnavailable(format!(
@@ -621,6 +628,43 @@ impl IdbClient {
 
     pub fn describe_by(&self, deadline: Deadline) -> Result<proto::ScreenDimensions> {
         self.describe_rpc_by(deadline).into_result()
+    }
+
+    /// Live display evidence for a portrait observation on this companion's bound Simulator.
+    pub(crate) fn observation_display_by(
+        &self,
+        deadline: Deadline,
+    ) -> Option<proto::TargetDescription> {
+        use proto::get_orientation_response::Orientation;
+
+        if deadline.has_passed() {
+            return None;
+        }
+        self.ensure_off_runtime("idb observation display").ok()?;
+        let end = tokio::time::Instant::from_std(deadline.instant()?);
+        let mut client = self.client.clone();
+        self.rt.block_on(async {
+            tokio::time::timeout_at(end, async {
+                let target = client
+                    .describe(proto::TargetDescriptionRequest {
+                        fetch_diagnostics: false,
+                    })
+                    .await
+                    .ok()?
+                    .into_inner()
+                    .target_description?;
+                let orientation = client
+                    .get_orientation(proto::GetOrientationRequest {})
+                    .await
+                    .ok()?
+                    .into_inner()
+                    .orientation;
+                (orientation == Orientation::Portrait as i32).then_some(target)
+            })
+            .await
+            .ok()
+            .flatten()
+        })
     }
 
     pub(crate) fn describe_rpc_by(

@@ -1008,6 +1008,14 @@ explicit package, a different foreground app, or a window whose live frame diffe
 session geometry yields an uncached full snapshot.
 Bounded Android accessibility reads skip the optional window probe and end revision continuity.
 
+iOS qualifies host `ax` and `axbridge` reads for apps whose installed manifest limits them to one
+scene. The reported application PID must match the live launched process, and the application
+frame must match the Simulator's backing scale and screen. The companion must report the expected
+Simulator and portrait device orientation around the fresh read. Multi-scene apps, unverifiable
+manifests, unknown orientation, older companions without the orientation query, and unverified
+roots yield uncached full snapshots. Bounded iOS accessibility reads skip the optional probe and
+end revision continuity.
+
 Attached X11 displays, Xwayland, unverified subjects or coordinate scopes, and the remaining
 backends return `context_unproven` with `cacheable: false`.
 Scope is an observed episode, with the ordinary snapshot's root guarantees; tokens do not identify
