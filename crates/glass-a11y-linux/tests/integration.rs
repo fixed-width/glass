@@ -1541,6 +1541,11 @@ fn wayland_a11y_finds_widgets(level: glass_core::SandboxLevel) {
         outline.contains("Button \"Save\""),
         "no Save button (wayland {level:?}):\n{outline}"
     );
+    let observation = glass.a11y_observation(None).expect("Wayland observation");
+    assert!(
+        observation.context.is_some(),
+        "the native Wayland window and AT-SPI root should qualify under {level:?}"
+    );
     glass.stop().expect("stop");
 }
 
