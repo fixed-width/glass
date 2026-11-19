@@ -14,6 +14,19 @@ const MSG_RUN_COMMAND: u32 = 0;
 const MSG_GET_OUTPUTS: u32 = 3;
 const MSG_GET_TREE: u32 = 4;
 
+fn reply_read_count(result: std::io::Result<usize>) -> std::io::Result<usize> {
+    use std::io::ErrorKind;
+
+    match result {
+        Ok(0) => Err(ErrorKind::UnexpectedEof.into()),
+        Ok(count) => Ok(count),
+        Err(error) => match error.kind() {
+            ErrorKind::Interrupted => Ok(0),
+            _ => Err(error),
+        },
+    }
+}
+
 /// One node from `get_tree` we care about (recursive).
 #[derive(Debug, Deserialize)]
 pub struct Node {
@@ -286,20 +299,11 @@ impl Ipc {
         deadline: Deadline,
         operation: &str,
     ) -> Result<()> {
-        use std::io::ErrorKind;
-
         // read_exact can spend the socket timeout again after every partial read.
         while !remaining.is_empty() {
             let received = self.io_by(
                 deadline,
-                |sock| match sock.read(remaining) {
-                    Ok(0) => Err(ErrorKind::UnexpectedEof.into()),
-                    Ok(count) => Ok(count),
-                    Err(error) => match error.kind() {
-                        ErrorKind::Interrupted => Ok(0),
-                        _ => Err(error),
-                    },
-                },
+                |sock| reply_read_count(sock.read(remaining)),
                 "read",
                 operation,
             )?;
@@ -671,6 +675,21 @@ mod tests {
                 "reply took {elapsed:?}"
             );
         }
+    }
+
+    #[test]
+    fn interrupted_reply_reads_retry_and_eof_fails() {
+        use std::io::ErrorKind;
+
+        assert_eq!(
+            reply_read_count(Err(ErrorKind::Interrupted.into())).unwrap(),
+            0
+        );
+        assert_eq!(reply_read_count(Ok(3)).unwrap(), 3);
+        assert_eq!(
+            reply_read_count(Ok(0)).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
     }
 
     /// After a failed read the stream is no longer at a message boundary: the reply glass gave up
