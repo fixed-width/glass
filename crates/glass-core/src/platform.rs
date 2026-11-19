@@ -284,6 +284,8 @@ pub struct AxObservationWindow {
     pub owner_pid: Option<u32>,
     /// Geometry sampled by the observation probe, when available.
     pub geometry: Option<WindowGeometry>,
+    /// Native outer frame when the reader may include borders outside the capture frame.
+    pub outer_geometry: Option<WindowGeometry>,
     /// Subject evidence for readers that observe the active app on a device.
     pub subject: Option<AxObservationSubject>,
 }
@@ -612,6 +614,7 @@ pub trait Platform {
             instance: 0,
             owner_pid: None,
             geometry: None,
+            outer_geometry: None,
             subject: None,
         })
     }

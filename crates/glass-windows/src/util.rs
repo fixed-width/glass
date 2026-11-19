@@ -86,6 +86,10 @@ fn get_class(h: HWND) -> String {
 }
 
 pub fn is_cloaked(h: HWND) -> bool {
+    cloaked(h).unwrap_or(false)
+}
+
+pub(crate) fn cloaked(h: HWND) -> Option<bool> {
     let mut v = 0u32;
     // SAFETY: DwmGetWindowAttribute writes exactly size_of::<u32>() bytes into our stack
     // `v` (the buffer and the size we pass match); HWND is only queried.
@@ -97,7 +101,7 @@ pub fn is_cloaked(h: HWND) -> bool {
             std::mem::size_of::<u32>() as u32,
         )
     };
-    ok.is_ok() && v != 0
+    ok.ok().map(|()| v != 0)
 }
 
 /// The visually-correct outer frame (excludes the invisible resize border) — the

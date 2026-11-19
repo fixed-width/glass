@@ -21,6 +21,9 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Experimental accessibility snapshot revisions support verified UI Automation reads of selected
+  Windows app windows.
+
 - Experimental accessibility snapshot revisions support verified reads of single-scene apps on
   the iOS Simulator through the host AX reader and axbridge when the companion reports portrait
   orientation.

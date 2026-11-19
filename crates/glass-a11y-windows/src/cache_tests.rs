@@ -217,6 +217,42 @@ fn snapshot_cache_is_element_scoped() {
 }
 
 #[test]
+fn observation_root_requires_a_matching_frame_even_when_the_bounds_overlap() {
+    let visible = WindowGeometry {
+        x: -500,
+        y: 125,
+        width: 440,
+        height: 450,
+    };
+    let outer = WindowGeometry {
+        x: -507,
+        y: 125,
+        width: 454,
+        height: 457,
+    };
+    assert!(root_matches_frame(
+        Rect::new(-507, 125, -53, 582),
+        &visible,
+        &outer,
+    ));
+    assert!(root_matches_frame(
+        Rect::new(-500, 125, -60, 575),
+        &visible,
+        &outer,
+    ));
+    assert!(!root_matches_frame(
+        Rect::new(-499, 125, -59, 575),
+        &visible,
+        &outer,
+    ));
+    assert!(!root_matches_frame(
+        Rect::new(-507, 125, -54, 582),
+        &visible,
+        &outer,
+    ));
+}
+
+#[test]
 #[ignore = "needs an interactive Windows desktop and WinForms"]
 fn cached_winforms_snapshot_matches_live_provider_reads() {
     let (_fixture, ctx) = Fixture::start(true);

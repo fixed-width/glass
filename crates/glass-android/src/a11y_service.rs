@@ -4052,6 +4052,7 @@ mod tests {
             instance: 1,
             owner_pid: Some(42),
             geometry: Some(geometry),
+            outer_geometry: None,
             subject: Some(glass_core::AxObservationSubject {
                 device: "emulator-fixture".into(),
                 application: "com.fixture".into(),

@@ -993,10 +993,19 @@ provider, process, limits, coordinate interpretation or disclosure changes requi
 Keep `max_nodes` consistent across observations and semantic actions to preserve limit continuity;
 an action's default limits can otherwise force a fresh full response.
 Selecting even the same window breaks continuity. macOS attests the selected window, AX
-root-selection uniqueness, and scale during the fresh read. Linux qualifies the application-wide
-AT-SPI tree when the launched process tree registers exactly one application root on the private
-bus and its provider owns the selected window. The reader checks the provider's top-level window
-bounds used to normalize the outline.
+root-selection uniqueness, and scale during the fresh read. Windows qualifies UI Automation reads
+when the root identifies the adopted HWND and its live owner in the launched process set. Glass
+checks the monitor and DPI around the fresh read and requires the UI Automation root bounds to
+match the visible DWM frame or the native outer frame, which can include invisible resize borders.
+Root and provider evidence has a separate time budget. Minimized, cloaked, fully off-display, and
+externally owned windows yield uncached full snapshots whenever the ordinary snapshot succeeds.
+Bounded Windows accessibility reads skip the optional scope check and end revision continuity.
+The separate-desktop worker returns uncached full snapshots because its transport does not supply
+this scope evidence.
+
+Linux qualifies the application-wide AT-SPI tree when the launched process tree registers
+exactly one application root on the private bus and its provider owns the selected window.
+The reader checks the provider's top-level window bounds used to normalize the outline.
 
 X11 qualifies viewable windows on owned Xvfb displays. Wayland qualifies visible native
 `xdg_shell` windows that intersect the session's single headless output at the origin with
@@ -1016,8 +1025,8 @@ manifests, unknown orientation, older companions without the orientation query, 
 roots yield uncached full snapshots. Bounded iOS accessibility reads skip the optional probe and
 end revision continuity.
 
-Attached X11 displays, Xwayland, unverified subjects or coordinate scopes, and the remaining
-backends return `context_unproven` with `cacheable: false`.
+Attached X11 displays, Xwayland, and unverified subjects or coordinate scopes return
+`context_unproven` with `cacheable: false`.
 Scope is an observed episode, with the ordinary snapshot's root guarantees; tokens do not identify
 a native object's lifetime. IDs remain immediate references from the latest read.
 

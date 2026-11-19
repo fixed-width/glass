@@ -251,6 +251,64 @@ impl A11yThread {
         )
     }
 
+    /// Complete the snapshot under its normal limit, then allow a short optional probe
+    /// on the same worker so it can reuse thread-affine native references.
+    pub fn snapshot_with_probe<T, P, F>(
+        &self,
+        deadline: Deadline,
+        probe_budget: Duration,
+        job: impl FnOnce() -> Result<(T, Option<F>)> + Send + 'static,
+    ) -> Result<(T, Option<P>)>
+    where
+        T: Send + 'static,
+        P: Send + 'static,
+        F: FnOnce(Deadline) -> Option<P>,
+    {
+        if deadline.has_passed() {
+            return Err(GlassError::deadline_not_started(
+                "native accessibility snapshot",
+            ));
+        }
+        let (ends, ended_by) = self.bounded_wait(deadline);
+        let (tree_tx, tree_rx) = mpsc::channel();
+        let (probe_tx, probe_rx) = mpsc::channel();
+        self.spawn_worker(move || {
+            let (tree, probe) = match job() {
+                Ok(tree) => tree,
+                Err(error) => {
+                    let _ = tree_tx.send(Err(error));
+                    return;
+                }
+            };
+            let probe_deadline = probe
+                .as_ref()
+                .map(|_| Deadline::at(deadline.resolve(Instant::now() + probe_budget).0));
+            if tree_tx.send(Ok((tree, probe_deadline))).is_ok()
+                && let (Some(probe), Some(probe_deadline)) = (probe, probe_deadline)
+                && !probe_deadline.has_passed()
+            {
+                let _ = probe_tx.send(Ok(probe(probe_deadline)));
+            }
+        })?;
+        let (tree, probe_deadline) = receive_by(
+            tree_rx,
+            ends,
+            || self.never_answered(ended_by),
+            || self.worker_panicked(Op::Snapshot),
+        )?;
+        let evidence = probe_deadline.and_then(Deadline::instant).and_then(|end| {
+            receive_by(
+                probe_rx,
+                end,
+                || self.timed_out(Op::Snapshot),
+                || self.worker_panicked(Op::Snapshot),
+            )
+            .ok()
+            .flatten()
+        });
+        Ok((tree, evidence))
+    }
+
     /// Write under the nearer caller/ceiling deadline. The detached write may still land after the
     /// caller stops waiting, so a caller timeout remains post-dispatch and fallback-ineligible.
     pub fn set_value(
@@ -492,16 +550,21 @@ impl A11yThread {
         on_disconnect: impl FnOnce() -> GlassError,
     ) -> Result<T> {
         let (tx, rx) = mpsc::channel();
+        self.spawn_worker(move || {
+            let _ = tx.send(job());
+        })?;
+        receive_by(rx, ends, on_timeout, on_disconnect)
+    }
+
+    fn spawn_worker(&self, job: impl FnOnce() + Send + 'static) -> Result<()> {
         // Named and fallible, unlike a bare `spawn`: a timed-out worker outlives its wait holding
         // the backend's connection, so several can be alive at once, and the OS refusing one is an
         // error this call can report rather than a panic in the caller.
         std::thread::Builder::new()
             .name(format!("glass-a11y-{}", self.backend))
-            .spawn(move || {
-                let _ = tx.send(job());
-            })
-            .map_err(|error| self.worker_spawn_failed(error))?;
-        receive_by(rx, ends, on_timeout, on_disconnect)
+            .spawn(job)
+            .map(|_| ())
+            .map_err(|error| self.worker_spawn_failed(error))
     }
 }
 
@@ -678,6 +741,35 @@ mod tests {
     #[test]
     fn an_answer_within_the_bound_is_returned() {
         assert_eq!(reader().snapshot(Deadline::UNBOUNDED, || Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_stalled_optional_probe_cannot_lose_the_completed_snapshot() {
+        let (release, wait) = mpsc::channel::<()>();
+        let (tree, evidence) = reader()
+            .snapshot_with_probe(Deadline::UNBOUNDED, IMPATIENT, move || {
+                Ok((
+                    7,
+                    Some(move |_| {
+                        let _ = wait.recv_timeout(Duration::from_secs(2));
+                        Some(9)
+                    }),
+                ))
+            })
+            .unwrap();
+        assert_eq!((tree, evidence), (7, None));
+        drop(release);
+    }
+
+    #[test]
+    fn an_optional_probe_can_read_thread_affine_snapshot_evidence() {
+        let (tree, evidence) = reader()
+            .snapshot_with_probe(Deadline::UNBOUNDED, Duration::from_secs(2), || {
+                let identity = std::rc::Rc::new(3);
+                Ok((7, Some(move |_| Some(*identity))))
+            })
+            .unwrap();
+        assert_eq!((tree, evidence), (7, Some(3)));
     }
 
     #[test]

@@ -450,6 +450,7 @@ mod tests {
             instance: 1,
             owner_pid: Some(1234),
             geometry: Some(geometry.clone()),
+            outer_geometry: None,
             subject: Some(glass_core::AxObservationSubject {
                 device: "emulator-fixture".into(),
                 application: "com.fixture".into(),

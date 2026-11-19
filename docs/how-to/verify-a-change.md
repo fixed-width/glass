@@ -162,6 +162,14 @@ Set `GLASS_EGUI_FIXTURE` to override the fixture executable on Windows as well. 
 if needed, then run the test executable through the scheduled-task bridge described below so
 input and capture have access to the interactive session.
 
+From an interactive Windows session, verify the snapshot revision protocol against the native
+UI Automation fixture:
+
+```powershell
+cargo build --locked -p glass-mcp
+python tools/interaction-bench/windows_snapshot_revisions.py target/debug/glass-mcp.exe
+```
+
 The X11 and Wayland **backend crates** also keep their display-backed unit tests behind
 `#[ignore]`, and no harness script runs those — if you changed `glass-x11` or `glass-wayland`,
 the command above covers the end-to-end suite but not them:

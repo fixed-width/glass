@@ -180,6 +180,8 @@ mod process;
 #[cfg(windows)]
 mod util;
 #[cfg(windows)]
+mod window_observation;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]
@@ -196,11 +198,12 @@ mod backend {
         AppSpec, HostPathProtectionMode, KeyEvent, Platform, PointerEvent, ProtectedHostPath,
         WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
     };
-    use glass_core::{GlassError, Result};
+    use glass_core::{AxObservationWindow, Deadline, GlassError, Result};
 
     use crate::containment::{Launched, LogSink};
     use crate::display::{DisplayProvider, ExistingDesktop};
     use crate::run_windows_call_by;
+    use crate::window_observation::WindowObservation;
     use crate::windows::{
         ExternalWindow, app_window_infos, find_app_window, focus_window, geometry_of, move_window,
         resize_window,
@@ -222,6 +225,7 @@ mod backend {
         /// [`crate::util::raw_to_hwnd`] at the point of use. `None` until window
         /// discovery or `select_window` sets it.
         active_hwnd: Option<isize>,
+        observation: Option<WindowObservation>,
         external_window: Option<ExternalWindow>,
         protected_host_paths: Vec<ProtectedHostPath>,
         private_host_paths: Vec<ProtectedHostPath>,
@@ -237,6 +241,7 @@ mod backend {
                 app: None,
                 logs: Arc::new(Mutex::new(Vec::new())),
                 active_hwnd: None,
+                observation: None,
                 external_window: None,
                 protected_host_paths: Vec::new(),
                 private_host_paths: Vec::new(),
@@ -320,6 +325,11 @@ mod backend {
                             Some(ExternalWindow::new(&w))
                         };
                         self.active_hwnd = Some(w.raw);
+                        self.observation = if self.external_window.is_none() {
+                            WindowObservation::adopt(w.raw, w.pid)
+                        } else {
+                            None
+                        };
                         return Ok(crate::windows::rect_to_geometry(r));
                     }
                 }
@@ -495,6 +505,7 @@ mod backend {
                         let _ = app.kill();
                     }
                     self.active_hwnd = None;
+                    self.observation = None;
                     self.external_window = None;
                     Err(e)
                 }
@@ -507,6 +518,7 @@ mod backend {
                 crate::process::disclose_teardown(app.kill());
             }
             self.active_hwnd = None;
+            self.observation = None;
             if let Some(window) = self.external_window.take() {
                 window.verify_stopped()?;
             }
@@ -650,8 +662,9 @@ mod backend {
                 dispatch.mark();
                 // Validate against the current app-window set (stronger than a bare IsWindow,
                 // and matches x11): only switch to a window the app actually owns right now.
-                if app_window_infos(&pids).iter().any(|w| w.raw == raw) {
+                if let Some(window) = app_window_infos(&pids).into_iter().find(|w| w.raw == raw) {
                     self.active_hwnd = Some(raw);
+                    self.observation = WindowObservation::adopt(raw, window.pid);
                     geometry_of(crate::util::raw_to_hwnd(raw))
                 } else {
                     Err(GlassError::WindowNotFound)
@@ -690,6 +703,18 @@ mod backend {
         /// to the exact window glass drives — same handle `send_pointer`/`window` use.
         fn active_window_handle(&self) -> Option<i64> {
             self.active_hwnd.map(|h| h as i64)
+        }
+
+        fn observation_window_by(&mut self, deadline: Deadline) -> Option<AxObservationWindow> {
+            if deadline.instant().is_some() {
+                return None;
+            }
+            let observation = self.observation.as_mut()?;
+            if !observation.owner_matches() {
+                self.observation = None;
+                return None;
+            }
+            observation.sample()
         }
     }
 
