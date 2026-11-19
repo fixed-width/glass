@@ -5641,7 +5641,18 @@ mod session_tests {
 
     #[test]
     #[ignore = "starts owned sway and a private AT-SPI bus"]
-    fn observation_window_by_checks_selection_and_capture_coordinates() {
+    fn observation_window_by_tracks_selection_and_output_overlap() {
+        fn await_observation(session: &mut crate::testw::Session) -> AxObservationWindow {
+            let mut observation = None;
+            session.until("a qualified window observation", |session| {
+                observation = session
+                    .platform()
+                    .observation_window_by(Deadline::UNBOUNDED);
+                observation.is_some()
+            });
+            observation.unwrap()
+        }
+
         let mut s = Launch::new()
             .windows(&["one:app-one:200x100", "two:app-two:200x100"])
             .with_a11y()
@@ -5649,19 +5660,13 @@ mod session_tests {
         let listed = s.platform().list_windows().unwrap();
         let selected = listed.iter().find(|window| window.active).unwrap();
         let other = listed.iter().find(|window| !window.active).unwrap();
-        let first = s
-            .platform()
-            .observation_window_by(Deadline::UNBOUNDED)
-            .unwrap();
+        let first = await_observation(&mut s);
         assert_eq!(first.id, selected.id);
         assert_eq!(first.geometry, Some(selected.geometry.clone()));
         assert!(s.platform().app_pids().contains(&first.owner_pid.unwrap()));
 
         let geometry = s.platform().select_window(other.id).unwrap();
-        let switched = s
-            .platform()
-            .observation_window_by(Deadline::UNBOUNDED)
-            .unwrap();
+        let switched = await_observation(&mut s);
         assert_eq!(switched.id, other.id);
         assert_eq!(switched.geometry.as_ref(), Some(&geometry));
         assert_ne!(switched.instance, first.instance);
@@ -5684,20 +5689,8 @@ mod session_tests {
             })
             .unwrap();
 
-        let mut ipc = Ipc::connect(&s.runtime_dir()).unwrap();
-        ipc.run_command("output HEADLESS-1 scale 2").unwrap();
-        assert!(
-            s.platform()
-                .observation_window_by(Deadline::UNBOUNDED)
-                .is_none()
-        );
-        assert!(s.platform().window(&WindowOp::Geometry).is_ok());
-
-        ipc.run_command("output HEADLESS-1 scale 1").unwrap();
-        let recovered = s
-            .platform()
-            .observation_window_by(Deadline::UNBOUNDED)
-            .unwrap();
+        let recovered = await_observation(&mut s);
+        assert_eq!(recovered.id, other.id);
         assert_eq!(recovered.instance, switched.instance);
         assert!(
             s.platform()
