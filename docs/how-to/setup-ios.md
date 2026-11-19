@@ -136,7 +136,9 @@ The first guest read verifies that the companion served it through `axbridge`. U
 to find the page's `Document` and look up controls with `glass_find_elements`. If the page is
 still loading, wait for a known control with `glass_wait_for_element` or its `glass_do` action. For WebView
 actions, use a fresh screenshot to choose tap coordinates, then verify the result with another
-read. Glass omits WebKit bounds when idb cannot establish their screen position. Use
+read. Glass refuses element clicks on guest nodes without verified bounds. idb's marker press
+looks up the first match in the foreground app, so it cannot guarantee an app-bound, unique target
+at dispatch. Native controls with verified bounds can still use the automatic pointer path. Use
 `glass_wait_for_element` with `value` to verify a reported control value.
 Pass `accessibility_reader: "ax"` to choose the host reader. Omit the field to use the server
 default, which is `ax` unless `GLASS_IOS_ACCESSIBILITY_BACKEND` sets a different default.

@@ -585,8 +585,14 @@ impl Accessibility for IosA11y {
         Err(last.unwrap_or_else(|| GlassError::value_not_applied(target.id.0, text, None)))
     }
 
-    fn invoke(&mut self, ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
-        SemanticPhase::Invoke.run(ctx.deadline, || Err(GlassError::AxUnsupported))
+    fn invoke(&mut self, ctx: &AxContext, target: &AxTarget) -> Result<Option<AxNodeId>> {
+        SemanticPhase::Invoke.run(ctx.deadline, || {
+            // idb resolves marker presses against the frontmost app and takes the first match.
+            if self.client.uses_guest_reader() && target.bounds.is_none() {
+                return Err(GlassError::AxElementNotClickable(target.id.0).before_dispatch());
+            }
+            Err(GlassError::AxUnsupported)
+        })
     }
 
     fn focus(&mut self, _ctx: &AxContext, _target: &AxTarget) -> Result<Option<AxNodeId>> {
@@ -1610,6 +1616,51 @@ mod tests {
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched)
         );
+    }
+
+    #[test]
+    fn guest_invoke_refuses_an_element_without_verified_bounds_before_dispatch() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+        a11y.configure_reader(Some("axbridge")).unwrap();
+        let target = AxTarget {
+            role: glass_core::AxRole::Button,
+            name: Some("Remove".into()),
+            bounds: None,
+            ..matching_target()
+        };
+
+        let error = a11y
+            .invoke(&ctx(Deadline::UNBOUNDED), &target)
+            .expect_err("a boundless guest target cannot be pressed safely");
+        assert!(
+            matches!(error.cause(), GlassError::AxElementNotClickable(id) if *id == target.id.0)
+        );
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        assert!(!error.invoke_fallback_eligible());
+    }
+
+    #[test]
+    fn guest_invoke_leaves_native_controls_with_bounds_eligible_for_pointer_fallback() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+        a11y.configure_reader(Some("axbridge")).unwrap();
+        let target = AxTarget {
+            role: glass_core::AxRole::Button,
+            bounds: Some(AxRect {
+                x: 10,
+                y: 10,
+                width: 40,
+                height: 20,
+            }),
+            ..matching_target()
+        };
+
+        let error = a11y
+            .invoke(&ctx(Deadline::UNBOUNDED), &target)
+            .expect_err("the guest reader has no native press");
+        assert!(error.invoke_fallback_eligible());
     }
 
     #[test]

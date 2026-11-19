@@ -923,6 +923,27 @@ fn web_fixture_button_and_field_respond() {
                 "iframe contents"
             );
         }
+
+        for name in ["Save account", "Duplicate semantic"] {
+            let button = find_named(&initial.root, name).expect("web button");
+            let target = AxTarget {
+                id: button.id,
+                role: button.role,
+                name: button.name.clone(),
+                bounds: button.bounds,
+                value: button.value.clone(),
+            };
+            let error = a11y
+                .invoke(&ctx, &target)
+                .expect_err("a WebView button without verified bounds must not be pressed");
+            assert_eq!(
+                error.bound_dispatch(),
+                Some(glass_core::BoundDispatch::NotDispatched)
+            );
+        }
+        let after = a11y.snapshot(&ctx).expect("snapshot after refused presses");
+        assert!(carries(&after, "Not saved").is_some());
+        assert!(carries(&after, "No semantic action activated").is_some());
         return;
     }
     println!(
