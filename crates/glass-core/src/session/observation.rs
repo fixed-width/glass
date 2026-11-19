@@ -39,6 +39,10 @@ impl Default for ObservationEpoch {
 }
 
 impl ObservationEpoch {
+    pub(super) fn has_context(&self) -> bool {
+        self.0.read().is_ok_and(|state| state.context.is_some())
+    }
+
     pub fn generation(&self) -> ObservationGeneration {
         self.0
             .read()
@@ -105,6 +109,7 @@ pub struct ObservationContext {
     pub generation: ObservationGeneration,
     pub backend: String,
     pub window: WindowId,
+    pub window_instance: u64,
     pub pids: Vec<u32>,
     pub geometry: WindowGeometry,
     pub limits: WalkLimits,
@@ -126,13 +131,9 @@ impl Glass {
     pub fn a11y_observation(&mut self, max_nodes: Option<usize>) -> Result<AxObservation> {
         self.set_a11y_limits(max_nodes)?;
         let mut context = None;
-        let tree = self.snapshot_worker(Deadline::UNBOUNDED, false, Some(&mut context))?;
-        if tree.subject.is_some() {
-            context = None;
-        }
-        if context.is_none() {
-            self.observation_epoch.invalidate();
-        }
+        let tree = self
+            .snapshot_worker(Deadline::UNBOUNDED, false, Some(&mut context))
+            .inspect_err(|_| self.observation_epoch.invalidate())?;
         Ok(AxObservation { tree, context })
     }
 }
@@ -215,6 +216,8 @@ mod tests {
     fn ordinary_snapshot_preserves_a_known_observation_episode() {
         let mut glass = glass_with_a11y(platform(), fake_tree());
         glass.start(&spec()).unwrap();
+        glass.a11y_snapshot(None).unwrap();
+        assert!(!glass.observation_epoch().has_context());
         let first = glass.a11y_observation(None).unwrap().context.unwrap();
         glass.a11y_snapshot(None).unwrap();
         assert_eq!(glass.observation_epoch().generation(), first.generation);
@@ -304,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_read_invalidates_the_episode_in_a_live_session() {
+        let mut glass = glass_with_a11y(platform().with_geometry_error_at(3), fake_tree());
+        glass.start(&spec()).unwrap();
+        let first = glass.a11y_observation(None).unwrap().context.unwrap();
+        assert!(glass.a11y_observation(None).is_err());
+        assert_ne!(
+            glass
+                .a11y_observation(None)
+                .unwrap()
+                .context
+                .unwrap()
+                .generation,
+            first.generation
+        );
+    }
+
+    #[test]
     fn unqualified_backend_skips_unnecessary_post_read_probes() {
         let mut glass = glass_with_a11y(
             FakePlatform::new(100, 100).with_geometry_error_at(2),
@@ -331,6 +351,53 @@ mod tests {
         let mut glass = glass_with_a11y(platform, fake_tree());
         glass.start(&spec()).unwrap();
         assert!(glass.a11y_observation(None).unwrap().context.is_none());
+    }
+
+    #[test]
+    fn changing_process_set_during_read_cannot_attest_scope() {
+        let platform = platform().with_observed_pids([vec![4242], vec![4242, 4243]]);
+        let mut glass = glass_with_a11y(platform, fake_tree());
+        glass.start(&spec()).unwrap();
+        let observation = glass.a11y_observation(None).unwrap();
+        assert!(observation.context.is_none());
+        assert_eq!(
+            observation.tree.find(AxNodeId(1)).unwrap().name.as_deref(),
+            Some("Save")
+        );
+    }
+
+    #[test]
+    fn invalidation_during_read_cannot_attest_scope() {
+        struct InvalidatingReader {
+            epoch: ObservationEpoch,
+            inner: FakeAccessibility,
+        }
+
+        impl Accessibility for InvalidatingReader {
+            fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
+                self.epoch.invalidate();
+                self.inner.snapshot(ctx)
+            }
+
+            fn observation_scope(&self) -> Option<crate::AxObservationScope> {
+                self.inner.observation_scope()
+            }
+        }
+
+        let epoch = ObservationEpoch::default();
+        let reader = InvalidatingReader {
+            epoch: epoch.clone(),
+            inner: FakeAccessibility::new(fake_tree()),
+        };
+        let mut glass = glass_with_backend(platform(), Box::new(reader));
+        glass.observation_epoch = epoch;
+        glass.start(&spec()).unwrap();
+        let observation = glass.a11y_observation(None).unwrap();
+        assert!(observation.context.is_none());
+        assert_eq!(
+            observation.tree.find(AxNodeId(1)).unwrap().name.as_deref(),
+            Some("Save")
+        );
     }
 
     #[test]

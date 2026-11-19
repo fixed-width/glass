@@ -1379,6 +1379,7 @@ dependencies = [
  "glass-proc-linux",
  "glass-wayland",
  "glass-x11",
+ "sha2",
  "tempfile",
  "tokio",
  "zbus",

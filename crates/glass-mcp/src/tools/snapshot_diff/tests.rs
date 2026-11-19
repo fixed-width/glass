@@ -18,6 +18,7 @@ fn observation(epoch: &ObservationEpoch) -> AxObservation {
             generation: epoch.generation(),
             backend: "fake".into(),
             window: WindowId(1),
+            window_instance: 0,
             pids: vec![42],
             geometry: WindowGeometry {
                 width: 100,
@@ -29,6 +30,7 @@ fn observation(epoch: &ObservationEpoch) -> AxObservation {
             reader_scope: glass_core::AxObservationScope {
                 provider: "fake",
                 coordinate_basis: 1,
+                root_identity: None,
             },
         }),
     }
@@ -272,16 +274,19 @@ fn subject_strings_stay_untrusted_and_scope_is_not_retained() {
 #[test]
 fn context_changes_force_full_even_for_equal_sized_overlapping_windows() {
     let store = SnapshotRevisionStore::new(ObservationEpoch::default());
-    for field in 0..5 {
+    for field in 0..7 {
         let revision = establish(&store, &"same\n".repeat(100));
         let pending = store.reserve(&args(Some(&revision))).unwrap();
         let mut current = observation(&store.epoch);
+        let context = current.context.as_mut().unwrap();
         match field {
-            0 => current.context.as_mut().unwrap().window = WindowId(2),
-            1 => current.context.as_mut().unwrap().pids = vec![43],
-            2 => current.context.as_mut().unwrap().backend = "other".into(),
-            3 => current.context.as_mut().unwrap().limits.nodes = 42,
-            _ => current.context.as_mut().unwrap().geometry.x = 1,
+            0 => context.window = WindowId(2),
+            1 => context.pids = vec![43],
+            2 => context.backend = "other".into(),
+            3 => context.limits.nodes = 42,
+            4 => context.geometry.x = 1,
+            5 => context.window_instance = 1,
+            _ => context.reader_scope.root_identity = Some([1; 32]),
         }
         let (result, _) = packet(
             &pending

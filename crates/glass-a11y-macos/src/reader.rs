@@ -141,6 +141,7 @@ impl Accessibility for MacosA11y {
                     unambiguous.then_some(glass_core::AxObservationScope {
                         provider: "macos-ax-v1",
                         coordinate_basis: scale.to_bits(),
+                        root_identity: None,
                     }),
                 ))
             })

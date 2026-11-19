@@ -21,6 +21,9 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Experimental accessibility snapshot revisions now support X11 on an owned Xvfb display when
+  Glass can verify the selected window and its application-wide AT-SPI provider.
+
 - Launch an iOS Simulator session with `accessibility_reader: "axbridge"` in `glass_start` to read
   WKWebView contents. `glass_capabilities` shows agents the option and reports the session reader.
 

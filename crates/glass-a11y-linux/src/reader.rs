@@ -3,24 +3,27 @@
 //! the caller's tokio runtime; finds the launched app by PID, and walks its subtree into an
 //! `AxTree`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atspi::connection::AccessibilityConnection;
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::component::ComponentProxy;
 use atspi_common::{CoordType, ObjectRefOwned};
 use glass_core::{
-    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
-    AxTree, Deadline, GlassError, PointerHit, Result, WalkBudget, Whose, normalize_description,
-    normalize_name, read_back_confirms, write_took_no_effect,
+    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId,
+    AxObservationScope, AxObservationWindow, AxRect, AxRole, AxTarget, AxTree, Deadline,
+    GlassError, PointerHit, Result, WalkBudget, Whose, normalize_description, normalize_name,
+    read_back_confirms, write_took_no_effect,
 };
+use sha2::{Digest, Sha256};
 
 use crate::mapping::{map_role, map_states, role_from_wire};
 
 /// Every bounded call runs on a fresh detached thread: this reader drives an async API with
 /// `block_on`, which panics inside the caller's tokio runtime. The cap is what stops a wedged bus
 /// hanging the calling tool for longer than it.
-static BUS: A11yThread = A11yThread::new("a11y bus", Duration::from_secs(10));
+const BUS_BUDGET: Duration = Duration::from_secs(10);
+static BUS: A11yThread = A11yThread::new("a11y bus", BUS_BUDGET);
 
 #[derive(Default)]
 pub struct LinuxA11y;
@@ -40,7 +43,20 @@ impl Accessibility for LinuxA11y {
 
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let ctx = ctx.clone();
-        BUS.snapshot(ctx.deadline, move || run_snapshot(&ctx))
+        BUS.snapshot(ctx.deadline, move || {
+            run_snapshot(&ctx, None).map(|(tree, _)| tree)
+        })
+    }
+
+    fn snapshot_for_observation(
+        &mut self,
+        ctx: &AxContext,
+        window: &AxObservationWindow,
+    ) -> Result<(AxTree, Option<AxObservationScope>)> {
+        let ctx = ctx.clone();
+        let (before, _) = ctx.deadline.resolve(Instant::now() + BUS_BUDGET);
+        let proof = window.owner_pid.map(|owner| (owner, before));
+        BUS.snapshot(ctx.deadline, move || run_snapshot(&ctx, proof))
     }
 
     fn state_coverage(&self) -> glass_core::AxStateCoverage {
@@ -116,12 +132,15 @@ fn invoke_with_thread(
     thread.invoke(ctx.deadline, move |dispatch| job(ctx, dispatch))
 }
 
-fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
+fn run_snapshot(
+    ctx: &AxContext,
+    proof: Option<(u32, Instant)>,
+) -> Result<(AxTree, Option<AxObservationScope>)> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("runtime: {e}")))?;
-    rt.block_on(snapshot_async(ctx))
+    rt.block_on(snapshot_async(ctx, proof))
 }
 
 fn run_set_value(
@@ -189,11 +208,8 @@ fn no_app_tree_message(pids: &[u32]) -> String {
     )
 }
 
-/// Connect + find the launched app's accessible ref (shared by snapshot and set_value).
-/// Returns the app's `ObjectRefOwned` (`'static`) and the connection — NOT a proxy (a
-/// proxy would borrow the connection and can't be returned alongside it).
-async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
-    let conn = match ctx.a11y_bus_addr.as_deref() {
+async fn open_accessibility_bus(ctx: &AxContext) -> Result<AccessibilityConnection> {
+    match ctx.a11y_bus_addr.as_deref() {
         Some(addr) => {
             let parsed = addr.try_into().map_err(|e| {
                 GlassError::AccessibilityUnavailable(format!("bad a11y address: {e}"))
@@ -204,17 +220,26 @@ async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)>
                     GlassError::AccessibilityUnavailable(format!(
                         "cannot reach the private a11y bus ({e})"
                     ))
-                })?
+                })
         }
-        None => {
-            return Err(GlassError::AccessibilityUnavailable(
-                "no accessibility bus for this launch — relaunch the app with a11y:true \
+        None => Err(GlassError::AccessibilityUnavailable(
+            "no accessibility bus for this launch — relaunch the app with a11y:true \
                  to enable the accessibility tree (Linux)"
-                    .into(),
-            ));
-        }
-    };
-    let zbus_conn = conn.connection().clone();
+                .into(),
+        )),
+    }
+}
+
+async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)> {
+    let conn = open_accessibility_bus(ctx).await?;
+    let app_ref = find_app_on_bus(ctx, &conn).await?;
+    Ok((app_ref, conn.connection().clone()))
+}
+
+async fn find_app_on_bus(
+    ctx: &AxContext,
+    conn: &AccessibilityConnection,
+) -> Result<ObjectRefOwned> {
     let root = conn.root_accessible_on_registry().await.map_err(bus_err)?;
 
     // The registry root's children are the registered applications. Pick ours by
@@ -222,32 +247,122 @@ async fn find_app(ctx: &AxContext) -> Result<(ObjectRefOwned, zbus::Connection)>
     // proxy after the loop, so the proxy doesn't borrow a loop-local `ObjectRef`.
     let mut chosen: Option<ObjectRefOwned> = None;
     for app_ref in root.get_children().await.map_err(bus_err)? {
-        if app_matches(&app_ref, ctx, &zbus_conn).await {
+        if app_matches(&app_ref, ctx, conn.connection()).await {
             chosen = Some(app_ref);
             break;
         }
     }
-    let app_ref =
-        chosen.ok_or_else(|| GlassError::AccessibilityNotReady(no_app_tree_message(&ctx.pids)))?;
-    Ok((app_ref, zbus_conn))
+    chosen.ok_or_else(|| GlassError::AccessibilityNotReady(no_app_tree_message(&ctx.pids)))
 }
 
-async fn snapshot_async(ctx: &AxContext) -> Result<AxTree> {
-    let (app_ref, zbus_conn) = find_app(ctx).await?;
+async fn snapshot_async(
+    ctx: &AxContext,
+    proof: Option<(u32, Instant)>,
+) -> Result<(AxTree, Option<AxObservationScope>)> {
+    let bus = open_accessibility_bus(ctx).await?;
+    let app_ref = find_app_on_bus(ctx, &bus).await?;
+    let zbus_conn = bus.connection();
     let app = app_ref
-        .as_accessible_proxy(&zbus_conn)
+        .as_accessible_proxy(zbus_conn)
         .await
         .map_err(bus_err)?;
 
+    let proof = if let Some((owner, before)) = proof
+        && prove_app_root(ctx, &bus, &app_ref, owner, before).await
+    {
+        Some((owner, before))
+    } else {
+        None
+    };
     let mut budget = WalkBudget::with_limits(ctx.limits);
-    let mut root_node = Box::pin(walk(&app, &zbus_conn, 0, &mut budget)).await?;
+    let mut root_node = Box::pin(walk(&app, zbus_conn, 0, &mut budget)).await?;
+    let scope = if let Some((owner, before)) = proof
+        && prove_app_root(ctx, &bus, &app_ref, owner, before).await
+    {
+        atspi_observation_scope(zbus_conn, &app_ref, owner, &root_node)
+    } else {
+        None
+    };
     crate::coordinates::normalize_tree(&mut root_node);
     let mut tree = AxTree::new(root_node);
     tree.truncated = budget.truncation();
     tree.unreadable = budget.unreadable();
     tree.unexposed = budget.unexposed();
     tree.assign_ids();
-    Ok(tree)
+    Ok((tree, scope))
+}
+
+async fn prove_app_root(
+    ctx: &AxContext,
+    bus: &AccessibilityConnection,
+    chosen: &ObjectRefOwned,
+    owner: u32,
+    before: Instant,
+) -> bool {
+    const PROOF_BUDGET: Duration = Duration::from_millis(100);
+    let remaining = before.saturating_duration_since(Instant::now());
+    if !ctx.pids.contains(&owner) || remaining <= PROOF_BUDGET {
+        return false;
+    }
+    tokio::time::timeout(PROOF_BUDGET, async {
+        let registry = bus.root_accessible_on_registry().await.ok()?;
+        let dbus = zbus::fdo::DBusProxy::new(bus.connection()).await.ok()?;
+        let mut matching_roots = 0;
+        for app_ref in registry.get_children().await.ok()? {
+            let name = app_ref.name()?;
+            let pid = dbus
+                .get_connection_unix_process_id(name.clone().into())
+                .await
+                .ok()?;
+            if ctx.pids.contains(&pid) {
+                if pid != owner || &app_ref != chosen || matching_roots != 0 {
+                    return None;
+                }
+                matching_roots += 1;
+            }
+        }
+        (matching_roots == 1).then_some(())
+    })
+    .await
+    .is_ok_and(|result| result.is_some())
+}
+
+fn atspi_observation_scope(
+    conn: &zbus::Connection,
+    root: &ObjectRefOwned,
+    owner: u32,
+    tree: &AxNode,
+) -> Option<AxObservationScope> {
+    let mut identity = Sha256::new();
+    for part in [
+        conn.server_guid().as_str(),
+        root.name_as_str()?,
+        root.path_as_str(),
+    ] {
+        identity.update(part.as_bytes());
+        identity.update([0]);
+    }
+    identity.update(owner.to_le_bytes());
+    append_window_bounds(tree, &mut identity).filter(|count| *count > 0)?;
+    Some(AxObservationScope {
+        provider: "atspi-application-v1",
+        coordinate_basis: 1,
+        root_identity: Some(identity.finalize().into()),
+    })
+}
+
+fn append_window_bounds(node: &AxNode, identity: &mut Sha256) -> Option<usize> {
+    if matches!(node.role, AxRole::Window | AxRole::Dialog) {
+        let bounds = node.bounds?;
+        identity.update(bounds.x.to_le_bytes());
+        identity.update(bounds.y.to_le_bytes());
+        identity.update(bounds.width.to_le_bytes());
+        identity.update(bounds.height.to_le_bytes());
+        return Some(1);
+    }
+    node.children.iter().try_fold(0, |count, child| {
+        Some(count + append_window_bounds(child, identity)?)
+    })
 }
 
 /// Whether `set_value` must write through the AT-SPI `Value` interface only, skipping

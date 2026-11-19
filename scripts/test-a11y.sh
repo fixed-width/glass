@@ -56,3 +56,14 @@ cargo test -p glass-a11y-linux --test integration -- --ignored --test-threads=1 
 cargo test -p glass-a11y-linux --test launcher_override -- --ignored "$TEST_FILTER"
 # Likewise, and --test-threads=1 so the environment it repoints stays this test's alone.
 cargo test -p glass-a11y-linux --test host_bus_unresponsive -- --ignored --test-threads=1 "$TEST_FILTER"
+
+if [[ x11_snapshot_revisions == *"$TEST_FILTER"* ]]; then
+    MCP_BIN="$(cargo build -p glass-mcp --locked --message-format=json-render-diagnostics |
+        python3 -c 'import json, sys
+for line in sys.stdin:
+    artifact = json.loads(line)
+    if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
+        if artifact["target"]["name"] == "glass-mcp":
+            print(artifact["executable"])')"
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/interaction-bench/x11_snapshot_revisions.py "$MCP_BIN"
+fi

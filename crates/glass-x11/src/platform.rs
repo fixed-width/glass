@@ -1,13 +1,16 @@
 use std::cell::{Cell, RefCell};
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, BoundDispatch, BoundKind, Deadline, Frame, GlassError, HostPathProtectionMode,
-    KeyEvent, Platform, PointerEvent, ProtectedHostPath, Region, Result, SandboxLevel, Stream,
-    TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint, WindowId, WindowInfo, WindowOp,
+    AppSpec, AxObservationWindow, BoundDispatch, BoundKind, Deadline, Frame, GlassError,
+    HostPathProtectionMode, KeyEvent, Platform, PointerEvent, ProtectedHostPath, Region, Result,
+    SandboxLevel, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowHint, WindowId, WindowInfo,
+    WindowOp,
 };
 use glass_pipe_unix::LineTap;
 use glass_proc_linux::{
@@ -18,8 +21,10 @@ use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
 use x11rb::protocol::ErrorKind;
+use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::rust_connection::DefaultStream;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -46,6 +51,10 @@ const _: () = assert!(
 const ASK_BUDGET: Duration = Duration::from_millis(400);
 const DISCOVERY_DIAGNOSTICS_BUDGET: Duration = Duration::from_millis(150);
 const DISCOVERY_CANDIDATE_LIMIT: usize = 4;
+const OBSERVATION_PROBE_BUDGET: Duration = Duration::from_millis(100);
+
+// OwnerGrabButton only modifies automatic grabs for a client receiving ButtonPress.
+const OBSERVATION_WINDOW_MARKER: EventMask = EventMask::OWNER_GRAB_BUTTON;
 
 const XT_MOTION: u8 = 6; // MotionNotify
 const XT_BTN_PRESS: u8 = 4; // ButtonPress
@@ -88,7 +97,7 @@ impl X11Dispatch {
     fn for_window(conn: &RustConnection, deadline: Deadline) -> Result<Self> {
         Ok(Self {
             sent: Cell::new(false),
-            deadline_watch: RefCell::new(X11DeadlineWatch::prepare(conn, deadline)?),
+            deadline_watch: RefCell::new(X11DeadlineWatch::prepare(conn.stream(), deadline)?),
         })
     }
 
@@ -181,11 +190,11 @@ struct X11DeadlineWatch {
 }
 
 impl X11DeadlineWatch {
-    fn prepare(conn: &RustConnection, deadline: Deadline) -> Result<Option<Self>> {
+    fn prepare(stream: impl AsFd, deadline: Deadline) -> Result<Option<Self>> {
         if deadline.remaining().is_none() {
             return Ok(None);
         }
-        let socket = rustix::io::dup(conn.stream().as_fd())
+        let socket = rustix::io::dup(stream)
             .map_err(|error| GlassError::Backend(format!("duplicate X11 socket: {error}")))?;
         Ok(Some(Self {
             deadline,
@@ -336,6 +345,8 @@ pub struct X11Platform {
     protected_host_paths: Vec<ProtectedHostPath>,
     a11y_setup_failed: bool,
     window: Option<Window>,
+    window_observation: Option<WindowObservation>,
+    last_window_instance: u64,
     discovery_hint: Option<WindowHint>,
     discovery_diagnostics: Vec<String>,
     read_only_inputs: Vec<std::path::PathBuf>,
@@ -353,6 +364,29 @@ pub struct X11Platform {
     clipboard_owner: Option<crate::clipboard::ClipboardOwner>,
     #[cfg(test)]
     window_process_tree_delay: Duration,
+}
+
+struct WindowObservation {
+    conn: RustConnection,
+    window: AxObservationWindow,
+}
+
+fn window_owner_pid(conn: &RustConnection, window: Window) -> Option<u32> {
+    let spec = ClientIdSpec {
+        client: window,
+        mask: ClientIdMask::LOCAL_CLIENT_PID,
+    };
+    let reply = conn.res_query_client_ids(&[spec]).ok()?.reply().ok()?;
+    let [client] = reply.ids.as_slice() else {
+        return None;
+    };
+    let [pid] = client.value.as_slice() else {
+        return None;
+    };
+    if client.spec.mask != ClientIdMask::LOCAL_CLIENT_PID {
+        return None;
+    }
+    NonZeroU32::new(*pid).map(NonZeroU32::get)
 }
 
 struct ContainedChild {
@@ -565,6 +599,8 @@ impl X11Platform {
             protected_host_paths: Vec::new(),
             a11y_setup_failed: false,
             window: None,
+            window_observation: None,
+            last_window_instance: 0,
             discovery_hint: None,
             discovery_diagnostics: Vec::new(),
             read_only_inputs: Vec::new(),
@@ -605,12 +641,102 @@ impl X11Platform {
         self.window.ok_or(GlassError::WindowNotFound)
     }
 
+    fn open_observation_stream(&self) -> Option<DefaultStream> {
+        use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
+
+        let addr = net::getpeername(self.conn.stream()).ok()??;
+        let socket = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC.union(SocketFlags::NONBLOCK),
+            None,
+        )
+        .ok()?;
+        net::connect(&socket, &addr).ok()?;
+        DefaultStream::from_unix_stream(UnixStream::from(socket))
+            .ok()
+            .map(|(stream, _)| stream)
+    }
+
+    fn probe_observation_window(
+        &mut self,
+        window: Window,
+        identities: &ProcessIdentitySet,
+        deadline: Deadline,
+    ) -> Option<AxObservationWindow> {
+        let id = WindowId(u64::from(window));
+        let previous = self
+            .window_observation
+            .take()
+            .filter(|entry| entry.window.id == id);
+        if deadline.has_passed() {
+            return None;
+        }
+        let (conn, previous, watch) = match previous {
+            Some(previous) => {
+                let mut watch =
+                    X11DeadlineWatch::prepare(previous.conn.stream(), deadline).ok()??;
+                watch.arm();
+                (previous.conn, Some(previous.window), watch)
+            }
+            None => {
+                let stream = self.open_observation_stream()?;
+                let mut watch = X11DeadlineWatch::prepare(&stream, deadline).ok()??;
+                watch.arm();
+                let conn = RustConnection::connect_to_stream(stream, self.screen_num).ok()?;
+                (conn, None, watch)
+            }
+        };
+        let pid = window_owner_pid(&conn, window)?;
+        identities.host_pids().binary_search(&pid).ok()?;
+        let geometry = read_window_geometry(&conn, self.root, window).ok()?;
+        let attrs = conn.get_window_attributes(window).ok()?.reply().ok()?;
+        if attrs.map_state != MapState::VIEWABLE {
+            return None;
+        }
+        let owner_pid = Some(pid);
+        let instance = if (attrs.your_event_mask & OBSERVATION_WINDOW_MARKER) != EventMask::NO_EVENT
+            && let Some(previous) = previous
+            && previous.owner_pid == owner_pid
+        {
+            previous.instance
+        } else {
+            // The marker disappears with the X resource even when its ID is reused.
+            conn.change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().event_mask(OBSERVATION_WINDOW_MARKER),
+            )
+            .ok()?
+            .check()
+            .ok()?;
+            self.last_window_instance = self.last_window_instance.checked_add(1)?;
+            self.last_window_instance
+        };
+        drop(watch);
+        if deadline.has_passed() {
+            return None;
+        }
+
+        let observed = AxObservationWindow {
+            id,
+            instance,
+            owner_pid,
+            geometry: Some(geometry),
+        };
+        self.window_observation = Some(WindowObservation {
+            conn,
+            window: observed.clone(),
+        });
+        Some(observed)
+    }
+
     /// The active window's resource is gone (it was closed/destroyed and the X
     /// server rejected an op against its id). Forget the stale id so the next op
     /// reports the friendly `WindowNotFound` rather than another raw protocol
     /// error, and return that error.
     fn note_window_gone(&mut self) -> GlassError {
         self.window = None;
+        self.window_observation = None;
         GlassError::WindowNotFound
     }
 
@@ -664,17 +790,7 @@ impl X11Platform {
     /// Read a window's absolute geometry, preserving the typed X11 error so
     /// callers can distinguish "window gone" from other backend failures.
     fn geometry_of_raw(&self, win: Window) -> std::result::Result<WindowGeometry, ReplyError> {
-        let geo = self.conn.get_geometry(win)?.reply()?;
-        let abs = self
-            .conn
-            .translate_coordinates(win, self.root, 0, 0)?
-            .reply()?;
-        Ok(WindowGeometry {
-            x: abs.dst_x as i32,
-            y: abs.dst_y as i32,
-            width: geo.width as u32,
-            height: geo.height as u32,
-        })
+        read_window_geometry(&self.conn, self.root, win)
     }
 
     /// Send everything buffered so far, without waiting for a reply. The input sinks commit
@@ -999,6 +1115,7 @@ impl X11Platform {
         &mut self,
         reap: impl FnOnce(&mut Child, &[u32], Duration) -> Vec<u32>,
     ) -> Result<()> {
+        self.window_observation = None;
         let mut result = Ok(());
         if let Some(launched) = self.child.take() {
             let ownership_root = launched.ownership_root();
@@ -2259,6 +2376,7 @@ impl Platform for X11Platform {
                 return Err(GlassError::WindowNotFound);
             }
             let previous = platform.window;
+            platform.window_observation = None;
             platform.window = Some(target);
             if let Err(error) = platform.focus_window(target) {
                 if legacy_window_selection(deadline) {
@@ -2320,6 +2438,38 @@ impl Platform for X11Platform {
     fn a11y_bus_addr(&self) -> Option<String> {
         self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
     }
+
+    fn observation_window_by(&mut self, deadline: Deadline) -> Option<AxObservationWindow> {
+        self.xvfb.as_ref()?;
+        self.dbus.as_ref()?;
+        let (end, _) = deadline
+            .reserving(OBSERVATION_PROBE_BUDGET)
+            .resolve(Instant::now() + OBSERVATION_PROBE_BUDGET);
+        let deadline = Deadline::at(end);
+        if deadline.has_passed() {
+            self.window_observation = None;
+            return None;
+        }
+        let window = self.window?;
+        let launched = self.child.as_ref()?.ownership_root();
+        let identities = ProcessIdentitySet::from_host_root(launched);
+        self.probe_observation_window(window, &identities, deadline)
+    }
+}
+
+fn read_window_geometry(
+    conn: &RustConnection,
+    root: Window,
+    window: Window,
+) -> std::result::Result<WindowGeometry, ReplyError> {
+    let geo = conn.get_geometry(window)?.reply()?;
+    let abs = conn.translate_coordinates(window, root, 0, 0)?.reply()?;
+    Ok(WindowGeometry {
+        x: i32::from(abs.dst_x),
+        y: i32::from(abs.dst_y),
+        width: u32::from(geo.width),
+        height: u32::from(geo.height),
+    })
 }
 
 fn describe_window_text(value: Option<&str>) -> String {
@@ -3489,6 +3639,151 @@ mod display_tests {
         let win = x.window().create();
         plat.window = Some(win);
         assert_eq!(plat.require_window().expect("now set"), win);
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn observation_window_instance_changes_when_an_xid_is_reused() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let (_server, client) = x.into_server_and_client();
+        let screen = &client.setup().roots[0];
+        let window = client.generate_id().unwrap();
+        let create = || {
+            client
+                .create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT,
+                    window,
+                    screen.root,
+                    0,
+                    0,
+                    200,
+                    100,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    screen.root_visual,
+                    &CreateWindowAux::new(),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            client.map_window(window).unwrap().check().unwrap();
+        };
+        create();
+        let identities = ProcessIdentitySet::from_pairs([(std::process::id(), None)]);
+        let mut probe =
+            || platform.probe_observation_window(window, &identities, Deadline::from_millis(200));
+        let first = probe().unwrap();
+        assert_eq!(probe(), Some(first.clone()));
+        client.destroy_window(window).unwrap().check().unwrap();
+        create();
+        let replacement = probe().unwrap();
+        assert_eq!(replacement.id, first.id);
+        assert_eq!(replacement.owner_pid, first.owner_pid);
+        assert_ne!(replacement.instance, first.instance);
+    }
+
+    #[test]
+    #[ignore = "launches a GTK app on an owned Xvfb with a private AT-SPI bus"]
+    fn observation_window_by_attests_an_owned_window_within_its_budget() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let (server, _client) = x.into_server_and_client();
+        platform.xvfb = Some(server);
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../glass-a11y-linux/tests/fixtures/snapshot_revision_fixture.py"
+        );
+        let spec = AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![("GDK_BACKEND".into(), "x11".into())],
+            window_hint: Some(WindowHint {
+                title: Some("Revision main".into()),
+                class: None,
+            }),
+            timeout_ms: 10_000,
+            sandbox: SandboxLevel::Off,
+            a11y: true,
+        };
+        let geometry = platform.start_app(&spec).unwrap();
+        let owner = platform.app_pid();
+        let observation = platform
+            .observation_window_by(Deadline::UNBOUNDED)
+            .expect("the owned window should qualify on a responsive Xvfb");
+        assert_eq!(observation.owner_pid, owner);
+        assert_eq!(observation.geometry, Some(geometry));
+        let observer = &platform.window_observation.as_ref().unwrap().conn;
+        assert!(
+            rustix::io::fcntl_getfd(observer.stream())
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        platform.stop_app_by(Deadline::UNBOUNDED).unwrap();
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn observation_window_timeout_preserves_the_session_connection() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let window = x.window().create();
+        platform.window = Some(window);
+        let identities = ProcessIdentitySet::from_pairs([(std::process::id(), None)]);
+        let first = platform
+            .probe_observation_window(window, &identities, Deadline::from_millis(200))
+            .unwrap();
+        let paused = PausedXServer::new(x.server_pid());
+        assert!(
+            platform
+                .probe_observation_window(window, &identities, Deadline::from_millis(40))
+                .is_none()
+        );
+        assert!(
+            !paused.resume(),
+            "the observation waited for the rescue thread"
+        );
+        assert!(platform.window_observation.is_none());
+        assert!(platform.window_geometry().is_ok());
+        let recovered = platform
+            .probe_observation_window(window, &identities, Deadline::from_millis(200))
+            .unwrap();
+        assert_ne!(first.instance, recovered.instance);
+    }
+
+    #[test]
+    #[ignore = "starts a real X server; needs Xvfb"]
+    fn observation_window_marker_does_not_queue_resize_events() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let window = x.window().create();
+        let (_server, client) = x.into_server_and_client();
+        let identities = ProcessIdentitySet::from_pairs([(std::process::id(), None)]);
+        let first = platform
+            .probe_observation_window(window, &identities, Deadline::from_millis(200))
+            .unwrap();
+        for width in 201..=456 {
+            client
+                .configure_window(window, &ConfigureWindowAux::new().width(width))
+                .unwrap();
+        }
+        client.sync().unwrap();
+        let attrs = platform
+            .conn
+            .get_window_attributes(window)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(attrs.your_event_mask, EventMask::NO_EVENT);
+        let observer = &platform.window_observation.as_ref().unwrap().conn;
+        observer.sync().unwrap();
+        assert!(observer.poll_for_event().unwrap().is_none());
+        let resized = platform
+            .probe_observation_window(window, &identities, Deadline::from_millis(200))
+            .unwrap();
+        assert_eq!(first.instance, resized.instance);
+        assert_eq!(resized.geometry.unwrap().width, 456);
     }
 
     #[test]
