@@ -21,6 +21,10 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Experimental accessibility snapshot revisions support native Wayland windows on Glass's headless
+  sway display when Glass can verify the selected window, output, and application-wide AT-SPI
+  provider.
+
 - Experimental accessibility snapshot revisions now support X11 on an owned Xvfb display when
   Glass can verify the selected window and its application-wide AT-SPI provider.
 

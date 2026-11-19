@@ -11,18 +11,27 @@ use serde::Deserialize;
 
 const MAGIC: &[u8; 6] = b"i3-ipc";
 const MSG_RUN_COMMAND: u32 = 0;
+const MSG_GET_OUTPUTS: u32 = 3;
 const MSG_GET_TREE: u32 = 4;
 
 /// One node from `get_tree` we care about (recursive).
 #[derive(Debug, Deserialize)]
 pub struct Node {
     pub id: i64,
+    #[serde(default, rename = "type")]
+    pub node_type: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
     pub focused: bool,
+    #[serde(default)]
+    pub visible: bool,
+    #[serde(default)]
+    pub pid: Option<i64>,
+    #[serde(default)]
+    pub shell: Option<String>,
     #[serde(default)]
     pub rect: Rect,
     #[serde(default)]
@@ -39,12 +48,36 @@ pub struct Node {
     pub floating_nodes: Vec<Node>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+impl Rect {
+    pub fn intersects(&self, other: &Self) -> bool {
+        [
+            (self.x, self.width, other.x, other.width),
+            (self.y, self.height, other.y, other.height),
+        ]
+        .into_iter()
+        .all(|(start, extent, other_start, other_extent)| {
+            let end = i64::from(start) + i64::from(extent);
+            let other_end = i64::from(other_start) + i64::from(other_extent);
+            i64::from(start.max(other_start)) < end.min(other_end)
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Output {
+    pub name: String,
+    pub active: bool,
+    pub rect: Rect,
+    pub scale: f64,
+    pub transform: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +94,10 @@ pub struct Window {
     pub class: Option<String>,
     pub rect: Rect,
     pub focused: bool,
+    pub visible: bool,
+    pub pid: Option<i64>,
+    pub shell: Option<String>,
+    pub output: Option<String>,
     pub identifier: String,
     /// X11 window id when the view came in through Xwayland; `None` for a native Wayland view.
     pub x11_window: Option<u32>,
@@ -70,10 +107,15 @@ impl Node {
     /// Depth-first collect of windows that have a foreign-toplevel identifier.
     pub fn windows(&self) -> Vec<Window> {
         let mut out = Vec::new();
-        self.collect(&mut out);
+        self.collect(None, &mut out);
         out
     }
-    fn collect(&self, out: &mut Vec<Window>) {
+    fn collect(&self, output: Option<&str>, out: &mut Vec<Window>) {
+        let output = if self.node_type.as_deref() == Some("output") {
+            self.name.as_deref()
+        } else {
+            output
+        };
         if let Some(id) = &self.foreign_toplevel_identifier {
             let class = self.app_id.clone().or_else(|| {
                 self.window_properties
@@ -91,12 +133,16 @@ impl Node {
                     height: self.rect.height,
                 },
                 focused: self.focused,
+                visible: self.visible,
+                pid: self.pid,
+                shell: self.shell.clone(),
+                output: output.map(str::to_owned),
                 identifier: id.clone(),
                 x11_window: self.x11_window,
             });
         }
         for c in self.nodes.iter().chain(self.floating_nodes.iter()) {
-            c.collect(out);
+            c.collect(output, out);
         }
     }
 }
@@ -138,6 +184,33 @@ impl Ipc {
         let mut ipc = Ipc::from_stream(sock)?;
         ipc.path = Some(path);
         Ok(ipc)
+    }
+
+    /// Query on a disposable socket so an optional scope probe can expire during a reply.
+    pub fn observation_by(&self, deadline: Deadline) -> Option<(Vec<Window>, Vec<Output>)> {
+        use rustix::net::{self, AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+
+        if deadline.has_passed() {
+            return None;
+        }
+        let address = SocketAddrUnix::new(self.path.as_deref()?).ok()?;
+        let socket = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC.union(SocketFlags::NONBLOCK),
+            None,
+        )
+        .ok()?;
+        net::connect(&socket, &address).ok()?;
+        let stream = UnixStream::from(socket);
+        stream.set_nonblocking(false).ok()?;
+        let mut ipc = Self::from_stream(stream).ok()?;
+        let windows = ipc.windows_by(deadline).ok()?;
+        let reply = ipc
+            .request_by(MSG_GET_OUTPUTS, b"", deadline, "sway outputs")
+            .ok()?;
+        let outputs = serde_json::from_slice(&reply).ok()?;
+        Some((windows, outputs))
     }
 
     /// Replace a desynchronized stream with a fresh one. A timed-out request is not evidence that
@@ -188,22 +261,10 @@ impl Ipc {
         buf.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
         buf.extend_from_slice(&msg_type.to_ne_bytes());
         buf.extend_from_slice(payload);
-        self.io_by(
-            deadline,
-            true,
-            |sock| sock.write_all(&buf),
-            "write",
-            operation,
-        )?;
+        self.io_by(deadline, |sock| sock.write_all(&buf), "write", operation)?;
 
         let mut header = [0u8; 14];
-        self.io_by(
-            deadline,
-            true,
-            |sock| sock.read_exact(&mut header),
-            "read",
-            operation,
-        )?;
+        self.read_reply_by(&mut header, deadline, operation)?;
         if &header[0..6] != MAGIC {
             // Also a desync: whatever is in the stream is not a reply glass can resynchronize to.
             self.broken = true;
@@ -211,13 +272,7 @@ impl Ipc {
         }
         let len = u32::from_ne_bytes(header[6..10].try_into().unwrap()) as usize;
         let mut reply = vec![0u8; len];
-        self.io_by(
-            deadline,
-            true,
-            |sock| sock.read_exact(&mut reply),
-            "read",
-            operation,
-        )?;
+        self.read_reply_by(&mut reply, deadline, operation)?;
         if deadline.has_passed() {
             Err(GlassError::caller_deadline_elapsed(operation))
         } else {
@@ -225,24 +280,48 @@ impl Ipc {
         }
     }
 
-    /// Run one socket operation, marking the connection broken if it fails. A timeout counts:
-    /// the bytes are still in flight, so the next request would read them as its own reply.
-    fn io_by(
+    fn read_reply_by(
         &mut self,
+        mut remaining: &mut [u8],
         deadline: Deadline,
-        dispatched: bool,
-        op: impl FnOnce(&mut UnixStream) -> std::io::Result<()>,
-        what: &str,
         operation: &str,
     ) -> Result<()> {
+        use std::io::ErrorKind;
+
+        // read_exact can spend the socket timeout again after every partial read.
+        while !remaining.is_empty() {
+            let received = self.io_by(
+                deadline,
+                |sock| match sock.read(remaining) {
+                    Ok(0) => Err(ErrorKind::UnexpectedEof.into()),
+                    Ok(count) => Ok(count),
+                    Err(error) => match error.kind() {
+                        ErrorKind::Interrupted => Ok(0),
+                        _ => Err(error),
+                    },
+                },
+                "read",
+                operation,
+            )?;
+            remaining = &mut remaining[received..];
+        }
+        Ok(())
+    }
+
+    /// Run one socket operation, marking the connection broken if it fails. A timeout counts:
+    /// the bytes are still in flight, so the next request would read them as its own reply.
+    fn io_by<T>(
+        &mut self,
+        deadline: Deadline,
+        op: impl FnOnce(&mut UnixStream) -> std::io::Result<T>,
+        what: &str,
+        operation: &str,
+    ) -> Result<T> {
         let now = std::time::Instant::now();
         let (timeout, owner) = deadline.budget(IPC_TIMEOUT, now);
         if timeout.is_zero() {
-            return Err(if dispatched {
-                GlassError::caller_deadline_elapsed(operation)
-            } else {
-                GlassError::deadline_not_started(operation)
-            });
+            self.broken = true;
+            return Err(GlassError::caller_deadline_elapsed(operation));
         }
         self.sock
             .set_read_timeout(Some(timeout))
@@ -256,11 +335,7 @@ impl Ipc {
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 )
             {
-                if dispatched {
-                    GlassError::caller_deadline_elapsed(operation)
-                } else {
-                    GlassError::deadline_not_started(operation)
-                }
+                GlassError::caller_deadline_elapsed(operation)
             } else {
                 GlassError::Backend(format!("sway IPC {what}: {error}"))
             }
@@ -381,6 +456,31 @@ mod tests {
         let wins = ipc.windows().expect("a framed reply should parse");
         assert_eq!(wins.len(), 1);
         assert_eq!(wins[0].identifier, "ftid");
+    }
+
+    #[test]
+    fn an_observation_timeout_leaves_the_session_ipc_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sway-ipc.1.2.sock");
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let mut session = Ipc::connect(dir.path()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(session.observation_by(Deadline::from_millis(100)).is_none());
+        assert!(started.elapsed() >= Duration::from_millis(70));
+        listener.set_nonblocking(true).unwrap();
+        let (mut optional, _) = listener.accept().unwrap();
+        optional
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut request = [0; 14];
+        optional.read_exact(&mut request).unwrap();
+        assert_eq!(&request[..], frame(MSG_GET_TREE, b"").as_slice());
+
+        peer.write_all(&frame(MSG_GET_TREE, br#"{"id":1}"#))
+            .unwrap();
+        assert!(session.windows().unwrap().is_empty());
     }
 
     /// Anything that is not a reply header is a desync, not a reply to interpret: the bytes in the
@@ -533,6 +633,44 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_millis(500));
         drop(theirs);
+    }
+
+    #[test]
+    fn partial_sway_headers_and_bodies_share_the_callers_deadline() {
+        for complete_header in [false, true] {
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            let mut ipc = Ipc::from_stream(ours).unwrap();
+            let writer = std::thread::spawn(move || {
+                let mut request = [0; 14];
+                if peer.read_exact(&mut request).is_err() {
+                    return;
+                }
+                let reply = frame(MSG_GET_TREE, br#"{"id":1,"floating_nodes":[]}"#);
+                let (prefix, chunks) = reply.split_at(if complete_header { 14 } else { 0 });
+                if peer.write_all(prefix).is_err() {
+                    return;
+                }
+                for chunk in chunks.chunks(1) {
+                    if peer.write_all(chunk).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(45));
+                }
+            });
+
+            let started = std::time::Instant::now();
+            let error = ipc.windows_by(Deadline::from_millis(150)).unwrap_err();
+            let elapsed = started.elapsed();
+            let broken = ipc.broken;
+            drop(ipc);
+            writer.join().unwrap();
+            assert_eq!(error.bound_owner(), Some(Whose::Caller));
+            assert!(broken, "the incomplete reply must retire the connection");
+            assert!(
+                elapsed < Duration::from_millis(400),
+                "reply took {elapsed:?}"
+            );
+        }
     }
 
     /// After a failed read the stream is no longer at a message boundary: the reply glass gave up

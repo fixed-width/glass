@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GTK4 fixture for checking application-wide snapshot revisions on X11."""
+"""GTK4 fixture for checking application-wide snapshot revisions on Linux."""
 
 import os
 import subprocess

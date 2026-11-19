@@ -1,7 +1,8 @@
-"""Exercise the X11 MCP revision tool with an owned display and a native GTK app."""
+"""Exercise MCP snapshot revisions with an owned Linux display and a native GTK app."""
 
 import os
 from pathlib import Path
+from shutil import which
 import sys
 from tempfile import TemporaryDirectory
 import time
@@ -36,7 +37,7 @@ def process_is_alive(pid):
     return state != "Z"
 
 
-def qualify(client, evidence):
+def qualify(client, evidence, backend):
     receiver = SnapshotReceiver()
 
     def call(tool, error=False, **arguments):
@@ -63,26 +64,45 @@ def qualify(client, evidence):
     def set_text(field, text):
         call("glass_set_value", target={"query": field}, text=text)
 
-    def start():
+    def start(gdk_backend=backend):
+        environment = {"GDK_BACKEND": gdk_backend, "LIBGL_ALWAYS_SOFTWARE": "1"}
+        if gdk_backend == "wayland":
+            environment["GSK_RENDERER"] = "cairo"
         call(
             "glass_start",
             run=[sys.executable, str(FIXTURE)],
-            env={"GDK_BACKEND": "x11", "LIBGL_ALWAYS_SOFTWARE": "1"},
+            env=environment,
             window_hint={"title": "Revision main"},
-            backend="x11",
+            backend=backend,
             a11y=True,
             sandbox="off",
         )
         end = time.monotonic() + 12
+        selected = False
+        previous_outline = None
         while time.monotonic() < end:
             reply = client.rpc(
                 "tools/call", {"name": "glass_a11y_snapshot", "arguments": {}}
             )
             read = evidence.decode("glass_a11y_snapshot", reply)
             if not read["is_error"] and "Sibling window content" in read["observations"][0]:
-                return
+                outline = read["observations"][0]
+                if selected:
+                    if outline == previous_outline:
+                        return
+                    previous_outline = outline
+                else:
+                    windows = call("glass_list_windows")["observations"][0]
+                    main = next(
+                        (window for window in windows if window["title"] == "Revision main"),
+                        None,
+                    )
+                    if main is not None:
+                        if not main["active"]:
+                            call("glass_select_window", id=main["id"])
+                        selected = True
             time.sleep(0.05)
-        raise AssertionError("Both windows did not publish to the private AT-SPI bus")
+        raise AssertionError("The two-window AT-SPI outline did not settle")
 
     def stop():
         owned = descendants(client.process.pid)
@@ -156,9 +176,20 @@ def qualify(client, evidence):
     assert unproven["full_reason"] == "context_unproven"
     stop()
 
+    if backend == "wayland":
+        if which("Xwayland"):
+            start(gdk_backend="x11")
+            xwayland = call(REVISION)["envelope"]["result"]
+            assert xwayland["kind"] == "full"
+            assert xwayland["cacheable"] is False
+            assert xwayland["full_reason"] == "context_unproven"
+            stop()
+        else:
+            print("Xwayland executable unavailable. Skipping the Xwayland revision case.")
 
-def main(server):
-    with TemporaryDirectory(prefix="glass-x11-revisions-") as root:
+
+def main(server, backend):
+    with TemporaryDirectory(prefix=f"glass-{backend}-revisions-") as root:
         root = Path(root)
         environment = os.environ.copy()
         for key in (
@@ -175,12 +206,12 @@ def main(server):
         client = Client([server, "--tool-profile", "full"], root / "wire", env=environment)
         try:
             client.initialize()
-            qualify(client, Evidence(root / "evidence", client))
+            qualify(client, Evidence(root / "evidence", client), backend)
         finally:
             clean = client.close()
         assert clean, "MCP process cleanup failed"
-    print("X11 snapshot revision qualification passed")
+    print(f"{backend} snapshot revision qualification passed")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2])

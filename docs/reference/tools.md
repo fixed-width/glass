@@ -993,13 +993,15 @@ provider, process, limits, coordinate interpretation or disclosure changes requi
 Keep `max_nodes` consistent across observations and semantic actions to preserve limit continuity;
 an action's default limits can otherwise force a fresh full response.
 Selecting even the same window breaks continuity. macOS attests the selected window, AX
-root-selection uniqueness, and scale during the fresh read. On an owned Xvfb display, X11 can
-attest the selected native window and the application-wide AT-SPI tree. Qualification requires
-a viewable window and exactly one application root registered by the launched process tree on the
-private bus, supplied by the process that owns the window. The reader checks the provider's
-top-level window bounds used to normalize the outline. Attached X11 displays, unverified X11
-providers and coordinate scopes, and all remaining backends return `context_unproven` with
-`cacheable: false`.
+root-selection uniqueness, and scale during the fresh read. Linux qualifies the application-wide
+AT-SPI tree when the launched process tree registers exactly one application root on the private
+bus and its provider owns the selected window. The reader checks the provider's top-level window
+bounds used to normalize the outline.
+
+X11 qualifies viewable windows on owned Xvfb displays. Wayland qualifies visible native
+`xdg_shell` windows that intersect the session's single headless output at the origin with
+1× scale and normal orientation. Attached X11 displays, Xwayland, unverified providers or
+coordinate scopes, and the remaining backends return `context_unproven` with `cacheable: false`.
 Scope is an observed episode, with the ordinary snapshot's root guarantees; tokens do not identify
 a native object's lifetime. IDs remain immediate references from the latest read.
 

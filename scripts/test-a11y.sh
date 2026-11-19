@@ -28,9 +28,11 @@ TEST_FILTER="${1:-}"
 # scripts/test-wayland.sh does. Named, not silently dropped: a run that says nothing about them
 # reads as "the suite passed" when a quarter of the launch paths never ran.
 SKIP_ARGS=()
+HAVE_SWAY=true
 if ! have_sway; then
     echo "test-a11y: no glass-discoverable sway >=1.12 — skipping the wayland_a11y_* tests."
     SKIP_ARGS=(--skip wayland_a11y)
+    HAVE_SWAY=false
 fi
 
 # Hermetic isolation: run the whole suite under a throwaway XDG_RUNTIME_DIR. AT-SPI derives its
@@ -57,7 +59,14 @@ cargo test -p glass-a11y-linux --test launcher_override -- --ignored "$TEST_FILT
 # Likewise, and --test-threads=1 so the environment it repoints stays this test's alone.
 cargo test -p glass-a11y-linux --test host_bus_unresponsive -- --ignored --test-threads=1 "$TEST_FILTER"
 
+REVISION_BACKENDS=()
 if [[ x11_snapshot_revisions == *"$TEST_FILTER"* ]]; then
+    REVISION_BACKENDS+=(x11)
+fi
+if [[ "$HAVE_SWAY" == true && wayland_a11y_snapshot_revisions == *"$TEST_FILTER"* ]]; then
+    REVISION_BACKENDS+=(wayland)
+fi
+if (( ${#REVISION_BACKENDS[@]} )); then
     MCP_BIN="$(cargo build -p glass-mcp --locked --message-format=json-render-diagnostics |
         python3 -c 'import json, sys
 for line in sys.stdin:
@@ -65,5 +74,7 @@ for line in sys.stdin:
     if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
         if artifact["target"]["name"] == "glass-mcp":
             print(artifact["executable"])')"
-    PYTHONDONTWRITEBYTECODE=1 python3 tools/interaction-bench/x11_snapshot_revisions.py "$MCP_BIN"
+    for backend in "${REVISION_BACKENDS[@]}"; do
+        PYTHONDONTWRITEBYTECODE=1 python3 tools/interaction-bench/linux_snapshot_revisions.py "$MCP_BIN" "$backend"
+    done
 fi

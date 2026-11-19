@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    AppSpec, BoundDispatch, Deadline, Frame, GlassError, HostPathProtectionMode, KeyEvent,
-    Platform, PointerEvent, ProtectedHostPath, Region, Result, SandboxLevel, Stream,
-    TEARDOWN_BUDGET, Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, AxObservationWindow, BoundDispatch, Deadline, Frame, GlassError,
+    HostPathProtectionMode, KeyEvent, Platform, PointerEvent, ProtectedHostPath, Region, Result,
+    SandboxLevel, Stream, TEARDOWN_BUDGET, Whose, WindowGeometry, WindowId, WindowInfo, WindowOp,
 };
 use glass_exec_unix::{Resolved, resolve_path};
 use glass_pipe_unix::LineTap;
@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use crate::clipboard::remaining_timespec;
 use crate::command::{LogSink, build_sway_command_with_status};
 use crate::input::evdev_button;
-use crate::swayipc::{Ipc, Window as SwayWindow};
+use crate::swayipc::{Ipc, Output as SwayOutput, Rect, Window as SwayWindow};
 
 // Keep the close-request and signal ladder within the non-cancellable teardown budget.
 const _: () = assert!(
@@ -958,6 +958,56 @@ fn rect_to_geom(r: &crate::swayipc::Rect) -> WindowGeometry {
         width: r.width.max(0) as u32,
         height: r.height.max(0) as u32,
     }
+}
+
+fn observation_target(
+    windows: &[SwayWindow],
+    outputs: &[SwayOutput],
+    identifier: &str,
+    id: WindowId,
+    capture_output: &str,
+    output_size: (u32, u32),
+) -> Option<AxObservationWindow> {
+    let [output] = outputs else {
+        return None;
+    };
+    let logical_rect = Rect {
+        x: 0,
+        y: 0,
+        width: i32::try_from(output_size.0).ok()?,
+        height: i32::try_from(output_size.1).ok()?,
+    };
+    if !output.active
+        || output.name != capture_output
+        || output.rect != logical_rect
+        || output.scale != 1.0
+        || output.transform != "normal"
+    {
+        return None;
+    }
+    let mut matching = windows
+        .iter()
+        .filter(|window| window.identifier == identifier);
+    let window = matching.next()?;
+    if matching.next().is_some()
+        || !window.visible
+        || window.shell.as_deref() != Some("xdg_shell")
+        || window.output.as_deref() != Some(capture_output)
+    {
+        return None;
+    }
+    let owner_pid = u32::try_from(window.pid?)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)?;
+    if !window.rect.intersects(&output.rect) {
+        return None;
+    }
+    Some(AxObservationWindow {
+        id,
+        instance: u64::try_from(window.con_id).ok()?,
+        owner_pid: Some(owner_pid.get()),
+        geometry: Some(rect_to_geom(&window.rect)),
+    })
 }
 
 /// How long one capture may take, from its request to the last event it needs — the format list,
@@ -3072,6 +3122,36 @@ impl Platform for WaylandPlatform {
     fn a11y_bus_addr(&self) -> Option<String> {
         self.dbus.as_ref().map(|b| b.a11y_bus_address().to_string())
     }
+
+    fn observation_window_by(&mut self, deadline: Deadline) -> Option<AxObservationWindow> {
+        const PROBE_BUDGET: Duration = Duration::from_millis(100);
+
+        self.dbus.as_ref()?;
+        let session = self.active.as_ref()?;
+        let identifier = session.active.as_deref()?;
+        let id = *session.ids.get(identifier)?;
+        let output = session.state.output.info(&session.output)?;
+        let capture_output = output.name.as_deref()?;
+        let (end, _) = deadline
+            .reserving(PROBE_BUDGET)
+            .resolve(Instant::now() + PROBE_BUDGET);
+        let probe = Deadline::at(end);
+        let (windows, outputs) = session.ipc.observation_by(probe)?;
+        let observed = observation_target(
+            &windows,
+            &outputs,
+            identifier,
+            id,
+            capture_output,
+            session.output_size,
+        )?;
+        let owner = observed.owner_pid?;
+        ProcessIdentitySet::from_host_root(session.ownership_root)
+            .host_pids()
+            .binary_search(&owner)
+            .ok()?;
+        (!probe.has_passed()).then_some(observed)
+    }
 }
 
 #[cfg(test)]
@@ -3791,9 +3871,149 @@ mod pure_tests {
                 height: 40,
             },
             focused: false,
+            visible: false,
+            pid: None,
+            shell: None,
+            output: None,
             identifier: identifier.into(),
             x11_window: x11,
         }
+    }
+
+    fn observation_window() -> SwayWindow {
+        SwayWindow {
+            con_id: 27,
+            visible: true,
+            pid: Some(42),
+            shell: Some("xdg_shell".into()),
+            output: Some("HEADLESS-1".into()),
+            ..win("selected", None)
+        }
+    }
+
+    fn observation_output() -> SwayOutput {
+        SwayOutput {
+            name: "HEADLESS-1".into(),
+            active: true,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 320,
+                height: 240,
+            },
+            scale: 1.0,
+            transform: "normal".into(),
+        }
+    }
+
+    fn select_observation(
+        windows: &[SwayWindow],
+        outputs: &[SwayOutput],
+    ) -> Option<AxObservationWindow> {
+        observation_target(
+            windows,
+            outputs,
+            "selected",
+            WindowId(8),
+            "HEADLESS-1",
+            (320, 240),
+        )
+    }
+
+    type InvalidObservationCase<T> = (&'static str, fn(&mut T));
+
+    #[test]
+    fn observation_uses_the_selected_native_view_on_the_capture_output() {
+        let other = SwayWindow {
+            con_id: 31,
+            identifier: "other".into(),
+            ..observation_window()
+        };
+        let selected = observation_window();
+        let geometry = rect_to_geom(&selected.rect);
+        let observed = select_observation(&[other, selected], &[observation_output()]).unwrap();
+        assert_eq!(observed.id, WindowId(8));
+        assert_eq!(observed.instance, 27);
+        assert_eq!(observed.owner_pid, Some(42));
+        assert_eq!(observed.geometry, Some(geometry));
+    }
+
+    #[test]
+    fn observation_refuses_unverified_views() {
+        let invalid: [InvalidObservationCase<SwayWindow>; 7] = [
+            ("hidden", |window| window.visible = false),
+            ("xwayland", |window| window.shell = Some("xwayland".into())),
+            ("different output", |window| {
+                window.output = Some("HEADLESS-2".into())
+            }),
+            ("missing PID", |window| window.pid = None),
+            ("zero PID", |window| window.pid = Some(0)),
+            ("zero width", |window| window.rect.width = 0),
+            ("zero height", |window| window.rect.height = 0),
+        ];
+        for (case, change) in invalid {
+            let mut window = observation_window();
+            change(&mut window);
+            assert!(
+                select_observation(&[window], &[observation_output()]).is_none(),
+                "{case}"
+            );
+        }
+        let output = observation_output();
+        assert!(select_observation(&[], std::slice::from_ref(&output)).is_none());
+        let duplicated = [observation_window(), observation_window()];
+        assert!(select_observation(&duplicated, &[output]).is_none());
+    }
+
+    #[test]
+    fn observation_requires_positive_overlap_with_the_capture_output() {
+        let output = [observation_output()];
+        for (x, y) in [(-30, 2), (320, 2), (1, -40), (1, 240)] {
+            let mut window = observation_window();
+            window.rect.x = x;
+            window.rect.y = y;
+            assert!(
+                select_observation(&[window], &output).is_none(),
+                "at ({x}, {y})"
+            );
+        }
+        let mut partial = observation_window();
+        partial.rect.x = -29;
+        partial.rect.y = -39;
+        let geometry = rect_to_geom(&partial.rect);
+        assert_eq!(
+            select_observation(&[partial], &output).unwrap().geometry,
+            Some(geometry)
+        );
+    }
+
+    #[test]
+    fn observation_refuses_unverified_output_coordinates() {
+        let invalid: [InvalidObservationCase<SwayOutput>; 6] = [
+            ("inactive", |output| output.active = false),
+            ("different from capture output", |output| {
+                output.name = "HEADLESS-2".into()
+            }),
+            ("translated", |output| output.rect.x = 1),
+            ("changed extent", |output| output.rect.height = 800),
+            ("scaled", |output| output.scale = 1.25),
+            ("rotated", |output| output.transform = "90".into()),
+        ];
+        let windows = [observation_window()];
+        for (case, change) in invalid {
+            let mut output = observation_output();
+            change(&mut output);
+            assert!(select_observation(&windows, &[output]).is_none(), "{case}");
+        }
+        assert!(select_observation(&windows, &[]).is_none());
+        let multiple = [
+            observation_output(),
+            SwayOutput {
+                name: "HEADLESS-2".into(),
+                ..observation_output()
+            },
+        ];
+        assert!(select_observation(&windows, &multiple).is_none());
     }
 
     /// A native Wayland view must be absent rather than carry a placeholder id, which could
@@ -5416,6 +5636,73 @@ mod session_tests {
             s.focused_title().as_deref(),
             target.title.as_deref(),
             "the compositor must actually have moved focus"
+        );
+    }
+
+    #[test]
+    #[ignore = "starts owned sway and a private AT-SPI bus"]
+    fn observation_window_by_checks_selection_and_capture_coordinates() {
+        let mut s = Launch::new()
+            .windows(&["one:app-one:200x100", "two:app-two:200x100"])
+            .with_a11y()
+            .start_mapped();
+        let listed = s.platform().list_windows().unwrap();
+        let selected = listed.iter().find(|window| window.active).unwrap();
+        let other = listed.iter().find(|window| !window.active).unwrap();
+        let first = s
+            .platform()
+            .observation_window_by(Deadline::UNBOUNDED)
+            .unwrap();
+        assert_eq!(first.id, selected.id);
+        assert_eq!(first.geometry, Some(selected.geometry.clone()));
+        assert!(s.platform().app_pids().contains(&first.owner_pid.unwrap()));
+
+        let geometry = s.platform().select_window(other.id).unwrap();
+        let switched = s
+            .platform()
+            .observation_window_by(Deadline::UNBOUNDED)
+            .unwrap();
+        assert_eq!(switched.id, other.id);
+        assert_eq!(switched.geometry.as_ref(), Some(&geometry));
+        assert_ne!(switched.instance, first.instance);
+
+        s.platform()
+            .window(&WindowOp::Move {
+                x: 100_000,
+                y: 100_000,
+            })
+            .unwrap();
+        assert!(
+            s.platform()
+                .observation_window_by(Deadline::UNBOUNDED)
+                .is_none()
+        );
+        s.platform()
+            .window(&WindowOp::Move {
+                x: geometry.x,
+                y: geometry.y,
+            })
+            .unwrap();
+
+        let mut ipc = Ipc::connect(&s.runtime_dir()).unwrap();
+        ipc.run_command("output HEADLESS-1 scale 2").unwrap();
+        assert!(
+            s.platform()
+                .observation_window_by(Deadline::UNBOUNDED)
+                .is_none()
+        );
+        assert!(s.platform().window(&WindowOp::Geometry).is_ok());
+
+        ipc.run_command("output HEADLESS-1 scale 1").unwrap();
+        let recovered = s
+            .platform()
+            .observation_window_by(Deadline::UNBOUNDED)
+            .unwrap();
+        assert_eq!(recovered.instance, switched.instance);
+        assert!(
+            s.platform()
+                .observation_window_by(Deadline::from_millis(0))
+                .is_none()
         );
     }
 
