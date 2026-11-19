@@ -144,6 +144,75 @@ fn semantic_fixture_spec(app: String) -> AppSpec {
     }
 }
 
+#[test]
+#[ignore = "needs a single-scene fixture on an owned portrait Simulator with idb v1.7.8 or newer"]
+fn both_readers_attest_a_live_simulator_app_observation() {
+    use glass_core::session::StartOptions;
+
+    let app = std::env::var("GLASS_IOS_APP").expect("build the iOS fixture and set GLASS_IOS_APP");
+    let spec = semantic_fixture_spec(app);
+    let registry = SimulatorRegistry::new();
+    let factory = Box::new(move |_: &str| {
+        let platform = IosPlatform::from_env(&registry)?;
+        let accessibility = platform
+            .session_accessibility()?
+            .expect("companion reader for Simulator observation");
+        Ok(Backend {
+            platform: Box::new(platform),
+            accessibility: Some(Box::new(accessibility)),
+        })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut glass = Glass::new(factory, "ios".into(), BaselineStore::new(dir.path()), 64);
+    for (reader, providers) in [
+        ("ax", ["ios-ax"].as_slice()),
+        (
+            "axbridge",
+            [
+                "axbridge-exclusive",
+                "axbridge-persistent",
+                "axbridge-oneshot",
+            ]
+            .as_slice(),
+        ),
+    ] {
+        glass
+            .start_on_with_options(
+                "ios",
+                &spec,
+                StartOptions {
+                    accessibility_reader: Some(reader),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let first = loop {
+            let observation = glass.a11y_observation(None).unwrap();
+            if observation.context.is_some() {
+                break observation;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "{reader} could not attest scope"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let provider = first.context.as_ref().unwrap().reader_scope.provider;
+        assert!(
+            providers.contains(&provider),
+            "{reader} returned {provider:?}"
+        );
+        assert_eq!(glass.a11y_observation(None).unwrap().context, first.context);
+        glass
+            .select_window(first.context.as_ref().unwrap().window)
+            .unwrap();
+        let selected = glass.a11y_observation(None).unwrap().context.unwrap();
+        assert_ne!(selected.generation, first.context.unwrap().generation);
+        glass.stop().unwrap();
+    }
+}
+
 struct CountingIosPlatform {
     inner: IosPlatform,
     pointer_events: Arc<Mutex<Vec<PointerEvent>>>,

@@ -25,6 +25,8 @@ struct RunningApp {
     /// the same reason the Android backend keeps it — it is what `app_pid` answers with, and what
     /// a liveness check on the operation path would need.
     pid: Option<u32>,
+    /// Recorded only when the installed bundle verifies that it supports one scene.
+    process_start: Option<String>,
     geometry: WindowGeometry,
     logs: LogStream,
     /// Builds HID events from glass input at the app's real, discovered point→pixel scale.
@@ -220,6 +222,114 @@ fn pid_is_running(pid: u32) -> bool {
     }
 }
 
+fn process_start_by(pid: u32, deadline: Deadline) -> Option<String> {
+    let mut cmd = Command::new("/bin/ps");
+    cmd.args(["-p", &pid.to_string(), "-o", "state=", "-o", "lstart="]);
+    cmd.env("LC_ALL", "C").env("TZ", "UTC0");
+    let output = glass_core::run_bounded_until(
+        &mut cmd,
+        Duration::from_millis(250),
+        deadline,
+        "ps:iOS observation process",
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_process_start(std::str::from_utf8(&output.stdout).ok()?).map(str::to_owned)
+}
+
+fn parse_process_start(stdout: &str) -> Option<&str> {
+    let mut lines = stdout.lines();
+    let (state, started) = lines.next()?.trim().split_once(char::is_whitespace)?;
+    let started = started.trim();
+    if lines.next().is_some()
+        || !matches!(
+            state.as_bytes().first(),
+            Some(b'I' | b'R' | b'S' | b'T' | b'U')
+        )
+        || started.split_ascii_whitespace().count() != 5
+    {
+        return None;
+    }
+    Some(started)
+}
+
+fn installed_app_is_single_scene(
+    target: &SimTarget,
+    bundle: &str,
+    deadline: Deadline,
+) -> Option<()> {
+    let container = target
+        .simctl()
+        .run_until(
+            &["get_app_container", target.udid(), bundle, "app"],
+            deadline,
+        )
+        .ok()?;
+    let path = std::path::Path::new(container.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut cmd = Command::new("/usr/bin/plutil");
+    cmd.args(["-convert", "json", "-o", "-", "--"])
+        .arg(path.join("Info.plist"));
+    let output = glass_core::run_bounded_until(
+        &mut cmd,
+        Duration::from_millis(250),
+        deadline,
+        "plutil:iOS observation scene",
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let plist = serde_json::from_slice(&output.stdout).ok()?;
+    single_scene_plist(&plist, bundle).then_some(())
+}
+
+fn single_scene_plist(plist: &serde_json::Value, bundle: &str) -> bool {
+    let Some(properties) = plist.as_object() else {
+        return false;
+    };
+    if properties
+        .get("CFBundleIdentifier")
+        .and_then(serde_json::Value::as_str)
+        != Some(bundle)
+    {
+        return false;
+    }
+    properties
+        .iter()
+        .filter(|(key, _)| key.starts_with("UIApplicationSceneManifest"))
+        .all(|(_, manifest)| {
+            manifest.as_object().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("UIApplicationSupportsMultipleScenes"))
+                    .all(|(_, value)| value.as_bool() == Some(false))
+            })
+        })
+}
+
+fn observation_scale(
+    target: &crate::idb::proto::TargetDescription,
+    device: &str,
+    geometry: &WindowGeometry,
+) -> Option<f64> {
+    let screen = target.screen_dimensions.as_ref()?;
+    let scale = checked_scale(screen.density).ok()?;
+    if target.udid != device
+        || screen.width != u64::from(geometry.width)
+        || screen.height != u64::from(geometry.height)
+        || (screen.width_points as f64 * scale).round() != f64::from(geometry.width)
+        || (screen.height_points as f64 * scale).round() != f64::from(geometry.height)
+    {
+        return None;
+    }
+    Some(scale)
+}
+
 /// The `simctl launch` sub-command argv: the verb, the target simulator and bundle, then the
 /// app's own launch arguments.
 ///
@@ -384,7 +494,9 @@ impl IosPlatform {
             driver.companion.bin(),
             driver.companion.build_info(),
         )?;
-        Ok(Some(crate::a11y::IosA11y::new(client)))
+        Ok(Some(
+            crate::a11y::IosA11y::new(client).with_device(self.target.udid()),
+        ))
     }
 }
 
@@ -637,9 +749,17 @@ impl Platform for IosPlatform {
             }
         }
 
+        let process_start = launch_pid.and_then(|pid| {
+            self.driver.as_ref()?;
+            let deadline = Deadline::from_millis(750);
+            let start = process_start_by(pid, deadline)?;
+            installed_app_is_single_scene(&self.target, &bundle_id, deadline)?;
+            Some(start)
+        });
         self.app = Some(RunningApp {
             bundle_id,
             pid: launch_pid,
+            process_start,
             geometry: geometry.clone(),
             logs,
             injector,
@@ -650,6 +770,37 @@ impl Platform for IosPlatform {
     /// The launched app's pid, when `simctl launch` reported one.
     fn app_pid(&self) -> Option<u32> {
         self.app.as_ref().and_then(|a| a.pid)
+    }
+
+    fn observation_window_by(
+        &mut self,
+        deadline: Deadline,
+    ) -> Option<glass_core::AxObservationWindow> {
+        if deadline.instant().is_some() {
+            return None;
+        }
+        let app = self.app.as_ref()?;
+        let driver = self.driver.as_ref()?;
+        let pid = std::num::NonZeroU32::new(app.pid?)?.get();
+        let start = app.process_start.as_deref()?;
+        let probe = Deadline::from_millis(750);
+        if process_start_by(pid, probe)? != start {
+            return None;
+        }
+        let screen = driver.client.observation_display_by(probe)?;
+        let device = self.target.udid();
+        let scale = observation_scale(&screen, device, &app.geometry)?;
+        Some(glass_core::AxObservationWindow {
+            id: IOS_WINDOW_ID,
+            instance: u64::from(pid),
+            owner_pid: Some(pid),
+            geometry: Some(app.geometry.clone()),
+            subject: Some(glass_core::AxObservationSubject {
+                device: device.to_owned(),
+                application: app.bundle_id.clone(),
+                coordinate_basis: scale.to_bits(),
+            }),
+        })
     }
 
     /// `terminate` measures ~101ms against the 3s all of teardown gets, so the deadline is not
@@ -858,6 +1009,100 @@ mod tests {
     }
 
     #[test]
+    fn observation_process_start_requires_one_live_process_record() {
+        const START: &str = "Thu Nov 19 20:29:54 2026";
+        assert_eq!(parse_process_start(&format!(" S  {START}\n")), Some(START));
+        for output in [
+            "",
+            "S unknown",
+            "Z Thu Nov 19 20:29:54 2026",
+            "? Thu Nov 19 20:29:54 2026",
+        ] {
+            assert!(parse_process_start(output).is_none(), "{output:?}");
+        }
+        assert!(parse_process_start(&format!("S {START}\nS {START}\n")).is_none());
+    }
+
+    #[test]
+    fn observation_requires_an_identified_single_scene_bundle() {
+        use serde_json::json;
+
+        let bundle = "tech.fixedwidth.fixture";
+        let installed = json!({"CFBundleIdentifier": bundle});
+        assert!(single_scene_plist(&installed, bundle));
+        assert!(!single_scene_plist(&installed, "tech.fixedwidth.other"));
+        assert!(!single_scene_plist(&json!(null), bundle));
+
+        let mut explicit = installed.clone();
+        explicit["UIApplicationSceneManifest"] =
+            json!({"UIApplicationSupportsMultipleScenes": false});
+        assert!(single_scene_plist(&explicit, bundle));
+
+        let mut multi_scene = explicit.clone();
+        multi_scene["UIApplicationSceneManifest"]["UIApplicationSupportsMultipleScenes"] =
+            json!(true);
+        assert!(!single_scene_plist(&multi_scene, bundle));
+
+        let mut ipad_override = explicit.clone();
+        ipad_override["UIApplicationSceneManifest~ipad"] =
+            multi_scene["UIApplicationSceneManifest"].clone();
+        assert!(!single_scene_plist(&ipad_override, bundle));
+
+        let mut malformed = installed;
+        malformed["UIApplicationSceneManifest"] =
+            json!({"UIApplicationSupportsMultipleScenes": "false"});
+        assert!(!single_scene_plist(&malformed, bundle));
+        malformed["UIApplicationSceneManifest"] = json!(null);
+        assert!(!single_scene_plist(&malformed, bundle));
+    }
+
+    #[test]
+    fn observation_scale_matches_the_native_device_and_both_coordinate_extents() {
+        use crate::idb::proto::{ScreenDimensions, TargetDescription};
+
+        let mut target = TargetDescription {
+            udid: "owned-simulator".into(),
+            screen_dimensions: Some(ScreenDimensions {
+                width: 1206,
+                height: 2622,
+                density: 3.0,
+                width_points: 402,
+                height_points: 874,
+            }),
+            ..Default::default()
+        };
+        let geometry = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1206,
+            height: 2622,
+        };
+        assert_eq!(
+            observation_scale(&target, "owned-simulator", &geometry),
+            Some(3.0)
+        );
+        assert!(observation_scale(&target, "other-simulator", &geometry).is_none());
+        for geometry in [
+            WindowGeometry {
+                width: 1200,
+                ..geometry.clone()
+            },
+            WindowGeometry {
+                height: 2620,
+                ..geometry.clone()
+            },
+        ] {
+            assert!(observation_scale(&target, "owned-simulator", &geometry).is_none());
+        }
+        target.screen_dimensions.as_mut().unwrap().width_points -= 1;
+        assert!(observation_scale(&target, "owned-simulator", &geometry).is_none());
+        let screen = target.screen_dimensions.as_mut().unwrap();
+        screen.width_points += 1;
+        screen.height_points -= 1;
+        assert!(observation_scale(&target, "owned-simulator", &geometry).is_none());
+    }
+
+    #[test]
     fn a_density_that_cannot_be_a_scale_is_rejected() {
         // Guessing here would place every tap at the wrong point, so it is an error and the
         // caller leaves the session unstarted.
@@ -903,6 +1148,7 @@ mod state_machine_tests {
             app: Some(RunningApp {
                 bundle_id: "tech.fixedwidth.demo".into(),
                 pid: None,
+                process_start: None,
                 geometry: geometry(),
                 logs: LogStream::spawn(target.simctl(), "fake"),
                 injector: Some(IdbInjector::new(1.0)),
@@ -931,6 +1177,7 @@ mod state_machine_tests {
             app: Some(RunningApp {
                 bundle_id: "tech.fixedwidth.demo".into(),
                 pid: None,
+                process_start: None,
                 geometry: geometry(),
                 logs: LogStream::spawn(target.simctl(), "fake"),
                 injector: None,
@@ -1385,6 +1632,7 @@ mod teardown_tests {
         let app = running.then(|| RunningApp {
             bundle_id: BUNDLE.into(),
             pid: None,
+            process_start: None,
             geometry: WindowGeometry {
                 x: 0,
                 y: 0,

@@ -156,23 +156,128 @@ pub(crate) fn build_tree_observing(
     limits: WalkLimits,
     observe: &mut impl FnMut(&Value),
 ) -> Result<AxTree> {
-    let v: Value = serde_json::from_str(json)
-        .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))?;
+    let value = parse_document(json)?;
+    build_document(&value, scale, window, limits, observe)
+}
+
+pub(crate) fn build_tree_with_scope(
+    json: &str,
+    scale: f64,
+    window: &WindowGeometry,
+    limits: WalkLimits,
+    owner: u32,
+    guest: bool,
+) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
+    let value = parse_document(json)?;
+    let scope = observation_scope(&value, window, scale, owner, guest);
+    let tree = build_document(&value, scale, window, limits, &mut |_| {})?;
+    Ok((tree, scope))
+}
+
+fn parse_document(json: &str) -> Result<Value> {
+    serde_json::from_str(json)
+        .map_err(|e| GlassError::AccessibilityUnavailable(format!("idb a11y JSON parse: {e}")))
+}
+
+fn guest_frame_scale(value: &Value, window: &WindowGeometry, scale: f64) -> Option<f64> {
+    value
+        .get("screen")
+        .filter(|screen| {
+            screen.get("coordinate_space").and_then(Value::as_str) == Some("screen")
+                && [("width", window.width), ("height", window.height)]
+                    .into_iter()
+                    .all(|(key, pixels)| {
+                        screen
+                            .get(key)
+                            .and_then(Value::as_f64)
+                            .is_some_and(|points| (points * scale).round() == f64::from(pixels))
+                    })
+        })
+        .map(|_| scale)
+}
+
+fn observation_scope(
+    document: &Value,
+    window: &WindowGeometry,
+    scale: f64,
+    owner: u32,
+    guest: bool,
+) -> Option<glass_core::AxObservationScope> {
+    let full_screen = AxRect {
+        x: 0,
+        y: 0,
+        width: window.width,
+        height: window.height,
+    };
+    let is_owned = |node: &Value| {
+        node.get("pid").and_then(Value::as_u64) == Some(u64::from(owner))
+            && node
+                .get("frame")
+                .and_then(|frame| frame_to_rect(frame, scale))
+                == Some(full_screen)
+    };
+    let provider = if guest {
+        let provider = crate::idb::client::guest_reader_name(document.get("backend")?.as_str()?)?;
+        guest_frame_scale(document, window, scale)?;
+        if document.get("target")?.get("kind")?.as_str()? != "frontmost"
+            || document.get("modal")? != &Value::Null
+        {
+            return None;
+        }
+        let [root] = document.get("elements")?.as_array()?.as_slice() else {
+            return None;
+        };
+        if !is_owned(root) {
+            return None;
+        }
+        let application = match root.get("type")?.as_str()? {
+            "Application" => root,
+            "Other" => {
+                let [app] = root.get("children")?.as_array()?.as_slice() else {
+                    return None;
+                };
+                app
+            }
+            _ => return None,
+        };
+        if application.get("type")?.as_str()? != "Application" || !is_owned(application) {
+            return None;
+        }
+        provider
+    } else {
+        if document.get("backend").is_some() {
+            return None;
+        }
+        let root = match document {
+            Value::Array(roots) => match roots.as_slice() {
+                [root] => root,
+                _ => return None,
+            },
+            Value::Object(_) => document,
+            _ => return None,
+        };
+        if root.get("role")?.as_str()? != "AXApplication" || !is_owned(root) {
+            return None;
+        }
+        "ios-ax"
+    };
+    Some(glass_core::AxObservationScope {
+        provider,
+        coordinate_basis: scale.to_bits(),
+        root_identity: None,
+    })
+}
+
+fn build_document(
+    v: &Value,
+    scale: f64,
+    window: &WindowGeometry,
+    limits: WalkLimits,
+    observe: &mut impl FnMut(&Value),
+) -> Result<AxTree> {
     let guest = v.get("backend").is_some();
     let frame_scale = if guest {
-        v.get("screen")
-            .filter(|screen| {
-                screen.get("coordinate_space").and_then(Value::as_str) == Some("screen")
-                    && [("width", window.width), ("height", window.height)]
-                        .into_iter()
-                        .all(|(key, pixels)| {
-                            screen
-                                .get(key)
-                                .and_then(Value::as_f64)
-                                .is_some_and(|points| (points * scale).round() == f64::from(pixels))
-                        })
-            })
-            .map(|_| scale)
+        guest_frame_scale(v, window, scale)
     } else {
         Some(scale)
     };
@@ -183,7 +288,7 @@ pub(crate) fn build_tree_observing(
             GlassError::AccessibilityUnavailable("idb axbridge: invalid complete response".into())
         })?
     } else {
-        (&v, false)
+        (v, false)
     };
     let mut budget = WalkBudget::with_limits(limits);
     // idb may return either a single root object or an array of top-level elements.
@@ -395,6 +500,98 @@ mod tests {
 
     const FIXTURE: &str = include_str!("../tests/fixtures/describe_nested.json");
     const HINT_FIXTURE: &str = include_str!("../tests/fixtures/describe_hint.json");
+
+    #[test]
+    fn host_observation_requires_one_screen_sized_application_with_the_launched_pid() {
+        use serde_json::json;
+        let geometry = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1206,
+            height: 2622,
+        };
+        let app = json!({
+            "role": "AXApplication", "pid": 71,
+            "frame": {"x": 0, "y": 0, "width": 402, "height": 874},
+            "children": [{"role": "AXButton", "AXLabel": "Save"}],
+        });
+        let reply = json!([app.clone()]).to_string();
+        let (tree, scope) =
+            build_tree_with_scope(&reply, 3.0, &geometry, WalkLimits::DEFAULT, 71, false).unwrap();
+        assert_eq!(scope.unwrap().provider, "ios-ax");
+        assert_eq!(
+            tree,
+            build_tree(&reply, 3.0, &geometry, WalkLimits::DEFAULT).unwrap()
+        );
+        assert!(observation_scope(&json!([app.clone()]), &geometry, 3.0, 88, false).is_none());
+        assert!(
+            observation_scope(
+                &json!([app.clone(), app.clone()]),
+                &geometry,
+                3.0,
+                71,
+                false
+            )
+            .is_none()
+        );
+        let mut without_pid = app.clone();
+        without_pid.as_object_mut().unwrap().remove("pid");
+        assert!(observation_scope(&json!([without_pid]), &geometry, 3.0, 71, false).is_none());
+        let mut other_provider = app.clone();
+        other_provider["backend"] = json!("axbridge-exclusive");
+        assert!(observation_scope(&other_provider, &geometry, 3.0, 71, false).is_none());
+        let mut shifted = app;
+        shifted["frame"]["x"] = json!(1);
+        assert!(observation_scope(&json!([shifted]), &geometry, 3.0, 71, false).is_none());
+    }
+
+    #[test]
+    fn guest_observation_requires_screen_provenance_and_an_owned_application() {
+        use serde_json::json;
+        let geometry = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1206,
+            height: 2622,
+        };
+        let frame = json!({"x": 0, "y": 0, "width": 402, "height": 874});
+        let actual = json!({
+            "backend": "axbridge-exclusive", "target": {"kind": "frontmost", "pid": null},
+            "screen": {"coordinate_space": "screen", "width": 402, "height": 874},
+            "modal": null, "truncated": false, "elements": [{
+                "type": "Other", "pid": 71, "frame": frame,
+                "children": [{
+                    "type": "Application", "pid": 71, "frame": frame,
+                    "children": [{"type": "Document", "pid": 88, "label": "Embedded content"}],
+                }],
+            }],
+        });
+        let reply = actual.to_string();
+        let (tree, scope) =
+            build_tree_with_scope(&reply, 3.0, &geometry, WalkLimits::DEFAULT, 71, true).unwrap();
+        assert_eq!(scope.unwrap().provider, "axbridge-exclusive");
+        assert_eq!(
+            tree,
+            build_tree(&reply, 3.0, &geometry, WalkLimits::DEFAULT).unwrap()
+        );
+        for (path, value) in [
+            ("/backend", json!("ax")),
+            ("/target/kind", json!("point")),
+            ("/modal", json!({"type":"Alert"})),
+            ("/screen/coordinate_space", json!("document")),
+            ("/screen/width", json!(874)),
+            ("/elements/0/pid", json!(88)),
+            ("/elements/0/children/0/pid", json!(88)),
+            ("/elements/0/children/0/type", json!("Group")),
+        ] {
+            let mut invalid = actual.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(
+                observation_scope(&invalid, &geometry, 3.0, 71, true).is_none(),
+                "{path}"
+            );
+        }
+    }
 
     /// The fixture app runs full-screen on an iPhone 17 simulator: 402x874 logical
     /// points at ×3 backing scale => 1206x2622 pixels.

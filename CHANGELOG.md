@@ -21,6 +21,10 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Experimental accessibility snapshot revisions support verified reads of single-scene apps on
+  the iOS Simulator through the host AX reader and axbridge when the companion reports portrait
+  orientation.
+
 - Experimental accessibility snapshot revisions support Android's uiautomator and accessibility
   service readers when Glass can verify the focused app window on the emulator's default display.
 
