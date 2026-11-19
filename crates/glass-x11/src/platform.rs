@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Stdio};
@@ -382,7 +383,10 @@ fn window_owner_pid(conn: &RustConnection, window: Window) -> Option<u32> {
     let [pid] = client.value.as_slice() else {
         return None;
     };
-    (client.spec.mask == ClientIdMask::LOCAL_CLIENT_PID && *pid != 0).then_some(*pid)
+    if client.spec.mask != ClientIdMask::LOCAL_CLIENT_PID {
+        return None;
+    }
+    NonZeroU32::new(*pid).map(NonZeroU32::get)
 }
 
 struct ContainedChild {
@@ -644,7 +648,7 @@ impl X11Platform {
         let socket = net::socket_with(
             AddressFamily::UNIX,
             SocketType::STREAM,
-            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            SocketFlags::CLOEXEC.union(SocketFlags::NONBLOCK),
             None,
         )
         .ok()?;
@@ -3677,6 +3681,46 @@ mod display_tests {
         assert_eq!(replacement.id, first.id);
         assert_eq!(replacement.owner_pid, first.owner_pid);
         assert_ne!(replacement.instance, first.instance);
+    }
+
+    #[test]
+    #[ignore = "launches a GTK app on an owned Xvfb with a private AT-SPI bus"]
+    fn observation_window_by_attests_an_owned_window_within_its_budget() {
+        let x = TestX::start();
+        let mut platform = x.platform();
+        let (server, _client) = x.into_server_and_client();
+        platform.xvfb = Some(server);
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../glass-a11y-linux/tests/fixtures/snapshot_revision_fixture.py"
+        );
+        let spec = AppSpec {
+            build: None,
+            run: vec!["python3".into(), fixture.into()],
+            cwd: None,
+            env: vec![("GDK_BACKEND".into(), "x11".into())],
+            window_hint: Some(WindowHint {
+                title: Some("Revision main".into()),
+                class: None,
+            }),
+            timeout_ms: 10_000,
+            sandbox: SandboxLevel::Off,
+            a11y: true,
+        };
+        let geometry = platform.start_app(&spec).unwrap();
+        let owner = platform.app_pid();
+        let observation = platform
+            .observation_window_by(Deadline::UNBOUNDED)
+            .expect("the owned window should qualify on a responsive Xvfb");
+        assert_eq!(observation.owner_pid, owner);
+        assert_eq!(observation.geometry, Some(geometry));
+        let observer = &platform.window_observation.as_ref().unwrap().conn;
+        assert!(
+            rustix::io::fcntl_getfd(observer.stream())
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+        platform.stop_app_by(Deadline::UNBOUNDED).unwrap();
     }
 
     #[test]

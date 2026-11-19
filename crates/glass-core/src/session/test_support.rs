@@ -72,6 +72,7 @@ pub(crate) struct FakePlatform {
     window_probe_log: Option<WindowProbeLog>,
     key_deadline_log: Option<InputDeadlineLog>,
     pid_deadline_log: Option<PidDeadlineLog>,
+    observed_pids: std::cell::RefCell<VecDeque<Vec<u32>>>,
     capture_delay: Option<Duration>,
     capture_deadline_error_owner: Option<crate::Whose>,
     capture_error_owners: VecDeque<Option<crate::Whose>>,
@@ -137,6 +138,10 @@ impl FakePlatform {
     }
     pub(crate) fn with_geometry_error_at(mut self, read: usize) -> Self {
         self.geometry_error_at = Some(read);
+        self
+    }
+    pub(crate) fn with_observed_pids(mut self, reads: impl IntoIterator<Item = Vec<u32>>) -> Self {
+        self.observed_pids.get_mut().extend(reads);
         self
     }
     pub(crate) fn with_window_occlusion(
@@ -562,7 +567,11 @@ impl Platform for FakePlatform {
                 "accessibility process discovery",
             ))
         } else {
-            Ok(vec![4242])
+            Ok(self
+                .observed_pids
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| vec![4242]))
         }
     }
     fn a11y_toggle_control_at_trailing_edge(&self) -> bool {
