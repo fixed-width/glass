@@ -43,6 +43,8 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- Decline element clicks on iOS Simulator guest nodes without verified bounds. Native controls
+  with verified bounds can still use the automatic pointer path.
 - On iOS Simulator and Android without the accessibility service, `glass_set_value` rechecks a
   temporarily missing field once within the existing read-back budget, so a transition can finish
   before the write is reported as unconfirmed.
