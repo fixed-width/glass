@@ -10,6 +10,7 @@ publish = false
 glass-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+sha2 = "0.11"
 # `event` gates the event-handler types `events.rs` registers.
 uiautomation = { version = "0.25", features = ["process", "event"] }
 # For `IUIAutomation2::SetTransactionTimeout`, which bounds the subscription's cross-process

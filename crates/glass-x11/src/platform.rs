@@ -722,6 +722,7 @@ impl X11Platform {
             instance,
             owner_pid,
             geometry: Some(geometry),
+            outer_geometry: None,
             subject: None,
         };
         self.window_observation = Some(WindowObservation {

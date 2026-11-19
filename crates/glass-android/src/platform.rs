@@ -691,6 +691,7 @@ impl Platform for AndroidPlatform {
             instance: app.observation_instance,
             owner_pid: Some(observed.owner_pid),
             geometry: Some(observed.frame.clone()),
+            outer_geometry: None,
             subject: Some(AxObservationSubject {
                 device,
                 application: app.package.clone(),

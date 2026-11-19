@@ -795,6 +795,7 @@ impl Platform for IosPlatform {
             instance: u64::from(pid),
             owner_pid: Some(pid),
             geometry: Some(app.geometry.clone()),
+            outer_geometry: None,
             subject: Some(glass_core::AxObservationSubject {
                 device: device.to_owned(),
                 application: app.bundle_id.clone(),

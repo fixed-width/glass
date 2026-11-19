@@ -3,13 +3,16 @@
 //! and walks the bounded Control view into an `AxTree`. Never returns a stub:
 //! failures are `AccessibilityUnavailable`.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glass_core::{
-    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId, AxRect, AxTarget,
-    AxTree, ChangeSignal, Deadline, GlassError, PointerHit, Result, WalkBudget, Whose,
-    normalize_description, normalize_name, read_back_confirms, write_took_no_effect,
+    A11yMutationDispatch, A11yThread, Accessibility, AxContext, AxNode, AxNodeId,
+    AxObservationScope, AxObservationWindow, AxRect, AxTarget, AxTree, ChangeSignal, Deadline,
+    GlassError, PointerHit, Result, WalkBudget, Whose, WindowGeometry, normalize_description,
+    normalize_name, read_back_confirms, write_took_no_effect,
 };
+use sha2::{Digest, Sha256};
 use uiautomation::core::UICacheRequest;
 use uiautomation::patterns::{
     UIExpandCollapsePattern, UIInvokePattern, UIRangeValuePattern, UISelectionItemPattern,
@@ -18,12 +21,15 @@ use uiautomation::patterns::{
 use uiautomation::types::{
     ElementMode, ExpandCollapseState, Handle, Rect, ToggleState, TreeScope, UIProperty,
 };
+use uiautomation::variants::Value;
 use uiautomation::{UIAutomation, UIElement, UITreeWalker};
+use windows::Win32::System::Variant::{VT_ARRAY, VT_I4};
 
 /// Every bounded call runs on a fresh detached thread: UIA is COM and thread-affine, so it must
 /// not run on the caller's. The cap is what stops a hung provider blocking the calling tool for
 /// longer than it.
 static UIA: A11yThread = A11yThread::new("UIA", Duration::from_secs(10));
+const OBSERVATION_PROBE_BUDGET: Duration = Duration::from_millis(150);
 /// Per-edge tolerance (px) for the set_value bounds-fingerprint check. Window-relative
 /// bounds are stable for a static element across snapshot→set_value (window moves cancel),
 /// so this only absorbs sub-pixel/timing jitter; a different element that drift landed on
@@ -42,18 +48,58 @@ const READ_ONLY_PROJECTION: &str = "this element's accessibility value may be a 
      without applying it — focus the element and type into it instead";
 
 #[derive(Default)]
-pub struct WindowsA11y;
+pub struct WindowsA11y {
+    // Allow only one optional COM request to outlive its wait in this reader.
+    observation_probe: Arc<Mutex<()>>,
+}
 
 impl WindowsA11y {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
 impl Accessibility for WindowsA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         let ctx = ctx.clone();
-        UIA.snapshot(ctx.deadline, move || run_snapshot(&ctx))
+        UIA.snapshot(ctx.deadline, move || {
+            run_snapshot(&ctx).map(|(tree, _, _)| tree)
+        })
+    }
+
+    fn snapshot_for_observation(
+        &mut self,
+        ctx: &AxContext,
+        window: &AxObservationWindow,
+    ) -> Result<(AxTree, Option<AxObservationScope>)> {
+        let owner = window.owner_pid.filter(|pid| {
+            ctx.window_handle == Some(window.id.0 as i64)
+                && window.geometry.as_ref() == Some(&ctx.window)
+                && ctx.pids.contains(pid)
+        });
+        let Some(((pid, handle), outer_frame)) = owner
+            .zip(ctx.window_handle)
+            .zip(window.outer_geometry.clone())
+        else {
+            return self.snapshot(ctx).map(|tree| (tree, None));
+        };
+        let probe_lock = Arc::clone(&self.observation_probe);
+        let ctx = ctx.clone();
+        UIA.snapshot_with_probe(ctx.deadline, OBSERVATION_PROBE_BUDGET, move || {
+            let (tree, automation, root) = run_snapshot(&ctx)?;
+            let probe = move |deadline| {
+                let _probe = probe_lock.try_lock().ok()?;
+                probe_root(
+                    &automation,
+                    &root,
+                    (pid, handle),
+                    &ctx.window,
+                    &outer_frame,
+                    deadline,
+                )
+            };
+            Ok((tree, Some(probe)))
+        })
     }
 
     fn subscribe_changes(&mut self, ctx: &AxContext) -> Option<Box<dyn ChangeSignal>> {
@@ -225,13 +271,10 @@ impl ReadMode {
 }
 
 fn snapshot_cache(automation: &UIAutomation, deadline: Deadline) -> Result<UICacheRequest> {
-    required_com(deadline, "configure UIA snapshot cache", || {
-        let cache = automation.create_cache_request()?;
-        // Element scope bounds each fetch; Full keeps the reference needed for the next step.
-        cache.set_tree_scope(TreeScope::Element)?;
-        // Live references also preserve the control-type-gated pattern reads used by actions.
-        cache.set_element_mode(ElementMode::Full)?;
-        for property in [
+    element_cache(
+        automation,
+        deadline,
+        &[
             UIProperty::ControlType,
             UIProperty::Name,
             UIProperty::HelpText,
@@ -242,14 +285,29 @@ fn snapshot_cache(automation: &UIAutomation, deadline: Deadline) -> Result<UICac
             UIProperty::HasKeyboardFocus,
             UIProperty::IsKeyboardFocusable,
             UIProperty::IsPassword,
-        ] {
+        ],
+    )
+}
+
+fn element_cache(
+    automation: &UIAutomation,
+    deadline: Deadline,
+    properties: &[UIProperty],
+) -> Result<UICacheRequest> {
+    required_com(deadline, "configure UIA snapshot cache", || {
+        let cache = automation.create_cache_request()?;
+        // Element scope bounds each fetch; Full keeps the reference needed for the next step.
+        cache.set_tree_scope(TreeScope::Element)?;
+        // Live references also preserve the control-type-gated pattern reads used by actions.
+        cache.set_element_mode(ElementMode::Full)?;
+        for &property in properties {
             cache.add_property(property)?;
         }
         Ok(cache)
     })
 }
 
-fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
+fn run_snapshot(ctx: &AxContext) -> Result<(AxTree, UIAutomation, UIElement)> {
     // UIAutomation::new() initializes COM (MTA) on this thread.
     let automation = required_com(ctx.deadline, "initialize UI Automation", UIAutomation::new)?;
     let walker = required_com(ctx.deadline, "get UIA control-view walker", || {
@@ -273,7 +331,85 @@ fn run_snapshot(ctx: &AxContext) -> Result<AxTree> {
     tree.truncated = budget.truncation();
     tree.unreadable = budget.unreadable();
     tree.assign_ids();
-    Ok(tree)
+    Ok((tree, automation, window))
+}
+
+fn root_matches_frame(bounds: Rect, capture: &WindowGeometry, outer: &WindowGeometry) -> bool {
+    // Compare the exclusive Win32 edges directly.
+    [capture, outer].iter().any(|frame| {
+        bounds.get_left() == frame.x
+            && bounds.get_top() == frame.y
+            && i64::from(bounds.get_right()) == i64::from(frame.x) + i64::from(frame.width)
+            && i64::from(bounds.get_bottom()) == i64::from(frame.y) + i64::from(frame.height)
+    })
+}
+
+fn probe_root(
+    automation: &UIAutomation,
+    root: &UIElement,
+    (pid, handle): (u32, i64),
+    capture_frame: &WindowGeometry,
+    outer_frame: &WindowGeometry,
+    deadline: Deadline,
+) -> Option<AxObservationScope> {
+    let bounds = root.get_cached_bounding_rectangle().ok()?;
+    if !root_matches_frame(bounds, capture_frame, outer_frame) {
+        return None;
+    }
+    let cache = element_cache(
+        automation,
+        deadline,
+        &[
+            UIProperty::BoundingRectangle,
+            UIProperty::ProcessId,
+            UIProperty::NativeWindowHandle,
+            UIProperty::RuntimeId,
+            UIProperty::ProviderDescription,
+        ],
+    )
+    .ok()?;
+    let cached = required_com(deadline, "cache UIA root provenance", || {
+        root.build_updated_cache(&cache)
+    })
+    .ok()?;
+    if cached.get_cached_bounding_rectangle().ok()? != bounds {
+        return None;
+    }
+    Some(AxObservationScope {
+        provider: "windows-uia",
+        // UIA screen rectangles and the DWM origin are both in physical pixels.
+        coordinate_basis: 1,
+        root_identity: Some(root_identity(&cached, pid, handle)?),
+    })
+}
+
+fn root_identity(root: &UIElement, pid: u32, handle: i64) -> Option<[u8; 32]> {
+    let native_handle: isize = root.get_cached_native_window_handle().ok()?.into();
+    if native_handle as i64 != handle || root.get_cached_process_id().ok()? as u32 != pid {
+        return None;
+    }
+    let runtime = root.get_cached_property_value(UIProperty::RuntimeId).ok()?;
+    if runtime.get_type().0 != (VT_ARRAY.0 | VT_I4.0) {
+        return None;
+    }
+    let Value::ArrayI4(runtime_id) = runtime.get_value().ok()? else {
+        return None;
+    };
+    let provider = root.get_cached_provider_description().ok()?;
+    if runtime_id.is_empty()
+        || runtime_id.len() > 64
+        || provider.is_empty()
+        || provider.len() > 8192
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update([runtime_id.len() as u8]);
+    for part in runtime_id {
+        digest.update(part.to_le_bytes());
+    }
+    digest.update(provider.as_bytes());
+    Some(digest.finalize().into())
 }
 
 /// Bind a UIA element to glass's adopted window via its handle (`AxContext::window_handle`, set by
