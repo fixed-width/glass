@@ -43,6 +43,9 @@ internal refactors, CI, or test-only changes.
 
 ### Fixed
 
+- iOS Simulator text writes that reach the `axbridge` reader report refusal before dispatch and
+  explain how to replace text by keyboard and verify the resulting value.
+
 - Decline element clicks on iOS Simulator guest nodes without verified bounds. Native controls
   with verified bounds can still use the automatic pointer path.
 - On iOS Simulator and Android without the accessibility service, `glass_set_value` rechecks a

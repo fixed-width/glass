@@ -515,9 +515,17 @@ impl Accessibility for IosA11y {
         let before_dispatch = SemanticPhase::SetValue { dispatched: false };
         before_dispatch.require(ctx.deadline)?;
         if self.client.uses_guest_reader() {
-            return Err(GlassError::Unsupported(
-                "iOS axbridge supports accessibility reads. Focus the field with a coordinate tap, +                 type, and confirm its value in a fresh snapshot".into(),
-            ));
+            return Err(GlassError::UnsupportedOperation {
+                operation: "set_value".into(),
+                reason: "axbridge cannot verify the write target and keyboard focus. Use \
+                         glass_screenshot to locate the field and a coordinate click to focus it. \
+                         Select all existing text before typing a replacement. Before checking \
+                         the exact value with wait_for_element, verify that the name, role, \
+                         and any description identify exactly one intended field. \
+                         Use glass_do for these actions in the lean profile."
+                    .into(),
+            }
+            .before_dispatch());
         }
         let (tree, scale) = self.describe(ctx, before_dispatch)?;
         let (bounds, before) = before_dispatch.run(ctx.deadline, || verify(&tree, target))?;
@@ -1680,6 +1688,26 @@ mod tests {
             error.bound_dispatch(),
             Some(glass_core::BoundDispatch::NotDispatched)
         );
+    }
+
+    #[test]
+    fn guest_set_value_refuses_before_dispatch_and_guides_verified_keyboard_input() {
+        let mut a11y = IosA11y::new(IdbClient::for_test());
+        a11y.configure_reader(Some("axbridge")).unwrap();
+        let error = a11y
+            .set_value(&ctx(Deadline::UNBOUNDED), &matching_target(), "new value")
+            .expect_err("guest a11y cannot verify the write target");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
+        let GlassError::UnsupportedOperation { operation, reason } = error.cause() else {
+            panic!("expected structured refusal, got {error}");
+        };
+        assert_eq!(operation, "set_value");
+        assert!(reason.contains("glass_screenshot") && reason.contains("wait_for_element"));
+        assert!(reason.contains("Select all existing text before typing a replacement"));
+        assert!(reason.contains("identify exactly one intended field"));
     }
 
     #[test]

@@ -143,6 +143,30 @@ at dispatch. Native controls with verified bounds can still use the automatic po
 Pass `accessibility_reader: "ax"` to choose the host reader. Omit the field to use the server
 default, which is `ax` unless `GLASS_IOS_ACCESSIBILITY_BACKEND` sets a different default.
 
+### Enter text with the guest reader
+
+Text writes through `glass_set_value` that reach the `axbridge` reader return
+`unsupported_operation` with `dispatch: "not_dispatched"`. idb reports the field's value
+but cannot verify keyboard focus for a semantic write.
+
+Use `glass_screenshot` to locate the field, tap it with a coordinate click, and check its focus.
+Select all existing text before typing a replacement.
+
+In a fresh, complete accessibility tree, confirm that the same name substring, role, and any
+description substring you plan to use with `wait_for_element` match exactly one intended field.
+Refine those predicates if several fields match. Check uniqueness before adding the `value`
+predicate, and recheck if the page changes. For an empty field or one with all its text selected,
+these `glass_do` actions type the new text and verify the exact value in the uniquely identified field.
+
+```json
+{
+  "actions": [
+    {"action": "type", "text": "example"},
+    {"action": "wait_for_element", "name": "Account name", "role": "TextField", "value": "example"}
+  ]
+}
+```
+
 ## Clipboard
 
 `glass_clipboard_get` and `glass_clipboard_set` act on the **Simulator's own** pasteboard (separate
