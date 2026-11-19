@@ -2,7 +2,8 @@
 //! line-JSON protocol to `glass-a11y.apk` over an `adb forward`ed socket, and maps the live
 //! `AccessibilityNodeInfo` tree (sent as JSON) into glass's `AxTree`.
 
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use serde_json::{Value, json};
 
@@ -236,6 +237,7 @@ pub(crate) struct RefTree {
     /// The package explicitly named by the companion. `AxTree::subject` intentionally cannot
     /// distinguish an explicit match from an omitted package, but retry authorization must.
     explicit_package: Option<String>,
+    reader_generation: u64,
 }
 
 impl RefTree {
@@ -300,6 +302,7 @@ pub(crate) fn tree_from_json(
         refs: walk.refs,
         clickable: walk.clickable,
         explicit_package: None,
+        reader_generation: 0,
     })
 }
 
@@ -311,12 +314,14 @@ struct TreeReply {
     /// on an older companion that predates this field, or on a current one that cannot name
     /// the active window on this platform/state — either way, absent is not a mismatch.
     package: Option<String>,
+    reader_generation: u64,
 }
 
 /// Line-JSON client to the on-device a11y service (mirrors `AgentClient`).
 pub struct ServiceClient {
     conn: Mutex<Conn>,
     port: u16,
+    generation: AtomicU64,
 }
 
 impl ServiceClient {
@@ -325,6 +330,7 @@ impl ServiceClient {
         Ok(ServiceClient {
             conn: Mutex::new(conn),
             port,
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -334,7 +340,7 @@ impl ServiceClient {
         req: Value,
         resend: fn(&CallFailure) -> bool,
         deadline: Deadline,
-    ) -> std::result::Result<Value, CallFailure> {
+    ) -> std::result::Result<(Value, u64), CallFailure> {
         if deadline.has_passed() {
             return Err(CallFailure::NotSent(GlassError::deadline_not_started(
                 "Android accessibility service request",
@@ -347,7 +353,7 @@ impl ServiceClient {
             )));
         }
         if conn.ensure_usable().is_err() {
-            *conn = service_connection(self.port, deadline).map_err(CallFailure::NotSent)?;
+            *conn = self.reconnect(deadline).map_err(CallFailure::NotSent)?;
         }
         let first = conn
             .call_within(
@@ -357,16 +363,23 @@ impl ServiceClient {
             )
             .map_err(CallFailure::NotSent)?;
         match first {
-            Ok(v) => Ok(v),
+            Ok(v) => Ok((v, self.generation.load(Ordering::Relaxed))),
             Err(f) if resend(&f) => {
                 // The service's accept loop accepts a fresh connection after a drop.
-                *conn = service_connection(self.port, deadline).map_err(|e| f.with_error(e))?;
+                *conn = self.reconnect(deadline).map_err(|e| f.with_error(e))?;
                 conn.call_within(req, deadline, "Android accessibility service retry")
                     .map_err(|e| f.with_error(e))?
                     .map_err(|retry| f.merge_retry(retry))
+                    .map(|reply| (reply, self.generation.load(Ordering::Relaxed)))
             }
             Err(f) => Err(f),
         }
+    }
+
+    fn reconnect(&self, deadline: Deadline) -> Result<Conn> {
+        let conn = service_connection(self.port, deadline)?;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(conn)
     }
 
     fn lock_by(
@@ -405,7 +418,11 @@ impl ServiceClient {
 
     /// Run a request that can be run twice without consequence, transparently reconnecting
     /// once if the socket dropped. A dead socket usually surfaces on the *read*, not the write.
-    fn call(&self, req: Value, deadline: Deadline) -> std::result::Result<Value, CallFailure> {
+    fn call(
+        &self,
+        req: Value,
+        deadline: Deadline,
+    ) -> std::result::Result<(Value, u64), CallFailure> {
         self.call_with(req, CallFailure::is_transport, deadline)
     }
 
@@ -455,7 +472,7 @@ impl ServiceClient {
         if let Some((x, y)) = point {
             request["pointer_point"] = json!({"x": x, "y": y});
         }
-        let r = self.call(request, deadline).map_err(|failure| {
+        let (r, reader_generation) = self.call(request, deadline).map_err(|failure| {
             let sent = !failure.nothing_sent();
             let error = failure.into_error();
             if sent && error.bound_dispatch() == Some(glass_core::BoundDispatch::NotDispatched) {
@@ -473,6 +490,7 @@ impl ServiceClient {
             tree,
             pointer_window: r.get("pointer_window").cloned(),
             package: r.get("package").and_then(Value::as_str).map(str::to_owned),
+            reader_generation,
         })
     }
 
@@ -536,6 +554,8 @@ fn sleep_within_semantic_deadline(
 pub struct ServiceA11y {
     client: ServiceClient,
     package: String,
+    device_serial: Option<String>,
+    session_package: Option<Arc<Mutex<Option<String>>>>,
     /// How long [`Self::wait_for_check`] polls; [`CHECK_TIMEOUT`] outside tests.
     check_timeout: std::time::Duration,
     /// How long [`Accessibility::set_value`] polls for the write; [`WRITE_VERIFY_BUDGET`] outside
@@ -558,6 +578,8 @@ impl ServiceA11y {
         Self {
             client,
             package,
+            device_serial: None,
+            session_package: None,
             check_timeout: CHECK_TIMEOUT,
             write_verify_budget: WRITE_VERIFY_BUDGET,
             #[cfg(test)]
@@ -571,6 +593,29 @@ impl ServiceA11y {
             #[cfg(test)]
             write_verify_poll: WRITE_VERIFY_POLL,
         }
+    }
+
+    pub(crate) fn with_session(
+        mut self,
+        device_serial: Option<String>,
+        package: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        self.device_serial = device_serial;
+        self.session_package = Some(package);
+        self
+    }
+
+    fn session_snapshot(&mut self, ctx: &AxContext) -> Result<RefTree> {
+        let mut read = self.snapshot_with_refs(ctx)?;
+        if let Some(package) = self
+            .session_package
+            .as_ref()
+            .and_then(|state| state.lock().ok())
+            && let Some(asked) = package.as_deref()
+        {
+            read.tree.subject = subject_of(asked, read.explicit_package.as_deref());
+        }
+        Ok(read)
     }
 
     fn check_poll(&self) -> std::time::Duration {
@@ -721,6 +766,7 @@ impl ServiceA11y {
         let mut rt = tree_from_json(&reply.tree, &ctx.window, ctx.limits)?;
         rt.tree.subject = subject_of(&self.package, reply.package.as_deref());
         rt.explicit_package = reply.package;
+        rt.reader_generation = reply.reader_generation;
         Ok(rt)
     }
 }
@@ -861,7 +907,31 @@ fn service_write_reading(tree: &AxTree, target: &AxTarget, text: &str) -> Result
 
 impl Accessibility for ServiceA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
-        Ok(self.snapshot_with_refs(ctx)?.tree)
+        Ok(self.session_snapshot(ctx)?.tree)
+    }
+
+    fn snapshot_for_observation(
+        &mut self,
+        ctx: &AxContext,
+        window: &glass_core::AxObservationWindow,
+    ) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
+        let read = self.session_snapshot(ctx)?;
+        let subject = crate::axmap::observation_subject(ctx, window, self.device_serial.as_deref());
+        let scope = subject.and_then(|expected| {
+            if read.explicit_package.as_deref() != Some(expected.application.as_str())
+                || !crate::axmap::root_fits_window(read.tree.root.bounds, &ctx.window)
+            {
+                return None;
+            }
+            let mut identity = [0; 32];
+            identity[..8].copy_from_slice(&read.reader_generation.to_le_bytes());
+            Some(glass_core::AxObservationScope {
+                provider: "android-accessibility-service-v1",
+                coordinate_basis: expected.coordinate_basis,
+                root_identity: Some(identity),
+            })
+        });
+        Ok((read.tree, scope))
     }
 
     fn state_coverage(&self) -> AxStateCoverage {
@@ -1062,7 +1132,6 @@ impl Accessibility for ServiceA11y {
 }
 
 use crate::adb::Adb;
-use std::sync::Arc;
 
 const SERVICE_COMPONENT: &str =
     "com.fixedwidth.glassa11y/com.fixedwidth.glassa11y.GlassA11yService";
@@ -3948,6 +4017,59 @@ mod tests {
         let mut a = ServiceA11y::new(client, String::new());
         a.check_timeout = check_timeout;
         a
+    }
+
+    #[test]
+    fn service_observations_require_a_named_subject_and_track_reconnections() {
+        let (port, _) = fake_service_full(
+            vec![device_tree()],
+            vec![OnAction::Ok],
+            vec![
+                TreePackage::Other("com.fixture".into()),
+                TreePackage::Other("com.fixture".into()),
+                TreePackage::Omitted,
+                TreePackage::Other("com.other".into()),
+            ],
+            vec![OnTree::Serve, OnTree::DropWithoutAnswering, OnTree::Serve],
+        );
+        let mut reader = reader(port, std::time::Duration::ZERO).with_session(
+            Some("emulator-fixture".into()),
+            Arc::new(Mutex::new(Some("com.fixture".into()))),
+        );
+        let geometry = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 2400,
+        };
+        let ctx = AxContext {
+            pids: vec![42],
+            window: geometry.clone(),
+            ..ctx()
+        };
+        let window = glass_core::AxObservationWindow {
+            id: glass_core::WindowId(7),
+            instance: 1,
+            owner_pid: Some(42),
+            geometry: Some(geometry),
+            subject: Some(glass_core::AxObservationSubject {
+                device: "emulator-fixture".into(),
+                application: "com.fixture".into(),
+                coordinate_basis: 2,
+            }),
+        };
+        let (tree, first) = reader.snapshot_for_observation(&ctx, &window).unwrap();
+        assert!(tree.subject.is_none());
+        let first = first.unwrap();
+        assert_eq!(first.coordinate_basis, 2);
+        let (_, recovered) = reader.snapshot_for_observation(&ctx, &window).unwrap();
+        assert_ne!(first.root_identity, recovered.unwrap().root_identity);
+        let (tree, unnamed) = reader.snapshot_for_observation(&ctx, &window).unwrap();
+        assert!(unnamed.is_none());
+        assert!(tree.subject.is_none());
+        let (tree, mismatch) = reader.snapshot_for_observation(&ctx, &window).unwrap();
+        assert!(mismatch.is_none());
+        assert_eq!(tree.subject.unwrap().asked, "com.fixture");
     }
 
     fn ctx() -> AxContext {

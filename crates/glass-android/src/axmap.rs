@@ -125,7 +125,49 @@ pub fn parse_bounds(s: &str, window: &WindowGeometry) -> Option<AxRect> {
 /// Parse uiautomator XML into an `AxTree`. Ids are left unset (the caller runs
 /// `AxTree::assign_ids`). The hierarchy is wrapped in a synthetic `Window` root
 /// sized to the app window.
+#[cfg(test)]
 pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Result<AxTree> {
+    build_tree_with_scope(xml, window, limits, None).map(|(tree, _)| tree)
+}
+
+pub(crate) fn observation_subject<'a>(
+    ctx: &glass_core::AxContext,
+    window: &'a glass_core::AxObservationWindow,
+    device: Option<&str>,
+) -> Option<&'a glass_core::AxObservationSubject> {
+    let subject = window.subject.as_ref()?;
+    if device != Some(subject.device.as_str())
+        || window.geometry.as_ref() != Some(&ctx.window)
+        || !ctx.pids.contains(&window.owner_pid?)
+    {
+        return None;
+    }
+    Some(subject)
+}
+
+pub(crate) fn root_fits_window(bounds: Option<AxRect>, window: &WindowGeometry) -> bool {
+    let Some(bounds) = bounds else {
+        return false;
+    };
+    let (Ok(x), Ok(y)) = (u32::try_from(bounds.x), u32::try_from(bounds.y)) else {
+        return false;
+    };
+    glass_core::Region {
+        x,
+        y,
+        width: bounds.width,
+        height: bounds.height,
+    }
+    .check_fits(window.width, window.height)
+    .is_ok()
+}
+
+pub(crate) fn build_tree_with_scope(
+    xml: &str,
+    window: &WindowGeometry,
+    limits: WalkLimits,
+    subject: Option<&glass_core::AxObservationSubject>,
+) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
     let doc = roxmltree::Document::parse(xml)
         .map_err(|e| GlassError::AccessibilityUnavailable(format!("uiautomator XML parse: {e}")))?;
     let hierarchy = doc.root_element();
@@ -134,6 +176,25 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
             "uiautomator XML has no <hierarchy> root".into(),
         ));
     }
+    let mut nodes = hierarchy
+        .children()
+        .filter(|node| node.has_tag_name("node"));
+    let scope = subject.and_then(|expected| {
+        let root = nodes.next()?;
+        let rotation = hierarchy.attribute("rotation")?.parse::<u64>().ok()?;
+        let bounds = root
+            .attribute("bounds")
+            .and_then(|value| parse_bounds(value, window));
+        (nodes.next().is_none()
+            && rotation == expected.coordinate_basis
+            && root.attribute("package") == Some(expected.application.as_str())
+            && root_fits_window(bounds, window))
+        .then_some(glass_core::AxObservationScope {
+            provider: "android-uiautomator-v1",
+            coordinate_basis: rotation,
+            root_identity: None,
+        })
+    });
     let mut budget = WalkBudget::with_limits(limits);
     let mut children = Vec::new();
     for (i, n) in hierarchy
@@ -165,7 +226,7 @@ pub fn build_tree(xml: &str, window: &WindowGeometry, limits: WalkLimits) -> Res
     demote_web_hosts(&mut root);
     let mut tree = AxTree::new(root);
     tree.truncated = budget.truncation();
-    Ok(tree)
+    Ok((tree, scope))
 }
 
 fn map_node(
@@ -342,6 +403,75 @@ fn non_empty(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uiautomator_attests_only_the_observed_package_and_rotation() {
+        let expected = glass_core::AxObservationSubject {
+            device: "emulator-fixture".into(),
+            application: "com.fixture".into(),
+            coordinate_basis: 1,
+        };
+        let xml = r#"<hierarchy rotation="1"><node package="com.fixture" bounds="[0,0][1080,1920]"/></hierarchy>"#;
+        let window = WindowGeometry {
+            x: 0,
+            y: 0,
+            width: 1080,
+            height: 1920,
+        };
+        let (tree, scope) =
+            build_tree_with_scope(xml, &window, WalkLimits::DEFAULT, Some(&expected)).unwrap();
+        assert_eq!(scope.unwrap().provider, "android-uiautomator-v1");
+        assert_eq!(tree, build_tree(xml, &window, WalkLimits::DEFAULT).unwrap());
+        for xml in [
+            xml.replace("rotation=\"1\"", "rotation=\"0\""),
+            xml.replace(" package=\"com.fixture\"", ""),
+            xml.replace("com.fixture", "com.other"),
+            xml.replace("[1080,1920]", "[1081,1920]"),
+            xml.replace(
+                "</hierarchy>",
+                "<node package=\"com.fixture\"/></hierarchy>",
+            ),
+        ] {
+            let (tree, scope) =
+                build_tree_with_scope(&xml, &window, WalkLimits::DEFAULT, Some(&expected)).unwrap();
+            assert!(scope.is_none());
+            assert_eq!(
+                tree,
+                build_tree(&xml, &window, WalkLimits::DEFAULT).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn device_owner_and_render_geometry_must_match_the_observation() {
+        let geometry = win();
+        let mut window = glass_core::AxObservationWindow {
+            id: glass_core::WindowId(9),
+            instance: 1,
+            owner_pid: Some(1234),
+            geometry: Some(geometry.clone()),
+            subject: Some(glass_core::AxObservationSubject {
+                device: "emulator-fixture".into(),
+                application: "com.fixture".into(),
+                coordinate_basis: 0,
+            }),
+        };
+        let mut ctx = glass_core::AxContext {
+            pids: vec![1234],
+            window: geometry,
+            window_handle: None,
+            a11y_bus_addr: None,
+            limits: WalkLimits::DEFAULT,
+            deadline: glass_core::Deadline::UNBOUNDED,
+        };
+        assert!(observation_subject(&ctx, &window, Some("emulator-fixture")).is_some());
+        assert!(observation_subject(&ctx, &window, Some("emulator-other")).is_none());
+        ctx.window.width += 1;
+        assert!(observation_subject(&ctx, &window, Some("emulator-fixture")).is_none());
+        ctx.window.width -= 1;
+        window.owner_pid = Some(3210);
+        assert!(observation_subject(&ctx, &window, Some("emulator-fixture")).is_none());
+    }
     use glass_core::accessibility::{AxRole, TruncationLimit};
     use glass_core::{GlassError, WindowGeometry};
 

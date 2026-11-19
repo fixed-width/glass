@@ -1007,6 +1007,7 @@ fn observation_target(
         instance: u64::try_from(window.con_id).ok()?,
         owner_pid: Some(owner_pid.get()),
         geometry: Some(rect_to_geom(&window.rect)),
+        subject: None,
     })
 }
 

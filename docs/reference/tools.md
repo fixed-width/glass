@@ -1000,8 +1000,16 @@ bounds used to normalize the outline.
 
 X11 qualifies viewable windows on owned Xvfb displays. Wayland qualifies visible native
 `xdg_shell` windows that intersect the session's single headless output at the origin with
-1× scale and normal orientation. Attached X11 displays, Xwayland, unverified providers or
-coordinate scopes, and the remaining backends return `context_unproven` with `cacheable: false`.
+1× scale and normal orientation. Android qualifies uiautomator and accessibility-service reads
+that identify the selected app's sole on-screen window when it has focus on the emulator's only
+display. Glass checks the device boot, window owner, frame, and display rotation around the fresh
+read. Uiautomator also reports its rotation in the dump. An older companion response without an
+explicit package, a different foreground app, or a window whose live frame differs from the
+session geometry yields an uncached full snapshot.
+Bounded Android accessibility reads skip the optional window probe and end revision continuity.
+
+Attached X11 displays, Xwayland, unverified subjects or coordinate scopes, and the remaining
+backends return `context_unproven` with `cacheable: false`.
 Scope is an observed episode, with the ordinary snapshot's root guarantees; tokens do not identify
 a native object's lifetime. IDs remain immediate references from the latest read.
 

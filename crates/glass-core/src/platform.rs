@@ -284,6 +284,15 @@ pub struct AxObservationWindow {
     pub owner_pid: Option<u32>,
     /// Geometry sampled by the observation probe, when available.
     pub geometry: Option<WindowGeometry>,
+    /// Subject evidence for readers that observe the active app on a device.
+    pub subject: Option<AxObservationSubject>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AxObservationSubject {
+    pub device: String,
+    pub application: String,
+    pub coordinate_basis: u64,
 }
 
 /// A top-level window belonging to the launched app.
@@ -603,6 +612,7 @@ pub trait Platform {
             instance: 0,
             owner_pid: None,
             geometry: None,
+            subject: None,
         })
     }
 
