@@ -1119,14 +1119,21 @@ and `observed: {settled, saw_motion, observed_ms}` when `return:"settle"`.
 
 Set exactly one immediate `#id` or one freshly resolved unique semantic target. Where the platform
 can write the value directly this is instant and takes no keystrokes. On a mobile
-backend (Android without the on-device accessibility service, and the iOS Simulator) it taps the
-element, clears it and types, then reads the element back to confirm. It can take up to three
-reads within the available time while the field's value updates. If a complete tree omits the
+backend (Android without the on-device accessibility service, and iOS Simulator with the host
+reader) it taps the element, clears it and types, then reads the element back to confirm. It can
+take up to three reads within the available time while the field's value updates. If a complete tree omits the
 field, it can read once more within that same limit to give a transition time to finish. A field
 that reappears must be the only match for its role and name in a complete tree. When both the old
 and new bounds are available, they must overlap. Errors if the element isn't editable, changed
 since the snapshot, does not hold the requested value afterwards, or the app exposes no
 accessibility tree.
+
+On iOS Simulator, text writes that reach the `axbridge` reader return `unsupported_operation`
+with `dispatch: "not_dispatched"`. Glass handles boolean requests on checkable controls
+separately. Use a screenshot to choose where to tap and check the field has focus. Select all
+existing text before typing a replacement. Verify that the field selector is unique before
+checking the exact value with `glass_wait_for_element`.
+[Enter text with the guest reader](../how-to/setup-ios.md#enter-text-with-the-guest-reader)
 
 On Linux, a text field can advertise `editable` while exposing no AT-SPI `EditableText` interface
 (for example, egui/AccessKit). Glass checks that interface before attempting the write and returns

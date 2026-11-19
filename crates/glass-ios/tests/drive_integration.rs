@@ -941,9 +941,34 @@ fn web_fixture_button_and_field_respond() {
                 Some(glass_core::BoundDispatch::NotDispatched)
             );
         }
+        let field = initial
+            .find_first(|node| {
+                node.role == AxRole::TextField && node.name.as_deref() == Some("Account name")
+            })
+            .expect("web text field");
+        let target = AxTarget {
+            id: field.id,
+            role: field.role,
+            name: field.name.clone(),
+            bounds: field.bounds,
+            value: field.value.clone(),
+        };
+        let error = a11y
+            .set_value(&ctx, &target, "unexpected write")
+            .expect_err("guest set_value must refuse before dispatch");
+        assert_eq!(
+            error.bound_dispatch(),
+            Some(glass_core::BoundDispatch::NotDispatched)
+        );
         let after = a11y.snapshot(&ctx).expect("snapshot after refused presses");
         assert!(carries(&after, "Not saved").is_some());
         assert!(carries(&after, "No semantic action activated").is_some());
+        let field_after = after
+            .find_first(|node| {
+                node.role == AxRole::TextField && node.name.as_deref() == Some("Account name")
+            })
+            .expect("web text field after refused write");
+        assert_eq!(field_after.value, field.value);
         return;
     }
     println!(
