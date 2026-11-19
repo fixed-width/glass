@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use glass_core::Deadline;
 use glass_core::Platform;
 use glass_core::{
-    AppSpec, Frame, GlassError, HostPathProtectionMode, KeyEvent, PointerEvent, ProtectedHostPath,
-    Region, Result, Stream, WindowGeometry, WindowId, WindowInfo, WindowOp,
+    AppSpec, AxObservationSubject, AxObservationWindow, Frame, GlassError, HostPathProtectionMode,
+    KeyEvent, PointerEvent, ProtectedHostPath, Region, Result, Stream, WindowGeometry, WindowId,
+    WindowInfo, WindowOp,
 };
 
 use crate::a11y::AndroidA11y;
@@ -17,8 +18,8 @@ use crate::cmd::{force_stop, install_args, launch_args, parse_launch};
 use crate::input::{AgentInjector, Injector, ShellInjector};
 use crate::logs::{LogSink, LogcatStream};
 use crate::parse::{
-    check_am_start, check_install, describe_missing_window, parse_app_windows, parse_pid,
-    parse_pids,
+    OBSERVATION_DUMP, ObservationWindowState, check_am_start, check_install,
+    describe_missing_window, parse_app_windows, parse_observation_window, parse_pid, parse_pids,
 };
 use crate::screencap::decode_screencap;
 use crate::target::AdbTarget;
@@ -34,6 +35,8 @@ struct RunningApp {
     active_id: WindowId,
     window: WindowGeometry,
     logcat: Option<LogcatStream>,
+    observed_window: Option<ObservationWindowState>,
+    observation_instance: u64,
 }
 
 /// Drives a native Android app in an AVD over `adb`.
@@ -43,6 +46,7 @@ pub struct AndroidPlatform {
     agent: Option<Arc<AgentClient>>,
     logs: LogSink,
     app: Option<RunningApp>,
+    session_package: Arc<Mutex<Option<String>>>,
     #[cfg(all(test, unix))]
     window_list_parse_delay: Option<Duration>,
 }
@@ -62,6 +66,10 @@ impl AndroidPlatform {
         let Some(mut app) = self.app.take() else {
             return Ok(());
         };
+        *self
+            .session_package
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         if let Some(mut logcat) = app.logcat.take() {
             logcat.stop();
         }
@@ -109,6 +117,7 @@ impl AndroidPlatform {
             agent,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
+            session_package: Arc::default(),
             #[cfg(all(test, unix))]
             window_list_parse_delay: None,
         })
@@ -143,9 +152,10 @@ impl AndroidPlatform {
             return Box::new(AndroidA11y::for_adb(self.resolved_adb()));
         };
         match services.ensure(&self.resolved_adb(), &apk) {
-            // The package isn't known until start_app; the device service serves the ACTIVE
-            // window regardless, so an empty package is correct for the MVP.
-            Ok(client) => Box::new(ServiceA11y::new(client, String::new())),
+            Ok(client) => Box::new(ServiceA11y::new(client, String::new()).with_session(
+                self.adb().serial().map(str::to_owned),
+                self.session_package.clone(),
+            )),
             Err(e) => {
                 eprintln!("glass-android: a11y service unavailable, using uiautomator: {e}");
                 Box::new(AndroidA11y::for_adb(self.resolved_adb()))
@@ -415,6 +425,10 @@ impl Platform for AndroidPlatform {
             None => None,
         };
 
+        *self
+            .session_package
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(target.package.clone());
         self.app = Some(RunningApp {
             package: target.package,
             component: target.component,
@@ -422,6 +436,8 @@ impl Platform for AndroidPlatform {
             active_id,
             window: window.clone(),
             logcat,
+            observed_window: None,
+            observation_instance: 0,
         });
         Ok(window)
     }
@@ -649,6 +665,41 @@ impl Platform for AndroidPlatform {
             Ok(self.app_pid().into_iter().collect())
         }
     }
+
+    fn observation_window_by(&mut self, deadline: Deadline) -> Option<AxObservationWindow> {
+        // Bounded accessibility reads need their caller deadline for the tree itself.
+        if deadline.instant().is_some() {
+            return None;
+        }
+        let probe = Deadline::from_millis(750);
+        self.app.as_ref()?;
+        let device = self.adb().serial()?.to_owned();
+        let dump = self
+            .adb()
+            .run_until(["shell", OBSERVATION_DUMP], probe)
+            .ok()?;
+        let app = self.app.as_mut()?;
+        let observed = parse_observation_window(&dump, &app.package, app.active_id.0)?;
+        if observed.frame != app.window || probe.has_passed() {
+            return None;
+        }
+        if app.observed_window.as_ref() != Some(&observed) {
+            app.observation_instance = app.observation_instance.checked_add(1)?;
+        }
+        let window = AxObservationWindow {
+            id: app.active_id,
+            instance: app.observation_instance,
+            owner_pid: Some(observed.owner_pid),
+            geometry: Some(observed.frame.clone()),
+            subject: Some(AxObservationSubject {
+                device,
+                application: app.package.clone(),
+                coordinate_basis: u64::from(observed.rotation),
+            }),
+        };
+        app.observed_window = Some(observed);
+        Some(window)
+    }
 }
 
 impl Drop for AndroidPlatform {
@@ -865,8 +916,146 @@ mod platform_tests {
             agent: None,
             logs: Arc::new(Mutex::new(Vec::new())),
             app: None,
+            session_package: Arc::default(),
             window_list_parse_delay: None,
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn observation_tracks_native_window_and_device_generations() {
+        use crate::parse::OBSERVATION_FIXTURE;
+
+        let fake = FakeAdb::new(&[
+            ("*shell am start *", Answer::says("Status: ok\n")),
+            (
+                "*shell dumpsys window windows",
+                Answer::says(OBSERVATION_FIXTURE),
+            ),
+            ("*shell pidof *", Answer::Silent),
+            (
+                "*shell cat /proc/sys/kernel/random/boot_id*",
+                Answer::says(OBSERVATION_FIXTURE),
+            ),
+            (
+                "*shell am force-stop *",
+                Answer::says("\n__glass_force_stop_status=0\n"),
+            ),
+        ]);
+        let mut platform = platform_over(&fake);
+        platform.target = Box::new(AttachedDevice::from_adb(
+            fake.adb().clone().with_serial("emulator-fixture"),
+        ));
+        assert!(
+            platform
+                .observation_window_by(Deadline::UNBOUNDED)
+                .is_none()
+        );
+        platform.start_app(&spec()).unwrap();
+        let first = platform.observation_window_by(Deadline::UNBOUNDED).unwrap();
+        assert_eq!(first.id, WindowId(0xabc));
+        assert_eq!(first.owner_pid, Some(4321));
+        assert_eq!(first.subject.as_ref().unwrap().device, "emulator-fixture");
+        assert_eq!(
+            platform.observation_window_by(Deadline::UNBOUNDED),
+            Some(first.clone())
+        );
+        platform.app.as_mut().unwrap().observed_window = parse_observation_window(
+            &OBSERVATION_FIXTURE.replace("561\nWINDOW", "567\nWINDOW"),
+            "com.example.app",
+            0xabc,
+        );
+        let recovered = platform.observation_window_by(Deadline::UNBOUNDED).unwrap();
+        assert_ne!(recovered.instance, first.instance);
+        platform.app.as_mut().unwrap().window.width += 1;
+        assert!(
+            platform
+                .observation_window_by(Deadline::UNBOUNDED)
+                .is_none()
+        );
+        assert!(
+            platform
+                .observation_window_by(Deadline::from_millis(0))
+                .is_none()
+        );
+        platform.stop_app_by(Deadline::UNBOUNDED).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_accessibility_wait_skips_observation_probes_and_retires_the_baseline() {
+        use crate::parse::OBSERVATION_FIXTURE;
+        use glass_core::{Backend, BaselineStore, ElementCondition, Glass, WaitElementParams};
+
+        let fake = FakeAdb::scripted(vec![
+            ("*shell am start *", vec![Answer::says("Status: ok\n")]),
+            (
+                "*shell dumpsys window windows",
+                vec![Answer::says(OBSERVATION_FIXTURE)],
+            ),
+            ("*shell pidof *", vec![Answer::says("4321\n")]),
+            (
+                "*shell cat /proc/sys/kernel/random/boot_id*",
+                vec![
+                    Answer::says(OBSERVATION_FIXTURE),
+                    Answer::says(OBSERVATION_FIXTURE),
+                    Answer::Lingers,
+                ],
+            ),
+            (
+                "*shell cat /sdcard/glass_dump*",
+                vec![Answer::says(
+                    r#"<hierarchy rotation="0"><node package="com.example.app" class="android.widget.Button" text="Ready" bounds="[0,0][1080,2400]"/></hierarchy>"#,
+                )],
+            ),
+            (
+                "*shell am force-stop *",
+                vec![Answer::says("\n__glass_force_stop_status=0\n")],
+            ),
+        ]);
+        let mut platform = platform_over(&fake);
+        let adb = fake.adb().clone().with_serial("emulator-fixture");
+        platform.target = Box::new(AttachedDevice::from_adb(adb.clone()));
+        let baselines = std::path::Path::new(adb.bin()).with_file_name("baselines");
+        let mut backend = Some(Backend {
+            platform: Box::new(platform),
+            accessibility: Some(Box::new(AndroidA11y::for_adb(adb))),
+        });
+        let mut glass = Glass::new(
+            Box::new(move |_| backend.take().ok_or(GlassError::NoActiveSession)),
+            "android".into(),
+            BaselineStore::new(baselines),
+            100,
+        );
+        glass.start(&spec()).unwrap();
+        let first = glass.a11y_observation(None).unwrap().context.unwrap();
+        let waits = WaitElementParams {
+            name: Some("Ready".into()),
+            description: None,
+            role: None,
+            value: None,
+            value_contains: None,
+            condition: ElementCondition::Appears,
+            interval_ms: 50,
+            timeout_ms: 500,
+        };
+        assert!(glass.wait_for_element(&waits).unwrap().matched);
+        let probes = fake
+            .calls()
+            .iter()
+            .filter(|call| call.contains(OBSERVATION_DUMP))
+            .count();
+        assert_eq!(
+            probes, 2,
+            "only the explicit revision read probes the window"
+        );
+        assert_eq!(
+            glass
+                .observation_epoch()
+                .if_current(&first.generation, || ()),
+            None
+        );
+        glass.stop().unwrap();
     }
 
     #[test]

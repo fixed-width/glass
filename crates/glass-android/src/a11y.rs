@@ -16,7 +16,6 @@ use glass_core::{
 };
 
 use crate::adb::{Adb, AdbOp};
-use crate::axmap::build_tree;
 use crate::input::{key_commands, pointer_commands};
 use crate::target::{choose_serial, parse_devices};
 
@@ -336,6 +335,15 @@ fn snapshot_with_runner(
     ctx: &AxContext,
     bound: RetryBound,
 ) -> Result<AxTree> {
+    read_with_runner(run, ctx, bound, None).map(|(tree, _)| tree)
+}
+
+fn read_with_runner(
+    run: &mut AdbRunner<'_>,
+    ctx: &AxContext,
+    bound: RetryBound,
+    subject: Option<&glass_core::AxObservationSubject>,
+) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
     let xml = dump_until_ready(
         run,
         DUMP_PREFIX,
@@ -343,7 +351,7 @@ fn snapshot_with_runner(
         Duration::from_millis(DUMP_POLL_INTERVAL_MS),
         ctx.deadline,
     )?;
-    build_tree(&xml, &ctx.window, ctx.limits)
+    crate::axmap::build_tree_with_scope(&xml, &ctx.window, ctx.limits, subject)
 }
 
 /// Whether a dump has ever succeeded on this reader, which decides how long its next one may wait.
@@ -652,6 +660,19 @@ fn verify_write(
 impl Accessibility for AndroidA11y {
     fn snapshot(&mut self, ctx: &AxContext) -> Result<AxTree> {
         self.snapshot_within(ctx, snapshot_bound(self.warmth(), ctx.deadline))
+    }
+
+    fn snapshot_for_observation(
+        &mut self,
+        ctx: &AxContext,
+        window: &glass_core::AxObservationWindow,
+    ) -> Result<(AxTree, Option<glass_core::AxObservationScope>)> {
+        let bound = snapshot_bound(self.warmth(), ctx.deadline);
+        let adb = self.ensure_adb_within(ctx.deadline)?;
+        let subject = crate::axmap::observation_subject(ctx, window, adb.serial());
+        let reading = read_with_runner(&mut adb_runner(&adb), ctx, bound, subject)?;
+        self.warmed = true;
+        Ok(reading)
     }
 
     fn state_coverage(&self) -> AxStateCoverage {

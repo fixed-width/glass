@@ -86,11 +86,12 @@ pub mod recording;
 pub mod recording_worker;
 pub mod rolling;
 pub use platform::{
-    A11yBind, AppSpec, AxObservationWindow, HostPathAccess, HostPathProtectionMode, KeyEvent,
-    MAX_CLICK_COUNT, MAX_GESTURE_POINTERS, MAX_SCROLL_NOTCHES, MouseButton, Platform, PointerEvent,
-    ProtectedHostPath, ProtectedHostPathKind, SandboxLevel, Segment, TEARDOWN_BUDGET,
-    TEARDOWN_HOOK_RESERVE, TEARDOWN_REAP_HEADROOM, WindowGeometry, WindowHint, WindowId,
-    WindowInfo, WindowOp, validate_click_count, validate_pointer_input, validate_scroll_delta,
+    A11yBind, AppSpec, AxObservationSubject, AxObservationWindow, HostPathAccess,
+    HostPathProtectionMode, KeyEvent, MAX_CLICK_COUNT, MAX_GESTURE_POINTERS, MAX_SCROLL_NOTCHES,
+    MouseButton, Platform, PointerEvent, ProtectedHostPath, ProtectedHostPathKind, SandboxLevel,
+    Segment, TEARDOWN_BUDGET, TEARDOWN_HOOK_RESERVE, TEARDOWN_REAP_HEADROOM, WindowGeometry,
+    WindowHint, WindowId, WindowInfo, WindowOp, validate_click_count, validate_pointer_input,
+    validate_scroll_delta,
 };
 pub use recording::{
     RecordedVideo, Recording, RecordingArtifact, RecordingFormat, RecordingOptions,

@@ -203,6 +203,223 @@ async fn snapshot_outline(client: &Peer<RoleClient>) -> String {
     call(client, "glass_a11y_snapshot", json!({})).await.1
 }
 
+fn revision_observation(text: &str) -> &str {
+    let (_, observation) = text.split_once("\n⟦untrusted:").expect("observation block");
+    let (_, body) = observation.split_once('\n').expect("observation body");
+    body.split_once("\n⟦/untrusted:")
+        .expect("observation end")
+        .0
+}
+
+async fn android_revision(
+    client: &Peer<RoleClient>,
+    base: Option<&str>,
+) -> (serde_json::Value, serde_json::Value) {
+    let (result, text) = call(
+        client,
+        "glass_a11y_snapshot_diff",
+        json!({"base_revision": base, "max_nodes": 40}),
+    )
+    .await;
+    (
+        result,
+        serde_json::from_str(revision_observation(&text)).unwrap(),
+    )
+}
+
+async fn android_revision_baseline(
+    client: &Peer<RoleClient>,
+    base: Option<&str>,
+) -> (serde_json::Value, serde_json::Value) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (result, payload) = android_revision(client, base).await;
+        assert_eq!(result["kind"], "full");
+        if result["cacheable"] == true {
+            return (result, payload);
+        }
+        assert_eq!(result["full_reason"], "context_unproven", "{result}");
+        assert!(std::time::Instant::now() < deadline, "{result}");
+        tokio::time::sleep(AWAIT_INTERVAL).await;
+    }
+}
+
+fn verify_revision_text(metadata: &serde_json::Value, outline: &str) {
+    use sha2::{Digest, Sha256};
+    assert_eq!(metadata["body_bytes"], outline.len());
+    assert_eq!(
+        metadata["line_count"],
+        outline.split_inclusive('\n').count()
+    );
+    let digest: String = Sha256::digest(outline.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(metadata["body_sha256"], digest);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a booted AVD, the accessibility-service APK and the Android role fixture APK"]
+async fn both_android_readers_produce_lossless_snapshot_revisions() {
+    let _device_lock = ANDROID_DEVICE_TEST.lock().await;
+    let fixture = std::env::var("GLASS_ANDROID_ROLE_FIXTURE_APK").expect("role fixture APK");
+    std::env::var("GLASS_ANDROID_A11Y_APK").expect("accessibility-service APK");
+    let device = Companions {
+        agents: AgentRegistry::new(),
+        a11y: A11yServiceRegistry::new(),
+        emulators: EmulatorRegistry::new(),
+    };
+    for (name, glass, companion) in [
+        ("android-revision-service", session_glass(&device), true),
+        (
+            "android-revision-uiautomator",
+            uiautomator_session_glass(&device),
+            false,
+        ),
+    ] {
+        let mcp = InProcessMcpHarness::boot(glass, name).await;
+        let peer = mcp.peer();
+        let fixture = fixture.clone();
+        let proof =
+            tokio::spawn(async move { android_revision_proof(&peer, fixture, companion).await })
+                .await;
+        let cleanup = mcp.shutdown().await;
+        match proof {
+            Ok(()) => cleanup.expect("Android revision session cleanup"),
+            Err(proof) => {
+                if let Err(cleanup) = cleanup {
+                    eprintln!("Android cleanup after revision failure: {cleanup}");
+                }
+                std::panic::resume_unwind(proof.into_panic());
+            }
+        }
+    }
+}
+
+async fn android_revision_proof(client: &Peer<RoleClient>, fixture: String, companion: bool) {
+    let launch = json!({
+        "run": [fixture, "tech.fixedwidth.glassrolefixture/.MainActivity"],
+        "backend": "android", "timeout_ms": 10_000,
+    });
+    call(client, "glass_start", launch.clone()).await;
+    call(
+        client,
+        "glass_wait_for_element",
+        json!({"name": "Semantic Save", "timeout_ms": 10_000}),
+    )
+    .await;
+    let (full, payload) = android_revision_baseline(client, None).await;
+    let outline = payload["outline"].as_str().unwrap();
+    verify_revision_text(&full, outline);
+    assert_eq!(
+        outline.lines().next().unwrap().contains("visible"),
+        companion
+    );
+    assert_eq!(semantic_status(outline), "save=0 type=0 move=0 duplicate=0");
+
+    let (unchanged, payload) = android_revision(client, full["revision"].as_str()).await;
+    assert_eq!(unchanged["kind"], "unchanged");
+    assert_eq!(payload["edits"], json!([]));
+    verify_revision_text(&unchanged, outline);
+
+    let (x, y, width, height) = node_bounds(outline, "Button \"Disabled semantic\"");
+    call(
+        client,
+        "glass_click",
+        json!({"x": x + (width / 2) as i32, "y": y + (height / 2) as i32}),
+    )
+    .await;
+    let (no_op, _) = android_revision(client, unchanged["revision"].as_str()).await;
+    assert_eq!(no_op["kind"], "unchanged");
+    verify_revision_text(&no_op, outline);
+
+    let (x, y, width, height) = node_bounds(outline, "Button \"Semantic Save\"");
+    call(
+        client,
+        "glass_click",
+        json!({"x": x + (width / 2) as i32, "y": y + (height / 2) as i32}),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + AWAIT_DEADLINE;
+    loop {
+        let (_, text) = call(client, "glass_a11y_snapshot", json!({"max_nodes": 40})).await;
+        let status = semantic_status(revision_observation(&text));
+        if status == "save=1 type=0 move=0 duplicate=0" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture status after tap: {status}"
+        );
+        tokio::time::sleep(AWAIT_INTERVAL).await;
+    }
+    let (diff, payload) = android_revision(client, no_op["revision"].as_str()).await;
+    assert_eq!(diff["kind"], "diff", "{diff}");
+    let mut lines: Vec<_> = outline.split_inclusive('\n').collect();
+    for edit in payload["edits"].as_array().unwrap().iter().rev() {
+        let start = edit["start"].as_u64().unwrap() as usize;
+        let end = start + edit["delete"].as_u64().unwrap() as usize;
+        lines.splice(
+            start..end,
+            edit["insert"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap()),
+        );
+    }
+    let reconstructed = lines.concat();
+    verify_revision_text(&diff, &reconstructed);
+    let (_, text) = call(client, "glass_a11y_snapshot", json!({"max_nodes": 40})).await;
+    assert_eq!(reconstructed, revision_observation(&text));
+    assert_eq!(
+        semantic_status(&reconstructed),
+        "save=1 type=0 move=0 duplicate=0"
+    );
+
+    let (recovery, _) = android_revision(client, full["revision"].as_str()).await;
+    assert_eq!(recovery["kind"], "full");
+    assert_eq!(recovery["full_reason"], "baseline_unavailable");
+    let (_, windows) = call(client, "glass_list_windows", json!({})).await;
+    let windows: Vec<serde_json::Value> =
+        serde_json::from_str(revision_observation(&windows)).unwrap();
+    let selected = windows
+        .iter()
+        .find(|window| window["active"] == true)
+        .unwrap();
+    call(client, "glass_select_window", json!({"id": selected["id"]})).await;
+    let (selected, _) = android_revision(client, recovery["revision"].as_str()).await;
+    assert_eq!(selected["kind"], "full");
+    assert_eq!(selected["cacheable"], true);
+    assert_ne!(selected["context_id"], recovery["context_id"]);
+    call(client, "glass_stop", json!({})).await;
+
+    call(client, "glass_start", launch).await;
+    call(
+        client,
+        "glass_wait_for_element",
+        json!({"name": "Semantic Save", "timeout_ms": 10_000}),
+    )
+    .await;
+    let (restarted, payload) =
+        android_revision_baseline(client, selected["revision"].as_str()).await;
+    assert_ne!(restarted["context_id"], selected["context_id"]);
+    assert_eq!(
+        semantic_status(payload["outline"].as_str().unwrap()),
+        "save=0 type=0 move=0 duplicate=0"
+    );
+    let (waited, _) = call(
+        client,
+        "glass_wait_for_element",
+        json!({"name": "Semantic Save", "timeout_ms": 10_000}),
+    )
+    .await;
+    assert_eq!(waited["matched"], true);
+    let (after_wait, _) = android_revision_baseline(client, restarted["revision"].as_str()).await;
+    assert_eq!(after_wait["full_reason"], "baseline_unavailable");
+    call(client, "glass_stop", json!({})).await;
+}
+
 async fn await_exact_status(client: &Peer<RoleClient>, expected: &str) -> String {
     let start = std::time::Instant::now();
     loop {

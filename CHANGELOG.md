@@ -21,6 +21,9 @@ internal refactors, CI, or test-only changes.
 
 ### Added
 
+- Experimental accessibility snapshot revisions support Android's uiautomator and accessibility
+  service readers when Glass can verify the focused app window on the emulator's default display.
+
 - Experimental accessibility snapshot revisions support native Wayland windows on Glass's headless
   sway display when Glass can verify the selected window, output, and application-wide AT-SPI
   provider.
