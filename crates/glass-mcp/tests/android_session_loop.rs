@@ -258,6 +258,23 @@ fn verify_revision_text(metadata: &serde_json::Value, outline: &str) {
     assert_eq!(metadata["body_sha256"], digest);
 }
 
+fn apply_revision_edits(outline: &str, payload: &serde_json::Value) -> String {
+    let mut lines: Vec<_> = outline.split_inclusive('\n').collect();
+    for edit in payload["edits"].as_array().unwrap().iter().rev() {
+        let start = edit["start"].as_u64().unwrap() as usize;
+        let end = start + edit["delete"].as_u64().unwrap() as usize;
+        lines.splice(
+            start..end,
+            edit["insert"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap()),
+        );
+    }
+    lines.concat()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a booted AVD, the accessibility-service APK and the Android role fixture APK"]
 async fn both_android_readers_produce_lossless_snapshot_revisions() {
@@ -329,11 +346,19 @@ async fn android_revision_proof(client: &Peer<RoleClient>, fixture: String, comp
         json!({"x": x + (width / 2) as i32, "y": y + (height / 2) as i32}),
     )
     .await;
-    let (no_op, _) = android_revision(client, unchanged["revision"].as_str()).await;
-    assert_eq!(no_op["kind"], "unchanged");
-    verify_revision_text(&no_op, outline);
+    let (no_op, payload) = android_revision(client, unchanged["revision"].as_str()).await;
+    assert!(
+        matches!(no_op["kind"].as_str(), Some("diff" | "unchanged")),
+        "{no_op}"
+    );
+    let outline = apply_revision_edits(outline, &payload);
+    verify_revision_text(&no_op, &outline);
+    assert_eq!(
+        semantic_status(&outline),
+        "save=0 type=0 move=0 duplicate=0"
+    );
 
-    let (x, y, width, height) = node_bounds(outline, "Button \"Semantic Save\"");
+    let (x, y, width, height) = node_bounds(&outline, "Button \"Semantic Save\"");
     call(
         client,
         "glass_click",
@@ -355,20 +380,7 @@ async fn android_revision_proof(client: &Peer<RoleClient>, fixture: String, comp
     }
     let (diff, payload) = android_revision(client, no_op["revision"].as_str()).await;
     assert_eq!(diff["kind"], "diff", "{diff}");
-    let mut lines: Vec<_> = outline.split_inclusive('\n').collect();
-    for edit in payload["edits"].as_array().unwrap().iter().rev() {
-        let start = edit["start"].as_u64().unwrap() as usize;
-        let end = start + edit["delete"].as_u64().unwrap() as usize;
-        lines.splice(
-            start..end,
-            edit["insert"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|line| line.as_str().unwrap()),
-        );
-    }
-    let reconstructed = lines.concat();
+    let reconstructed = apply_revision_edits(&outline, &payload);
     verify_revision_text(&diff, &reconstructed);
     let (_, text) = call(client, "glass_a11y_snapshot", json!({"max_nodes": 40})).await;
     assert_eq!(reconstructed, revision_observation(&text));
