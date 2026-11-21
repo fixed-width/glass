@@ -216,6 +216,32 @@ fn native_invoke_actuates_the_fixture() {
         || counter(&mut a11y),
     );
 
+    // A disabled button errors, and says why.
+    let t = snap(&mut a11y);
+    let gated = target(by_desc(&t.root, "GatedBtn").expect("GatedBtn"));
+    let err = a11y
+        .invoke(&ctx, &gated)
+        .expect_err("a disabled button must not report success");
+    assert!(err.to_string().contains("disabled"), "{err}");
+    assert!(!err.invoke_fallback_eligible(), "must not fall back: {err}");
+
+    // Check the visible checkbox before invoking a row that can scroll the fixture.
+    let t = snap(&mut a11y);
+    let box_node = by_desc(&t.root, "AgreeBox").expect("AgreeBox");
+    let was = box_node.states.checked;
+    let agree = target(box_node);
+    a11y.invoke(&ctx, &agree)
+        .expect("native invoke on a checkbox");
+    let t = snap(&mut a11y);
+    assert_ne!(
+        by_desc(&t.root, "AgreeBox")
+            .expect("AgreeBox")
+            .states
+            .checked,
+        was,
+        "the checkbox must actually toggle"
+    );
+
     // A row far below the fold actuates — the case a pointer tap cannot serve.
     let t = snap(&mut a11y);
     let row_node = by_desc(&t.root, "Row250").expect("Row250");
@@ -241,32 +267,6 @@ fn native_invoke_actuates_the_fixture() {
     assert!(
         after.contains("row=250"),
         "the RIGHT row must actuate, got {after}"
-    );
-
-    // A disabled button errors, and says why.
-    let t = snap(&mut a11y);
-    let gated = target(by_desc(&t.root, "GatedBtn").expect("GatedBtn"));
-    let err = a11y
-        .invoke(&ctx, &gated)
-        .expect_err("a disabled button must not report success");
-    assert!(err.to_string().contains("disabled"), "{err}");
-    assert!(!err.invoke_fallback_eligible(), "must not fall back: {err}");
-
-    // A checkbox flips, and the flip is observed rather than assumed.
-    let t = snap(&mut a11y);
-    let box_node = by_desc(&t.root, "AgreeBox").expect("AgreeBox");
-    let was = box_node.states.checked;
-    let agree = target(box_node);
-    a11y.invoke(&ctx, &agree)
-        .expect("native invoke on a checkbox");
-    let t = snap(&mut a11y);
-    assert_ne!(
-        by_desc(&t.root, "AgreeBox")
-            .expect("AgreeBox")
-            .states
-            .checked,
-        was,
-        "the checkbox must actually toggle"
     );
 
     // Compose: the label is not the clickable node, so this exercises the climb.
