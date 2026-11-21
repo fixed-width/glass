@@ -458,24 +458,29 @@ fn unique_outline_id(
     }
 }
 
-fn name_id_from_outline_result(outline: &str) -> Result<u32, String> {
+fn name_id_from_outline_result(outline: &str, expected_value: &str) -> Result<u32, String> {
     let nodes = outline_nodes(outline);
+    let value_prefix = format!("value=\"{expected_value}\" ");
     unique_outline_id(
         outline,
         "Name TextField",
         nodes
             .iter()
             .filter(|node| {
-                (node.shape.starts_with("TextField value=\"\" ")
-                    || node.shape.starts_with("TextField \"Name\" value=\"\" "))
-                    && node.shape.contains("editable")
+                node.shape.strip_prefix("TextField ").is_some_and(|field| {
+                    field
+                        .strip_prefix("\"Name\" ")
+                        .unwrap_or(field)
+                        .starts_with(&value_prefix)
+                        && field.contains("editable")
+                })
             })
             .map(|node| node.id),
     )
 }
 
 fn name_id_from_outline(outline: &str) -> u32 {
-    name_id_from_outline_result(outline).unwrap_or_else(|error| panic!("{error}"))
+    name_id_from_outline_result(outline, "").unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn save_button_id_from_outline_result(outline: &str) -> Result<u32, String> {
@@ -665,14 +670,7 @@ async fn ime_form_proof(client: Peer<RoleClient>, fixture: String) {
         "{all_text}"
     );
     let (_, after) = call(&client, "glass_a11y_snapshot", json!({})).await;
-    let submitted = outline_nodes(&after)
-        .into_iter()
-        .filter(|node| {
-            node.shape.starts_with("TextField value=\"viaBatch\" ")
-                && node.shape.contains("editable")
-        })
-        .count();
-    assert_eq!(submitted, 1, "expected one submitted TextField:\n{after}");
+    name_id_from_outline_result(&after, "viaBatch").unwrap_or_else(|error| panic!("{error}"));
 
     call(&client, "glass_stop", json!({})).await;
 }
@@ -1056,6 +1054,9 @@ fn outline_selectors_require_the_observed_unique_control_shapes() {
 "#;
     assert_eq!(name_id_from_outline(outline), 3);
     assert_eq!(save_button_id_from_outline(outline), 6);
+    let submitted =
+        r#"#3 TextField "Name" value="viaBatch" (63,338 735x147) [enabled,visible,editable]"#;
+    assert_eq!(name_id_from_outline_result(submitted, "viaBatch"), Ok(3));
 }
 
 #[test]
@@ -1064,7 +1065,7 @@ fn outline_selectors_reject_ambiguous_controls() {
   #3 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
   #4 TextField "Name" value="" (63,338 735x147) [focusable,enabled,visible,editable]
 "#;
-    let error = name_id_from_outline_result(outline).unwrap_err();
+    let error = name_id_from_outline_result(outline, "").unwrap_err();
     assert!(error.contains("expected exactly one Name TextField"));
     assert!(error.contains(outline.trim()));
 
